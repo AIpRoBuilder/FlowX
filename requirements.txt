@@ -1,0 +1,11 @@
+# MCP runtime
+mcp>=1.2.0
+
+# Workflow packages (install editable from source instead if preferred):
+#   pip install -e ../meta_agent --no-deps
+#   pip install -e ../ag_ui_worflow --no-deps
+meta-agent
+ag-ui-workflow
+
+# Optional: load .env for local dev
+python-dotenv
