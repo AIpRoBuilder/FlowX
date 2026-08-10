@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import contextlib
 import io
 import importlib
 import json
 import logging
+import mimetypes
 import os
 import sys
 import traceback
@@ -74,6 +77,65 @@ def _resolve_workspace(workspace: Optional[str]) -> str:
     return _default_workspace()
 
 
+def _decode_base64_file_content(content_base64: str) -> bytes:
+    payload = str(content_base64 or "").strip()
+    if not payload:
+        raise ValueError("content_base64 must be a non-empty base64 string")
+    lowered = payload.lower()
+    if lowered.startswith("data:") and ";base64," in lowered:
+        payload = payload.split(",", 1)[1]
+    normalized = "".join(payload.split())
+    try:
+        return base64.b64decode(normalized, validate=True)
+    except binascii.Error as exc:
+        raise ValueError("content_base64 is not valid base64-encoded file content") from exc
+
+
+def _write_workspace_input_file(
+    *,
+    file_name: str,
+    content_base64: str,
+    workspace: Optional[str] = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    workspace_dir = Path(_resolve_workspace(workspace)).resolve()
+    inputs_dir = (workspace_dir / "inputs").resolve()
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+
+    requested_name = _normalize_name(file_name, "file_name")
+    if Path(requested_name).name != requested_name:
+        raise ValueError("file_name must be a plain file name under workspace/inputs")
+
+    target_path = (inputs_dir / requested_name).resolve()
+    try:
+        target_path.relative_to(inputs_dir)
+    except ValueError as exc:
+        raise ValueError("file_name must resolve inside workspace/inputs") from exc
+    if target_path.exists() and target_path.is_dir():
+        raise ValueError(f"file_name '{requested_name}' resolves to a directory")
+
+    existed = target_path.is_file()
+    if existed and not overwrite:
+        raise FileExistsError(
+            f"input file '{requested_name}' already exists under {inputs_dir}; "
+            "pass overwrite=true to replace it"
+        )
+
+    content = _decode_base64_file_content(content_base64)
+    target_path.write_bytes(content)
+    mime_type, _ = mimetypes.guess_type(target_path.name)
+    return {
+        "workspace": str(workspace_dir),
+        "inputs_dir": str(inputs_dir),
+        "file_name": target_path.name,
+        "relative_path": target_path.relative_to(workspace_dir).as_posix(),
+        "file_path": str(target_path),
+        "mime_type": mime_type or "application/octet-stream",
+        "size_bytes": len(content),
+        "overwritten": existed,
+    }
+
+
 def _discover_workflow_folders(root_dir: str) -> list[dict[str, Any]]:
     workspace_dir = Path(root_dir).expanduser().resolve()
     discovered: list[dict[str, Any]] = []
@@ -93,6 +155,125 @@ def _discover_workflow_folders(root_dir: str) -> list[dict[str, Any]]:
             }
         )
     return discovered
+
+
+def _resolve_workflow_root(workflow_name: str, workspace: Optional[str] = None) -> Path:
+    workspace_dir = Path(_resolve_workspace(workspace)).resolve()
+    workflow_root = (workspace_dir / _normalize_name(workflow_name, "workflow_name")).resolve()
+    try:
+        workflow_root.relative_to(workspace_dir)
+    except ValueError as exc:
+        raise ValueError("workflow_name must resolve inside the workspace directory") from exc
+    if not workflow_root.is_dir():
+        raise KeyError(f"workflow '{workflow_name}' does not exist at {workflow_root}")
+    return workflow_root
+
+
+def _workflow_relative_path(workflow_root: Path, path: Path) -> str:
+    return path.relative_to(workflow_root).as_posix()
+
+
+def _resolve_requested_workflow_file(workflow_root: Path, file_name: str) -> Path:
+    requested_name = _normalize_name(file_name, "file_name")
+    direct_path = (workflow_root / requested_name).resolve()
+    try:
+        direct_path.relative_to(workflow_root)
+    except ValueError as exc:
+        raise ValueError(f"file_name '{requested_name}' escapes the workflow directory") from exc
+    if direct_path.is_file():
+        return direct_path
+
+    matches = sorted(
+        [path for path in workflow_root.rglob("*") if path.is_file() and path.name == requested_name],
+        key=lambda path: _workflow_relative_path(workflow_root, path).lower(),
+    )
+    if not matches:
+        raise FileNotFoundError(
+            f"file '{requested_name}' was not found under workflow '{workflow_root.name}'"
+        )
+    if len(matches) > 1:
+        match_list = ", ".join(_workflow_relative_path(workflow_root, path) for path in matches)
+        raise ValueError(
+            f"file name '{requested_name}' is ambiguous under workflow '{workflow_root.name}': "
+            f"{match_list}. Pass a relative path instead."
+        )
+    return matches[0]
+
+
+def _list_python_workflow_files(workflow_root: Path) -> list[dict[str, str]]:
+    python_files = [path for path in workflow_root.rglob("*.py") if path.is_file()]
+    return [
+        {
+            "file_name": path.name,
+            "relative_path": _workflow_relative_path(workflow_root, path),
+        }
+        for path in sorted(
+            python_files,
+            key=lambda path: _workflow_relative_path(workflow_root, path).lower(),
+        )
+    ]
+
+
+def _get_workflow_files_by_name(
+    workflow_root: Path,
+    file_names: list[str],
+) -> list[dict[str, str]]:
+    files: list[dict[str, str]] = []
+    for requested_name in file_names:
+        path = _resolve_requested_workflow_file(workflow_root, requested_name)
+        files.append(
+            {
+                "requested_name": requested_name,
+                "file_name": path.name,
+                "relative_path": _workflow_relative_path(workflow_root, path),
+                "content": path.read_text(encoding="utf-8"),
+            }
+        )
+    return files
+
+
+def _get_workflow_binary_files_by_name(
+    workflow_root: Path,
+    file_names: list[str],
+) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for requested_name in file_names:
+        path = _resolve_requested_workflow_file(workflow_root, requested_name)
+        content = path.read_bytes()
+        mime_type, _ = mimetypes.guess_type(path.name)
+        files.append(
+            {
+                "requested_name": requested_name,
+                "file_name": path.name,
+                "relative_path": _workflow_relative_path(workflow_root, path),
+                "mime_type": mime_type or "application/octet-stream",
+                "size_bytes": len(content),
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        )
+    return files
+
+
+def _replace_workflow_files_by_name(
+    workflow_root: Path,
+    file_names: list[str],
+    new_file_contents: list[str],
+) -> list[dict[str, str]]:
+    if len(file_names) != len(new_file_contents):
+        raise ValueError("file_names and new_file_contents must have the same length")
+
+    updated_files: list[dict[str, str]] = []
+    for requested_name, new_content in zip(file_names, new_file_contents):
+        path = _resolve_requested_workflow_file(workflow_root, requested_name)
+        path.write_text(str(new_content), encoding="utf-8")
+        updated_files.append(
+            {
+                "requested_name": requested_name,
+                "file_name": path.name,
+                "relative_path": _workflow_relative_path(workflow_root, path),
+            }
+        )
+    return updated_files
 
 
 def _normalize_name(value: str, field: str) -> str:
@@ -317,7 +498,8 @@ def create_server() -> Any:
         instructions=(
             "FlowX workflow builder and runner. Use these tools to create AG-UI workflows "
             "with meta_agent, update node backends, start or reload the backend engine, "
-            "inspect required user-input formats, and run workflow steps from chat input."
+            "inspect required user-input formats, upload workspace input files, and run "
+            "workflow steps from chat input."
         ),
     )
 
@@ -765,6 +947,149 @@ def create_server() -> Any:
             }
 
         return _tool_call("list_workflow_folders", _impl)
+
+    @mcp.tool()
+    def upload_workspace_input_file(
+        file_name: str,
+        content_base64: str,
+        workspace: Optional[str] = None,
+        overwrite: bool = False,
+    ) -> str:
+        """Upload a base64-encoded file into workspace/inputs.
+
+        Args:
+            file_name: File name to write under workspace/inputs, including any extension.
+            content_base64: Base64-encoded file bytes or a data URL.
+            workspace: Workspace root that owns the inputs folder.
+            overwrite: If true, replace an existing file with the same name.
+        """
+
+        def _impl() -> dict[str, Any]:
+            saved_file = _write_workspace_input_file(
+                file_name=file_name,
+                content_base64=content_base64,
+                workspace=workspace,
+                overwrite=overwrite,
+            )
+            return {
+                "ok": True,
+                **saved_file,
+            }
+
+        return _tool_call("upload_workspace_input_file", _impl)
+
+    @mcp.tool()
+    def list_workflow_python_files(
+        workflow_name: str,
+        workspace: Optional[str] = None,
+    ) -> str:
+        """List all Python files under a workflow folder.
+
+        Args:
+            workflow_name: Existing workflow folder name.
+            workspace: Parent directory containing workflow folders.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workflow_root = _resolve_workflow_root(workflow_name, workspace=workspace)
+            files = _list_python_workflow_files(workflow_root)
+            return {
+                "ok": True,
+                "workflow_name": workflow_root.name,
+                "workspace": str(workflow_root.parent),
+                "count": len(files),
+                "file_names": [item["file_name"] for item in files],
+                "files": files,
+            }
+
+        return _tool_call("list_workflow_python_files", _impl)
+
+    @mcp.tool()
+    def get_workflow_files(
+        workflow_name: str,
+        file_names: list[str],
+        workspace: Optional[str] = None,
+    ) -> str:
+        """Read specific files from a workflow folder by file name or relative path.
+
+        Args:
+            workflow_name: Existing workflow folder name.
+            file_names: File names or unique relative paths under the workflow folder.
+            workspace: Parent directory containing workflow folders.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workflow_root = _resolve_workflow_root(workflow_name, workspace=workspace)
+            files = _get_workflow_files_by_name(workflow_root, list(file_names))
+            return {
+                "ok": True,
+                "workflow_name": workflow_root.name,
+                "workspace": str(workflow_root.parent),
+                "count": len(files),
+                "files": files,
+            }
+
+        return _tool_call("get_workflow_files", _impl)
+
+    @mcp.tool()
+    def get_workflow_binary_files(
+        workflow_name: str,
+        file_names: list[str],
+        workspace: Optional[str] = None,
+    ) -> str:
+        """Read specific binary files from a workflow folder by file name or relative path.
+
+        Args:
+            workflow_name: Existing workflow folder name.
+            file_names: File names or unique relative paths under the workflow folder.
+            workspace: Parent directory containing workflow folders.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workflow_root = _resolve_workflow_root(workflow_name, workspace=workspace)
+            files = _get_workflow_binary_files_by_name(workflow_root, list(file_names))
+            return {
+                "ok": True,
+                "workflow_name": workflow_root.name,
+                "workspace": str(workflow_root.parent),
+                "count": len(files),
+                "files": files,
+            }
+
+        return _tool_call("get_workflow_binary_files", _impl)
+
+    @mcp.tool()
+    def replace_workflow_files(
+        workflow_name: str,
+        file_names: list[str],
+        new_file_contents: list[str],
+        workspace: Optional[str] = None,
+    ) -> str:
+        """Replace specific files in a workflow folder.
+
+        Args:
+            workflow_name: Existing workflow folder name.
+            file_names: File names or unique relative paths under the workflow folder.
+            new_file_contents: Replacement text for each requested file.
+            workspace: Parent directory containing workflow folders.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workflow_root = _resolve_workflow_root(workflow_name, workspace=workspace)
+            updated_files = _replace_workflow_files_by_name(
+                workflow_root,
+                list(file_names),
+                list(new_file_contents),
+            )
+            return {
+                "ok": True,
+                "workflow_name": workflow_root.name,
+                "workspace": str(workflow_root.parent),
+                "count": len(updated_files),
+                "updated_files": updated_files,
+            }
+
+        return _tool_call("replace_workflow_files", _impl)
 
     return mcp
 

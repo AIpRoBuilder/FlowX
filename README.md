@@ -49,6 +49,11 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 | `run_workflow_step` | Format a chat message into a step input, run it, return results. |
 | `list_workflows` | (helper) List workflows known to the server. |
 | `list_workflow_folders` | List workflow folders discovered on disk under the workspace root. |
+| `upload_workspace_input_file` | Save a base64-encoded file into `workspace/inputs` and return its path. |
+| `list_workflow_python_files` | List all `.py` files under a workflow folder. |
+| `get_workflow_files` | Read specific workflow files by file name or relative path. |
+| `get_workflow_binary_files` | Read specific workflow binary files and return base64 content plus MIME type. |
+| `replace_workflow_files` | Replace specific workflow files by file name or relative path. |
 
 ## Setup
 
@@ -111,7 +116,11 @@ Start the server on the remote machine:
 cd /home/testuser/FlowX
 export FLOWX_LLM_PROVIDER=deepseek
 export FLOWX_LLM_MODEL=deepseek-chat
+<<<<<<< HEAD
 export FLOWX_LLM_API_KEY='sk-7b750ecf940b45be82019e430be390b0'
+=======
+export FLOWX_LLM_API_KEY='<your key>'
+>>>>>>> 103246e (add mcp remote)
 export FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces
 export FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow
 python3 run_server.py --transport streamable-http --host 0.0.0.0 --port 8000 --verbose
@@ -145,14 +154,22 @@ load FlowX settings from `/home/testuser/FlowX/.env` or export them inline.
       "command": "ssh",
       "args": [
         "-i",
+<<<<<<< HEAD
         "~/.ssh/flowx_hermes",
+=======
+        "/absolute/path/to/flowx_hermes",
+>>>>>>> 103246e (add mcp remote)
         "-T",
         "testuser@203.195.208.49",
         "bash",
         "--noprofile",
         "--norc",
         "-lc",
+<<<<<<< HEAD
         "cd /home/testuser/FlowX && export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY='sk-7b750ecf940b45be82019e430be390b0' FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces && exec python3 FlowX/run_server.py --transport streamable-http --host 0.0.0.0 --port 8100 --verbose"
+=======
+        "cd /home/testuser/FlowX && export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY='<your key>' FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow && exec python3 run_server.py --verbose"
+>>>>>>> 103246e (add mcp remote)
       ]
     }
   }
