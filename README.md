@@ -12,23 +12,25 @@ builder and the **`ag_ui_workflow`** runtime engine as a set of tools, so any MC
 5. **inspect** the input format required by every user-input node,
 6. **run** a workflow step from a chat message and collect the results.
 
-It follows the same `FastMCP` + stdio pattern used by the `hermes-agent` MCP server.
+It follows the same `FastMCP` tool-registration pattern used by the `hermes-agent`
+MCP server. By default it serves over stdio, and it can also serve over
+Streamable HTTP when you want clients to attach to an already-running instance.
 
 ---
 
 ## Architecture
 
 ```
-MCP client  ──stdio──►  flowx_mcp.server (FastMCP)
-                            │
-                            ├── meta_agent.AgentBuilder  ──►  LLM (DeepSeek/...)
-                            │       (create / update / plan / generate)
-                            │
-                            └── subprocess: python main.py  ──►  FastAPI backend
-                                    │                                  │
-                                    │   POST /api/run-step (SSE)       │
-                                    └──────────────────────────────────┘
-                                       ag_ui_workflow.WorkflowEngine
+MCP client  ──stdio / streamable-http──►  flowx_mcp.server (FastMCP)
+                │
+                ├── meta_agent.AgentBuilder  ──►  LLM (DeepSeek/...)
+                │       (create / update / plan / generate)
+                │
+                └── subprocess: python main.py  ──►  FastAPI backend
+                  │                                  │
+                  │   POST /api/run-step (SSE)       │
+                  └──────────────────────────────────┘
+               ag_ui_workflow.WorkflowEngine
 ```
 
 The MCP server keeps a per-workflow `WorkflowHandle` (an `AgentBuilder` plus the running
@@ -65,12 +67,19 @@ Copy `.env.example` to `.env` and fill in your LLM key.
 ## Run
 
 ```bash
+# default: stdio transport for local MCP hosts
 python3.10 run_server.py
 # or with verbose logging
 python3.10 run_server.py --verbose
+
+# streamable HTTP transport for a long-running remote server
+python3.10 run_server.py --transport streamable-http --host 0.0.0.0 --port 8000
 ```
 
-## MCP client config (e.g. Claude Desktop / VS Code)
+Use stdio when the MCP host should launch FlowX itself. Use Streamable HTTP when
+you want to keep one FlowX instance running and let clients attach to it by URL.
+
+## Local stdio MCP client config (e.g. Claude Desktop / VS Code)
 
 ```jsonc
 {
@@ -84,6 +93,66 @@ python3.10 run_server.py --verbose
         "FLOWX_LLM_API_KEY": "<your key>",
         "FLOWX_DEFAULT_WORKSPACE": "/Users/xiechuxi/Desktop/codes/flowx_workspaces"
       }
+    }
+  }
+}
+```
+
+## Remote MCP client config for an existing FlowX server
+
+If FlowX is already running on the remote host, start it there with the HTTP
+transport and connect the client to the MCP endpoint instead of spawning a fresh
+process over SSH.
+
+Start the server on the remote machine:
+
+```bash
+cd /home/testuser/FlowX
+export FLOWX_LLM_PROVIDER=deepseek
+export FLOWX_LLM_MODEL=deepseek-chat
+export FLOWX_LLM_API_KEY='<your key>'
+export FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces
+export FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow
+python3 run_server.py --transport streamable-http --host 0.0.0.0 --port 8000 --verbose
+```
+
+Then point a URL-capable MCP host at that running server:
+
+```jsonc
+{
+  "mcpServers": {
+    "flowx-remote": {
+      "url": "http://203.195.208.49:8000/mcp"
+    }
+  }
+}
+```
+
+If your MCP host only supports stdio launch commands, keep using the SSH pattern
+below.
+
+## Remote MCP client config via SSH (starts a new FlowX process)
+
+When the MCP client runs on a different machine, keep FlowX on the remote host and let
+the client start it through `ssh -T`. Use an absolute path for the SSH key and either
+load FlowX settings from `/home/testuser/FlowX/.env` or export them inline.
+
+```jsonc
+{
+  "mcpServers": {
+    "flowx-remote": {
+      "command": "ssh",
+      "args": [
+        "-i",
+        "/absolute/path/to/flowx_hermes",
+        "-T",
+        "testuser@203.195.208.49",
+        "bash",
+        "--noprofile",
+        "--norc",
+        "-lc",
+        "cd /home/testuser/FlowX && export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY='<your key>' FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow && exec python3 run_server.py --verbose"
+      ]
     }
   }
 }

@@ -729,6 +729,18 @@ def create_server() -> Any:
 
 def run_stdio_server(verbose: bool = False) -> None:
     """Start the FlowX MCP server on stdio."""
+    run_server(transport="stdio", verbose=verbose)
+
+
+def run_server(
+    *,
+    transport: str = "stdio",
+    verbose: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    streamable_http_path: str = "/mcp",
+) -> None:
+    """Start the FlowX MCP server on the selected transport."""
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server could not load a compatible MCP SDK entry point.\n"
@@ -739,18 +751,51 @@ def run_stdio_server(verbose: bool = False) -> None:
         )
         sys.exit(1)
 
+    if transport == "streamable-http" and not streamable_http_path.startswith("/"):
+        raise ValueError("streamable_http_path must start with '/'")
+
     _load_env_from_repo()
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         stream=sys.stderr,
     )
     server = create_server()
-
-    async def _run() -> None:
-        await server.run_stdio_async()
+    run = getattr(server, "run", None)
 
     try:
-        asyncio.run(_run())
+        if callable(run):
+            kwargs: dict[str, Any] = {}
+            if transport == "streamable-http":
+                kwargs.update(
+                    {
+                        "transport": "streamable-http",
+                        "host": host,
+                        "port": port,
+                    }
+                )
+                if streamable_http_path != "/mcp":
+                    kwargs["streamable_http_path"] = streamable_http_path
+            run(**kwargs)
+            return
+
+        if transport != "stdio":
+            raise RuntimeError(
+                "The installed MCP SDK does not expose server.run(...), so the "
+                "streamable-http transport is unavailable. Upgrade the SDK with: "
+                f"{sys.executable} -m pip install -U 'mcp'"
+            )
+
+        run_stdio_async = getattr(server, "run_stdio_async", None)
+        if not callable(run_stdio_async):
+            raise RuntimeError(
+                "The installed MCP SDK does not expose a compatible server runner. "
+                "Expected server.run(...) or server.run_stdio_async()."
+            )
+
+        async def _run_stdio() -> None:
+            await run_stdio_async()
+
+        asyncio.run(_run_stdio())
     except KeyboardInterrupt:
         logger.info("FlowX MCP server interrupted")
 
@@ -763,8 +808,36 @@ def main(argv: Optional[list[str]] = None) -> None:
         action="store_true",
         help="Enable verbose logging on stderr",
     )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "streamable-http"),
+        default="stdio",
+        help="Transport to serve. Use streamable-http so remote clients can attach to an already-running FlowX instance.",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Listen host for the streamable-http transport.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Listen port for the streamable-http transport.",
+    )
+    parser.add_argument(
+        "--streamable-http-path",
+        default="/mcp",
+        help="HTTP path for the MCP endpoint when using the streamable-http transport.",
+    )
     args = parser.parse_args(argv)
-    run_stdio_server(verbose=bool(args.verbose))
+    run_server(
+        transport=str(args.transport),
+        verbose=bool(args.verbose),
+        host=str(args.host),
+        port=int(args.port),
+        streamable_http_path=str(args.streamable_http_path),
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
