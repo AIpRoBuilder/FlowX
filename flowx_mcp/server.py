@@ -74,6 +74,27 @@ def _resolve_workspace(workspace: Optional[str]) -> str:
     return _default_workspace()
 
 
+def _discover_workflow_folders(root_dir: str) -> list[dict[str, Any]]:
+    workspace_dir = Path(root_dir).expanduser().resolve()
+    discovered: list[dict[str, Any]] = []
+    for child in sorted(workspace_dir.iterdir(), key=lambda path: path.name.lower()):
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        has_graph_plan = (child / "graph_plan.json").is_file()
+        has_workflow_json = (child / "workflow.json").is_file()
+        if not has_graph_plan and not has_workflow_json:
+            continue
+        discovered.append(
+            {
+                "workflow_name": child.name,
+                "root_dir": str(child),
+                "has_graph_plan": has_graph_plan,
+                "has_workflow_json": has_workflow_json,
+            }
+        )
+    return discovered
+
+
 def _normalize_name(value: str, field: str) -> str:
     normalized = str(value or "").strip()
     if not normalized:
@@ -723,6 +744,27 @@ def create_server() -> Any:
             }
 
         return _tool_call("list_workflows", _impl)
+
+    @mcp.tool()
+    def list_workflow_folders(workspace: Optional[str] = None) -> str:
+        """List workflow folder names under the workspace root on disk.
+
+        Args:
+            workspace: Parent directory containing workflow folders.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workspace_dir = _resolve_workspace(workspace)
+            workflows = _discover_workflow_folders(workspace_dir)
+            return {
+                "ok": True,
+                "workspace": workspace_dir,
+                "count": len(workflows),
+                "workflow_names": [item["workflow_name"] for item in workflows],
+                "workflows": workflows,
+            }
+
+        return _tool_call("list_workflow_folders", _impl)
 
     return mcp
 

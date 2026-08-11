@@ -48,6 +48,7 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 | `get_node_input_formats` | List every user-input node and the input it expects. |
 | `run_workflow_step` | Format a chat message into a step input, run it, return results. |
 | `list_workflows` | (helper) List workflows known to the server. |
+| `list_workflow_folders` | List workflow folders discovered on disk under the workspace root. |
 
 ## Setup
 
@@ -110,7 +111,7 @@ Start the server on the remote machine:
 cd /home/testuser/FlowX
 export FLOWX_LLM_PROVIDER=deepseek
 export FLOWX_LLM_MODEL=deepseek-chat
-export FLOWX_LLM_API_KEY='<your key>'
+export FLOWX_LLM_API_KEY='sk-7b750ecf940b45be82019e430be390b0'
 export FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces
 export FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow
 python3 run_server.py --transport streamable-http --host 0.0.0.0 --port 8000 --verbose
@@ -144,14 +145,14 @@ load FlowX settings from `/home/testuser/FlowX/.env` or export them inline.
       "command": "ssh",
       "args": [
         "-i",
-        "/absolute/path/to/flowx_hermes",
+        "~/.ssh/flowx_hermes",
         "-T",
         "testuser@203.195.208.49",
         "bash",
         "--noprofile",
         "--norc",
         "-lc",
-        "cd /home/testuser/FlowX && export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY='<your key>' FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow && exec python3 run_server.py --verbose"
+        "cd /home/testuser/FlowX && export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY='sk-7b750ecf940b45be82019e430be390b0' FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces && exec python3 FlowX/run_server.py --transport streamable-http --host 0.0.0.0 --port 8100 --verbose"
       ]
     }
   }
