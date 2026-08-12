@@ -147,5 +147,3 @@ If you are interested in using FlowX or co-building it, contact me at [peterxcx@
 WeChat QR code:
 
 <img src="assets/qrcode.svg" alt="WeChat QR code placeholder" width="200" />
-
-Replace this placeholder with the actual WeChat QR code image when it is available.
