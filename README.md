@@ -60,8 +60,8 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 `meta_agent` and `ag_ui_workflow` must be importable. Install them editable:
 
 ```bash
-python3.10 -m pip install -e /Users/xiechuxi/Desktop/codes/meta_agent --no-deps
-python3.10 -m pip install -e /Users/xiechuxi/Desktop/codes/ag_ui_worflow --no-deps
+python3.10 -m pip install -e /Users/user/Desktop/codes/meta_agent --no-deps
+python3.10 -m pip install -e /Users/user/Desktop/codes/ag_ui_worflow --no-deps
 python3.10 -m pip install -r requirements.txt
 ```
 
@@ -92,12 +92,12 @@ you want to keep one FlowX instance running and let clients attach to it by URL.
   "mcpServers": {
     "flowx": {
       "command": "python3.10",
-      "args": ["/Users/xiechuxi/Desktop/codes/FlowX/run_server.py"],
+      "args": ["/Users/user/Desktop/codes/FlowX/run_server.py"],
       "env": {
         "FLOWX_LLM_PROVIDER": "deepseek",
         "FLOWX_LLM_MODEL": "deepseek-chat",
         "FLOWX_LLM_API_KEY": "<your key>",
-        "FLOWX_DEFAULT_WORKSPACE": "/Users/xiechuxi/Desktop/codes/flowx_workspaces"
+        "FLOWX_DEFAULT_WORKSPACE": "/Users/user/Desktop/codes/flowx_workspaces"
       }
     }
   }
@@ -116,11 +116,7 @@ Start the server on the remote machine:
 cd /home/testuser/FlowX
 export FLOWX_LLM_PROVIDER=deepseek
 export FLOWX_LLM_MODEL=deepseek-chat
-<<<<<<< HEAD
-export FLOWX_LLM_API_KEY='sk-7b750ecf940b45be82019e430be390b0'
-=======
 export FLOWX_LLM_API_KEY='<your key>'
->>>>>>> 103246e (add mcp remote)
 export FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces
 export FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow
 python3 run_server.py --transport streamable-http --host 0.0.0.0 --port 8000 --verbose
@@ -132,7 +128,7 @@ Then point a URL-capable MCP host at that running server:
 {
   "mcpServers": {
     "flowx-remote": {
-      "url": "http://203.195.208.49:8000/mcp"
+      "url": "http://{url}/mcp"
     }
   }
 }
@@ -140,38 +136,3 @@ Then point a URL-capable MCP host at that running server:
 
 If your MCP host only supports stdio launch commands, keep using the SSH pattern
 below.
-
-## Remote MCP client config via SSH (starts a new FlowX process)
-
-When the MCP client runs on a different machine, keep FlowX on the remote host and let
-the client start it through `ssh -T`. Use an absolute path for the SSH key and either
-load FlowX settings from `/home/testuser/FlowX/.env` or export them inline.
-
-```jsonc
-{
-  "mcpServers": {
-    "flowx-remote": {
-      "command": "ssh",
-      "args": [
-        "-i",
-<<<<<<< HEAD
-        "~/.ssh/flowx_hermes",
-=======
-        "/absolute/path/to/flowx_hermes",
->>>>>>> 103246e (add mcp remote)
-        "-T",
-        "testuser@203.195.208.49",
-        "bash",
-        "--noprofile",
-        "--norc",
-        "-lc",
-<<<<<<< HEAD
-        "cd /home/testuser/FlowX && export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY='sk-7b750ecf940b45be82019e430be390b0' FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces && exec python3 FlowX/run_server.py --transport streamable-http --host 0.0.0.0 --port 8100 --verbose"
-=======
-        "cd /home/testuser/FlowX && export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY='<your key>' FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow && exec python3 run_server.py --verbose"
->>>>>>> 103246e (add mcp remote)
-      ]
-    }
-  }
-}
-```
