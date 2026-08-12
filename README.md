@@ -1,5 +1,7 @@
 # FlowX MCP Server
 
+FlowX is an MCP server for creating workflows through conversation, designed to integrate easily with agent systems such as Hermes, WorkBuddy, and TraeWork.
+
 An [MCP](https://modelcontextprotocol.io) server that exposes the **`meta_agent`** workflow
 builder and the **`ag_ui_workflow`** runtime engine as a set of tools, so any MCP client
 (Claude Code, Cursor, Codex, VS Code Copilot Chat, ...) can:
@@ -45,6 +47,7 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 | `update_workflow_node` | Amend `workflow.json` + `{node}.py` + `main.py` from a change prompt. |
 | `start_backend` | Launch the generated FastAPI backend for a workflow. |
 | `reload_workflow` | Restart the backend (picks up updated node files / `workflow.json`). |
+| `restart_builder` | Recreate the in-memory `AgentBuilder` for a workflow from disk and optionally restart the backend. |
 | `get_node_input_formats` | List every user-input node and the input it expects. |
 | `run_workflow_step` | Format a chat message into a step input, run it, return results. |
 | `list_workflows` | (helper) List workflows known to the server. |
@@ -128,7 +131,7 @@ Then point a URL-capable MCP host at that running server:
 {
   "mcpServers": {
     "flowx-remote": {
-      "url": "http://{url}/mcp"
+      "url": "https://{url}/mcp"
     }
   }
 }
@@ -136,3 +139,13 @@ Then point a URL-capable MCP host at that running server:
 
 If your MCP host only supports stdio launch commands, keep using the SSH pattern
 below.
+
+## Contact
+
+If you are interested in using FlowX or co-building it, contact me at [peterxcx@gmail.com](mailto:peterxcx@gmail.com).
+
+WeChat QR code:
+
+![WeChat QR code placeholder](assets/qrcode.svg)
+
+Replace this placeholder with the actual WeChat QR code image when it is available.

@@ -91,6 +91,9 @@ class WorkflowHandle:
     api_key: str
     model: str
     provider: str
+    services_root: Optional[str] = None
+    skills_root: Optional[str] = None
+    frontend_style_prompt: Optional[str] = None
 
     # generated artifacts
     graph_plan_path: str = ""
@@ -293,6 +296,10 @@ class WorkflowRegistry:
             )
         return handle
 
+    def pop(self, workflow_name: str) -> Optional[WorkflowHandle]:
+        with self._lock:
+            return self._handles.pop(workflow_name, None)
+
     def get_or_create(
         self,
         *,
@@ -325,6 +332,10 @@ class WorkflowRegistry:
                         existing.model = model
                     if provider:
                         existing.provider = provider
+                if services_root is not None:
+                    existing.services_root = services_root
+                if skills_root is not None:
+                    existing.skills_root = skills_root
                 return existing
 
             defaults = _default_llm_config()
@@ -350,6 +361,8 @@ class WorkflowRegistry:
                 api_key=eff_api_key,
                 model=eff_model,
                 provider=eff_provider,
+                services_root=services_root,
+                skills_root=skills_root,
             )
             self._handles[workflow_name] = handle
             return handle

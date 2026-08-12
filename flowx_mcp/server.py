@@ -313,6 +313,8 @@ def _attach_existing_workflow(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
+    services_root: Optional[str] = None,
+    skills_root: Optional[str] = None,
 ) -> Any:
     workflow_name = _normalize_name(workflow_name, "workflow_name")
     workspace_dir = _resolve_workspace(workspace)
@@ -328,6 +330,8 @@ def _attach_existing_workflow(
         api_key=api_key,
         model=model,
         provider=provider,
+        services_root=services_root,
+        skills_root=skills_root,
     )
     graph_path = root_dir / "graph_plan.json"
     workflow_json_path = root_dir / "workflow.json"
@@ -366,6 +370,70 @@ def _require_handle(workflow_name: str, workspace: Optional[str] = None) -> Any:
     if handle is not None:
         return handle
     return _attach_existing_workflow(workflow_name, workspace=workspace)
+
+
+def _restart_builder_handle(
+    workflow_name: str,
+    *,
+    workspace: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    services_root: Optional[str] = None,
+    skills_root: Optional[str] = None,
+    reset_session: bool = True,
+) -> tuple[Any, bool]:
+    workflow = _normalize_name(workflow_name, "workflow_name")
+    previous_handle = registry.pop(workflow)
+
+    backend_port: Optional[int] = None
+    backend_was_running = False
+    previous_session_id: Optional[str] = None
+    previous_completed_steps: list[str] = []
+    previous_frontend_style_prompt: Optional[str] = None
+
+    if previous_handle is not None:
+        backend_port = previous_handle.backend_port
+        if previous_handle.backend_port:
+            backend_was_running = bool(
+                previous_handle.is_running
+                and health_check(previous_handle.backend_port, timeout=1.0)
+            )
+        previous_session_id = previous_handle.session_id
+        previous_completed_steps = list(previous_handle.completed_steps)
+        previous_frontend_style_prompt = (
+            previous_handle.frontend_style_prompt
+            or getattr(previous_handle.builder, "frontend_style_prompt", None)
+        )
+        api_key = api_key or previous_handle.api_key or None
+        model = model or previous_handle.model or None
+        provider = provider or previous_handle.provider or None
+        if services_root is None:
+            services_root = previous_handle.services_root
+        if skills_root is None:
+            skills_root = previous_handle.skills_root
+        previous_handle.stop_backend()
+
+    handle = _attach_existing_workflow(
+        workflow,
+        workspace=workspace,
+        api_key=api_key,
+        model=model,
+        provider=provider,
+        services_root=services_root,
+        skills_root=skills_root,
+    )
+    if backend_port:
+        handle.backend_port = backend_port
+    if previous_frontend_style_prompt is not None:
+        handle.frontend_style_prompt = previous_frontend_style_prompt
+        handle.builder.frontend_style_prompt = previous_frontend_style_prompt
+    if reset_session:
+        handle.new_session()
+    elif previous_session_id is not None:
+        handle.session_id = previous_session_id
+        handle.completed_steps = previous_completed_steps
+    return handle, backend_was_running
 
 
 def _load_steps_meta(handle: Any, *, include_hidden: bool = True) -> list[dict[str, Any]]:
@@ -497,7 +565,7 @@ def create_server() -> Any:
         "flowx",
         instructions=(
             "FlowX workflow builder and runner. Use these tools to create AG-UI workflows "
-            "with meta_agent, update node backends, start or reload the backend engine, "
+            "with meta_agent, restart the in-memory builder, update node backends, start or reload the backend engine, "
             "inspect required user-input formats, upload workspace input files, and run "
             "workflow steps from chat input."
         ),
@@ -545,7 +613,8 @@ def create_server() -> Any:
             port = int(backend_port) if int(backend_port or 0) > 0 else find_free_port()
             handle.backend_port = port
             if isinstance(frontend_style_prompt, str):
-                handle.builder.frontend_style_prompt = frontend_style_prompt.strip() or None
+                handle.frontend_style_prompt = frontend_style_prompt.strip() or None
+                handle.builder.frontend_style_prompt = handle.frontend_style_prompt
 
             with _capture_builder_output("create_workflow.analyze_requirement"):
                 req_path = handle.builder.analyze_requirement(requirement_text=requirement)
@@ -790,6 +859,91 @@ def create_server() -> Any:
             return info
 
         return _tool_call("reload_workflow", _impl)
+
+    @mcp.tool()
+    def restart_builder(
+        workflow_name: str,
+        workspace: Optional[str] = None,
+        reset_session: bool = True,
+        restart_backend: bool = False,
+        with_frontend: bool = False,
+        timeout_sec: int = 30,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        services_root: Optional[str] = None,
+        skills_root: Optional[str] = None,
+    ) -> str:
+        """Recreate the in-memory AgentBuilder for a workflow from files on disk.
+
+        Args:
+            workflow_name: Existing workflow name.
+            workspace: Parent directory containing the workflow folder.
+            reset_session: If true, allocate a new session id for the recreated builder.
+            restart_backend: If true, start the backend again after recreating the builder.
+            with_frontend: Also start the generated Vue dev server when restarting the backend.
+            timeout_sec: How long to wait for backend health when restarting it.
+            api_key: Optional LLM API key override for the recreated builder.
+            model: Optional LLM model override for the recreated builder.
+            provider: Optional LLM provider override for the recreated builder.
+            services_root: Optional services root path for the recreated builder.
+            skills_root: Optional skills root path for the recreated builder.
+        """
+
+        def _impl() -> dict[str, Any]:
+            handle, backend_was_running = _restart_builder_handle(
+                workflow_name,
+                workspace=workspace,
+                api_key=api_key,
+                model=model,
+                provider=provider,
+                services_root=services_root,
+                skills_root=skills_root,
+                reset_session=reset_session,
+            )
+
+            backend_info: Optional[dict[str, Any]] = None
+            if restart_backend or backend_was_running:
+                if not handle.backend_port:
+                    handle.backend_port = find_free_port()
+                with _capture_builder_output("restart_builder.generate_main"):
+                    handle.main_entrypoint_path = str(
+                        handle.builder.generate_main_entrypoint(
+                            handle.graph_plan_path,
+                            output_filename="main.py",
+                            temperature=0.0,
+                            fastapi_port=handle.backend_port,
+                        )
+                    )
+                with _capture_builder_output("restart_builder.start"):
+                    backend_info = handle.start_backend(
+                        with_frontend=with_frontend,
+                        timeout=float(timeout_sec),
+                    )
+
+            handle.sync_artifacts()
+            result: dict[str, Any] = {
+                "ok": True,
+                "workflow_name": handle.workflow_name,
+                "workspace": handle.workspace,
+                "root_dir": handle.root_dir,
+                "session_id": handle.session_id,
+                "backend_port": handle.backend_port,
+                "builder_restarted": True,
+                "backend_was_running": backend_was_running,
+                "backend_restarted": backend_info is not None,
+                "graph_plan_path": handle.graph_plan_path,
+                "workflow_json_path": handle.workflow_json_path,
+                "requirement_md_path": handle.requirement_md_path,
+                "main_entrypoint": handle.main_entrypoint_path,
+                "completed_steps": list(handle.completed_steps),
+            }
+            if backend_info is not None:
+                result["backend"] = backend_info
+                result["ok"] = bool(backend_info.get("is_running", False))
+            return result
+
+        return _tool_call("restart_builder", _impl)
 
     @mcp.tool()
     def get_node_input_formats(
@@ -1106,6 +1260,8 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     streamable_http_path: str = "/mcp",
+    sse_path: str = "/sse",
+    message_path: str = "/messages/",
 ) -> None:
     """Start the FlowX MCP server on the selected transport."""
     if not _MCP_SERVER_AVAILABLE:
@@ -1120,6 +1276,10 @@ def run_server(
 
     if transport == "streamable-http" and not streamable_http_path.startswith("/"):
         raise ValueError("streamable_http_path must start with '/'")
+    if transport == "sse" and not sse_path.startswith("/"):
+        raise ValueError("sse_path must start with '/'")
+    if transport == "sse" and not message_path.startswith("/"):
+        raise ValueError("message_path must start with '/'")
 
     _load_env_from_repo()
     logging.basicConfig(
@@ -1142,6 +1302,18 @@ def run_server(
                 )
                 if streamable_http_path != "/mcp":
                     kwargs["streamable_http_path"] = streamable_http_path
+            elif transport == "sse":
+                kwargs.update(
+                    {
+                        "transport": "sse",
+                        "host": host,
+                        "port": port,
+                    }
+                )
+                if sse_path != "/sse":
+                    kwargs["sse_path"] = sse_path
+                if message_path != "/messages/":
+                    kwargs["message_path"] = message_path
             run(**kwargs)
             return
 
@@ -1177,9 +1349,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
     parser.add_argument(
         "--transport",
-        choices=("stdio", "streamable-http"),
+        choices=("stdio", "sse", "streamable-http"),
         default="stdio",
-        help="Transport to serve. Use streamable-http so remote clients can attach to an already-running FlowX instance.",
+        help="Transport to serve. Use streamable-http or sse so remote clients can attach to an already-running FlowX instance.",
     )
     parser.add_argument(
         "--host",
@@ -1197,6 +1369,16 @@ def main(argv: Optional[list[str]] = None) -> None:
         default="/mcp",
         help="HTTP path for the MCP endpoint when using the streamable-http transport.",
     )
+    parser.add_argument(
+        "--sse-path",
+        default="/sse",
+        help="HTTP path for the SSE stream endpoint when using the sse transport.",
+    )
+    parser.add_argument(
+        "--message-path",
+        default="/messages/",
+        help="HTTP path for the SSE message endpoint when using the sse transport.",
+    )
     args = parser.parse_args(argv)
     run_server(
         transport=str(args.transport),
@@ -1204,6 +1386,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         host=str(args.host),
         port=int(args.port),
         streamable_http_path=str(args.streamable_http_path),
+        sse_path=str(args.sse_path),
+        message_path=str(args.message_path),
     )
 
 
