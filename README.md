@@ -386,7 +386,7 @@ V*_t = V_t / EMA(V_t)
 </details>
 
 <p align="center">
-  <img src="assets/stock_chip_distribution.png" alt="stock_distribution workflow example" width="860" />
+  <img src="assets/stock_chip_distribution.png" alt="stock_distribution workflow example" width="720" />
 </p>
 
 ### 3. `picture_to_svg`
@@ -403,7 +403,7 @@ V*_t = V_t / EMA(V_t)
 </details>
 
 <p align="center">
-  <img src="assets/picture_to_svg.png" alt="picture_to_svg workflow example" width="920" />
+  <img src="assets/picture_to_svg.png" alt="picture_to_svg workflow example" width="720" />
 </p>
 
 ### 4. `policy_scrawler`
@@ -424,7 +424,7 @@ V*_t = V_t / EMA(V_t)
 </details>
 
 <p align="center">
-  <img src="assets/policy_scrawler.png" alt="policy_scrawler workflow example" width="860" />
+  <img src="assets/policy_scrawler.png" alt="policy_scrawler workflow example" width="720" />
 </p>
 
 ## Contact
