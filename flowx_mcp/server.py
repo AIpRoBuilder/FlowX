@@ -1159,6 +1159,32 @@ def create_server() -> Any:
         return _tool_call("list_workflow_python_files", _impl)
 
     @mcp.tool()
+    def get_workflow_json(
+        workflow_name: str,
+        workspace: Optional[str] = None,
+    ) -> str:
+        """Read the root workflow.json file for a workflow folder.
+
+        Args:
+            workflow_name: Existing workflow folder name.
+            workspace: Parent directory containing workflow folders.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workflow_root = _resolve_workflow_root(workflow_name, workspace=workspace)
+            workflow_file = _get_workflow_files_by_name(workflow_root, ["workflow.json"])[0]
+            return {
+                "ok": True,
+                "workflow_name": workflow_root.name,
+                "workspace": str(workflow_root.parent),
+                "file_name": workflow_file["file_name"],
+                "relative_path": workflow_file["relative_path"],
+                "workflow_json": json.loads(workflow_file["content"]),
+            }
+
+        return _tool_call("get_workflow_json", _impl)
+
+    @mcp.tool()
     def get_workflow_files(
         workflow_name: str,
         file_names: list[str],

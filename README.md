@@ -54,6 +54,7 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 | `list_workflow_folders` | List workflow folders discovered on disk under the workspace root. |
 | `upload_workspace_input_file` | Save a base64-encoded file into `workspace/inputs` and return its path. |
 | `list_workflow_python_files` | List all `.py` files under a workflow folder. |
+| `get_workflow_json` | Read the root `workflow.json` file for a workflow folder and return it as JSON. |
 | `get_workflow_files` | Read specific workflow files by file name or relative path. |
 | `get_workflow_binary_files` | Read specific workflow binary files and return base64 content plus MIME type. |
 | `replace_workflow_files` | Replace specific workflow files by file name or relative path. |
