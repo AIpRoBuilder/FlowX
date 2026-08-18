@@ -428,6 +428,21 @@ V*_t = V_t / EMA(V_t)
   <img src="assets/policy_scrawler.png" alt="policy_scrawler workflow example" width="720" />
 </p>
 
+### 5. `start-up-hiring`
+
+<details>
+<summary>Prompt</summary>
+
+```text
+flowx-remote-us帮我构建一个到LinkedIn上找n个正在招人的AI startups的创始人的爬虫工作流
+```
+
+</details>
+
+<p align="center">
+  <img src="assets/start-up-hiring.png" alt="start-up-hiring workflow example" width="720" />
+</p>
+
 ## Contact
 
 If you are interested in using FlowX or co-building it, contact me at [peterxcx@gmail.com](mailto:peterxcx@gmail.com).
