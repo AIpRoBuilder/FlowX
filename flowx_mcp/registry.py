@@ -300,6 +300,62 @@ class WorkflowRegistry:
         with self._lock:
             return self._handles.pop(workflow_name, None)
 
+    def find_by_backend_port(self, backend_port: int) -> Optional[WorkflowHandle]:
+        with self._lock:
+            for handle in self._handles.values():
+                if handle.backend_port == backend_port:
+                    return handle
+        return None
+
+    def kill_workflow(
+        self,
+        workflow_name: str,
+        *,
+        backend_port: int,
+    ) -> WorkflowHandle:
+        requested_port = int(backend_port)
+        if requested_port <= 0:
+            raise ValueError("backend_port must be a positive integer")
+
+        with self._lock:
+            handle = self._handles.get(workflow_name)
+            if handle is None:
+                port_owner = next(
+                    (item for item in self._handles.values() if item.backend_port == requested_port),
+                    None,
+                )
+                if port_owner is not None:
+                    raise KeyError(
+                        f"workflow '{workflow_name}' is not registered; "
+                        f"backend_port {requested_port} belongs to workflow '{port_owner.workflow_name}'"
+                    )
+                raise KeyError(f"workflow '{workflow_name}' is not registered")
+
+            assigned_port = handle.backend_port
+            if assigned_port is None:
+                raise ValueError(
+                    f"workflow '{workflow_name}' does not have a backend_port assigned"
+                )
+            if assigned_port != requested_port:
+                port_owner = next(
+                    (item for item in self._handles.values() if item.backend_port == requested_port),
+                    None,
+                )
+                if port_owner is not None and port_owner.workflow_name != workflow_name:
+                    raise ValueError(
+                        f"workflow '{workflow_name}' is registered on backend_port {assigned_port}; "
+                        f"backend_port {requested_port} belongs to workflow '{port_owner.workflow_name}'"
+                    )
+                raise ValueError(
+                    f"workflow '{workflow_name}' is registered on backend_port {assigned_port}, "
+                    f"not {requested_port}"
+                )
+
+            stopped_handle = self._handles.pop(workflow_name)
+
+        stopped_handle.stop_backend()
+        return stopped_handle
+
     def get_or_create(
         self,
         *,

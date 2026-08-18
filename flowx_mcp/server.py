@@ -1082,6 +1082,40 @@ def create_server() -> Any:
         return _tool_call("list_workflows", _impl)
 
     @mcp.tool()
+    def kill_workflow(
+        workflow_name: str,
+        backend_port: int,
+    ) -> str:
+        """Stop and unregister a workflow by workflow name and backend port.
+
+        Args:
+            workflow_name: Existing workflow name.
+            backend_port: Backend port that must match the registered workflow.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workflow = _normalize_name(workflow_name, "workflow_name")
+            port = int(backend_port)
+            if port <= 0:
+                raise ValueError("backend_port must be a positive integer")
+
+            existing = registry.get(workflow)
+            was_running = bool(existing and existing.is_running)
+            stopped = registry.kill_workflow(workflow, backend_port=port)
+            return {
+                "ok": True,
+                "workflow_name": stopped.workflow_name,
+                "workspace": stopped.workspace,
+                "root_dir": stopped.root_dir,
+                "backend_port": port,
+                "was_running": was_running,
+                "is_running": stopped.is_running,
+                "removed_from_registry": True,
+            }
+
+        return _tool_call("kill_workflow", _impl)
+
+    @mcp.tool()
     def list_workflow_folders(workspace: Optional[str] = None) -> str:
         """List workflow folder names under the workspace root on disk.
 
