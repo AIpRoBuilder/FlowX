@@ -13,6 +13,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -46,8 +47,17 @@ except ImportError:  # pragma: no cover - optional dependency
     load_dotenv = None
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _json(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
+
+
+_JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 
 def _error(tool: str, message: str, **extra: Any) -> str:
@@ -497,13 +507,29 @@ def _input_nodes_summary(handle: Any) -> list[dict[str, Any]]:
     return nodes
 
 
-def _parse_explicit_input_json(input_json: Optional[str]) -> Any:
+def _parse_explicit_input_json(input_json: Any) -> Any:
     if input_json is None:
         return None
+    if not isinstance(input_json, str):
+        return input_json
     stripped = input_json.strip()
     if not stripped:
         return None
-    return json.loads(stripped)
+
+    should_parse = (
+        stripped[0] in '{["'
+        or stripped in {"true", "false", "null"}
+        or bool(_JSON_NUMBER_RE.fullmatch(stripped))
+    )
+    if not should_parse:
+        return input_json
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"input_json uses JSON syntax but could not be decoded: {exc.msg}"
+        ) from exc
 
 
 def _format_chat_request(
@@ -727,7 +753,11 @@ def create_server() -> Any:
                     fastapi_port=handle.backend_port,
                 )
 
+            backend_was_running = bool(handle.is_running)
             handle.sync_artifacts()
+            handle.new_session()
+            if backend_was_running:
+                handle.stop_backend()
             return {
                 "ok": True,
                 "workflow_name": handle.workflow_name,
@@ -737,8 +767,11 @@ def create_server() -> Any:
                 "backend_node_paths": regenerated_paths,
                 "workflow_json_path": workflow_json_path,
                 "main_entrypoint": main_entrypoint,
+                "session_id": handle.session_id,
+                "completed_steps": list(handle.completed_steps),
+                "backend_was_running": backend_was_running,
                 "backend_running": bool(handle.is_running),
-                "needs_reload": bool(handle.is_running),
+                "needs_reload": backend_was_running,
             }
 
         return _tool_call("update_workflow_node", _impl)
@@ -979,7 +1012,7 @@ def create_server() -> Any:
         step_id: Optional[str] = None,
         workspace: Optional[str] = None,
         file_path: Optional[str] = None,
-        input_json: Optional[str] = None,
+        input_json: Any = None,
         reset_session: bool = False,
         timeout_sec: int = DEFAULT_RUN_TIMEOUT,
     ) -> str:
@@ -991,7 +1024,7 @@ def create_server() -> Any:
             step_id: Optional explicit step id. If omitted, the next pending user-input step is used.
             workspace: Parent directory containing the workflow folder.
             file_path: Optional file path for file-input steps.
-            input_json: Optional explicit JSON payload to send as the step input.
+            input_json: Optional explicit payload to send as the step input. Structured JSON strings are decoded; plain strings are passed through unchanged.
             reset_session: If true, use a fresh workflow session.
             timeout_sec: How long to wait for the SSE run-step response.
         """

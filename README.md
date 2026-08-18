@@ -44,7 +44,7 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 | Tool | Purpose |
 | --- | --- |
 | `create_workflow` | Build a workflow from a requirement into `workspace/workflow_name`. |
-| `update_workflow_node` | Amend `workflow.json` + `{node}.py` + `main.py` from a change prompt. |
+| `update_workflow_node` | Amend `workflow.json` + `{node}.py` + `main.py` from a change prompt, then invalidate the current runtime session/backend so stale processes cannot keep serving the old graph. |
 | `start_backend` | Launch the generated FastAPI backend for a workflow. |
 | `reload_workflow` | Restart the backend (picks up updated node files / `workflow.json`). |
 | `restart_builder` | Recreate the in-memory `AgentBuilder` for a workflow from disk and optionally restart the backend. |
