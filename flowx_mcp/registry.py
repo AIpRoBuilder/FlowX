@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("flowx.registry")
 
@@ -77,6 +77,10 @@ def _default_llm_config() -> Dict[str, str]:
         ),
         "base_url": os.environ.get("FLOWX_LLM_BASE_URL", ""),
     }
+
+
+def _registry_key(workspace: str, workflow_name: str) -> Tuple[str, str]:
+    return (str(Path(workspace).expanduser().resolve()), workflow_name)
 
 
 # --- handle -----------------------------------------------------------------
@@ -260,14 +264,38 @@ def _read_log_tail(path: str, lines: int) -> str:
 
 # --- registry ---------------------------------------------------------------
 class WorkflowRegistry:
-    """Process-wide registry of workflow handles keyed by workflow name."""
+    """Process-wide registry of workflow handles keyed by workspace and workflow name."""
 
     def __init__(self) -> None:
-        self._handles: Dict[str, WorkflowHandle] = {}
+        self._handles: Dict[Tuple[str, str], WorkflowHandle] = {}
         self._lock = threading.RLock()
 
-    def list_workflows(self) -> List[Dict[str, Any]]:
+    def _find_unlocked(
+        self,
+        workflow_name: str,
+        workspace: Optional[str] = None,
+    ) -> Optional[WorkflowHandle]:
+        if workspace is not None:
+            return self._handles.get(_registry_key(workspace, workflow_name))
+
+        matches = [
+            handle
+            for (handle_workspace, handle_name), handle in self._handles.items()
+            if handle_name == workflow_name
+        ]
+        if len(matches) > 1:
+            raise KeyError(
+                f"workflow '{workflow_name}' exists in multiple workspaces; pass workspace to disambiguate"
+            )
+        if not matches:
+            return None
+        return matches[0]
+
+    def list_workflows(self, workspace: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._lock:
+            resolved_workspace = (
+                str(Path(workspace).expanduser().resolve()) if workspace is not None else None
+            )
             return [
                 {
                     "workflow_name": h.workflow_name,
@@ -281,14 +309,19 @@ class WorkflowRegistry:
                     "completed_steps": list(h.completed_steps),
                 }
                 for h in self._handles.values()
+                if resolved_workspace is None or h.workspace == resolved_workspace
             ]
 
-    def get(self, workflow_name: str) -> Optional[WorkflowHandle]:
+    def get(
+        self,
+        workflow_name: str,
+        workspace: Optional[str] = None,
+    ) -> Optional[WorkflowHandle]:
         with self._lock:
-            return self._handles.get(workflow_name)
+            return self._find_unlocked(workflow_name, workspace)
 
-    def require(self, workflow_name: str) -> WorkflowHandle:
-        handle = self.get(workflow_name)
+    def require(self, workflow_name: str, workspace: Optional[str] = None) -> WorkflowHandle:
+        handle = self.get(workflow_name, workspace=workspace)
         if handle is None:
             raise KeyError(
                 f"workflow '{workflow_name}' is not registered. "
@@ -296,9 +329,16 @@ class WorkflowRegistry:
             )
         return handle
 
-    def pop(self, workflow_name: str) -> Optional[WorkflowHandle]:
+    def pop(
+        self,
+        workflow_name: str,
+        workspace: Optional[str] = None,
+    ) -> Optional[WorkflowHandle]:
         with self._lock:
-            return self._handles.pop(workflow_name, None)
+            handle = self._find_unlocked(workflow_name, workspace)
+            if handle is None:
+                return None
+            return self._handles.pop(_registry_key(handle.workspace, handle.workflow_name), None)
 
     def find_by_backend_port(self, backend_port: int) -> Optional[WorkflowHandle]:
         with self._lock:
@@ -312,13 +352,14 @@ class WorkflowRegistry:
         workflow_name: str,
         *,
         backend_port: int,
+        workspace: Optional[str] = None,
     ) -> WorkflowHandle:
         requested_port = int(backend_port)
         if requested_port <= 0:
             raise ValueError("backend_port must be a positive integer")
 
         with self._lock:
-            handle = self._handles.get(workflow_name)
+            handle = self._find_unlocked(workflow_name, workspace)
             if handle is None:
                 port_owner = next(
                     (item for item in self._handles.values() if item.backend_port == requested_port),
@@ -351,7 +392,9 @@ class WorkflowRegistry:
                     f"not {requested_port}"
                 )
 
-            stopped_handle = self._handles.pop(workflow_name)
+            stopped_handle = self._handles.pop(
+                _registry_key(handle.workspace, handle.workflow_name)
+            )
 
         stopped_handle.stop_backend()
         return stopped_handle
@@ -373,7 +416,9 @@ class WorkflowRegistry:
                 f"or set FLOWX_EXTRA_PATHS. Underlying error: {_IMPORT_ERROR}"
             )
         with self._lock:
-            existing = self._handles.get(workflow_name)
+            resolved_workspace = str(Path(workspace).expanduser().resolve())
+            key = _registry_key(resolved_workspace, workflow_name)
+            existing = self._handles.get(key)
             if existing is not None:
                 # Reuse the long-lived builder; allow callers to refresh credentials.
                 if api_key or model or provider:
@@ -398,7 +443,7 @@ class WorkflowRegistry:
             eff_api_key = api_key or defaults["api_key"]
             eff_model = model or defaults["model"]
             eff_provider = provider or defaults["provider"]
-            root_dir = str(Path(workspace) / workflow_name)
+            root_dir = str(Path(resolved_workspace) / workflow_name)
             Path(root_dir).mkdir(parents=True, exist_ok=True)
 
             builder = AgentBuilder(  # type: ignore[misc]
@@ -411,7 +456,7 @@ class WorkflowRegistry:
             )
             handle = WorkflowHandle(
                 workflow_name=workflow_name,
-                workspace=workspace,
+                workspace=resolved_workspace,
                 root_dir=root_dir,
                 builder=builder,
                 api_key=eff_api_key,
@@ -420,7 +465,7 @@ class WorkflowRegistry:
                 services_root=services_root,
                 skills_root=skills_root,
             )
-            self._handles[workflow_name] = handle
+            self._handles[key] = handle
             return handle
 
 
