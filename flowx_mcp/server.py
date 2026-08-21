@@ -2047,7 +2047,18 @@ def _build_authenticated_http_app(
             status_code=200,
         )
 
+    mcp_router = getattr(mcp_app, "router", None)
+    mcp_lifespan_context = getattr(mcp_router, "lifespan_context", None)
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_: Any):
+        async with contextlib.AsyncExitStack() as stack:
+            if callable(mcp_lifespan_context):
+                await stack.enter_async_context(mcp_lifespan_context(mcp_app))
+            yield
+
     app = Starlette(
+        lifespan=_lifespan,
         routes=[
             Route("/healthz", _healthz, methods=["GET"]),
             Route("/admin/tokens", _issue_user_token, methods=["POST"]),
