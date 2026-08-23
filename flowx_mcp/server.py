@@ -569,6 +569,62 @@ def _write_workspace_input_file(
     }
 
 
+def _workspace_relative_path(workspace_dir: Path, path: Path) -> str:
+    return path.relative_to(workspace_dir).as_posix()
+
+
+def _resolve_requested_workspace_file(workspace_dir: Path, file_name: str) -> Path:
+    requested_name = _normalize_name(file_name, "file_name")
+    direct_path = (workspace_dir / requested_name).resolve()
+    try:
+        direct_path.relative_to(workspace_dir)
+    except ValueError as exc:
+        raise ValueError(f"file_name '{requested_name}' escapes the workspace directory") from exc
+    if direct_path.is_file():
+        return direct_path
+
+    matches: list[Path] = []
+    for path in workspace_dir.rglob("*"):
+        if not path.is_file() or path.name != requested_name:
+            continue
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(workspace_dir)
+        except ValueError:
+            continue
+        matches.append(resolved_path)
+
+    matches.sort(key=lambda path: _workspace_relative_path(workspace_dir, path).lower())
+    if not matches:
+        raise FileNotFoundError(f"file '{requested_name}' was not found under workspace '{workspace_dir}'")
+    if len(matches) > 1:
+        match_list = ", ".join(_workspace_relative_path(workspace_dir, path) for path in matches)
+        raise ValueError(
+            f"file name '{requested_name}' is ambiguous under workspace '{workspace_dir.name}': "
+            f"{match_list}. Pass a relative path instead."
+        )
+    return matches[0]
+
+
+def _delete_workspace_files_by_name(
+    file_names: list[str],
+    workspace: Optional[str] = None,
+) -> list[dict[str, str]]:
+    workspace_dir = Path(_resolve_workspace(workspace)).resolve()
+    deleted_files: list[dict[str, str]] = []
+    for requested_name in file_names:
+        path = _resolve_requested_workspace_file(workspace_dir, requested_name)
+        path.unlink()
+        deleted_files.append(
+            {
+                "requested_name": requested_name,
+                "file_name": path.name,
+                "relative_path": _workspace_relative_path(workspace_dir, path),
+            }
+        )
+    return deleted_files
+
+
 def _discover_workflow_folders(root_dir: str) -> list[dict[str, Any]]:
     workspace_dir = Path(root_dir).expanduser().resolve()
     discovered: list[dict[str, Any]] = []
@@ -1038,7 +1094,7 @@ def create_server() -> Any:
         instructions=(
             "FlowX workflow builder and runner. Use these tools to create AG-UI workflows "
             "with meta_agent, restart the in-memory builder, update node backends, start or reload the backend engine, "
-            "inspect required user-input formats, upload workspace input files, and run "
+            "inspect required user-input formats, upload or delete workspace files, and run "
             "workflow steps from chat input."
         ),
     )
@@ -1665,6 +1721,33 @@ def create_server() -> Any:
             }
 
         return _tool_call("upload_workspace_input_file", _impl)
+
+    @mcp.tool()
+    def delete_workspace_files(
+        file_names: list[str],
+        workspace: Optional[str] = None,
+    ) -> str:
+        """Delete specific files under a workspace by file name or relative path.
+
+        Args:
+            file_names: File names or unique relative paths under the workspace root.
+            workspace: Workspace root that owns the files.
+        """
+
+        def _impl() -> dict[str, Any]:
+            workspace_dir = _resolve_workspace(workspace)
+            deleted_files = _delete_workspace_files_by_name(
+                list(file_names),
+                workspace=workspace_dir,
+            )
+            return {
+                "ok": True,
+                "workspace": workspace_dir,
+                "count": len(deleted_files),
+                "deleted_files": deleted_files,
+            }
+
+        return _tool_call("delete_workspace_files", _impl)
 
     @mcp.tool()
     def list_workflow_python_files(
