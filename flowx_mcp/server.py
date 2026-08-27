@@ -7,23 +7,22 @@ import asyncio
 import base64
 import binascii
 import contextlib
-import contextvars
-import hashlib
-import hmac
-import io
 import importlib
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
-import secrets
 import sys
-import threading
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
+
+from .bootstrap import bootstrap_import_paths, load_env_from_runtime_context
+
+load_env_from_runtime_context(__file__)
+bootstrap_import_paths(__file__)
 
 from .client import DEFAULT_RUN_TIMEOUT, health_check, run_step_sse
 from .registry import find_free_port, meta_agent_available, meta_agent_import_error, registry
@@ -46,12 +45,6 @@ for module_name, attr_name in (
 if not _MCP_SERVER_AVAILABLE:
     MCPServerClass = None
 
-load_dotenv: Any = None
-try:
-    load_dotenv = importlib.import_module("dotenv").load_dotenv
-except ImportError:  # pragma: no cover - optional dependency
-    load_dotenv = None
-
 
 def _json_default(value: Any) -> Any:
     if isinstance(value, os.PathLike):
@@ -64,413 +57,6 @@ def _json(payload: Any) -> str:
 
 
 _JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$")
-_USERNAME_RE = re.compile(r"[A-Za-z0-9._@-]+$")
-_USERNAME_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
-_TOKEN_LIMIT_MESSAGE = "reach token limit please recharge"
-
-_REQUEST_AUTH_CONTEXT: contextvars.ContextVar[Optional[dict[str, str]]] = contextvars.ContextVar(
-    "flowx_request_auth_context",
-    default=None,
-)
-
-
-class TokenBalanceError(RuntimeError):
-    def __init__(self, *, balance: int, required_tokens: int = 0) -> None:
-        super().__init__(_TOKEN_LIMIT_MESSAGE)
-        self.balance = int(balance)
-        self.required_tokens = int(required_tokens)
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _normalize_username(username: str) -> str:
-    normalized = str(username or "").strip()
-    if not normalized:
-        raise ValueError("username must be a non-empty string")
-    if not _USERNAME_RE.fullmatch(normalized):
-        raise ValueError(
-            "username may contain only letters, numbers, '.', '_', '@', and '-'"
-        )
-    return normalized
-
-
-def _normalize_token_amount(value: Any, field: str = "token_amount") -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{field} must be a positive integer")
-    try:
-        amount = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be a positive integer") from exc
-    if amount <= 0:
-        raise ValueError(f"{field} must be a positive integer")
-    return amount
-
-
-def _workspace_slug_for_username(username: str) -> str:
-    base = _USERNAME_SLUG_RE.sub("_", username).strip("._-")
-    if not base:
-        base = "user"
-    digest = hashlib.sha256(username.encode("utf-8")).hexdigest()[:8]
-    return f"{base}_{digest}"
-
-
-def _assigned_workspace_for_username(username: str) -> str:
-    workspace_root = Path(_default_workspace()).resolve()
-    assigned = (workspace_root / "users" / _workspace_slug_for_username(username)).resolve()
-    assigned.mkdir(parents=True, exist_ok=True)
-    return str(assigned)
-
-
-class _AuthorizationStore:
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-
-    def _balance_from_user_record(self, user_record: Any) -> int:
-        if not isinstance(user_record, dict):
-            return 0
-        raw_balance = user_record.get("token_balance", 0)
-        try:
-            return int(raw_balance)
-        except (TypeError, ValueError):
-            return 0
-
-    def _records_path(self) -> Path:
-        configured = str(os.environ.get("FLOWX_AUTH_RECORDS_FILE", "")).strip()
-        if configured:
-            path = Path(configured).expanduser().resolve()
-        else:
-            path = Path(_default_workspace()).resolve() / ".flowx_auth_records.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _empty_records(self) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "users": {},
-            "tokens": {},
-        }
-
-    def _load_records(self) -> dict[str, Any]:
-        path = self._records_path()
-        if not path.is_file():
-            return self._empty_records()
-
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError(f"authorization records file {path} must contain a JSON object")
-
-        users = payload.get("users")
-        tokens = payload.get("tokens")
-        if users is None:
-            users = {}
-        if tokens is None:
-            tokens = {}
-        if not isinstance(users, dict) or not isinstance(tokens, dict):
-            raise ValueError(
-                f"authorization records file {path} must contain object values for 'users' and 'tokens'"
-            )
-
-        return {
-            "version": 1,
-            "users": dict(users),
-            "tokens": dict(tokens),
-        }
-
-    def _save_records(self, records: Mapping[str, Any]) -> Path:
-        path = self._records_path()
-        tmp_path = path.with_name(f"{path.name}.tmp")
-        tmp_path.write_text(
-            json.dumps(records, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        tmp_path.replace(path)
-        return path
-
-    def _token_hash(self, token: str) -> str:
-        return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-    def _require_admin_meta_token(self) -> str:
-        meta_token = str(os.environ.get("FLOWX_ADMIN_META_TOKEN", "")).strip()
-        if not meta_token:
-            raise RuntimeError(
-                "FLOWX_ADMIN_META_TOKEN is not configured; set it before using /admin/tokens"
-            )
-        return meta_token
-
-    def verify_meta_token(self, meta_token: str) -> bool:
-        expected = self._require_admin_meta_token()
-        candidate = str(meta_token or "").strip()
-        return bool(candidate) and hmac.compare_digest(candidate, expected)
-
-    def get_user_balance(self, username: str) -> int:
-        normalized_username = _normalize_username(username)
-        with self._lock:
-            records = self._load_records()
-            users = records.get("users") or {}
-            return self._balance_from_user_record(users.get(normalized_username))
-
-    def issue_user_token(self, username: str) -> dict[str, Any]:
-        normalized_username = _normalize_username(username)
-        issued_at = _utc_now_iso()
-        raw_token = f"flowx_{secrets.token_urlsafe(32)}"
-        token_hash = self._token_hash(raw_token)
-
-        with self._lock:
-            records = self._load_records()
-            users = dict(records.get("users") or {})
-            tokens = dict(records.get("tokens") or {})
-
-            existing_user = users.get(normalized_username)
-            replaced_existing_token = isinstance(existing_user, dict)
-            current_balance = self._balance_from_user_record(existing_user)
-
-            workspace = ""
-            if isinstance(existing_user, dict):
-                workspace = str(existing_user.get("workspace", "")).strip()
-                previous_hash = str(existing_user.get("token_hash", "")).strip()
-                if previous_hash:
-                    tokens.pop(previous_hash, None)
-            if not workspace:
-                workspace = _assigned_workspace_for_username(normalized_username)
-
-            workspace_path = Path(workspace).expanduser().resolve()
-            workspace_path.mkdir(parents=True, exist_ok=True)
-
-            user_record = dict(existing_user) if isinstance(existing_user, dict) else {}
-            user_record.update(
-                {
-                    "username": normalized_username,
-                    "workspace": str(workspace_path),
-                    "workspace_slug": _workspace_slug_for_username(normalized_username),
-                    "token_hash": token_hash,
-                    "issued_at": issued_at,
-                    "updated_at": issued_at,
-                    "token_balance": current_balance,
-                }
-            )
-            token_record = {
-                "username": normalized_username,
-                "workspace": str(workspace_path),
-                "issued_at": issued_at,
-            }
-
-            users[normalized_username] = user_record
-            tokens[token_hash] = token_record
-            saved_path = self._save_records(
-                {
-                    "version": 1,
-                    "users": users,
-                    "tokens": tokens,
-                }
-            )
-
-        return {
-            "username": normalized_username,
-            "workspace": str(workspace_path),
-            "authorization_token": raw_token,
-            "authorization_header": f"Bearer {raw_token}",
-            "token_balance": current_balance,
-            "records_file": str(saved_path),
-            "replaced_existing_token": replaced_existing_token,
-        }
-
-    def add_user_token_balance(self, username: str, token_amount: Any) -> dict[str, Any]:
-        normalized_username = _normalize_username(username)
-        amount = _normalize_token_amount(token_amount)
-        updated_at = _utc_now_iso()
-
-        with self._lock:
-            records = self._load_records()
-            users = dict(records.get("users") or {})
-            tokens = dict(records.get("tokens") or {})
-
-            existing_user = users.get(normalized_username)
-            user_record = dict(existing_user) if isinstance(existing_user, dict) else {}
-
-            workspace = str(user_record.get("workspace", "")).strip()
-            if not workspace:
-                workspace = _assigned_workspace_for_username(normalized_username)
-            workspace_path = Path(workspace).expanduser().resolve()
-            workspace_path.mkdir(parents=True, exist_ok=True)
-
-            current_balance = self._balance_from_user_record(existing_user)
-            new_balance = current_balance + amount
-
-            token_hash = str(user_record.get("token_hash", "")).strip()
-            user_record.update(
-                {
-                    "username": normalized_username,
-                    "workspace": str(workspace_path),
-                    "workspace_slug": _workspace_slug_for_username(normalized_username),
-                    "updated_at": updated_at,
-                    "token_balance": new_balance,
-                }
-            )
-            if token_hash:
-                user_record["token_hash"] = token_hash
-            else:
-                user_record.pop("token_hash", None)
-
-            users[normalized_username] = user_record
-            saved_path = self._save_records(
-                {
-                    "version": 1,
-                    "users": users,
-                    "tokens": tokens,
-                }
-            )
-
-        return {
-            "username": normalized_username,
-            "workspace": str(workspace_path),
-            "token_balance": new_balance,
-            "added_token_balance": amount,
-            "records_file": str(saved_path),
-        }
-
-    def consume_user_token_balance(
-        self,
-        username: str,
-        token_amount: int,
-        *,
-        reason: str,
-    ) -> dict[str, Any]:
-        normalized_username = _normalize_username(username)
-        amount = int(token_amount)
-        if amount < 0:
-            raise ValueError("token_amount must be zero or greater")
-
-        with self._lock:
-            records = self._load_records()
-            users = dict(records.get("users") or {})
-            tokens = dict(records.get("tokens") or {})
-
-            existing_user = users.get(normalized_username)
-            if not isinstance(existing_user, dict):
-                raise TokenBalanceError(balance=0, required_tokens=amount)
-
-            current_balance = self._balance_from_user_record(existing_user)
-            if current_balance <= 0 or amount > current_balance:
-                raise TokenBalanceError(balance=current_balance, required_tokens=amount)
-            if amount == 0:
-                return {
-                    "username": normalized_username,
-                    "token_balance": current_balance,
-                    "consumed_token_balance": 0,
-                    "reason": reason,
-                }
-
-            user_record = dict(existing_user)
-            new_balance = current_balance - amount
-            user_record["token_balance"] = new_balance
-            user_record["updated_at"] = _utc_now_iso()
-            users[normalized_username] = user_record
-            saved_path = self._save_records(
-                {
-                    "version": 1,
-                    "users": users,
-                    "tokens": tokens,
-                }
-            )
-
-        return {
-            "username": normalized_username,
-            "token_balance": new_balance,
-            "consumed_token_balance": amount,
-            "reason": reason,
-            "records_file": str(saved_path),
-        }
-
-    def resolve_authorization_token(self, token: str) -> Optional[dict[str, str]]:
-        candidate = str(token or "").strip()
-        if not candidate:
-            return None
-
-        with self._lock:
-            records = self._load_records()
-            tokens = records.get("tokens") or {}
-            token_record = tokens.get(self._token_hash(candidate))
-
-        if not isinstance(token_record, dict):
-            return None
-
-        username = str(token_record.get("username", "")).strip()
-        workspace = str(token_record.get("workspace", "")).strip()
-        if not username or not workspace:
-            return None
-
-        workspace_path = Path(workspace).expanduser().resolve()
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        return {
-            "username": username,
-            "workspace": str(workspace_path),
-        }
-
-
-_AUTH_STORE = _AuthorizationStore()
-
-
-def _current_request_auth() -> Optional[dict[str, str]]:
-    auth_context = _REQUEST_AUTH_CONTEXT.get()
-    if not isinstance(auth_context, dict):
-        return None
-    username = str(auth_context.get("username", "")).strip()
-    workspace = str(auth_context.get("workspace", "")).strip()
-    if not username or not workspace:
-        return None
-    return {
-        "username": username,
-        "workspace": workspace,
-    }
-
-
-def _parse_bearer_token(header_value: Optional[str]) -> Optional[str]:
-    value = str(header_value or "").strip()
-    if not value:
-        return None
-    if not value.lower().startswith("bearer "):
-        return None
-    token = value[7:].strip()
-    return token or None
-
-
-def _authorization_token_from_headers(headers: Mapping[str, str]) -> Optional[str]:
-    bearer = _parse_bearer_token(headers.get("authorization"))
-    if bearer:
-        return bearer
-    token = str(headers.get("x-flowx-authorization-token", "")).strip()
-    return token or None
-
-
-def _stringified_value_length(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, str):
-        return len(value)
-    try:
-        return len(json.dumps(value, ensure_ascii=False, default=_json_default))
-    except TypeError:
-        return len(str(value))
-
-
-def _extract_requested_username(payload: Mapping[str, Any]) -> str:
-    return str(payload.get("username") or payload.get("user_name") or "").strip()
-
-
-def _extract_admin_meta_token(
-    payload: Mapping[str, Any],
-    headers: Mapping[str, str],
-) -> str:
-    meta_token = str(payload.get("meta_token") or "").strip()
-    if not meta_token:
-        meta_token = str(headers.get("x-flowx-meta-token") or "").strip()
-    if not meta_token:
-        meta_token = str(_parse_bearer_token(headers.get("authorization")) or "").strip()
-    return meta_token
-
-
 def _error(tool: str, message: str, **extra: Any) -> str:
     payload = {
         "ok": False,
@@ -491,18 +77,6 @@ def _default_workspace() -> str:
 
 
 def _resolve_workspace(workspace: Optional[str]) -> str:
-    auth_context = _current_request_auth()
-    if auth_context is not None:
-        assigned_path = Path(auth_context["workspace"]).expanduser().resolve()
-        if isinstance(workspace, str) and workspace.strip():
-            requested_path = Path(workspace).expanduser().resolve()
-            if requested_path != assigned_path:
-                raise PermissionError(
-                    f"workspace '{requested_path}' is not assigned to username '{auth_context['username']}'"
-                )
-        assigned_path.mkdir(parents=True, exist_ok=True)
-        return str(assigned_path)
-
     if isinstance(workspace, str) and workspace.strip():
         path = Path(workspace).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
@@ -786,16 +360,6 @@ def _capture_builder_output(label: str) -> Iterator[None]:
 def _tool_call(tool: str, func):
     try:
         return _json(func())
-    except TokenBalanceError as exc:
-        payload = {
-            "ok": False,
-            "tool": tool,
-            "error": str(exc),
-            "token_balance": exc.balance,
-        }
-        if exc.required_tokens > 0:
-            payload["required_tokens"] = exc.required_tokens
-        return _json(payload)
     except Exception as exc:
         logger.exception("%s failed", tool)
         return _error(
@@ -803,17 +367,6 @@ def _tool_call(tool: str, func):
             str(exc),
             traceback=traceback.format_exc().splitlines()[-20:],
         )
-
-
-def _charge_current_user_token_balance(tool: str, token_amount: int) -> Optional[dict[str, Any]]:
-    auth_context = _current_request_auth()
-    if auth_context is None:
-        return None
-    return _AUTH_STORE.consume_user_token_balance(
-        auth_context["username"],
-        int(token_amount),
-        reason=tool,
-    )
 
 
 def _attach_existing_workflow(
@@ -1071,12 +624,7 @@ def _format_chat_request(
 
 
 def _load_env_from_repo() -> None:
-    if load_dotenv is None:
-        return
-    root = Path(__file__).resolve().parent.parent
-    env_path = root / ".env"
-    if env_path.is_file():
-        load_dotenv(dotenv_path=env_path, override=False)
+    load_env_from_runtime_context(__file__)
 
 
 def create_server() -> Any:
@@ -1131,7 +679,6 @@ def create_server() -> Any:
                 )
             workflow = _normalize_name(workflow_name, "workflow_name")
             requirement = _normalize_name(user_prompt, "user_prompt")
-            _charge_current_user_token_balance("create_workflow", len(requirement) * 30)
             workspace_dir = _resolve_workspace(workspace)
             handle = registry.get_or_create(
                 workspace=workspace_dir,
@@ -1218,7 +765,6 @@ def create_server() -> Any:
             handle = _require_handle(workflow_name, workspace=workspace)
             node = _normalize_name(node_name, "node_name")
             amendment = _normalize_name(user_prompt, "user_prompt")
-            _charge_current_user_token_balance("update_workflow_node", len(amendment) * 25)
             if int(backend_port or 0) > 0:
                 handle.backend_port = int(backend_port)
             if not handle.backend_port:
@@ -1535,10 +1081,6 @@ def create_server() -> Any:
 
         def _impl() -> dict[str, Any]:
             handle = _require_handle(workflow_name, workspace=workspace)
-            _charge_current_user_token_balance(
-                "run_workflow_step",
-                len(str(chat_request or "")) + _stringified_value_length(input_json),
-            )
             if reset_session:
                 handle.new_session()
 
@@ -1615,13 +1157,9 @@ def create_server() -> Any:
         """List workflows known to the current MCP server process."""
 
         def _impl() -> dict[str, Any]:
-            auth_context = _current_request_auth()
-            workspace = auth_context["workspace"] if auth_context is not None else None
             return {
                 "ok": True,
-                "username": auth_context["username"] if auth_context is not None else None,
-                "workspace": workspace,
-                "workflows": registry.list_workflows(workspace=workspace),
+                "workflows": registry.list_workflows(),
             }
 
         return _tool_call("list_workflows", _impl)
@@ -1705,10 +1243,6 @@ def create_server() -> Any:
         """
 
         def _impl() -> dict[str, Any]:
-            _charge_current_user_token_balance(
-                "upload_workspace_input_file",
-                len(str(content_base64 or "")),
-            )
             saved_file = _write_workspace_input_file(
                 file_name=file_name,
                 content_base64=content_base64,
@@ -1872,10 +1406,6 @@ def create_server() -> Any:
         """
 
         def _impl() -> dict[str, Any]:
-            _charge_current_user_token_balance(
-                "replace_workflow_files",
-                sum(len(str(content)) for content in list(new_file_contents)),
-            )
             workflow_root = _resolve_workflow_root(workflow_name, workspace=workspace)
             updated_files = _replace_workflow_files_by_name(
                 workflow_root,
@@ -1895,282 +1425,16 @@ def create_server() -> Any:
     return mcp
 
 
-class _FlowXAuthMiddleware:
-    def __init__(self, app: Any, *, exempt_paths: set[str]) -> None:
-        self.app = app
-        self.exempt_paths = {path.rstrip("/") or "/" for path in exempt_paths}
-
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") != "http":
-            await self.app(scope, receive, send)
-            return
-
-        path = (str(scope.get("path") or "").rstrip("/") or "/")
-        method = str(scope.get("method") or "").upper()
-        if method == "OPTIONS" or path in self.exempt_paths:
-            await self.app(scope, receive, send)
-            return
-
-        from starlette.datastructures import Headers
-        from starlette.responses import JSONResponse
-
-        token = _authorization_token_from_headers(Headers(scope=scope))
-        if token is None:
-            response = JSONResponse(
-                {
-                    "ok": False,
-                    "error": "missing authorization token; send Authorization: Bearer <token>",
-                },
-                status_code=401,
-            )
-            await response(scope, receive, send)
-            return
-
-        auth_context = _AUTH_STORE.resolve_authorization_token(token)
-        if auth_context is None:
-            response = JSONResponse(
-                {
-                    "ok": False,
-                    "error": "invalid authorization token",
-                },
-                status_code=401,
-            )
-            await response(scope, receive, send)
-            return
-
-        balance = _AUTH_STORE.get_user_balance(auth_context["username"])
-        if balance <= 0:
-            response = JSONResponse(
-                {
-                    "ok": False,
-                    "error": _TOKEN_LIMIT_MESSAGE,
-                    "token_balance": balance,
-                },
-                status_code=402,
-            )
-            await response(scope, receive, send)
-            return
-
-        request_token = _REQUEST_AUTH_CONTEXT.set(auth_context)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            _REQUEST_AUTH_CONTEXT.reset(request_token)
-
-
-def _build_authenticated_http_app(
-    server: Any,
-    *,
-    transport: str,
-    host: str,
-    streamable_http_path: str,
-    sse_path: str,
-    message_path: str,
-) -> Any:
-    try:
-        from starlette.applications import Starlette
-        from starlette.requests import Request
-        from starlette.responses import JSONResponse
-        from starlette.routing import Route
-    except ImportError as exc:  # pragma: no cover - depends on runtime extras
-        raise RuntimeError(
-            "HTTP transport requires starlette. Repair the MCP HTTP runtime dependencies."
-        ) from exc
-
-    if transport == "streamable-http":
-        app_factory = getattr(server, "streamable_http_app", None)
-        if not callable(app_factory):
-            raise RuntimeError(
-                "The installed MCP SDK does not expose streamable_http_app(...), "
-                "so authenticated HTTP transport is unavailable."
-            )
-        mcp_app = app_factory(
-            streamable_http_path=streamable_http_path,
-            host=host,
-        )
-    elif transport == "sse":
-        app_factory = getattr(server, "sse_app", None)
-        if not callable(app_factory):
-            raise RuntimeError(
-                "The installed MCP SDK does not expose sse_app(...), so authenticated SSE transport is unavailable."
-            )
-        mcp_app = app_factory(
-            sse_path=sse_path,
-            message_path=message_path,
-            host=host,
-        )
-    else:
-        raise ValueError(f"unsupported HTTP transport: {transport}")
-
-    async def _healthz(_: Request) -> Any:
-        return JSONResponse(
-            {
-                "ok": True,
-                "transport": transport,
-            }
-        )
-
-    async def _issue_user_token(request: Request) -> Any:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "request body must be a JSON object",
-                },
-                status_code=400,
-            )
-
-        if not isinstance(payload, dict):
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "request body must be a JSON object",
-                },
-                status_code=400,
-            )
-
-        meta_token = _extract_admin_meta_token(payload, request.headers)
-        username = _extract_requested_username(payload)
-
-        try:
-            if not _AUTH_STORE.verify_meta_token(meta_token):
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "error": "invalid meta_token",
-                    },
-                    status_code=403,
-                )
-            issued = _AUTH_STORE.issue_user_token(username)
-        except RuntimeError as exc:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                },
-                status_code=503,
-            )
-        except ValueError as exc:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                },
-                status_code=400,
-            )
-
-        return JSONResponse(
-            {
-                "ok": True,
-                **issued,
-                "token_type": "Bearer",
-            },
-            status_code=201,
-        )
-
-    async def _add_user_balance(request: Request) -> Any:
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "request body must be a JSON object",
-                },
-                status_code=400,
-            )
-
-        if not isinstance(payload, dict):
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": "request body must be a JSON object",
-                },
-                status_code=400,
-            )
-
-        meta_token = _extract_admin_meta_token(payload, request.headers)
-        username = _extract_requested_username(payload)
-        token_amount = payload.get("token_amount", payload.get("amount"))
-
-        try:
-            if not _AUTH_STORE.verify_meta_token(meta_token):
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "error": "invalid meta_token",
-                    },
-                    status_code=403,
-                )
-            updated_balance = _AUTH_STORE.add_user_token_balance(username, token_amount)
-        except RuntimeError as exc:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                },
-                status_code=503,
-            )
-        except ValueError as exc:
-            return JSONResponse(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                },
-                status_code=400,
-            )
-
-        return JSONResponse(
-            {
-                "ok": True,
-                **updated_balance,
-            },
-            status_code=200,
-        )
-
-    mcp_router = getattr(mcp_app, "router", None)
-    mcp_lifespan_context = getattr(mcp_router, "lifespan_context", None)
-
-    @contextlib.asynccontextmanager
-    async def _lifespan(_: Any):
-        async with contextlib.AsyncExitStack() as stack:
-            if callable(mcp_lifespan_context):
-                await stack.enter_async_context(mcp_lifespan_context(mcp_app))
-            yield
-
-    app = Starlette(
-        lifespan=_lifespan,
-        routes=[
-            Route("/healthz", _healthz, methods=["GET"]),
-            Route("/admin/tokens", _issue_user_token, methods=["POST"]),
-            Route("/admin/balances", _add_user_balance, methods=["POST"]),
-        ]
-    )
-    app.mount("/", mcp_app)
-    return _FlowXAuthMiddleware(
-        app,
-        exempt_paths={"/healthz", "/admin/tokens", "/admin/balances"},
-    )
-
-
 def run_stdio_server(verbose: bool = False) -> None:
     """Start the FlowX MCP server on stdio."""
-    run_server(transport="stdio", verbose=verbose)
+    run_server(verbose=verbose)
 
 
 def run_server(
     *,
-    transport: str = "stdio",
     verbose: bool = False,
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    streamable_http_path: str = "/mcp",
-    sse_path: str = "/sse",
-    message_path: str = "/messages/",
 ) -> None:
-    """Start the FlowX MCP server on the selected transport."""
+    """Start the local FlowX MCP server on stdio."""
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server could not load a compatible MCP SDK entry point.\n"
@@ -2181,13 +1445,6 @@ def run_server(
         )
         sys.exit(1)
 
-    if transport == "streamable-http" and not streamable_http_path.startswith("/"):
-        raise ValueError("streamable_http_path must start with '/'")
-    if transport == "sse" and not sse_path.startswith("/"):
-        raise ValueError("sse_path must start with '/'")
-    if transport == "sse" and not message_path.startswith("/"):
-        raise ValueError("message_path must start with '/'")
-
     _load_env_from_repo()
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -2196,29 +1453,6 @@ def run_server(
     server = create_server()
 
     try:
-        if transport in {"streamable-http", "sse"}:
-            app = _build_authenticated_http_app(
-                server,
-                transport=transport,
-                host=host,
-                streamable_http_path=streamable_http_path,
-                sse_path=sse_path,
-                message_path=message_path,
-            )
-            try:
-                import uvicorn
-            except ImportError as exc:  # pragma: no cover - depends on runtime extras
-                raise RuntimeError(
-                    "HTTP transport requires uvicorn. Repair the MCP HTTP runtime dependencies."
-                ) from exc
-            uvicorn.run(
-                app,
-                host=host,
-                port=port,
-                log_level="debug" if verbose else "info",
-            )
-            return
-
         run = getattr(server, "run", None)
         if callable(run):
             run()
@@ -2240,55 +1474,15 @@ def run_server(
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Run FlowX as an MCP server")
+    parser = argparse.ArgumentParser(description="Run FlowX as a local stdio MCP server")
     parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         help="Enable verbose logging on stderr",
     )
-    parser.add_argument(
-        "--transport",
-        choices=("stdio", "sse", "streamable-http"),
-        default="stdio",
-        help="Transport to serve. Use streamable-http or sse so remote clients can attach to an already-running FlowX instance.",
-    )
-    parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Listen host for the streamable-http transport.",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Listen port for the streamable-http transport.",
-    )
-    parser.add_argument(
-        "--streamable-http-path",
-        default="/mcp",
-        help="HTTP path for the MCP endpoint when using the streamable-http transport.",
-    )
-    parser.add_argument(
-        "--sse-path",
-        default="/sse",
-        help="HTTP path for the SSE stream endpoint when using the sse transport.",
-    )
-    parser.add_argument(
-        "--message-path",
-        default="/messages/",
-        help="HTTP path for the SSE message endpoint when using the sse transport.",
-    )
     args = parser.parse_args(argv)
-    run_server(
-        transport=str(args.transport),
-        verbose=bool(args.verbose),
-        host=str(args.host),
-        port=int(args.port),
-        streamable_http_path=str(args.streamable_http_path),
-        sse_path=str(args.sse_path),
-        message_path=str(args.message_path),
-    )
+    run_server(verbose=bool(args.verbose))
 
 
 if __name__ == "__main__":  # pragma: no cover

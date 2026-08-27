@@ -2,6 +2,8 @@
 
 FlowX is an MCP server for creating workflows through conversation, designed to integrate easily with agent systems such as Hermes, WorkBuddy, and TraeWork.
 
+FlowX is released under the Apache License 2.0.
+
 An [MCP](https://modelcontextprotocol.io) server that exposes the **`meta_agent`** workflow
 builder and the **`ag_ui_workflow`** runtime engine as a set of tools, so any MCP client
 (Claude Code, Cursor, Codex, VS Code Copilot Chat, ...) can:
@@ -15,15 +17,14 @@ builder and the **`ag_ui_workflow`** runtime engine as a set of tools, so any MC
 6. **run** a workflow step from a chat message and collect the results.
 
 It follows the same `FastMCP` tool-registration pattern used by the `hermes-agent`
-MCP server. By default it serves over stdio, and it can also serve over
-Streamable HTTP when you want clients to attach to an already-running instance.
+MCP server and is intended for pure local stdio use.
 
 ---
 
 ## Architecture
 
 ```
-MCP client  ──stdio / streamable-http──►  flowx_mcp.server (FastMCP)
+MCP client  ──stdio──►  flowx_mcp.server (FastMCP)
                 │
                 ├── meta_agent.AgentBuilder  ──►  LLM (DeepSeek/...)
                 │       (create / update / plan / generate)
@@ -59,35 +60,132 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 | `get_workflow_binary_files` | Read specific workflow binary files and return base64 content plus MIME type. |
 | `replace_workflow_files` | Replace specific workflow files by file name or relative path. |
 
-## Setup
+## Installation
 
-`meta_agent` and `ag_ui_workflow` must be importable. Install them editable:
+FlowX requires Python 3.10+.
+
+Use the package-index path when `meta-agent` and `ag-ui-workflow` are available
+from the package index your environment can reach. Use the local-source path
+when you keep sibling checkouts of those repos next to FlowX.
+
+### Package-index install
+
+#### pip
 
 ```bash
-python3.10 -m pip install -e /Users/user/Desktop/codes/meta_agent --no-deps
-python3.10 -m pip install -e /Users/user/Desktop/codes/ag_ui_worflow --no-deps
-python3.10 -m pip install -r requirements.txt
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-If you do not want to `pip install -e` them, set `FLOWX_EXTRA_PATHS` to a colon-separated
-list of their source roots and the entry point will add them to `sys.path`.
+#### Poetry
 
-Copy `.env.example` to `.env` and fill in your LLM key.
+```bash
+poetry env use python3.10
+poetry install
+```
+
+#### uv
+
+```bash
+uv sync
+```
+
+#### conda
+
+```bash
+conda env create -f environment.yml
+conda activate flowx-mcp
+```
+
+### Local sibling source install
+
+If `meta_agent` and `ag_ui_workflow` are only available as local checkouts,
+install them into the same environment before installing FlowX itself.
+
+#### pip
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ../meta_agent --no-deps
+python -m pip install -e ../ag_ui_workflow --no-deps
+python -m pip install -e .
+```
+
+#### Poetry
+
+```bash
+poetry env use python3.10
+poetry run pip install -e ../meta_agent --no-deps
+poetry run pip install -e ../ag_ui_workflow --no-deps
+poetry run pip install -e .
+```
+
+#### uv
+
+```bash
+uv venv --python 3.10
+uv pip install --python .venv/bin/python -e ../meta_agent --no-deps
+uv pip install --python .venv/bin/python -e ../ag_ui_workflow --no-deps
+uv pip install --python .venv/bin/python -e .
+```
+
+#### conda
+
+```bash
+conda env create -f environment.yml
+conda activate flowx-mcp
+pip install -e ../meta_agent --no-deps
+pip install -e ../ag_ui_workflow --no-deps
+pip install -e .
+```
+
+FlowX also auto-detects sibling folders named `meta_agent`,
+`ag_ui_workflow`, and the legacy `ag_ui_worflow`. If you do not want editable
+installs, set `FLOWX_EXTRA_PATHS` instead.
+
+## Configuration
+
+```bash
+cp .env.example .env
+```
+
+Then fill in at least `FLOWX_LLM_PROVIDER`, `FLOWX_LLM_MODEL`,
+`FLOWX_LLM_API_KEY`, and `FLOWX_DEFAULT_WORKSPACE`.
+
+FlowX loads configuration from existing process environment variables first, then
+from `.env` under `FLOWX_CONFIG_ROOT` when that variable is set, then from `.env`
+in the current working directory, and finally from a repo-local `.env` when you
+run from a source checkout.
+
+Use `FLOWX_EXTRA_PATHS` to add source roots for `meta_agent` and
+`ag_ui_workflow` when those packages are not installed into the current
+environment. On macOS and Linux, separate entries with `:`.
 
 ## Run
 
+Use the installed `flowx-mcp` console script when possible. If you are working
+directly from a repo checkout, `python3.10 run_server.py` still works.
+
 ```bash
 # default: stdio transport for local MCP hosts
-python3.10 run_server.py
-# or with verbose logging
-python3.10 run_server.py --verbose
+flowx-mcp
 
-# streamable HTTP transport for a long-running remote server
-python3.10 run_server.py --transport streamable-http --host 0.0.0.0 --port 8000
+# verbose logging
+flowx-mcp --verbose
+
+# source-checkout entry point
+python3.10 run_server.py
+
 ```
 
-Use stdio when the MCP host should launch FlowX itself. Use Streamable HTTP when
-you want to keep one FlowX instance running and let clients attach to it by URL.
+If you are using Poetry or uv without activating the environment, prefix the
+command with `poetry run` or `uv run`.
+
+Use stdio when the MCP host should launch FlowX itself.
 
 ## Local stdio MCP client config (e.g. Claude Desktop / VS Code)
 
@@ -95,8 +193,7 @@ you want to keep one FlowX instance running and let clients attach to it by URL.
 {
   "mcpServers": {
     "flowx": {
-      "command": "python3.10",
-      "args": ["/Users/user/Desktop/codes/FlowX/run_server.py"],
+      "command": "flowx-mcp",
       "env": {
         "FLOWX_LLM_PROVIDER": "deepseek",
         "FLOWX_LLM_MODEL": "deepseek-chat",
@@ -108,43 +205,14 @@ you want to keep one FlowX instance running and let clients attach to it by URL.
 }
 ```
 
-## Remote MCP client config for an existing FlowX server
-
-If FlowX is already running on the remote host, start it there with the HTTP
-transport and connect the client to the MCP endpoint instead of spawning a fresh
-process over SSH.
-
-Start the server on the remote machine:
-
-```bash
-cd /home/testuser/FlowX
-export FLOWX_LLM_PROVIDER=deepseek
-export FLOWX_LLM_MODEL=deepseek-chat
-export FLOWX_LLM_API_KEY='<your key>'
-export FLOWX_DEFAULT_WORKSPACE=/home/testuser/flowx_workspaces
-export FLOWX_EXTRA_PATHS=/home/testuser/meta_agent:/home/testuser/ag_ui_worflow
-python3 run_server.py --transport streamable-http --host 0.0.0.0 --port 8000 --verbose
-```
-
-Then point a URL-capable MCP host at that running server:
-
-```jsonc
-{
-  "mcpServers": {
-    "flowx-remote": {
-      "url": "https://{url}/mcp"
-    }
-  }
-}
-```
-
-If your MCP host only supports stdio launch commands, keep using the SSH pattern
-below.
+If your environment is isolated behind Poetry or uv, set the command to
+`poetry` with args `['run', 'flowx-mcp']` or to `uv` with args
+`['run', 'flowx-mcp']`.
 
 ## Example workflow prompts
 
 The following prompts are ready to paste into an MCP client that is already
-connected to `flowx-remote`.
+connected to your local `flowx` MCP server.
 
 ### 1. `stock_pressure`
 
@@ -152,7 +220,7 @@ connected to `flowx-remote`.
 <summary>Prompt</summary>
 
 ```text
-使用 flowx-remote 创建一个名字是 stock_pressure 的工作流。
+使用 flowx 创建一个名字是 stock_pressure 的工作流。
 
 根据下述理论构建一个工作流，根据最近 n 个交易日（用户指定）计算出指定股票（用户指定）庄家未来可能出货的价格位置，并在图表上显示。
 
@@ -344,7 +412,7 @@ return top_pressure_prices
 <summary>Prompt</summary>
 
 ```text
-使用 flowx-remote 创建一个名字是 stock_distribution 的工作流。
+使用 flowx 创建一个名字是 stock_distribution 的工作流。
 
 根据如下理论构建一个可以预估当前和历史价格大小户筹码分布并画成图的工作流。
 
@@ -396,7 +464,7 @@ V*_t = V_t / EMA(V_t)
 <summary>Prompt</summary>
 
 ```text
-使用 flowx-remote 创建一个名字是 picture_to_svg 的工作流。
+使用 flowx 创建一个名字是 picture_to_svg 的工作流。
 
 创建一个上传微信二维码图片、自动去除人名信息并转成 SVG 格式的工作流。
 ```
@@ -413,7 +481,7 @@ V*_t = V_t / EMA(V_t)
 <summary>Prompt</summary>
 
 ```text
-使用 flowx-remote 创建一个名字是 policy_scrawler 的工作流。
+使用 flowx 创建一个名字是 policy_scrawler 的工作流。
 
 要求：
 1. 从全国政策发布机构名录获取需要的机构名称模版。
@@ -434,7 +502,7 @@ V*_t = V_t / EMA(V_t)
 <summary>Prompt</summary>
 
 ```text
-flowx-remote-us帮我构建一个到LinkedIn上找n个正在招人的AI startups的创始人的爬虫工作流
+flowx帮我构建一个到LinkedIn上找n个正在招人的AI startups的创始人的爬虫工作流
 ```
 
 </details>
