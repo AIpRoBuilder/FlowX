@@ -1,8 +1,19 @@
-# FlowX MCP Server
+# FlowX | Workflow Compiler for AI Agents
 
-FlowX is an MCP server for creating workflows through conversation, designed to integrate easily with agent systems such as Hermes, WorkBuddy, and TraeWork.
+FlowX is a local MCP server for creating workflows through conversation, designed to integrate easily with agent systems such as Hermes, WorkBuddy, and TraeWork.
 
 FlowX is released under the Apache License 2.0.
+
+FlowX can be understood in two layers:
+
+- As a workflow compiler for AI agents, it turns natural-language requirements into runnable workflow artifacts.
+- As a workflow evolution engine, it lets an agent keep updating node logic, execution paths, and output quality through follow-up prompts.
+
+It also acts as the bridge between agent-side skills and MCP-side execution.
+
+FlowX packages workflow creation, updates, startup, debugging, and execution into one MCP tool surface. You describe the task, and the agent can continuously generate and iterate backend workflows, allowing the system to behave like a workflow evolution engine that keeps moving closer to real business goals.
+
+> Your agent can now build, rerun, and evolve its own workflows.
 
 An [MCP](https://modelcontextprotocol.io) server that exposes the **`meta_agent`** workflow
 builder and the **`ag_ui_workflow`** runtime engine as a set of tools, so any MCP client
@@ -20,6 +31,68 @@ It follows the same `FastMCP` tool-registration pattern used by the `hermes-agen
 MCP server and is intended for pure local stdio use.
 
 ---
+
+## Product Positioning
+
+FlowX connects the full local workflow loop inside one MCP surface:
+
+1. Describe the task in natural language.
+2. Generate or amend `workflow.json`, node backends, and `main.py`.
+3. Start or reload the local FastAPI backend.
+4. Run workflow steps from chat, inspect results, and continue the next iteration.
+
+### Where FlowX sits
+
+```text
+AI Agent
+   |
+   +-------------------+
+   |                   |
+   v                   v
+ Skill                MCP
+   |                   |
+   +---------+---------+
+             |
+             v
+           FlowX
+             |
+             v
+          Workflow
+             |
+             v
+   Code / Tools / APIs
+             |
+             v
+           Runtime
+```
+
+FlowX is the convergence layer where reusable agent skills and MCP-exposed tool access are compiled into an explicit workflow that can actually run.
+
+### Transform skill into workflow
+
+```text
+Skill
+  |
+  v
+FlowX Compiler
+  |
+  v
+Executable Workflow
+```
+
+This is the key conceptual upgrade FlowX provides:
+
+- A skill stays at the level of reusable intent, reasoning pattern, or operating procedure.
+- FlowX compiles that skill into workflow structure, node code, tool wiring, and runnable backend behavior.
+- The result is an executable workflow that can be started, reloaded, inspected, and evolved inside the same local MCP loop.
+
+| Positioning | What it means |
+| --- | --- |
+| Conversational workflow generation | Turn a requirement directly into workflow files and executable node code. |
+| Compile skills into workflows | Transform a reusable skill into an executable workflow with explicit nodes, code, tools, and runtime steps. |
+| Dynamic updates and reloads | Refine a running workflow after each feedback round instead of recreating it from scratch. |
+| Native MCP integration | Plug FlowX into local MCP clients so the agent can operate the workflow from the same conversation. |
+| Recoverable outputs | Inspect inputs, run steps, and feed returned text, files, or images into the next decision. |
 
 ## Architecture
 
@@ -217,7 +290,8 @@ If your environment is isolated behind Poetry or uv, set the command to
 `poetry` with args `['run', 'flowx-mcp']` or to `uv` with args
 `['run', 'flowx-mcp']`.
 
-## Example workflow prompts
+<details>
+<summary><strong>Example workflow prompts</strong> (click to expand)</summary>
 
 The following prompts are ready to paste into an MCP client that is already
 connected to your local `flowx` MCP server.
@@ -228,169 +302,166 @@ connected to your local `flowx` MCP server.
 <summary>Prompt</summary>
 
 ```text
-使用 flowx 创建一个名字是 stock_pressure 的工作流。
+Use flowx to create a workflow named stock_pressure.
 
-根据下述理论构建一个工作流，根据最近 n 个交易日（用户指定）计算出指定股票（用户指定）庄家未来可能出货的价格位置，并在图表上显示。
+Build a workflow based on the following theory. Using the most recent n trading days, specified by the user, estimate the likely future distribution price levels for market makers in a user-specified stock and display them on a chart.
 
-庄家出货压力峰预测理论模型
+Market Maker Distribution Pressure Peak Forecasting Model
 
-一、模型目标
+I. Model Goal
 
-根据历史成交数据、筹码分布、庄家成本和历史高点信息，寻找未来可能形成出货压力的价格区域。
+Use historical trading data, chip distribution, market-maker cost basis, and historical highs to identify future price regions that may form distribution pressure.
 
-核心假设：
-1. 庄家在股价大跌后低位吸筹。
-2. 吸筹阶段形成庄家平均成本区。
-3. 后续拉升过程中，庄家通过试盘测试上方卖压。
-4. 历史大量成交区域和前期高点会形成动态压力。
-5. 出货压力点由多因素共同决定。
+Core assumptions:
+1. Market makers accumulate positions at low prices after a sharp decline.
+2. The accumulation phase forms the market maker's average cost zone.
+3. During subsequent rallies, market makers probe overhead sell pressure.
+4. Historical high-volume trading zones and previous highs create dynamic resistance.
+5. Distribution pressure points are determined by multiple factors together.
 
-二、输入数据
+II. Input Data
 
-每日行情：
-Date: 日期
-Open: 开盘价
-High: 最高价
-Low: 最低价
-Close: 收盘价
-Volume: 成交量
+Daily market data:
+Date: date
+Open: open price
+High: high price
+Low: low price
+Close: close price
+Volume: trading volume
 
-三、筹码分布模型
+III. Chip Distribution Model
 
-将价格区间划分为 N 个价格桶。
+Divide the price range into N price buckets.
 
-对于每个价格区间 p：
+For each price interval p:
 C(p)=Σ Volume(t)
 
-其中：
-C(p) 表示该价格区域累计成交筹码数量。
+Where:
+C(p) represents the cumulative traded chips in that price region.
 
-成交峰值：
+Peak trading concentration:
 P_peak = argmax C(p)
 
-表示市场成本最密集区域。
+This represents the price zone with the highest cost concentration in the market.
 
-四、庄家吸筹成本估计
+IV. Estimating the Market-Maker Accumulation Cost
 
-选择吸筹阶段：
+Select the accumulation phase using these conditions:
+1. The stock experienced a sharp decline.
+2. Trading volume expanded significantly.
+3. Price entered a sideways consolidation range.
 
-条件：
-1. 股价经历大幅下跌。
-2. 成交量明显放大。
-3. 股价进入横盘震荡。
-
-庄家平均成本：
+Average market-maker cost:
 C_dealer = Σ(P_t × V_t) / ΣV_t
 
-其中：
-P_t: 成交价格
-V_t: 成交量
+Where:
+P_t: transaction price
+V_t: volume
 
-得到庄家主要持仓成本。
+This yields the market maker's primary holding cost.
 
-五、历史压力峰计算
+V. Historical Pressure Peak Calculation
 
-定义压力评分：
+Define the pressure score:
 Pressure(p)= w1C(p) + w2High_Test(p) + w3Profit(p) + w4Gain(p)
 
-其中：
-1. 成交密集压力 C(p)
-表示该价格区域历史交易筹码数量。
+Where:
+1. Trading-density pressure C(p)
+Represents the historical trading-chip volume accumulated in that price zone.
 
-2. 历史高点压力 High_Test(p)
-统计：
-- 历史是否出现过高点
-- 是否多次冲高失败
-- 是否形成顶部区域
+2. Historical-high pressure High_Test(p)
+Measure:
+- Whether historical highs occurred at this level
+- Whether rallies failed multiple times near this level
+- Whether the region formed a top structure
 
-3. 获利盘压力 Profit(p)
-计算：
+3. Profitable-position pressure Profit(p)
+Calculate:
 Profit(p)=ΣC(x), x<p
 
-表示当前价格以下有多少筹码处于盈利状态。
+This indicates how many chips below the current price are already in profit.
 
-盈利筹码越多：
-潜在卖压越大。
+The more profitable chips there are,
+the greater the potential selling pressure.
 
-4. 庄家收益压力 Gain(p)
+4. Market-maker gain pressure Gain(p)
 Gain(p)= (p-C_dealer)/C_dealer
 
-表示庄家在该价格位置的理论收益。
+This represents the market maker's theoretical return at price p.
 
-六、压力峰搜索算法
+VI. Pressure Peak Search Algorithm
 
-步骤1：
-建立价格-成交量矩阵：
+Step 1:
+Build a price-volume matrix:
 price_bins = divide(min_price,max_price,N)
 
-步骤2：
-统计：
+Step 2:
+Aggregate:
 volume_profile[p]
 
-步骤3：
-计算每个价格位置：
-Pressure Score
+Step 3:
+Compute the pressure score for each price level.
 
-步骤4：
-排序：
-Score 最高的位置作为第一压力峰。
+Step 4:
+Sort:
+The highest-scoring levels are the primary pressure peaks.
 
-输出：
+Output:
 Pressure_1
 Pressure_2
 Pressure_3
 
-分别代表：
-第一压力区
-第二压力区
-第三压力区
+Representing:
+Primary pressure zone
+Secondary pressure zone
+Tertiary pressure zone
 
-七、动态试盘验证
+VII. Dynamic Probe Validation
 
-庄家拉升过程中观察：
+Observe the market-maker's probing behavior during an upward move:
 
-情况 A：
-价格上涨，成交量下降。
-说明：上方阻力较小。
+Case A:
+Price rises while volume declines.
+Meaning: overhead resistance is relatively weak.
 
-情况 B：
-价格上涨，成交量突然放大，同时出现长上影线，随后回落。
-说明：该价格区域存在大量卖盘。
+Case B:
+Price rises, volume expands sharply, a long upper shadow appears, and price then falls back.
+Meaning: this price region contains substantial sell pressure.
 
-定义：
-P_pressure = 当前测试失败价格
+Define:
+P_pressure = the current failed test price
 
-八、综合出货价格模型
+VIII. Integrated Distribution Price Model
 
-最终预测：
+Final prediction:
 P_exit = argmax Pressure(p)
 
-即：
-最大压力评分对应价格。
+That is:
+the price corresponding to the maximum pressure score.
 
-实际计算：
-P_exit ≈ 庄家成本 × (1+r)
+Practical estimate:
+P_exit ≈ market-maker cost × (1+r)
 
-并且：
-接近历史成交峰。
+And:
+it should also be close to a historical trading concentration peak.
 
-其中：
-r: 庄家目标收益率。
+Where:
+r: target market-maker return.
 
-九、Python 实现思路
+IX. Python Implementation Outline
 
-输入：
-K 线数据 DataFrame
+Input:
+OHLCV DataFrame
 
-计算：
-1. 计算成交量分布
-2. 估计庄家成本
-3. 寻找历史高点
-4. 计算盈利筹码比例
-5. 计算 Pressure Score
-6. 输出压力峰
+Compute:
+1. Compute volume distribution
+2. Estimate market-maker cost
+3. Detect historical highs
+4. Compute the proportion of profitable chips
+5. Compute pressure scores
+6. Output pressure peaks
 
-伪代码：
+Pseudocode:
 for price in price_bins:
     score = (
         w1 * volume_density(price)
@@ -403,9 +474,9 @@ rank(score)
 
 return top_pressure_prices
 
-十、最终解释
+X. Final Interpretation
 
-庄家未来可能出货的位置，不是简单的历史最高价。
+The future price at which market makers may distribute is not simply the historical high.
 ```
 
 </details>
@@ -420,44 +491,44 @@ return top_pressure_prices
 <summary>Prompt</summary>
 
 ```text
-使用 flowx 创建一个名字是 stock_distribution 的工作流。
+Use flowx to create a workflow named stock_distribution.
 
-根据如下理论构建一个可以预估当前和历史价格大小户筹码分布并画成图的工作流。
+Build a workflow based on the following theory that estimates large-holder and retail chip distribution across current and historical price levels and visualizes it.
 
-## 角色
-你是一名量化研究员，负责根据 1 小时级 OHLCV 数据建立“隐含大小户筹码状态”模型，并识别吸筹、派发与潜在价格压力峰。
+## Role
+You are a quantitative researcher responsible for building an implicit large-holder versus retail-holder chip-state model from 1-hour OHLCV data, and for identifying accumulation, distribution, and potential price pressure peaks.
 
-## 重要原则
-1. 只有价格和成交量时，无法直接观测真实账户的大户/小户持仓。
-2. large_ratio / small_ratio 是模型隐变量估计，不是真实账户持仓。
-3. “上涨=大户卖给小户、下跌=小户卖给大户”是待检验假设，而不是事实。
-4. 所有实时特征只能使用当前及过去数据，禁止未来函数。
-5. 输出概率/置信度，不把模型结果描述成确定事实。
+## Important Principles
+1. With only price and volume, you cannot directly observe the true holdings of large and small accounts.
+2. large_ratio / small_ratio are latent-state estimates of the model, not real account holdings.
+3. "Price up = large holders sell to small holders, price down = small holders sell to large holders" is a hypothesis to test, not a fact.
+4. All real-time features may use only current and past data; no future leakage is allowed.
+5. Output probabilities and confidence levels, and do not present model results as certainty.
 
-## 输入
-CSV 至少包含：
+## Input
+The CSV must contain at least:
 datetime, open, high, low, close, volume
 
-## 核心状态
-H_t：估计大户筹码比例
-L_t：估计小户筹码比例
+## Core State
+H_t: estimated large-holder chip ratio
+L_t: estimated retail-holder chip ratio
 H_t + L_t = 1
 D_t = H_t - L_t = 2H_t - 1
 
 R_t = (P_t-P_{t-1})/P_{t-1}
 V*_t = V_t / EMA(V_t)
 
-## 状态转移
-最简可校准模型：
+## State Transition
+Simplest calibratable model:
 
 ΔH_t = -alpha * tanh(R_t / sigma_R) * V*_t
 
-并限制 H_t ∈ [h_min, h_max]。
+Constrain H_t ∈ [h_min, h_max].
 
-解释：
-- 放量上涨：模型倾向 H 下降，即“大户→小户”的隐含分散；
-- 放量下跌：模型倾向 H 上升，即“小户→大户”的隐含聚合；
-- 小波动/正常成交：状态变化较小。
+Interpretation:
+- High-volume upward moves push H lower, implying implicit dispersion from large holders to small holders.
+- High-volume downward moves push H higher, implying implicit concentration from small holders to large holders.
+- Small price moves or normal volume produce smaller state changes.
 ```
 
 </details>
@@ -472,9 +543,9 @@ V*_t = V_t / EMA(V_t)
 <summary>Prompt</summary>
 
 ```text
-使用 flowx 创建一个名字是 picture_to_svg 的工作流。
+Use flowx to create a workflow named picture_to_svg.
 
-创建一个上传微信二维码图片、自动去除人名信息并转成 SVG 格式的工作流。
+Create a workflow that uploads a WeChat QR code image, automatically removes personal name information, and converts it to SVG format.
 ```
 
 </details>
@@ -489,13 +560,13 @@ V*_t = V_t / EMA(V_t)
 <summary>Prompt</summary>
 
 ```text
-使用 flowx 创建一个名字是 policy_scrawler 的工作流。
+Use flowx to create a workflow named policy_scrawler.
 
-要求：
-1. 从全国政策发布机构名录获取需要的机构名称模版。
-2. 结合全国省-市-县名称，整理全国政策机构的具体搜索名称。
-3. 使用 Playwright 模拟浏览器，在百度搜索对应机构官网名称。
-4. 构建一个可以爬取全国政策机构官网 URL 的工作流。
+Requirements:
+1. Obtain the institution-name templates you need from the national policy publishing institution directory.
+2. Combine province, city, and county names across China to construct concrete search names for policy institutions nationwide.
+3. Use Playwright to simulate a browser and search Baidu for the official website names of the target institutions.
+4. Build a workflow that crawls the official website URLs of policy institutions nationwide.
 ```
 
 </details>
@@ -510,7 +581,7 @@ V*_t = V_t / EMA(V_t)
 <summary>Prompt</summary>
 
 ```text
-flowx帮我构建一个到LinkedIn上找n个正在招人的AI startups的创始人的爬虫工作流
+Use flowx to build a crawler workflow that finds the founders of n AI startups that are currently hiring on LinkedIn.
 ```
 
 </details>
@@ -518,6 +589,8 @@ flowx帮我构建一个到LinkedIn上找n个正在招人的AI startups的创始�
 <p align="center">
   <img src="assets/start-up-hiring.png" alt="start-up-hiring workflow example" width="720" />
 </p>
+
+</details>
 
 ## Contact
 
