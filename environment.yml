@@ -4,5 +4,6 @@ channels:
 dependencies:
   - python=3.10
   - pip
+  - git
   - pip:
-      - -e .
+      - -e .[git]

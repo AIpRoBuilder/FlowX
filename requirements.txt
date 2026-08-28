@@ -1,4 +1,3 @@
-# Install FlowX from the local checkout, including its declared runtime dependencies.
-# If meta_agent / ag_ui_workflow are only available as sibling source checkouts,
-# install them into the same environment first or set FLOWX_EXTRA_PATHS.
--e .
+# Install FlowX plus its git-hosted workflow-builder dependency.
+# For sibling source checkouts instead, install those repos manually and then use `pip install -e .`.
+-e .[git]

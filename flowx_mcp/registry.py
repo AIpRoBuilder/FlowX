@@ -412,7 +412,8 @@ class WorkflowRegistry:
     ) -> WorkflowHandle:
         if not _META_AGENT_AVAILABLE:
             raise ImportError(
-                "meta_agent is not importable. Install it (pip install -e ../meta_agent) "
+                "meta_agent is not importable. Install FlowX with the git extra "
+                "(for example: pip install -e '.[git]'), install local sibling checkouts, "
                 f"or set FLOWX_EXTRA_PATHS. Underlying error: {_IMPORT_ERROR}"
             )
         with self._lock:

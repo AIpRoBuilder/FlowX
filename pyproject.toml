@@ -11,14 +11,18 @@ license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.2.0",
-    "meta-agent",
-    "ag-ui-workflow",
     "python-dotenv",
 ]
+
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+]
+
+[project.optional-dependencies]
+git = [
+    "meta_agent @ git+https://github.com/AIpRoBuilder/meta_agent.git",
 ]
 
 [project.scripts]
@@ -42,9 +46,11 @@ packages = [{ include = "flowx_mcp" }]
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
 mcp = ">=1.2.0"
-meta-agent = "*"
-ag-ui-workflow = "*"
 python-dotenv = "*"
+meta_agent = { git = "https://github.com/AIpRoBuilder/meta_agent.git", optional = true }
 
 [tool.poetry.scripts]
 flowx-mcp = "flowx_mcp.server:main"
+
+[tool.poetry.extras]
+git = ["meta_agent"]

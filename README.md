@@ -64,11 +64,12 @@ backend process, port and session state). Tools 3–6 talk to the running backen
 
 FlowX requires Python 3.10+.
 
-Use the package-index path when `meta-agent` and `ag-ui-workflow` are available
-from the package index your environment can reach. Use the local-source path
-when you keep sibling checkouts of those repos next to FlowX.
+`meta_agent` and `ag-ui-workflow` are installed from Git remotes, not from PyPI.
+The default install path below pulls `meta_agent` from GitHub, and `meta_agent`
+then resolves its compatible `ag-ui-workflow` dependency from its own pinned
+Git reference.
 
-### Package-index install
+### Git remote install
 
 #### pip
 
@@ -76,20 +77,20 @@ when you keep sibling checkouts of those repos next to FlowX.
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -e '.[git]'
 ```
 
 #### Poetry
 
 ```bash
 poetry env use python3.10
-poetry install
+poetry install -E git
 ```
 
 #### uv
 
 ```bash
-uv sync
+uv sync --extra git
 ```
 
 #### conda
@@ -110,8 +111,8 @@ install them into the same environment before installing FlowX itself.
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+python -m pip install -e ../ag_ui_worflow --no-deps
 python -m pip install -e ../meta_agent --no-deps
-python -m pip install -e ../ag_ui_workflow --no-deps
 python -m pip install -e .
 ```
 
@@ -119,17 +120,17 @@ python -m pip install -e .
 
 ```bash
 poetry env use python3.10
+poetry install
+poetry run pip install -e ../ag_ui_worflow --no-deps
 poetry run pip install -e ../meta_agent --no-deps
-poetry run pip install -e ../ag_ui_workflow --no-deps
-poetry run pip install -e .
 ```
 
 #### uv
 
 ```bash
 uv venv --python 3.10
+uv pip install --python .venv/bin/python -e ../ag_ui_worflow --no-deps
 uv pip install --python .venv/bin/python -e ../meta_agent --no-deps
-uv pip install --python .venv/bin/python -e ../ag_ui_workflow --no-deps
 uv pip install --python .venv/bin/python -e .
 ```
 
@@ -138,14 +139,21 @@ uv pip install --python .venv/bin/python -e .
 ```bash
 conda env create -f environment.yml
 conda activate flowx-mcp
+pip uninstall -y meta-agent meta_agent ag-ui-workflow || true
+pip install -e ../ag_ui_worflow --no-deps
 pip install -e ../meta_agent --no-deps
-pip install -e ../ag_ui_workflow --no-deps
 pip install -e .
 ```
 
 FlowX also auto-detects sibling folders named `meta_agent`,
-`ag_ui_workflow`, and the legacy `ag_ui_worflow`. If you do not want editable
-installs, set `FLOWX_EXTRA_PATHS` instead.
+`ag_ui_worflow`, and `ag_ui_workflow`. If you do not want editable installs,
+set `FLOWX_EXTRA_PATHS` instead.
+
+The Git remote used by the default install path is:
+
+```text
+https://github.com/AIpRoBuilder/meta_agent.git
+```
 
 ## Configuration
 
