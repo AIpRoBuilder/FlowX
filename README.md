@@ -1,5 +1,11 @@
 # FlowX | Workflow Compiler for AI Agents
 
+
+
+![badge](https://img.shields.io/badge/License-Apache%202.0-blue.svg) ![badge](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg) ![badge](https://img.shields.io/badge/MCP-server-6A5ACD.svg)
+
+![FlowX 横幅：AI 智能体与工作流编译器的概念视觉](assets/banner.png)
+
 FlowX is a local MCP server for creating workflows through conversation, designed to integrate easily with agent systems such as Hermes, WorkBuddy, and TraeWork.
 
 FlowX is released under the Apache License 2.0.
@@ -33,6 +39,10 @@ MCP server and is intended for pure local stdio use.
 ---
 
 ## Product Positioning
+
+
+![FlowX 概念图：从自然语言需求编译为可运行工作流](assets/features.png)
+*FlowX 将自然语言需求编译为可运行、可迭代的工作流产物*
 
 FlowX connects the full local workflow loop inside one MCP surface:
 
@@ -95,6 +105,10 @@ This is the key conceptual upgrade FlowX provides:
 | Recoverable outputs | Inspect inputs, run steps, and feed returned text, files, or images into the next decision. |
 
 ## Architecture
+
+
+![FlowX 架构概念图：MCP 客户端、AgentBuilder 与 FastAPI 工作流后端的协作关系](assets/architecture.png)
+*FlowX 将 MCP 客户端、AgentBuilder 与 FastAPI 工作流后端串成一条本地闭环*
 
 ```
 MCP client  ──stdio──►  flowx_mcp.server (FastMCP)
