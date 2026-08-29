@@ -35,3 +35,18 @@ A clean conceptual illustration showing natural language on the left side of the
 ```text
 A clean modern architecture diagram for a local MCP server workflow compiler. On the left, an abstract AI agent node connects through a thin stdio channel to a central FastMCP server block. From the central block, two branches flow outward: one toward an AgentBuilder / LLM engine node, and another toward a subprocess FastAPI backend engine node with a workflow runtime loop. Use a soft blue and indigo palette with a subtle orange accent for workflow artifact nodes. Flat minimal vector style, soft rounded rectangles, light grid background, gentle shadows, no photorealism, no precise readable text; text areas are represented by small neutral placeholder bars. Composition should be balanced and easy to scan, with clear directional arrows showing data flow and reload loops. Aspect ratio: 16:9
 ```
+
+## 2026-08-29 11:08
+
+## 2026-08-29 11:12
+
+### usage (16:9)
+
+- alt: FlowX 使用流程概念图：从对话式需求到可运行工作流
+- caption: FlowX 会话式工作流编译：从自然语言到可运行后端
+- 文件: assets/usage.png
+
+```text
+A modern developer documentation illustration showing a conversation-to-workflow pipeline: on the left, a clean terminal/MCP client window with an abstract chat line and code cursor; in the center, a compiler stage represented by arrows and a glowing pipeline; on the right, an abstract workflow graph with connected nodes, a small FastAPI lightning bolt, and subtle circuit-board patterns. Style: clean flat 3D, deep blue and violet gradient palette with cyan accents, soft shadows, professional tech aesthetic. Avoid rendering any readable text or real UI; use abstract shapes.
+Aspect ratio: 16:9
+```

@@ -262,6 +262,10 @@ environment. On macOS and Linux, separate entries with `:`.
 
 ## Run
 
+
+![FlowX 使用流程概念图：从对话式需求到可运行工作流](assets/usage.png)
+*FlowX 会话式工作流编译：从自然语言到可运行后端*
+
 Use the installed `flowx-mcp` console script when possible. If you are working
 directly from a repo checkout, `python3.10 run_server.py` still works.
 
