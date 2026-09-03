@@ -376,7 +376,6 @@ def _attach_existing_workflow(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
-    services_root: Optional[str] = None,
     skills_root: Optional[str] = None,
 ) -> Any:
     workflow_name = _normalize_name(workflow_name, "workflow_name")
@@ -393,7 +392,6 @@ def _attach_existing_workflow(
         api_key=api_key,
         model=model,
         provider=provider,
-        services_root=services_root,
         skills_root=skills_root,
     )
     graph_path = root_dir / "graph_plan.json"
@@ -443,7 +441,6 @@ def _restart_builder_handle(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     provider: Optional[str] = None,
-    services_root: Optional[str] = None,
     skills_root: Optional[str] = None,
     reset_session: bool = True,
 ) -> tuple[Any, bool]:
@@ -473,8 +470,6 @@ def _restart_builder_handle(
         api_key = api_key or previous_handle.api_key or None
         model = model or previous_handle.model or None
         provider = provider or previous_handle.provider or None
-        if services_root is None:
-            services_root = previous_handle.services_root
         if skills_root is None:
             skills_root = previous_handle.skills_root
         previous_handle.stop_backend()
@@ -485,7 +480,6 @@ def _restart_builder_handle(
         api_key=api_key,
         model=model,
         provider=provider,
-        services_root=services_root,
         skills_root=skills_root,
     )
     if backend_port:
@@ -653,7 +647,6 @@ def create_server() -> Any:
         user_prompt: str,
         workspace: Optional[str] = None,
         backend_port: int = 0,
-        services_root: Optional[str] = None,
         skills_root: Optional[str] = None,
         frontend_style_prompt: Optional[str] = None,
         temperature: float = 0.3,
@@ -665,7 +658,6 @@ def create_server() -> Any:
             user_prompt: Natural-language requirement used to generate the workflow.
             workspace: Parent directory that will contain the workflow folder.
             backend_port: Optional backend port; 0 selects a free local port.
-            services_root: Optional services root path passed to AgentBuilder.
             skills_root: Optional skills root path passed to AgentBuilder.
             frontend_style_prompt: Optional styling prompt for the generated frontend.
             temperature: LLM temperature passed to the meta_agent generation calls.
@@ -683,7 +675,6 @@ def create_server() -> Any:
             handle = registry.get_or_create(
                 workspace=workspace_dir,
                 workflow_name=workflow,
-                services_root=services_root,
                 skills_root=skills_root,
             )
             port = int(backend_port) if int(backend_port or 0) > 0 else find_free_port()
@@ -699,7 +690,6 @@ def create_server() -> Any:
                     requirement_md_path=req_path,
                     graph_plan_filename="workflow.json",
                     temperature=temperature,
-                    services_root=services_root,
                 )
             with _capture_builder_output("create_workflow.update_backend_nodes"):
                 artifacts = handle.builder.update_backend_nodes(
@@ -954,7 +944,6 @@ def create_server() -> Any:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
-        services_root: Optional[str] = None,
         skills_root: Optional[str] = None,
     ) -> str:
         """Recreate the in-memory AgentBuilder for a workflow from files on disk.
@@ -969,7 +958,6 @@ def create_server() -> Any:
             api_key: Optional LLM API key override for the recreated builder.
             model: Optional LLM model override for the recreated builder.
             provider: Optional LLM provider override for the recreated builder.
-            services_root: Optional services root path for the recreated builder.
             skills_root: Optional skills root path for the recreated builder.
         """
 
@@ -980,7 +968,6 @@ def create_server() -> Any:
                 api_key=api_key,
                 model=model,
                 provider=provider,
-                services_root=services_root,
                 skills_root=skills_root,
                 reset_session=reset_session,
             )

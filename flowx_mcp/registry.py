@@ -95,7 +95,6 @@ class WorkflowHandle:
     api_key: str
     model: str
     provider: str
-    services_root: Optional[str] = None
     skills_root: Optional[str] = None
     frontend_style_prompt: Optional[str] = None
 
@@ -407,7 +406,6 @@ class WorkflowRegistry:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
-        services_root: Optional[str] = None,
         skills_root: Optional[str] = None,
     ) -> WorkflowHandle:
         if not _META_AGENT_AVAILABLE:
@@ -434,8 +432,6 @@ class WorkflowRegistry:
                         existing.model = model
                     if provider:
                         existing.provider = provider
-                if services_root is not None:
-                    existing.services_root = services_root
                 if skills_root is not None:
                     existing.skills_root = skills_root
                 return existing
@@ -452,7 +448,6 @@ class WorkflowRegistry:
                 model=eff_model,
                 provider=eff_provider,
                 root_dir=root_dir,
-                services_root_path=services_root,
                 skills_root_path=skills_root,
             )
             handle = WorkflowHandle(
@@ -463,7 +458,6 @@ class WorkflowRegistry:
                 api_key=eff_api_key,
                 model=eff_model,
                 provider=eff_provider,
-                services_root=services_root,
                 skills_root=skills_root,
             )
             self._handles[key] = handle
