@@ -398,7 +398,6 @@ def _attach_existing_workflow(
     workflow_json_path = root_dir / "workflow.json"
     requirement_path = root_dir / "requirement_analysis.md"
     main_path = root_dir / "main.py"
-    frontend_path = root_dir / "frontend" / "src"
 
     chosen_graph = graph_path if graph_path.is_file() else workflow_json_path
     if not chosen_graph.is_file():
@@ -416,8 +415,6 @@ def _attach_existing_workflow(
         handle.builder.workflow_json_path = str(workflow_json_path)
     if main_path.is_file():
         handle.main_entrypoint_path = str(main_path)
-    if frontend_path.exists():
-        handle.frontend_output_path = str(frontend_path)
 
     with _capture_builder_output("attach_existing_workflow.load_graph"):
         handle.builder._load_planned_graph(handle.graph_plan_path)
@@ -452,7 +449,6 @@ def _restart_builder_handle(
     backend_was_running = False
     previous_session_id: Optional[str] = None
     previous_completed_steps: list[str] = []
-    previous_frontend_style_prompt: Optional[str] = None
 
     if previous_handle is not None:
         backend_port = previous_handle.backend_port
@@ -463,10 +459,6 @@ def _restart_builder_handle(
             )
         previous_session_id = previous_handle.session_id
         previous_completed_steps = list(previous_handle.completed_steps)
-        previous_frontend_style_prompt = (
-            previous_handle.frontend_style_prompt
-            or getattr(previous_handle.builder, "frontend_style_prompt", None)
-        )
         api_key = api_key or previous_handle.api_key or None
         model = model or previous_handle.model or None
         provider = provider or previous_handle.provider or None
@@ -484,9 +476,6 @@ def _restart_builder_handle(
     )
     if backend_port:
         handle.backend_port = backend_port
-    if previous_frontend_style_prompt is not None:
-        handle.frontend_style_prompt = previous_frontend_style_prompt
-        handle.builder.frontend_style_prompt = previous_frontend_style_prompt
     if reset_session:
         handle.new_session()
     elif previous_session_id is not None:
@@ -648,7 +637,6 @@ def create_server() -> Any:
         workspace: Optional[str] = None,
         backend_port: int = 0,
         skills_root: Optional[str] = None,
-        frontend_style_prompt: Optional[str] = None,
         temperature: float = 0.3,
     ) -> str:
         """Create a workflow using meta_agent with a workspace and workflow name.
@@ -659,7 +647,6 @@ def create_server() -> Any:
             workspace: Parent directory that will contain the workflow folder.
             backend_port: Optional backend port; 0 selects a free local port.
             skills_root: Optional skills root path passed to AgentBuilder.
-            frontend_style_prompt: Optional styling prompt for the generated frontend.
             temperature: LLM temperature passed to the meta_agent generation calls.
         """
 
@@ -679,9 +666,6 @@ def create_server() -> Any:
             )
             port = int(backend_port) if int(backend_port or 0) > 0 else find_free_port()
             handle.backend_port = port
-            if isinstance(frontend_style_prompt, str):
-                handle.frontend_style_prompt = frontend_style_prompt.strip() or None
-                handle.builder.frontend_style_prompt = handle.frontend_style_prompt
 
             with _capture_builder_output("create_workflow.analyze_requirement"):
                 req_path = handle.builder.analyze_requirement(requirement_text=requirement)
@@ -696,7 +680,6 @@ def create_server() -> Any:
                     graph_plan_path=graph_path,
                     requirement_md_path=req_path,
                     node_docs_dirname="node_docs",
-                    node_ui_dirname="node_ui",
                     language="python",
                     temperature=temperature,
                 )
@@ -821,7 +804,6 @@ def create_server() -> Any:
         workflow_name: str,
         workspace: Optional[str] = None,
         reset_session: bool = False,
-        with_frontend: bool = False,
         timeout_sec: int = 30,
     ) -> str:
         """Start the generated FastAPI backend engine for a workflow.
@@ -830,7 +812,6 @@ def create_server() -> Any:
             workflow_name: Existing workflow name.
             workspace: Parent directory containing the workflow folder.
             reset_session: If true, allocate a fresh session id before starting.
-            with_frontend: Also start the generated Vue dev server via AgentBuilder.rerun_server().
             timeout_sec: How long to wait for backend health.
         """
 
@@ -863,7 +844,6 @@ def create_server() -> Any:
                 )
             with _capture_builder_output("start_backend.start"):
                 info = handle.start_backend(
-                    with_frontend=with_frontend,
                     timeout=float(timeout_sec),
                 )
             handle.sync_artifacts()
@@ -883,7 +863,6 @@ def create_server() -> Any:
         workflow_name: str,
         workspace: Optional[str] = None,
         reset_session: bool = True,
-        with_frontend: bool = False,
         timeout_sec: int = 30,
     ) -> str:
         """Reload a workflow in the backend after files were updated.
@@ -892,7 +871,6 @@ def create_server() -> Any:
             workflow_name: Existing workflow name.
             workspace: Parent directory containing the workflow folder.
             reset_session: If true, allocate a new session id for the restarted backend.
-            with_frontend: Also restart the generated Vue dev server.
             timeout_sec: How long to wait for backend health.
         """
 
@@ -917,7 +895,6 @@ def create_server() -> Any:
             with _capture_builder_output("reload_workflow.restart"):
                 info = handle.reload_backend(
                     reset_session=reset_session,
-                    with_frontend=with_frontend,
                     timeout=float(timeout_sec),
                 )
 
@@ -939,7 +916,6 @@ def create_server() -> Any:
         workspace: Optional[str] = None,
         reset_session: bool = True,
         restart_backend: bool = False,
-        with_frontend: bool = False,
         timeout_sec: int = 30,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
@@ -953,7 +929,6 @@ def create_server() -> Any:
             workspace: Parent directory containing the workflow folder.
             reset_session: If true, allocate a new session id for the recreated builder.
             restart_backend: If true, start the backend again after recreating the builder.
-            with_frontend: Also start the generated Vue dev server when restarting the backend.
             timeout_sec: How long to wait for backend health when restarting it.
             api_key: Optional LLM API key override for the recreated builder.
             model: Optional LLM model override for the recreated builder.
@@ -987,7 +962,6 @@ def create_server() -> Any:
                     )
                 with _capture_builder_output("restart_builder.start"):
                     backend_info = handle.start_backend(
-                        with_frontend=with_frontend,
                         timeout=float(timeout_sec),
                     )
 
@@ -1075,7 +1049,7 @@ def create_server() -> Any:
                 handle.backend_port = find_free_port()
             if not handle.is_running or not health_check(handle.backend_port, timeout=1.0):
                 with _capture_builder_output("run_workflow_step.autostart"):
-                    start_info = handle.start_backend(with_frontend=False, timeout=30.0)
+                    start_info = handle.start_backend(timeout=30.0)
                 if not start_info.get("is_running", False):
                     return {
                         "ok": False,

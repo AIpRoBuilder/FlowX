@@ -96,14 +96,12 @@ class WorkflowHandle:
     model: str
     provider: str
     skills_root: Optional[str] = None
-    frontend_style_prompt: Optional[str] = None
 
     # generated artifacts
     graph_plan_path: str = ""
     requirement_md_path: str = ""
     workflow_json_path: str = ""
     main_entrypoint_path: str = ""
-    frontend_output_path: str = ""
 
     # runtime
     backend_port: Optional[int] = None
@@ -128,15 +126,11 @@ class WorkflowHandle:
 
     # ----------------------------------------------------------- backend proc
     def stop_backend(self) -> None:
-        """Stop the backend (and any frontend) managed by this handle."""
-        # Processes started by AgentBuilder.rerun_server()
+        """Stop the backend process managed by this handle."""
         try:
             if self.builder is not None:
                 self.builder._stop_managed_server_process(
                     getattr(self.builder, "backend_server_process", None)
-                )
-                self.builder._stop_managed_server_process(
-                    getattr(self.builder, "frontend_server_process", None)
                 )
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("stop builder-managed processes failed: %s", exc)
@@ -171,16 +165,9 @@ class WorkflowHandle:
     def start_backend(
         self,
         *,
-        with_frontend: bool = False,
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
-        """Start the generated FastAPI backend.
-
-        ``with_frontend=True`` delegates to ``AgentBuilder.rerun_server`` (which also
-        launches the Vue dev server via npm and therefore requires a generated
-        frontend project). Otherwise a backend-only ``python main.py`` subprocess is
-        launched — the common case for headless workflow execution.
-        """
+        """Start the generated FastAPI backend."""
         from .client import health_check
 
         self.stop_backend()
@@ -188,28 +175,20 @@ class WorkflowHandle:
         port = self.backend_port or 8000
         self.backend_port = port
 
-        if with_frontend:
-            runtime = self.builder.rerun_server(
-                graph_plan_path=self.graph_plan_path,
-                backend_port=port,
-            )
-            self.backend_process = getattr(self.builder, "backend_server_process", None)
-            self.is_running = True
-        else:
-            python_cmd = _select_python_command()
-            log_path = str(Path(self.root_dir) / "backend.log")
-            self.backend_log_path = log_path
-            log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - kept open for process lifetime
-            log_fh.write(f"\n=== flowx backend start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-            log_fh.flush()
-            self.backend_process = subprocess.Popen(  # type: ignore[assignment]
-                [python_cmd, str(self.main_entrypoint_path)],
-                cwd=str(Path(self.main_entrypoint_path).parent),
-                env=os.environ.copy(),
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-            )
-            self.is_running = True
+        python_cmd = _select_python_command()
+        log_path = str(Path(self.root_dir) / "backend.log")
+        self.backend_log_path = log_path
+        log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 - kept open for process lifetime
+        log_fh.write(f"\n=== flowx backend start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        log_fh.flush()
+        self.backend_process = subprocess.Popen(  # type: ignore[assignment]
+            [python_cmd, str(self.main_entrypoint_path)],
+            cwd=str(Path(self.main_entrypoint_path).parent),
+            env=os.environ.copy(),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+        )
+        self.is_running = True
 
         ready = health_check(port, timeout=timeout)
         info: Dict[str, Any] = {
@@ -232,14 +211,13 @@ class WorkflowHandle:
         self,
         *,
         reset_session: bool = True,
-        with_frontend: bool = False,
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
         """Restart the backend so updated node files / workflow.json take effect."""
         self.stop_backend()
         if reset_session:
             self.new_session()
-        return self.start_backend(with_frontend=with_frontend, timeout=timeout)
+        return self.start_backend(timeout=timeout)
 
     # --------------------------------------------------------------- artifacts
     def sync_artifacts(self) -> None:
@@ -247,7 +225,6 @@ class WorkflowHandle:
         self.graph_plan_path = str(getattr(self.builder, "graph_plan_path", "") or "")
         self.requirement_md_path = str(getattr(self.builder, "requirement_md_path", "") or "")
         self.workflow_json_path = str(getattr(self.builder, "workflow_json_path", "") or "")
-        self.frontend_output_path = str(getattr(self.builder, "frontend_output_path", "") or "")
         main_path = getattr(self.builder, "main_output_path", None) or getattr(self.builder, "main_entrypoint_path", None)
         if main_path:
             self.main_entrypoint_path = str(main_path)
