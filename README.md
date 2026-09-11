@@ -1,7 +1,6 @@
 <a name="readme-top"></a>
 
 <div align="center">
-  <img src="assets/banner.png" alt="FlowX banner" width="960" />
   <h1>FlowX</h1>
   <p><strong>Workflow compiler and evolution loop for AI agents.</strong></p>
   <p>
@@ -172,15 +171,7 @@ Build a workflow that accepts a screenshot, extracts visible issues, and returns
 a structured report with severity, location, and next-action suggestions.
 ```
 
-<div align="center">
-  <img src="assets/usage.png" alt="FlowX usage loop" width="780" />
-</div>
-
 ## Why FlowX?
-
-<div align="center">
-  <img src="assets/features.png" alt="FlowX workflow compiler overview" width="780" />
-</div>
 
 FlowX sits between reusable agent skills and executable workflow runtime. A skill stays descriptive; FlowX turns it into explicit nodes, code, tool wiring, and a managed backend that can be rerun and refined.
 
@@ -198,7 +189,7 @@ FlowX has two cooperating layers: a runtime topology that manages MCP requests a
 ### Runtime topology
 
 <div align="center">
-  <img src="assets/architecture.png" alt="FlowX runtime architecture" width="820" />
+  <img src="assets/architecture.png" alt="FlowX runtime architecture" width="460" height="400" />
 </div>
 
 - `flowx_mcp.server` exposes the tool surface over stdio through FastMCP.
