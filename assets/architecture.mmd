@@ -1,0 +1,16 @@
+flowchart LR
+    A[Raw requirement] --> B[requirement_analysis.md]
+    B --> C[workflow.json]
+    C --> D[node_docs/*.md]
+    D --> E[nodes/*.py]
+    E --> F[main.py]
+
+    C --> G[Graph audit]
+    E --> H[Node audit]
+    F --> I[Entrypoint audit]
+    F --> J[Runtime log audit]
+
+    G -->|feedback| C
+    H -->|feedback| E
+    I -->|feedback| F
+    J -->|feedback| E

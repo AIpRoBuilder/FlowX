@@ -1,168 +1,44 @@
-# FlowX | Workflow Compiler for AI Agents
+<a name="readme-top"></a>
 
+<div align="center">
+  <img src="assets/banner.png" alt="FlowX banner" width="960" />
+  <h1>FlowX</h1>
+  <p><strong>Workflow compiler and evolution loop for AI agents.</strong></p>
+  <p>
+    <a href="https://modelcontextprotocol.io">Model Context Protocol</a> ·
+    <a href="https://github.com/AIpRoBuilder/meta_agent">meta_agent</a> ·
+    <a href="https://github.com/AIpRoBuilder/ag_ui_worflow">ag_ui_workflow</a>
+  </p>
+  <p>
+    <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0" />
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB.svg" alt="Python 3.10+" />
+    <img src="https://img.shields.io/badge/MCP-Local%20stdio-0A7E3B.svg" alt="Local stdio MCP" />
+  </p>
+</div>
 
+FlowX is a local MCP server that turns natural-language requirements into runnable workflow artifacts and keeps those workflows editable after the first generation pass. It exposes the builder from [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and the runtime engine from [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) through one MCP tool surface for local hosts such as Claude Code, Cursor, Codex, and VS Code Copilot Chat.
 
-![badge](https://img.shields.io/badge/License-Apache%202.0-blue.svg) ![badge](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg) ![badge](https://img.shields.io/badge/MCP-server-6A5ACD.svg)
+FlowX packages workflow creation, updates, startup, debugging, and step execution into a single local loop. An agent can describe the task, generate the workflow, revise node logic, restart the backend, inspect inputs, and run steps without leaving the same conversation.
 
-![FlowX 横幅：AI 智能体与工作流编译器的概念视觉](assets/banner.png)
-
-FlowX is a local MCP server for creating workflows through conversation, designed to integrate easily with agent systems such as Hermes, WorkBuddy, and TraeWork.
-
-FlowX is released under the Apache License 2.0.
-
-FlowX can be understood in two layers:
-
-- As a workflow compiler for AI agents, it turns natural-language requirements into runnable workflow artifacts.
-- As a workflow evolution engine, it lets an agent keep updating node logic, execution paths, and output quality through follow-up prompts.
-
-It also acts as the bridge between agent-side skills and MCP-side execution.
-
-FlowX packages workflow creation, updates, startup, debugging, and execution into one MCP tool surface. You describe the task, and the agent can continuously generate and iterate backend workflows, allowing the system to behave like a workflow evolution engine that keeps moving closer to real business goals.
-
-> Your agent can now build, rerun, and evolve its own workflows.
-
-An [MCP](https://modelcontextprotocol.io) server that exposes the **`meta_agent`** workflow
-builder and the **`ag_ui_workflow`** runtime engine as a set of tools, so any MCP client
-(Claude Code, Cursor, Codex, VS Code Copilot Chat, ...) can:
-
-1. **create** a new AG-UI workflow from a natural-language requirement,
-2. **dynamically update** a workflow's backend artifacts (`workflow.json`, `{node}.py`,
-   `main.py`) from a change prompt,
-3. **start** the generated FastAPI backend engine for a workflow,
-4. **reload** the backend after an update,
-5. **inspect** the input format required by every user-input node,
-6. **run** a workflow step from a chat message and collect the results.
-
-It follows the same `FastMCP` tool-registration pattern used by the `hermes-agent`
-MCP server and is intended for pure local stdio use.
-
----
-
-## Product Positioning
-
-
-![FlowX 概念图：从自然语言需求编译为可运行工作流](assets/features.png)
-*FlowX 将自然语言需求编译为可运行、可迭代的工作流产物*
-
-FlowX connects the full local workflow loop inside one MCP surface:
-
-1. Describe the task in natural language.
-2. Generate or amend `workflow.json`, node backends, and `main.py`.
-3. Start or reload the local FastAPI backend.
-4. Run workflow steps from chat, inspect results, and continue the next iteration.
-
-### Where FlowX sits
-
-```text
-AI Agent
-   |
-   +-------------------+
-   |                   |
-   v                   v
- Skill                MCP
-   |                   |
-   +---------+---------+
-             |
-             v
-           FlowX
-             |
-             v
-          Workflow
-             |
-             v
-   Code / Tools / APIs
-             |
-             v
-           Runtime
-```
-
-FlowX is the convergence layer where reusable agent skills and MCP-exposed tool access are compiled into an explicit workflow that can actually run.
-
-### Transform skill into workflow
-
-```text
-Skill
-  |
-  v
-FlowX Compiler
-  |
-  v
-Executable Workflow
-```
-
-This is the key conceptual upgrade FlowX provides:
-
-- A skill stays at the level of reusable intent, reasoning pattern, or operating procedure.
-- FlowX compiles that skill into workflow structure, node code, tool wiring, and runnable backend behavior.
-- The result is an executable workflow that can be started, reloaded, inspected, and evolved inside the same local MCP loop.
-
-| Positioning | What it means |
-| --- | --- |
-| Conversational workflow generation | Turn a requirement directly into workflow files and executable node code. |
-| Compile skills into workflows | Transform a reusable skill into an executable workflow with explicit nodes, code, tools, and runtime steps. |
-| Dynamic updates and reloads | Refine a running workflow after each feedback round instead of recreating it from scratch. |
-| Native MCP integration | Plug FlowX into local MCP clients so the agent can operate the workflow from the same conversation. |
-| Recoverable outputs | Inspect inputs, run steps, and feed returned text, files, or images into the next decision. |
-
-## Architecture
-
-
-![FlowX 架构概念图：MCP 客户端、AgentBuilder 与 FastAPI 工作流后端的协作关系](assets/architecture.png)
-*FlowX 将 MCP 客户端、AgentBuilder 与 FastAPI 工作流后端串成一条本地闭环*
-
-```
-MCP client  ──stdio──►  flowx_mcp.server (FastMCP)
-                │
-                ├── meta_agent.AgentBuilder  ──►  LLM (DeepSeek/...)
-                │       (create / update / plan / generate)
-                │
-                └── subprocess: python main.py  ──►  FastAPI backend
-                  │                                  │
-                  │   POST /api/run-step (SSE)       │
-                  └──────────────────────────────────┘
-               ag_ui_workflow.WorkflowEngine
-```
-
-The MCP server keeps a per-workflow `WorkflowHandle` (an `AgentBuilder` plus the running
-backend process, port and session state). Tools 3–6 talk to the running backend over HTTP
-(`urllib`, no extra deps) and parse the AG-UI SSE event stream.
-
-## Provided tools
-
-| Tool | Purpose |
-| --- | --- |
-| `create_workflow` | Build a workflow from a requirement into `workspace/workflow_name`. |
-| `update_workflow_node` | Amend `workflow.json` + `{node}.py` + `main.py` from a change prompt, then invalidate the current runtime session/backend so stale processes cannot keep serving the old graph. |
-| `start_backend` | Launch the generated FastAPI backend for a workflow. |
-| `reload_workflow` | Restart the backend (picks up updated node files / `workflow.json`). |
-| `restart_builder` | Recreate the in-memory `AgentBuilder` for a workflow from disk and optionally restart the backend. |
-| `get_node_input_formats` | List every user-input node and the input it expects. |
-| `run_workflow_step` | Format a chat message into a step input, run it, return results. |
-| `list_workflows` | (helper) List workflows known to the server. |
-| `list_workflow_folders` | List workflow folders discovered on disk under the workspace root. |
-| `upload_workspace_input_file` | Save a base64-encoded file into `workspace/inputs` and return its path. |
-| `list_workflow_python_files` | List all `.py` files under a workflow folder. |
-| `get_workflow_json` | Read the root `workflow.json` file for a workflow folder and return it as JSON. |
-| `get_workflow_files` | Read specific workflow files by file name or relative path. |
-| `get_workflow_binary_files` | Read specific workflow binary files and return base64 content plus MIME type. |
-| `replace_workflow_files` | Replace specific workflow files by file name or relative path. |
+> [!NOTE]
+> FlowX is designed for local stdio deployments. The same MCP session can create workflows, update backend artifacts, restart the generated FastAPI service, and run workflow steps end to end.
 
 ## Installation
 
-FlowX requires Python 3.10+.
+FlowX requires Python 3.10 or later.
 
-`meta_agent` and `ag-ui-workflow` are installed from Git remotes, not from PyPI.
-The default install path below pulls `meta_agent` from GitHub, and `meta_agent`
-then resolves its compatible `ag-ui-workflow` dependency from its own pinned
-Git reference.
+The default Git install pulls [meta_agent](https://github.com/AIpRoBuilder/meta_agent) from GitHub, and that project resolves its compatible [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) dependency from a pinned Git reference.
 
-### Git remote install
+### Install from Git
 
 #### pip
 
 ```bash
+# Create and activate a virtual environment
 python3.10 -m venv .venv
 source .venv/bin/activate
+
+# Install FlowX and its git-based dependencies
 python -m pip install --upgrade pip
 python -m pip install -e '.[git]'
 ```
@@ -187,10 +63,9 @@ conda env create -f environment.yml
 conda activate flowx-mcp
 ```
 
-### Local sibling source install
+### Install from local sibling checkouts
 
-If `meta_agent` and `ag_ui_workflow` are only available as local checkouts,
-install them into the same environment before installing FlowX itself.
+If you are developing alongside local checkouts of [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow), install those into the same environment before installing FlowX itself.
 
 #### pip
 
@@ -232,61 +107,43 @@ pip install -e ../meta_agent --no-deps
 pip install -e .
 ```
 
-FlowX also auto-detects sibling folders named `meta_agent`,
-`ag_ui_worflow`, and `ag_ui_workflow`. If you do not want editable installs,
-set `FLOWX_EXTRA_PATHS` instead.
+FlowX also auto-detects sibling folders for [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow): `meta_agent`, `ag_ui_worflow`, and `ag_ui_workflow`. If you prefer not to use editable installs, set `FLOWX_EXTRA_PATHS` instead.
 
-The Git remote used by the default install path is:
+## Quickstart
 
-```text
-https://github.com/AIpRoBuilder/meta_agent.git
-```
-
-## Configuration
+### 1. Configure FlowX
 
 ```bash
 cp .env.example .env
 ```
 
-Then fill in at least `FLOWX_LLM_PROVIDER`, `FLOWX_LLM_MODEL`,
-`FLOWX_LLM_API_KEY`, and `FLOWX_DEFAULT_WORKSPACE`.
+Set at least `FLOWX_LLM_PROVIDER`, `FLOWX_LLM_MODEL`, `FLOWX_LLM_API_KEY`, and `FLOWX_DEFAULT_WORKSPACE`.
 
-FlowX loads configuration from existing process environment variables first, then
-from `.env` under `FLOWX_CONFIG_ROOT` when that variable is set, then from `.env`
-in the current working directory, and finally from a repo-local `.env` when you
-run from a source checkout.
-
-Use `FLOWX_EXTRA_PATHS` to add source roots for `meta_agent` and
-`ag_ui_workflow` when those packages are not installed into the current
-environment. On macOS and Linux, separate entries with `:`.
-
-## Run
-
-
-![FlowX 使用流程概念图：从对话式需求到可运行工作流](assets/usage.png)
-*FlowX 会话式工作流编译：从自然语言到可运行后端*
-
-Use the installed `flowx-mcp` console script when possible. If you are working
-directly from a repo checkout, `python3.10 run_server.py` still works.
-
-```bash
-# default: stdio transport for local MCP hosts
-flowx-mcp
-
-# verbose logging
-flowx-mcp --verbose
-
-# source-checkout entry point
-python3.10 run_server.py
-
+```dotenv
+FLOWX_LLM_PROVIDER=deepseek
+FLOWX_LLM_MODEL=deepseek-chat
+FLOWX_LLM_API_KEY=
+FLOWX_DEFAULT_WORKSPACE=./.flowx_workspaces
 ```
 
-If you are using Poetry or uv without activating the environment, prefix the
-command with `poetry run` or `uv run`.
+`FLOWX_CONFIG_ROOT` lets an installed `flowx-mcp` resolve a `.env` file outside the repository checkout. `FLOWX_EXTRA_PATHS` can point at local [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) sources when those packages are not installed into the current environment.
 
-Use stdio when the MCP host should launch FlowX itself.
+### 2. Start the server
 
-## Local stdio MCP client config (e.g. Claude Desktop / VS Code)
+```bash
+# Default local stdio entry point
+flowx-mcp
+
+# Verbose logging
+flowx-mcp --verbose
+
+# Source-checkout entry point
+python3.10 run_server.py
+```
+
+If you are using Poetry or uv without activating the environment, prefix the command with `poetry run` or `uv run`.
+
+### 3. Register FlowX in an MCP client
 
 ```jsonc
 {
@@ -304,15 +161,102 @@ Use stdio when the MCP host should launch FlowX itself.
 }
 ```
 
-If your environment is isolated behind Poetry or uv, set the command to
-`poetry` with args `['run', 'flowx-mcp']` or to `uv` with args
-`['run', 'flowx-mcp']`.
+If your environment is isolated behind Poetry or uv, set the command to `poetry` with args `['run', 'flowx-mcp']` or to `uv` with args `['run', 'flowx-mcp']`.
+
+### 4. Create a workflow from chat
+
+```text
+Use flowx to create a workflow named screenshot_triage.
+
+Build a workflow that accepts a screenshot, extracts visible issues, and returns
+a structured report with severity, location, and next-action suggestions.
+```
+
+<div align="center">
+  <img src="assets/usage.png" alt="FlowX usage loop" width="780" />
+</div>
+
+## Why FlowX?
+
+<div align="center">
+  <img src="assets/features.png" alt="FlowX workflow compiler overview" width="780" />
+</div>
+
+FlowX sits between reusable agent skills and executable workflow runtime. A skill stays descriptive; FlowX turns it into explicit nodes, code, tool wiring, and a managed backend that can be rerun and refined.
+
+| Capability | What it means in practice |
+| --- | --- |
+| Conversational workflow compilation | Turn a requirement into `workflow.json`, node implementations, and a runnable `main.py`. |
+| Workflow evolution | Apply follow-up change prompts to existing nodes instead of rebuilding the workflow from scratch. |
+| MCP-native runtime loop | Start, reload, inspect, and run the generated backend from the same chat surface. |
+| Artifact-level control | Read, replace, upload, or delete workflow files when the agent needs direct file access. |
+
+## Architecture
+
+FlowX has two cooperating layers: a runtime topology that manages MCP requests and backend processes, and a compilation pipeline that continuously regenerates workflow artifacts.
+
+### Runtime topology
+
+<div align="center">
+  <img src="assets/architecture.png" alt="FlowX runtime architecture" width="820" />
+</div>
+
+- `flowx_mcp.server` exposes the tool surface over stdio through FastMCP.
+- The [meta_agent](https://github.com/AIpRoBuilder/meta_agent) `AgentBuilder` creates and updates workflow artifacts from prompts.
+- The generated `main.py` runs as a managed FastAPI subprocess per workflow.
+- `run_workflow_step` communicates with the backend over HTTP and parses AG-UI SSE events back into MCP responses.
+
+### Compilation pipeline
+
+The artifact flow below is mirrored from [assets/architecture.mmd](assets/architecture.mmd).
+
+```mermaid
+flowchart LR
+    A[Raw requirement] --> B[requirement_analysis.md]
+    B --> C[workflow.json]
+    C --> D[node_docs/*.md]
+    D --> E[nodes/*.py]
+    E --> F[main.py]
+
+    C --> G[Graph audit]
+    E --> H[Node audit]
+    F --> I[Entrypoint audit]
+    F --> J[Runtime log audit]
+
+    G -->|feedback| C
+    H -->|feedback| E
+    I -->|feedback| F
+    J -->|feedback| E
+```
+
+## Tool surface
+
+| Category | Tool | Purpose |
+| --- | --- | --- |
+| Build | `create_workflow` | Build a workflow from a requirement into `workspace/workflow_name`. |
+| Build | `update_workflow_node` | Update `workflow.json`, node code, and `main.py` from a change prompt. |
+| Build | `restart_builder` | Recreate the in-memory builder state from the workflow on disk. |
+| Runtime | `start_backend` | Launch the generated FastAPI backend for a workflow. |
+| Runtime | `reload_workflow` | Restart the backend so updated files take effect. |
+| Runtime | `kill_workflow` | Stop the running backend for a workflow. |
+| Runtime | `run_workflow_step` | Format a chat message into step input, run it, and return results. |
+| Inspection | `get_node_input_formats` | List each user-input node and the payload it expects. |
+| Inspection | `list_workflows` | List workflows registered in the current FlowX server process. |
+| Inspection | `list_workflow_folders` | Discover workflow folders on disk under the workspace root. |
+| Inspection | `list_workflow_python_files` | List all Python files inside a workflow folder. |
+| Inspection | `get_workflow_json` | Read the root `workflow.json` file for a workflow. |
+| Inspection | `get_workflow_files` | Read specific workflow files by file name or relative path. |
+| Inspection | `get_workflow_binary_files` | Read binary workflow files and return base64 content with MIME type. |
+| Workspace | `upload_workspace_input_file` | Save a base64-encoded file into `workspace/inputs` and return its path. |
+| Workspace | `delete_workspace_files` | Delete files from the workspace by file name. |
+| Workspace | `replace_workflow_files` | Replace specific workflow files by file name or relative path. |
+
+## Example workflows
+
+The prompts below are ready to paste into an MCP client that is already connected to your local `flowx` server. Each example creates a workflow that can then be reloaded, rerun, and refined through follow-up prompts.
 
 <details>
-<summary><strong>Example workflow prompts</strong> (click to expand)</summary>
-
-The following prompts are ready to paste into an MCP client that is already
-connected to your local `flowx` MCP server.
+<summary><strong>Example workflow prompts</strong></summary>
 
 ### 1. `stock_pressure`
 
@@ -617,3 +561,7 @@ If you are interested in using FlowX or co-building it, contact me at [peterxcx@
 WeChat QR code:
 
 <img src="assets/qrcode.svg" alt="WeChat QR code" width="220" />
+
+<p align="right">
+  <a href="#readme-top">Back to top ↑</a>
+</p>
