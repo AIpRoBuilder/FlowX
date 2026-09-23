@@ -1,0 +1,46 @@
+# Copyright 2025 Alibaba Group Holding Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import os
+from datetime import timedelta
+
+from opensandbox import Sandbox
+from opensandbox.config import ConnectionConfig
+
+
+async def main() -> None:
+    domain = os.getenv("SANDBOX_DOMAIN", "localhost:8100")
+    image = os.getenv("SANDBOX_IMAGE", "ubuntu:22.04")
+
+    config = ConnectionConfig(
+        domain=domain,
+        request_timeout=timedelta(seconds=60),
+    )
+
+    sandbox = await Sandbox.create(
+        image,
+        connection_config=config,
+        timeout=timedelta(minutes=10),
+    )
+
+    async with sandbox:
+        execution = await sandbox.commands.run("echo hello world")
+        stdout = execution.logs.stdout[0].text if execution.logs.stdout else ""
+        print(f"command output: {stdout}")
+        await sandbox.kill()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

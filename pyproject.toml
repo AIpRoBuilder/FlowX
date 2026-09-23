@@ -3,15 +3,19 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flowx-mcp"
-version = "0.1.0"
-description = "Local MCP server that wraps meta_agent + ag_ui_workflow for AG-UI workflow build and run"
+name = "flowx"
+version = "0.2.0"
+description = "Agent workflow compiler with MCP, SDK, and A2A interfaces"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
+    "ag-ui-workflow @ git+https://github.com/AIpRoBuilder/ag_ui_worflow.git",
+    "fastapi>=0.110",
     "mcp>=1.2.0",
+    "openai>=1.0",
     "python-dotenv",
+    "uvicorn>=0.30",
 ]
 
 classifiers = [
@@ -20,37 +24,20 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
 ]
 
-[project.optional-dependencies]
-git = [
-    "meta_agent @ git+https://github.com/AIpRoBuilder/meta_agent.git",
-]
-
 [project.scripts]
 flowx-mcp = "flowx_mcp.server:main"
+flowx-a2a = "flowx_a2a.server:main"
 
 [tool.setuptools]
 license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
-include = ["flowx_mcp*"]
+where = ["packages/core", "packages/mcp", "packages/sdk", "packages/a2a"]
+include = ["flowx_core*", "flowx_mcp*", "flowx_sdk*", "flowx_a2a*"]
+namespaces = true
 
-[tool.poetry]
-name = "flowx-mcp"
-version = "0.1.0"
-description = "Local MCP server that wraps meta_agent + ag_ui_workflow for AG-UI workflow build and run"
-authors = ["AIpRoBuilder"]
-license = "Apache-2.0"
-readme = "README.md"
-packages = [{ include = "flowx_mcp" }]
+[tool.setuptools.package-data]
+"flowx_core" = ["**/*.md", "**/*.tmpl"]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<4.0"
-mcp = ">=1.2.0"
-python-dotenv = "*"
-meta_agent = { git = "https://github.com/AIpRoBuilder/meta_agent.git", optional = true }
-
-[tool.poetry.scripts]
-flowx-mcp = "flowx_mcp.server:main"
-
-[tool.poetry.extras]
-git = ["meta_agent"]
+[tool.pytest.ini_options]
+pythonpath = ["packages/core", "packages/mcp", "packages/sdk", "packages/a2a"]

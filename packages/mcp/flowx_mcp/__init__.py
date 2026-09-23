@@ -1,4 +1,4 @@
-"""FlowX MCP server — wrap meta_agent + ag_ui_workflow as MCP tools."""
+"""FlowX MCP server — wrap core + ag_ui_workflow as MCP tools."""
 
 from .server import main, create_server
 

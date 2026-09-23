@@ -22,14 +22,14 @@ def _inject_path(path_value: Path) -> None:
 
 
 def _candidate_roots(module_file: str) -> list[Path]:
-    package_root = Path(module_file).resolve().parent.parent
+    module_path = Path(module_file).resolve()
     roots: list[Path] = []
     seen: set[str] = set()
 
     for candidate in (
         os.environ.get("FLOWX_CONFIG_ROOT", "").strip(),
         str(Path.cwd()),
-        str(package_root),
+        str(module_path.parent),
     ):
         if not candidate:
             continue
@@ -39,6 +39,19 @@ def _candidate_roots(module_file: str) -> list[Path]:
         seen.add(resolved)
         roots.append(Path(resolved))
     return roots
+
+
+def _source_package_roots(module_file: str) -> list[Path]:
+    """Return package roots when FlowX is run directly from its checkout."""
+    module_path = Path(module_file).resolve()
+    for parent in module_path.parents:
+        packages_dir = parent / "packages"
+        if packages_dir.is_dir():
+            return [
+                packages_dir / component
+                for component in ("core", "mcp", "sdk", "a2a")
+            ]
+    return []
 
 
 def load_env_from_runtime_context(module_file: str) -> None:
@@ -58,9 +71,11 @@ def bootstrap_import_paths(module_file: str) -> None:
             if candidate:
                 _inject_path(Path(candidate))
 
+    for package_root in _source_package_roots(module_file):
+        _inject_path(package_root)
+
     for root in _candidate_roots(module_file):
         for candidate in (
-            root.parent / "meta_agent",
             root.parent / "ag_ui_workflow",
             root.parent / "ag_ui_worflow",
         ):

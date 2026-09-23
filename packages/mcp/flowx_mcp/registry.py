@@ -1,6 +1,6 @@
 """Per-workflow state registry and backend process management.
 
-A :class:`WorkflowHandle` bundles one ``meta_agent.AgentBuilder`` instance together with
+A :class:`WorkflowHandle` bundles one ``flowx_core.AgentBuilder`` instance together with
 the runtime state of the workflow it owns: the generated artifact paths, the running
 backend process, the HTTP port it listens on and the current session/progress state.
 
@@ -26,30 +26,30 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("flowx.registry")
 
-# --- lazy meta_agent import -------------------------------------------------
+# --- lazy core import -------------------------------------------------
 try:
-    from meta_agent.agent_builder import AgentBuilder  # type: ignore
-    _META_AGENT_AVAILABLE = True
+    from flowx_core.agent_builder import AgentBuilder  # type: ignore
+    _CORE_AVAILABLE = True
     _IMPORT_ERROR: Optional[str] = None
 except Exception as exc:  # pragma: no cover - import guard
     AgentBuilder = None  # type: ignore[assignment]
-    _META_AGENT_AVAILABLE = False
+    _CORE_AVAILABLE = False
     _IMPORT_ERROR = str(exc)
 
 
-def meta_agent_available() -> bool:
-    return _META_AGENT_AVAILABLE
+def core_available() -> bool:
+    return _CORE_AVAILABLE
 
 
-def meta_agent_import_error() -> Optional[str]:
+def core_import_error() -> Optional[str]:
     return _IMPORT_ERROR
 
 
 # --- helpers ----------------------------------------------------------------
 def _select_python_command() -> str:
-    """Pick a python executable, preferring the one meta_agent would use."""
+    """Pick a python executable, preferring the one FlowX core would use."""
     try:
-        from meta_agent.tools.agent_builder_tools import select_python_command  # type: ignore
+        from flowx_core.tools.agent_builder_tools import select_python_command  # type: ignore
         return select_python_command()
     except Exception:
         return "python3"
@@ -91,7 +91,7 @@ class WorkflowHandle:
     workflow_name: str
     workspace: str
     root_dir: str
-    builder: Any  # meta_agent.AgentBuilder
+    builder: Any  # flowx_core.AgentBuilder
     api_key: str
     model: str
     provider: str
@@ -385,11 +385,10 @@ class WorkflowRegistry:
         provider: Optional[str] = None,
         skills_root: Optional[str] = None,
     ) -> WorkflowHandle:
-        if not _META_AGENT_AVAILABLE:
+        if not _CORE_AVAILABLE:
             raise ImportError(
-                "meta_agent is not importable. Install FlowX with the git extra "
-                "(for example: pip install -e '.[git]'), install local sibling checkouts, "
-                f"or set FLOWX_EXTRA_PATHS. Underlying error: {_IMPORT_ERROR}"
+                "core is not importable. Install the unified FlowX package "
+                f"(for example: pip install -e .). Underlying error: {_IMPORT_ERROR}"
             )
         with self._lock:
             resolved_workspace = str(Path(workspace).expanduser().resolve())

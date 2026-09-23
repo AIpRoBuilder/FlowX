@@ -1,3 +1,2 @@
-# Install FlowX plus its git-hosted workflow-builder dependency.
-# For sibling source checkouts instead, install those repos manually and then use `pip install -e .`.
--e .[git]
+# Install the unified FlowX distribution and its agent flowx_core.
+-e .

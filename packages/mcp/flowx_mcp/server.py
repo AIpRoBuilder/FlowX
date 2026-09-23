@@ -1,4 +1,4 @@
-"""FastMCP server that wraps ``meta_agent`` and ``ag_ui_workflow`` workflows."""
+"""FastMCP server that wraps ``core`` and ``ag_ui_workflow`` workflows."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ load_env_from_runtime_context(__file__)
 bootstrap_import_paths(__file__)
 
 from .client import DEFAULT_RUN_TIMEOUT, health_check, run_step_sse
-from .registry import find_free_port, meta_agent_available, meta_agent_import_error, registry
+from .registry import core_available, core_import_error, find_free_port, registry
 
 logger = logging.getLogger("flowx.server")
 
@@ -33,8 +33,8 @@ _MCP_SERVER_AVAILABLE = False
 _MCP_SERVER_IMPORT_ERROR = ""
 MCPServerClass: Any = None
 for module_name, attr_name in (
-    ("mcp.server.fastmcp", "FastMCP"),
-    ("mcp.server.mcpserver", "MCPServer"),
+    ("flowx_mcp.server.fastmcp", "FastMCP"),
+    ("flowx_mcp.server.mcpserver", "MCPServer"),
 ):
     try:
         MCPServerClass = getattr(importlib.import_module(module_name), attr_name)
@@ -615,7 +615,7 @@ def create_server() -> Any:
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server could not load a compatible SDK entry point. "
-            "Expected either 'mcp.server.fastmcp.FastMCP' or 'mcp.server.mcpserver.MCPServer'. "
+            "Expected either 'flowx_mcp.server.fastmcp.FastMCP' or 'flowx_mcp.server.mcpserver.MCPServer'. "
             f"Install or repair the SDK with: {sys.executable} -m pip install -U 'mcp'. "
             f"Last import error: {_MCP_SERVER_IMPORT_ERROR}"
         )
@@ -624,13 +624,13 @@ def create_server() -> Any:
         "flowx",
         instructions=(
             "FlowX workflow builder and runner. Use these tools to create AG-UI workflows "
-            "with meta_agent, restart the in-memory builder, update node backends, start or reload the backend engine, "
+            "with FlowX core, restart the in-memory builder, update node backends, start or reload the backend engine, "
             "inspect required user-input formats, upload or delete workspace files, and run "
             "workflow steps from chat input."
         ),
     )
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def create_workflow(
         workflow_name: str,
         user_prompt: str,
@@ -639,7 +639,7 @@ def create_server() -> Any:
         skills_root: Optional[str] = None,
         temperature: float = 0.3,
     ) -> str:
-        """Create a workflow using meta_agent with a workspace and workflow name.
+        """Create a workflow using FlowX core with a workspace and workflow name.
 
         Args:
             workflow_name: Logical name and folder name for the workflow.
@@ -647,14 +647,14 @@ def create_server() -> Any:
             workspace: Parent directory that will contain the workflow folder.
             backend_port: Optional backend port; 0 selects a free local port.
             skills_root: Optional skills root path passed to AgentBuilder.
-            temperature: LLM temperature passed to the meta_agent generation calls.
+            temperature: LLM temperature passed to the FlowX core generation calls.
         """
 
         def _impl() -> dict[str, Any]:
-            if not meta_agent_available():
+            if not core_available():
                 raise ImportError(
-                    "meta_agent is not importable. "
-                    f"Underlying error: {meta_agent_import_error()}"
+                    "FlowX core is not importable. "
+                    f"Underlying error: {core_import_error()}"
                 )
             workflow = _normalize_name(workflow_name, "workflow_name")
             requirement = _normalize_name(user_prompt, "user_prompt")
@@ -714,7 +714,7 @@ def create_server() -> Any:
 
         return _tool_call("create_workflow", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def update_workflow_node(
         workflow_name: str,
         node_name: str,
@@ -799,7 +799,7 @@ def create_server() -> Any:
 
         return _tool_call("update_workflow_node", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def start_backend(
         workflow_name: str,
         workspace: Optional[str] = None,
@@ -858,7 +858,7 @@ def create_server() -> Any:
 
         return _tool_call("start_backend", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def reload_workflow(
         workflow_name: str,
         workspace: Optional[str] = None,
@@ -910,7 +910,7 @@ def create_server() -> Any:
 
         return _tool_call("reload_workflow", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def restart_builder(
         workflow_name: str,
         workspace: Optional[str] = None,
@@ -989,7 +989,7 @@ def create_server() -> Any:
 
         return _tool_call("restart_builder", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def get_node_input_formats(
         workflow_name: str,
         workspace: Optional[str] = None,
@@ -1016,7 +1016,7 @@ def create_server() -> Any:
 
         return _tool_call("get_node_input_formats", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def run_workflow_step(
         workflow_name: str,
         chat_request: str = "",
@@ -1113,7 +1113,7 @@ def create_server() -> Any:
 
         return _tool_call("run_workflow_step", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def list_workflows() -> str:
         """List workflows known to the current MCP server process."""
 
@@ -1125,7 +1125,7 @@ def create_server() -> Any:
 
         return _tool_call("list_workflows", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def kill_workflow(
         workflow_name: str,
         backend_port: int,
@@ -1166,7 +1166,7 @@ def create_server() -> Any:
 
         return _tool_call("kill_workflow", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def list_workflow_folders(workspace: Optional[str] = None) -> str:
         """List workflow folder names under the workspace root on disk.
 
@@ -1187,7 +1187,7 @@ def create_server() -> Any:
 
         return _tool_call("list_workflow_folders", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def upload_workspace_input_file(
         file_name: str,
         content_base64: str,
@@ -1217,7 +1217,7 @@ def create_server() -> Any:
 
         return _tool_call("upload_workspace_input_file", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def delete_workspace_files(
         file_names: list[str],
         workspace: Optional[str] = None,
@@ -1244,7 +1244,7 @@ def create_server() -> Any:
 
         return _tool_call("delete_workspace_files", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def list_workflow_python_files(
         workflow_name: str,
         workspace: Optional[str] = None,
@@ -1270,7 +1270,7 @@ def create_server() -> Any:
 
         return _tool_call("list_workflow_python_files", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def get_workflow_json(
         workflow_name: str,
         workspace: Optional[str] = None,
@@ -1296,7 +1296,7 @@ def create_server() -> Any:
 
         return _tool_call("get_workflow_json", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def get_workflow_files(
         workflow_name: str,
         file_names: list[str],
@@ -1323,7 +1323,7 @@ def create_server() -> Any:
 
         return _tool_call("get_workflow_files", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def get_workflow_binary_files(
         workflow_name: str,
         file_names: list[str],
@@ -1350,7 +1350,7 @@ def create_server() -> Any:
 
         return _tool_call("get_workflow_binary_files", _impl)
 
-    @mcp.tool()
+    @flowx_mcp.tool()
     def replace_workflow_files(
         workflow_name: str,
         file_names: list[str],
@@ -1399,7 +1399,7 @@ def run_server(
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server could not load a compatible MCP SDK entry point.\n"
-            "Expected either mcp.server.fastmcp.FastMCP or mcp.server.mcpserver.MCPServer.\n"
+            "Expected either flowx_mcp.server.fastmcp.FastMCP or flowx_mcp.server.mcpserver.MCPServer.\n"
             f"Install or repair with: {sys.executable} -m pip install -U 'mcp'\n"
             f"Last import error: {_MCP_SERVER_IMPORT_ERROR}",
             file=sys.stderr,

@@ -5,7 +5,8 @@
   <p><strong>Workflow compiler and evolution loop for AI agents.</strong></p>
   <p>
     <a href="https://modelcontextprotocol.io">Model Context Protocol</a> ·
-    <a href="https://github.com/AIpRoBuilder/meta_agent">meta_agent</a> ·
+    <a href="#python-flowx_sdk">Python SDK</a> ·
+    <a href="#flowx_a2a-server">A2A</a> ·
     <a href="https://github.com/AIpRoBuilder/ag_ui_worflow">ag_ui_workflow</a>
   </p>
   <p>
@@ -15,7 +16,7 @@
   </p>
 </div>
 
-FlowX is a local MCP server that turns natural-language requirements into runnable workflow artifacts and keeps those workflows editable after the first generation pass. It exposes the builder from [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and the runtime engine from [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) through one MCP tool surface for local hosts such as Claude Code, Cursor, Codex, and VS Code Copilot Chat.
+FlowX is an agent workflow compiler that turns natural-language requirements into runnable workflow artifacts and keeps those workflows editable after the first generation pass. Its in-repository `core` package owns agent planning, generation, auditing, and runtime support; MCP, Python SDK, and A2A adapters share that same flowx_core.
 
 FlowX packages workflow creation, updates, startup, debugging, and step execution into a single local loop. An agent can describe the task, generate the workflow, revise node logic, restart the backend, inspect inputs, and run steps without leaving the same conversation.
 
@@ -24,9 +25,7 @@ FlowX packages workflow creation, updates, startup, debugging, and step executio
 
 ## Installation
 
-FlowX requires Python 3.10 or later.
-
-The default Git install pulls [meta_agent](https://github.com/AIpRoBuilder/meta_agent) from GitHub, and that project resolves its compatible [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) dependency from a pinned Git reference.
+FlowX requires Python 3.10 or later. Installing the project includes the FlowX core, MCP adapter, SDK, and A2A adapter.
 
 ### Install from Git
 
@@ -37,43 +36,8 @@ The default Git install pulls [meta_agent](https://github.com/AIpRoBuilder/meta_
 python3.10 -m venv .venv
 source .venv/bin/activate
 
-# Install FlowX and its git-based dependencies
+# Install FlowX and its runtime dependencies
 python -m pip install --upgrade pip
-python -m pip install -e '.[git]'
-```
-
-#### Poetry
-
-```bash
-poetry env use python3.10
-poetry install -E git
-```
-
-#### uv
-
-```bash
-uv sync --extra git
-```
-
-#### conda
-
-```bash
-conda env create -f environment.yml
-conda activate flowx-mcp
-```
-
-### Install from local sibling checkouts
-
-If you are developing alongside local checkouts of [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow), install those into the same environment before installing FlowX itself.
-
-#### pip
-
-```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ../ag_ui_worflow --no-deps
-python -m pip install -e ../meta_agent --no-deps
 python -m pip install -e .
 ```
 
@@ -82,17 +46,12 @@ python -m pip install -e .
 ```bash
 poetry env use python3.10
 poetry install
-poetry run pip install -e ../ag_ui_worflow --no-deps
-poetry run pip install -e ../meta_agent --no-deps
 ```
 
 #### uv
 
 ```bash
-uv venv --python 3.10
-uv pip install --python .venv/bin/python -e ../ag_ui_worflow --no-deps
-uv pip install --python .venv/bin/python -e ../meta_agent --no-deps
-uv pip install --python .venv/bin/python -e .
+uv sync
 ```
 
 #### conda
@@ -100,13 +59,48 @@ uv pip install --python .venv/bin/python -e .
 ```bash
 conda env create -f environment.yml
 conda activate flowx-mcp
-pip uninstall -y meta-agent meta_agent ag-ui-workflow || true
-pip install -e ../ag_ui_worflow --no-deps
-pip install -e ../meta_agent --no-deps
-pip install -e .
 ```
 
-FlowX also auto-detects sibling folders for [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow): `meta_agent`, `ag_ui_worflow`, and `ag_ui_workflow`. If you prefer not to use editable installs, set `FLOWX_EXTRA_PATHS` instead.
+### Install with a local AG-UI workflow checkout
+
+The FlowX agent is vendored under `packages/core/flowx_core`. Only [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) remains an external workflow-runtime dependency. To use a local checkout instead of its Git dependency, install it first and then install FlowX without dependencies.
+
+#### pip
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ../ag_ui_worflow --no-deps
+python -m pip install -e . --no-deps
+```
+
+#### Poetry
+
+```bash
+poetry env use python3.10
+poetry install
+poetry run pip install -e ../ag_ui_worflow --no-deps
+```
+
+#### uv
+
+```bash
+uv venv --python 3.10
+uv pip install --python .venv/bin/python -e ../ag_ui_worflow --no-deps
+uv pip install --python .venv/bin/python -e . --no-deps
+```
+
+#### conda
+
+```bash
+conda env create -f environment.yml
+conda activate flowx
+pip install -e ../ag_ui_worflow --no-deps
+pip install -e . --no-deps
+```
+
+For source-checkout execution, FlowX automatically discovers each `packages/*` component. Set `FLOWX_EXTRA_PATHS` only when the external `ag_ui_workflow` source is not installed.
 
 ## Quickstart
 
@@ -125,7 +119,7 @@ FLOWX_LLM_API_KEY=
 FLOWX_DEFAULT_WORKSPACE=./.flowx_workspaces
 ```
 
-`FLOWX_CONFIG_ROOT` lets an installed `flowx-mcp` resolve a `.env` file outside the repository checkout. `FLOWX_EXTRA_PATHS` can point at local [meta_agent](https://github.com/AIpRoBuilder/meta_agent) and [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) sources when those packages are not installed into the current environment.
+`FLOWX_CONFIG_ROOT` lets an installed `flowx-mcp` resolve a `.env` file outside the repository checkout. `FLOWX_EXTRA_PATHS` can point at a local [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) source when it is not installed into the current environment.
 
 ### 2. Start the server
 
@@ -162,6 +156,31 @@ If you are using Poetry or uv without activating the environment, prefix the com
 
 If your environment is isolated behind Poetry or uv, set the command to `poetry` with args `['run', 'flowx-mcp']` or to `uv` with args `['run', 'flowx-mcp']`.
 
+### Python SDK
+
+Use the SDK when FlowX is called directly from a Python agent rather than over a transport protocol:
+
+```python
+from flowx_sdk import FlowXClient
+
+client = FlowXClient(workspace="./workflows")
+artifacts = client.create_workflow(
+  "ticket_triage",
+  "Build a workflow that categorizes and prioritizes support tickets.",
+)
+print(artifacts.workflow_json_path)
+```
+
+### A2A server
+
+Start the non-streaming Agent2Agent endpoint with:
+
+```bash
+flowx-a2a --host 127.0.0.1 --port 8001
+```
+
+It serves an A2A agent card at `/.well-known/agent-card.json` and JSON-RPC at `/a2a` (also `/`). Supported methods are `message/send`, `tasks/get`, and `tasks/cancel`. Send an A2A text message with `metadata.workflowName` to compile a workflow; the completed task contains the generated artifact paths.
+
 ### 4. Create a workflow from chat
 
 ```text
@@ -184,7 +203,7 @@ FlowX sits between reusable agent skills and executable workflow runtime. A skil
 
 ## Architecture
 
-FlowX has two cooperating layers: a runtime topology that manages MCP requests and backend processes, and a compilation pipeline that continuously regenerates workflow artifacts.
+FlowX has four cooperating package components: `core` (agent and compiler), `mcp` (MCP port), `flowx_sdk` (Python SDK), and `flowx_a2a` (A2A port). They share a compilation pipeline that continuously regenerates workflow artifacts.
 
 ### Runtime topology
 
@@ -193,7 +212,8 @@ FlowX has two cooperating layers: a runtime topology that manages MCP requests a
 </div>
 
 - `flowx_mcp.server` exposes the tool surface over stdio through FastMCP.
-- The [meta_agent](https://github.com/AIpRoBuilder/meta_agent) `AgentBuilder` creates and updates workflow artifacts from prompts.
+- `flowx_core.AgentBuilder` creates and updates workflow artifacts from prompts.
+- `flowx_sdk.FlowXClient` and `flowx_a2a` call the same agent core without routing through MCP.
 - The generated `main.py` runs as a managed FastAPI subprocess per workflow.
 - `run_workflow_step` communicates with the backend over HTTP and parses AG-UI SSE events back into MCP responses.
 

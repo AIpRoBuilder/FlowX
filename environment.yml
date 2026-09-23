@@ -1,4 +1,4 @@
-name: flowx-mcp
+name: flowx
 channels:
   - conda-forge
 dependencies:
@@ -6,4 +6,4 @@ dependencies:
   - pip
   - git
   - pip:
-      - -e .[git]
+      - -e .

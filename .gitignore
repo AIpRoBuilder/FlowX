@@ -1,0 +1,9 @@
+*cpython*
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.pytest_cache/
+*.flowx_workspaces
+*build/
