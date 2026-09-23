@@ -234,7 +234,6 @@ class BuilderComponentFactory:
     workflow_operation_node_coder_cls: Any
     workflow_file_node_coder_cls: Any
     workflow_skill_node_coder_cls: Any
-    spatial_temporal_contract_node_coder_cls: Any
 
     def create_bundle(self) -> LLMComponentBundle:
         analyzer = self.analyzer_cls(
@@ -291,8 +290,6 @@ class BuilderComponentFactory:
                 skills_root_path=self.skills_root_path,
                 **coder_kwargs,
             )
-        if reference.meta_node_kind == "SpatialTemporalContractNode":
-            return self.spatial_temporal_contract_node_coder_cls(**coder_kwargs)
         if reference.meta_node_kind == "WorkflowOperationNode":
             return self.workflow_operation_node_coder_cls(**coder_kwargs)
         if reference.meta_node_kind == "WorkflowFileNode":

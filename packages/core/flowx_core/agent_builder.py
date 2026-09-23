@@ -19,7 +19,6 @@ from flowx_core.worker.main_writer import PromptMainFileCoder
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import (
     PromptNodeFileCoderBase,
-    SpatialTemporalContractNodeCoder,
     WorkflowOperationNodeCoder,
     WorkflowSkillNodeCoder,
     WorkflowFileNodeCoder,
@@ -263,7 +262,6 @@ class AgentBuilder:
             workflow_operation_node_coder_cls=WorkflowOperationNodeCoder,
             workflow_file_node_coder_cls=WorkflowFileNodeCoder,
             workflow_skill_node_coder_cls=WorkflowSkillNodeCoder,
-            spatial_temporal_contract_node_coder_cls=SpatialTemporalContractNodeCoder,
         )
 
     def _reset_llm_components(self) -> None:
