@@ -3,14 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from pydaograph import CStatus, GNode
+from ag_ui_workflow import WorkflowOperationNode
+from pydaograph import CStatus
 
 
 RunnableGNodeType = TypeVar("RunnableGNodeType", bound="RunnableGNode")
 
 
-class RunnableGNode(GNode):
-    """A GNode that executes one configured instance method through run()."""
+class RunnableGNode(WorkflowOperationNode):
+    """A workflow operation node that executes one configured method through run()."""
 
     def __init__(self) -> None:
         super().__init__()

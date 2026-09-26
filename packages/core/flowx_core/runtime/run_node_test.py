@@ -4,10 +4,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from pydaograph import CStatus, GNode  # pyright: ignore[reportMissingImports]
+from ag_ui_workflow import WorkflowOperationNode
+from pydaograph import CStatus  # pyright: ignore[reportMissingImports]
 
 
-class RunNodeTest(GNode):
+class RunNodeTest(WorkflowOperationNode):
     """Execute one generated node pytest file and persist its dedicated log."""
 
     def __init__(

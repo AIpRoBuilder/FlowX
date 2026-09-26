@@ -31,7 +31,6 @@ _WORKFLOW_NODE_CLASS_NAMES = (
 	"WorkflowOperationNode",
 	"WorkflowFileNode",
 	"WorkflowSkillNode",
-	"SpatialTemporalContractNode",
 )
 
 
@@ -55,11 +54,6 @@ _META_NODE_KIND_TRAITS: dict[str, dict[str, Any]] = {
 		"capability_category": "skill",
 		"recommended_ext_data_type": "skill",
 		"supports_inputs_format": True,
-	},
-	"SpatialTemporalContractNode": {
-		"capability_category": "spatial_temporal_contract",
-		"recommended_ext_data_type": "spatial_temporal_contract",
-		"supports_inputs_format": False,
 	},
 }
 

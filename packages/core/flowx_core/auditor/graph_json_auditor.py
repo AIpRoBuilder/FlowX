@@ -121,7 +121,7 @@ class GraphJsonAuditor(BaseJsonAuditor):
 					)
 				)
 
-			if ext_type in {"user_input", "user_file_input", "skill", "spatial_temporal_contract"}:
+			if ext_type in {"user_input", "user_file_input", "skill"}:
 				expected_meta_node_kind = canonical_meta_node_kind(ext_data=node.get("ext_data"))
 				if meta_node_kind and meta_node_kind != expected_meta_node_kind:
 					violations.append(
@@ -142,7 +142,7 @@ class GraphJsonAuditor(BaseJsonAuditor):
 						rule="image_ext_type_unsupported",
 						detail=(
 							f"Node '{name or '<empty>'}' uses deprecated ext_data.type='image'. "
-							"Use supported node kinds such as user_file_input, user_input, skill, spatial_temporal_contract, or none."
+							"Use supported node kinds such as user_file_input, user_input, skill, or none."
 						),
 						lineno=index,
 					)

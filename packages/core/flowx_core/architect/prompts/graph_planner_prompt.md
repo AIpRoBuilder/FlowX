@@ -20,10 +20,9 @@
     - 当 `meta_node_kind="WorkflowStepNode"` 时，type 必须为 "user_input"。
     - 当 `meta_node_kind="WorkflowFileNode"` 时，type 必须为 "user_file_input"。
     - 当 `meta_node_kind="WorkflowSkillNode"` 时，type 必须为 "skill"，并填写 skill_name（值为默认技能目录中的子目录名）。
-    - 当 `meta_node_kind="SpatialTemporalContractNode"` 时，type 必须为 "spatial_temporal_contract"。
     - 当 `meta_node_kind="WorkflowOperationNode"` 时，type 可为 "none" 或领域外部源类型，如 "url"、"file"、"db"。
     - 若 type 为 "none"，desc 必须为 "no need for ext data"。
-    - 示例：{"type":"user_input","desc":"user input income"}、{"type":"user_file_input","desc":"upload files for storage and downstream processing"}、{"type":"skill","skill_name":"baidu_search","desc":"search baidu for query results"}、{"type":"spatial_temporal_contract","desc":"generate spatial-temporal contract JSON from upstream description"}、{"type":"url","desc":"image generator api"}。
+    - 示例：{"type":"user_input","desc":"user input income"}、{"type":"user_file_input","desc":"upload files for storage and downstream processing"}、{"type":"skill","skill_name":"baidu_search","desc":"search baidu for query results"}、{"type":"url","desc":"image generator api"}。
   - enable: 布尔值。
   - loop: 整数，默认 1；若未提及循环可省略。
     - 若某节点需要执行多次以更新节点状态，必须显式设置 loop > 1。
@@ -83,5 +82,4 @@
 - 依赖关系根据流程/交互顺序判断；不确定时保持独立并省略 depends。
 - 节点 name/type 一律使用英文，且二者保持相同；禁止使用 MyNode、NewNode、Node1、N1、A 这类无语义占位名。
 - 即使信息不完整，也要基于节点功能写出语义化名称（如 UserInputCollection、ContentSearchExecution、FinalSummaryOutput）。
-- 当需求明确要求产出场景/关系/对象的时空 contract JSON 时，优先选择 catalog 中对应时空 contract 的 `meta_node_kind`，并设置 ext_data.type="spatial_temporal_contract"。
 - 若有可并行的模块，避免互相依赖。

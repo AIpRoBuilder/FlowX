@@ -30,7 +30,6 @@ _WORKFLOW_BASE_CLASS_NAMES = frozenset(
         "WorkflowOperationNode",
         "WorkflowFileNode",
         "WorkflowSkillNode",
-        "SpatialTemporalContractNode",
     }
 )
 
@@ -150,7 +149,6 @@ class PromptNodeTestFileCoder(Coder):
             "- Include at least one behavioral test focused on the node's primary StepRunOutput contract.\n"
             "- For WorkflowFileNode, avoid duplicating ag_ui_workflow base-class tests; only exercise behavior that this node file defines or overrides.\n"
             "- For WorkflowSkillNode, avoid real installation side effects; monkeypatch installation behavior or create the smallest temporary skill.md needed to instantiate the class.\n"
-            "- For SpatialTemporalContractNode, avoid live model calls by monkeypatching _create_openai_client or the narrowest external boundary used by the node.\n"
             "- Return only runnable Python test code with no markdown fences or commentary.\n\n"
             "Selected ag_ui_workflow base-node reference (authoritative):\n"
             f"{render_workflow_node_reference(reference)}\n\n"

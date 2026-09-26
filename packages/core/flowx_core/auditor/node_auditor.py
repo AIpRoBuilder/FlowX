@@ -12,9 +12,16 @@ from flowx_core.architect.graph import Graph, NodeMeta
 from flowx_core.tools.file_tools import compile_node_file_and_get_derived_keys
 from flowx_core.tools.workflow_node_reference import (
     resolve_workflow_node_reference,
-    workflow_meta_node_kind_name_set,
     workflow_node_references,
 )
+
+
+WORKFLOW_NODE_BASE_NAMES = {
+    "WorkflowStepNode",
+    "WorkflowOperationNode",
+    "WorkflowFileNode",
+    "WorkflowSkillNode",
+}
 
 
 class NodeAuditor(BaseAuditor):
@@ -89,10 +96,14 @@ class NodeAuditor(BaseAuditor):
                 elif isinstance(base, ast.Attribute) and base.attr == "GParam":
                     subclass_names.add(cls.name)
 
-        gnode_subclasses = self._collect_local_gnode_subclasses(class_defs)
+        workflow_node_subclasses = self._collect_local_workflow_node_subclasses(class_defs)
 
         for cls in class_defs:
-            self._check_gnode_subclass_register_class(cls, gnode_subclasses, violations)
+            self._check_workflow_node_subclass_register_class(
+                cls,
+                workflow_node_subclasses,
+                violations,
+            )
             self._check_registered_class_name_matches_file_prefix(cls, path, violations)
             self._check_clone(cls, violations)
             self._check_init(cls, violations)
@@ -275,11 +286,10 @@ class NodeAuditor(BaseAuditor):
             )
 
     def _is_workflow_step_node_subclass(self, cls: ast.ClassDef) -> bool:
-        workflow_meta_node_kinds = workflow_meta_node_kind_name_set()
         for base in cls.bases:
-            if isinstance(base, ast.Name) and base.id in workflow_meta_node_kinds:
+            if isinstance(base, ast.Name) and base.id in WORKFLOW_NODE_BASE_NAMES:
                 return True
-            if isinstance(base, ast.Attribute) and base.attr in workflow_meta_node_kinds:
+            if isinstance(base, ast.Attribute) and base.attr in WORKFLOW_NODE_BASE_NAMES:
                 return True
         return False
 
@@ -314,9 +324,6 @@ class NodeAuditor(BaseAuditor):
                     lineno=method.lineno,
                 )
             )
-
-    def _is_spatial_temporal_contract_node_subclass(self, cls: ast.ClassDef) -> bool:
-        return self._is_direct_or_attr_base_subclass(cls, {"SpatialTemporalContractNode"})
 
     def _workflow_step_output_method_names_for_class(self, cls: ast.ClassDef) -> List[str]:
         base_names: Set[str] = set()
@@ -1267,42 +1274,46 @@ class NodeAuditor(BaseAuditor):
             return True
         return False
 
-    def _collect_local_gnode_subclasses(self, class_defs: List[ast.ClassDef]) -> Set[str]:
-        """Collect class names that subclass GNode directly or through local classes."""
-        gnode_subclasses: Set[str] = set()
+    def _collect_local_workflow_node_subclasses(self, class_defs: List[ast.ClassDef]) -> Set[str]:
+        """Collect classes derived from an ag_ui_workflow node base."""
+        workflow_node_subclasses: Set[str] = set()
         unresolved = {cls.name: cls for cls in class_defs}
 
         while unresolved:
             progressed = False
             for class_name, cls in list(unresolved.items()):
-                if self._has_gnode_ancestor(cls, gnode_subclasses):
-                    gnode_subclasses.add(class_name)
+                if self._has_workflow_node_ancestor(cls, workflow_node_subclasses):
+                    workflow_node_subclasses.add(class_name)
                     unresolved.pop(class_name, None)
                     progressed = True
 
             if not progressed:
                 break
 
-        return gnode_subclasses
+        return workflow_node_subclasses
 
-    def _has_gnode_ancestor(self, cls: ast.ClassDef, known_gnode_subclasses: Set[str]) -> bool:
+    def _has_workflow_node_ancestor(
+        self,
+        cls: ast.ClassDef,
+        known_workflow_node_subclasses: Set[str],
+    ) -> bool:
         for base in cls.bases:
             if isinstance(base, ast.Name):
-                if base.id == "GNode" or base.id in known_gnode_subclasses:
+                if base.id in WORKFLOW_NODE_BASE_NAMES or base.id in known_workflow_node_subclasses:
                     return True
             elif isinstance(base, ast.Attribute):
-                if base.attr == "GNode" or base.attr in known_gnode_subclasses:
+                if base.attr in WORKFLOW_NODE_BASE_NAMES or base.attr in known_workflow_node_subclasses:
                     return True
         return False
 
-    def _check_gnode_subclass_register_class(
+    def _check_workflow_node_subclass_register_class(
         self,
         cls: ast.ClassDef,
-        gnode_subclasses: Set[str],
+        workflow_node_subclasses: Set[str],
         violations: List[RuleViolation],
     ) -> None:
-        """Ensure every local GNode subclass has a @register_class decorator."""
-        if cls.name not in gnode_subclasses:
+        """Ensure every local workflow node subclass has a @register_class decorator."""
+        if cls.name not in workflow_node_subclasses:
             return
         if self._is_registered_class(cls):
             return
@@ -1310,8 +1321,8 @@ class NodeAuditor(BaseAuditor):
         violations.append(
             RuleViolation(
                 class_name=cls.name,
-                rule="gnode_subclass_missing_register_class",
-                detail="Classes that subclass GNode must be decorated with @register_class.",
+                rule="workflow_node_subclass_missing_register_class",
+                detail="Workflow node subclasses must be decorated with @register_class.",
                 lineno=cls.lineno,
             )
         )

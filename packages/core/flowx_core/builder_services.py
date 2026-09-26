@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, TYPE_CHECKING
 
-from pydaograph import CStatus, GNode, GPipeline  # pyright: ignore[reportMissingImports]
+from ag_ui_workflow import WorkflowOperationNode
+from pydaograph import CStatus, GPipeline  # pyright: ignore[reportMissingImports]
 
 from flowx_core.llm_client.coder import MAX_TOKENS
 from flowx_core.runtime import RunNodeTest
@@ -157,8 +158,8 @@ class NodeGenerationWorker:
             raise RuntimeError(f"node generation failed for {self.node_name}: {exc}") from exc
 
 
-class _NodeGenerationNode(GNode):
-    """Fresh PyDaoGraph node wrapper for a cached generation worker."""
+class _NodeGenerationNode(WorkflowOperationNode):
+    """Workflow operation wrapper for a cached generation worker."""
 
     def __init__(self, worker: NodeGenerationWorker) -> None:
         super().__init__()

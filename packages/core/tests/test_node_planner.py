@@ -2,11 +2,6 @@ import json
 from types import SimpleNamespace
 
 from flowx_core.architect.node_planner import NodePlanner
-from flowx_core.tools.workflow_node_reference import (
-	render_subclass_guidance_method_signatures,
-	render_workflow_method_signatures,
-	resolve_workflow_node_reference,
-)
 
 
 class _FakeCompletions:
@@ -55,7 +50,6 @@ def test_node_context_lists_selectable_types_and_skill_descriptions(tmp_path) ->
 	assert "user_input -> WorkflowStepNode" in context
 	assert "service ->" not in context
 	assert "skill -> WorkflowSkillNode" in context
-	assert "spatial_temporal_contract -> SpatialTemporalContractNode" in context
 	assert "- available skills:" in context
 	assert "baidu_search:" in context
 
@@ -83,40 +77,6 @@ def test_node_context_omits_legacy_service_metadata(tmp_path) -> None:
 	assert "subclass implementation hooks: process_operation(dependency_results, session_state)" in context
 	assert "service_name" not in context
 	assert "- services:" not in context
-
-
-def test_node_context_recommends_spatial_temporal_contract_node(tmp_path) -> None:
-	planner = NodePlanner(client=_FakeClient([]), skills_root_path=str(tmp_path / "skills"))
-	spatial_reference = resolve_workflow_node_reference(meta_node_kind="SpatialTemporalContractNode")
-	spatial_hook = render_workflow_method_signatures(
-		spatial_reference.base_class,
-		spatial_reference.subclass_implementation_methods,
-	)[0]
-	spatial_guidance_hooks = render_subclass_guidance_method_signatures(
-		spatial_reference.base_class,
-		spatial_reference.subclass_implementation_methods,
-	)
-
-	context = planner._node_context(
-		{
-			"name": "BuildContract",
-			"desc": "generate a spatial-temporal contract from upstream scene text",
-			"depends": ["DescribeScene"],
-			"ext_data": {
-				"type": "spatial_temporal_contract",
-				"desc": "build contract json from upstream description",
-			},
-		},
-		1,
-	)
-
-	assert "recommended base class: SpatialTemporalContractNode" in context
-	assert "- meta_node_kind: SpatialTemporalContractNode" in context
-	assert "StepRunOutput schema methods: process_operation(dependency_results, session_state)" in context
-	assert f"subclass implementation hooks: {spatial_hook}" in context
-	assert spatial_guidance_hooks
-	for guidance_hook in spatial_guidance_hooks:
-		assert guidance_hook in context
 
 
 def test_amend_graph_node_from_files_updates_graph_and_regenerates_node_plan(tmp_path) -> None:

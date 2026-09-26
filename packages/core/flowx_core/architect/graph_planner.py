@@ -26,7 +26,7 @@ class GraphPlanner(Coder):
 
 	`ext_data` should be a JSON object for every node with shape:
 	{
-		"type": "user_input" | "user_file_input" | "url" | "file" | "db" | "skill" | "spatial_temporal_contract" | "none" | ...,
+		"type": "user_input" | "user_file_input" | "url" | "file" | "db" | "skill" | "none" | ...,
 		"desc": "short description",
 		"skill_name": "optional skill directory name (required when type=skill)"
 	}
@@ -37,7 +37,6 @@ class GraphPlanner(Coder):
 	{"email_address": "string", "password": "number"}. 
 	Use `{"type": "user_file_input", ...}` for nodes that should be implemented as WorkflowFileNode.
 	Use `{"type": "skill", "skill_name": "<skill>", ...}` for nodes that should be implemented as WorkflowSkillNode.
-	Use `{"type": "spatial_temporal_contract", ...}` for nodes that should be implemented as SpatialTemporalContractNode.
 	"""
 
 	prompt_path: str = "architect/prompts/graph_planner_prompt.md"

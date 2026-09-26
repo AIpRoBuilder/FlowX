@@ -5,7 +5,6 @@
 ## 规划规则
 - 严格依据系统注入的 ag_ui_workflow 基类 `step_meta()` / `meta_node_kind()` catalog，不要虚构不存在的基类契约。
 - 必须优先使用 graph_plan 中节点的 `meta_node_kind` 推导实现类别；只有当 `meta_node_kind` 缺失时，才允许回退到 `ext_data.type` 与 catalog 推荐值做匹配。
-- 对 `spatial_temporal_contract` 类节点，优先说明其依赖 workflow reference 中声明的继承 `StepRunOutput` 合约函数生成 contract，通常仅需声明类常量与最小 `clone(self)`；只有 reference 标注的 subclass hook 明确需要定制时才覆写。
 - 对 reference 中的 `StepRunOutput card/derived contract methods`，要明确说明这些函数决定节点输出的 `card`/`derived` 键和值格式。
 - 对 `decorator-marked subclass implementation hooks`，优先说明这些才是子类应考虑覆写/实现的入口；无明确需求不要扩展其他基类方法。
 
