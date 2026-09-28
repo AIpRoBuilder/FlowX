@@ -27,7 +27,6 @@ from flowx_core.tools.workflow_node_reference import (
 _WORKFLOW_BASE_CLASS_NAMES = frozenset(
     {
         "WorkflowStepNode",
-        "WorkflowOperationNode",
         "WorkflowFileNode",
         "WorkflowSkillNode",
     }

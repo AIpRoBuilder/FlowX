@@ -69,7 +69,7 @@ from typing import Any
 
 from pydaograph import register_class, CStatus
 
-from ag_ui_workflow.nodes import WorkflowOperationNode, WorkflowStepNode
+from ag_ui_workflow.nodes import WorkflowStepNode
 from ag_ui_workflow.workflow_types import StepRunOutput
 
 
@@ -161,17 +161,20 @@ class BudgetAdvisorNode(WorkflowStepNode):
 
 
 @register_class
-class SavingsPlanNode(WorkflowOperationNode):
+class SavingsPlanNode(WorkflowStepNode):
     STEP_ID = "SavingsPlanNode"
     TITLE = "Step 3 · Savings Plan"
     PROMPT = ""
     DEPENDENCIES = ["income", "expense"]
+    INPUT_REQUIRED = False
 
-    def process_operation(
+    def process_input(
         self,
+        user_input: str,
         dependency_results: dict[str, StepRunOutput],
         session_state: dict[str, Any],
     ) -> StepRunOutput:
+        del user_input
         monthly_income = dependency_results["income"].derived["monthlyIncome"]
         monthly_expense = dependency_results["expense"].derived["monthlyExpense"]
         monthly_savings = monthly_income - monthly_expense

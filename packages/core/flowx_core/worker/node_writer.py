@@ -561,32 +561,6 @@ class PromptNodeFileCoderBase(Coder):
 
 
 @dataclass
-class WorkflowOperationNodeCoder(PromptNodeFileCoderBase):
-    def get_node_contract_text(self) -> str:
-        reference = resolve_workflow_node_reference(meta_node_kind="WorkflowOperationNode")
-        subclass_hook_text = _reference_method_signature_text(reference, reference.subclass_implementation_methods)
-        return (
-            "Generate a WorkflowOperationNode subclass with STEP_ID, TITLE, PROMPT, and DEPENDENCIES.\n"
-            f"Implement business logic in {subclass_hook_text} and return StepRunOutput.\n"
-            "Keep implementation minimal: only imports, constants, and methods required by this node contract.\n"
-            "Read upstream values from dependency_results[step_id].derived and persist cross-step values in session_state.\n"
-            "When a required variable is absent in both dependency_results[step_id].derived and session_state, use safe fallback handling before returning explicit validation errors.\n"
-            "Extract upstream variables only from nodes listed in DEPENDENCIES and from keys present in those dependencies' derived payloads.\n"
-            "When dependency context is provided, treat it as authoritative for dependency ids and derived keys; do not invent non-existent upstream keys.\n"
-            "Keep card payload JSON-serializable and derived payload structured for downstream nodes.\n"
-            "Do not require user input for this node.\n\n"
-        )
-
-    def get_feedback_contract_text(self) -> str:
-        reference = resolve_workflow_node_reference(meta_node_kind="WorkflowOperationNode")
-        subclass_hook_text = _reference_method_signature_text(reference, reference.subclass_implementation_methods)
-        return (
-            "Preserve the WorkflowOperationNode contract "
-            f"(STEP_ID/TITLE/PROMPT/DEPENDENCIES and {subclass_hook_text} returning StepRunOutput).\n"
-        )
-
-
-@dataclass
 class WorkflowFileNodeCoder(PromptNodeFileCoderBase):
     def _build_requirement_prompt(
         self,
@@ -671,6 +645,7 @@ class WorkflowStepNodeCoder(PromptNodeFileCoderBase):
             "Generate a WorkflowStepNode subclass with STEP_ID, TITLE, PROMPT, and DEPENDENCIES.\n"
             f"Implement business logic in {subclass_hook_text} and return StepRunOutput.\n"
             "If node metadata includes inputs_format, parse/validate user_input according to that schema (field names + primitive types).\n"
+            "Set INPUT_REQUIRED = False when ext_data.type is not user_input and the step should run automatically.\n"
             "Keep implementation minimal: only imports, constants, and methods required by this node contract.\n"
             "Read upstream values from dependency_results[step_id].derived and persist cross-step values in session_state.\n"
             "When a required variable is absent in both dependency_results[step_id].derived and session_state, use safe fallback handling before returning explicit validation errors.\n"

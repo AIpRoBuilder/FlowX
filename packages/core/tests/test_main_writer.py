@@ -14,7 +14,6 @@ from flowx_core.tools.workflow_node_reference import (
 from flowx_core.worker.main_writer import PromptMainFileCoder
 from flowx_core.worker.node_writer import (
     WorkflowFileNodeCoder,
-    WorkflowOperationNodeCoder,
     WorkflowSkillNodeCoder,
     WorkflowStepNodeCoder,
 )
@@ -177,12 +176,12 @@ def test_agent_builder_make_node_coder_passes_session_marking_prompt(monkeypatch
     )
 
 
-def test_agent_builder_make_node_coder_routes_operation_from_meta_node_kind(monkeypatch, tmp_path):
+def test_agent_builder_make_node_coder_routes_automatic_step(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "WorkflowOperationNodeCoder", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "WorkflowStepNodeCoder", _FakeComponent)
 
     builder = AgentBuilder(
         api_key="key",
@@ -196,7 +195,7 @@ def test_agent_builder_make_node_coder_routes_operation_from_meta_node_kind(monk
             name="FetchRemoteData",
             type="",
             desc="Fetch from remote url",
-            meta_node_kind="WorkflowOperationNode",
+            meta_node_kind="WorkflowStepNode",
             ext_data={"type": "url", "desc": "remote api"},
         )
     )
@@ -218,17 +217,12 @@ def test_node_planner_system_prompt_includes_session_marking_prompt():
 
 def test_node_writer_contract_text_uses_reference_hook_signatures() -> None:
     step_reference = resolve_workflow_node_reference(meta_node_kind="WorkflowStepNode")
-    operation_reference = resolve_workflow_node_reference(meta_node_kind="WorkflowOperationNode")
     skill_reference = resolve_workflow_node_reference(meta_node_kind="WorkflowSkillNode")
     file_reference = resolve_workflow_node_reference(meta_node_kind="WorkflowFileNode")
 
     step_hook = render_workflow_method_signatures(
         step_reference.base_class,
         step_reference.subclass_implementation_methods,
-    )[0]
-    operation_hook = render_workflow_method_signatures(
-        operation_reference.base_class,
-        operation_reference.subclass_implementation_methods,
     )[0]
     skill_hook = render_workflow_method_signatures(
         skill_reference.base_class,
@@ -240,7 +234,6 @@ def test_node_writer_contract_text_uses_reference_hook_signatures() -> None:
     )[0]
 
     assert step_hook in WorkflowStepNodeCoder(client=_FakeClient()).get_node_contract_text()
-    assert operation_hook in WorkflowOperationNodeCoder(client=_FakeClient()).get_node_contract_text()
     assert skill_hook in WorkflowSkillNodeCoder(client=_FakeClient()).get_node_contract_text()
     file_contract_text = WorkflowFileNodeCoder(client=_FakeClient()).get_node_contract_text()
     assert file_main_utility in file_contract_text

@@ -19,7 +19,6 @@ from flowx_core.worker.main_writer import PromptMainFileCoder
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import (
     PromptNodeFileCoderBase,
-    WorkflowOperationNodeCoder,
     WorkflowSkillNodeCoder,
     WorkflowFileNodeCoder,
     WorkflowStepNodeCoder,
@@ -259,7 +258,6 @@ class AgentBuilder:
             node_planner_cls=NodePlanner,
             main_writer_cls=PromptMainFileCoder,
             workflow_step_node_coder_cls=WorkflowStepNodeCoder,
-            workflow_operation_node_coder_cls=WorkflowOperationNodeCoder,
             workflow_file_node_coder_cls=WorkflowFileNodeCoder,
             workflow_skill_node_coder_cls=WorkflowSkillNodeCoder,
         )

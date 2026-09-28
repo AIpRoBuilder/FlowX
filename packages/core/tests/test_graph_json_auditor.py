@@ -127,6 +127,6 @@ def test_graph_planner_backfills_meta_node_kind_and_keeps_operation_ext_type(tmp
 
     assert normalized["nodes"][0]["meta_node_kind"] == "WorkflowStepNode"
     assert normalized["nodes"][0]["ext_data"]["type"] == "user_input"
-    assert normalized["nodes"][1]["meta_node_kind"] == "WorkflowOperationNode"
+    assert normalized["nodes"][1]["meta_node_kind"] == "WorkflowStepNode"
     assert normalized["nodes"][1]["ext_data"]["type"] == "url"
 

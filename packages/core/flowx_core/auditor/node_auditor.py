@@ -18,7 +18,6 @@ from flowx_core.tools.workflow_node_reference import (
 
 WORKFLOW_NODE_BASE_NAMES = {
     "WorkflowStepNode",
-    "WorkflowOperationNode",
     "WorkflowFileNode",
     "WorkflowSkillNode",
 }
@@ -298,9 +297,6 @@ class NodeAuditor(BaseAuditor):
 
     def _is_workflow_input_node_subclass(self, cls: ast.ClassDef) -> bool:
         return self._is_direct_or_attr_base_subclass(cls, {"WorkflowStepNode"})
-
-    def _is_workflow_operation_node_subclass(self, cls: ast.ClassDef) -> bool:
-        return self._is_direct_or_attr_base_subclass(cls, {"WorkflowOperationNode"})
 
     def _is_workflow_file_node_subclass(self, cls: ast.ClassDef) -> bool:
         return self._is_direct_or_attr_base_subclass(cls, {"WorkflowFileNode"})

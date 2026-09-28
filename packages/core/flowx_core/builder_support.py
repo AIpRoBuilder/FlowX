@@ -231,7 +231,6 @@ class BuilderComponentFactory:
     node_planner_cls: Any
     main_writer_cls: Any
     workflow_step_node_coder_cls: Any
-    workflow_operation_node_coder_cls: Any
     workflow_file_node_coder_cls: Any
     workflow_skill_node_coder_cls: Any
 
@@ -290,8 +289,6 @@ class BuilderComponentFactory:
                 skills_root_path=self.skills_root_path,
                 **coder_kwargs,
             )
-        if reference.meta_node_kind == "WorkflowOperationNode":
-            return self.workflow_operation_node_coder_cls(**coder_kwargs)
         if reference.meta_node_kind == "WorkflowFileNode":
             return self.workflow_file_node_coder_cls(**coder_kwargs)
         return self.workflow_step_node_coder_cls(**coder_kwargs)

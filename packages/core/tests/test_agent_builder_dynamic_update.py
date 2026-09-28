@@ -71,7 +71,7 @@ def test_update_nodes_plan_preserves_existing_files_and_generates_only_missing(m
         [
             {
                 "name": "ExistingNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "existing",
                 "enable": True,
                 "depends": [],
@@ -79,7 +79,7 @@ def test_update_nodes_plan_preserves_existing_files_and_generates_only_missing(m
             },
             {
                 "name": "AddedNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "added",
                 "enable": True,
                 "depends": ["ExistingNode"],
@@ -87,7 +87,7 @@ def test_update_nodes_plan_preserves_existing_files_and_generates_only_missing(m
             },
             {
                 "name": "HiddenNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "hidden",
                 "enable": True,
                 "depends": [],
@@ -142,7 +142,7 @@ def test_update_nodes_generates_only_missing_backend_nodes(monkeypatch, tmp_path
         [
             {
                 "name": "ExistingNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "existing",
                 "enable": True,
                 "depends": [],
@@ -150,7 +150,7 @@ def test_update_nodes_generates_only_missing_backend_nodes(monkeypatch, tmp_path
             },
             {
                 "name": "AddedNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "added",
                 "enable": True,
                 "depends": ["ExistingNode"],
@@ -258,7 +258,7 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
         [
             {
                 "name": "GeneratedNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "generated",
                 "enable": True,
                 "depends": [],
@@ -361,7 +361,7 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
         [
             {
                 "name": "FirstNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "first",
                 "enable": True,
                 "depends": [],
@@ -369,7 +369,7 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
             },
             {
                 "name": "SecondNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "second",
                 "enable": True,
                 "depends": ["FirstNode"],
@@ -447,7 +447,7 @@ def test_cached_node_worker_can_amend_from_log_prompt(monkeypatch, tmp_path):
         [
             {
                 "name": "GeneratedNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "generated",
                 "enable": True,
                 "depends": [],
@@ -633,7 +633,7 @@ def test_get_node_input_output_formats_collects_inputs_and_backend_card_schema(m
             },
             {
                 "name": "Summarize",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "summarize results",
                 "enable": True,
                 "depends": ["CollectInput"],
@@ -691,7 +691,7 @@ def test_rerun_server_validates_artifacts_and_restarts_processes(monkeypatch, tm
         [
             {
                 "name": "ExistingNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "existing",
                 "enable": True,
                 "depends": [],
@@ -798,7 +798,7 @@ def test_run_node_tests_uses_selected_python_command_and_writes_separate_node_lo
         [
             {
                 "name": "ExistingNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "existing",
                 "enable": True,
                 "depends": [],
@@ -806,7 +806,7 @@ def test_run_node_tests_uses_selected_python_command_and_writes_separate_node_lo
             },
             {
                 "name": "AddedNode",
-                "type": "WorkflowOperationNode",
+                "type": "WorkflowStepNode",
                 "desc": "added",
                 "enable": True,
                 "depends": ["ExistingNode"],

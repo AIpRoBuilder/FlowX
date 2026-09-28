@@ -271,11 +271,7 @@ class GraphPlanner(Coder):
 
 			ext_data = node.get("ext_data")
 			if not isinstance(ext_data, dict):
-				default_ext_type = (
-					reference.recommended_ext_data_type
-					if reference.meta_node_kind != "WorkflowOperationNode"
-					else "none"
-				)
+				default_ext_type = reference.recommended_ext_data_type
 				ext_data = {"type": default_ext_type, "desc": ""}
 				if default_ext_type == "none":
 					ext_data["desc"] = self.NONE_EXT_DESC
@@ -284,10 +280,10 @@ class GraphPlanner(Coder):
 				node["ext_data"] = ext_data
 
 			ext_type = str(ext_data.get("type", "")).strip().lower()
-			if reference.meta_node_kind != "WorkflowOperationNode":
+			if reference.meta_node_kind in {"WorkflowFileNode", "WorkflowSkillNode"}:
 				ext_type = reference.recommended_ext_data_type
 			elif not ext_type:
-				ext_type = "none"
+				ext_type = reference.recommended_ext_data_type
 			ext_data["type"] = ext_type
 			node["meta_node_kind"] = canonical_meta_node_kind(
 				meta_node_kind=node.get("meta_node_kind"),

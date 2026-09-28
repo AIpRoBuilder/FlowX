@@ -17,10 +17,9 @@
   - meta_node_kind: 字符串，必须等于所选 ag_ui_workflow 基类 `meta_node_kind()` 返回值。
   - desc: 字符串，对应节点的功能描述（中文）。
   - ext_data: 必填，JSON 对象，格式为 {"type": "...", "desc": "..."}。
-    - 当 `meta_node_kind="WorkflowStepNode"` 时，type 必须为 "user_input"。
+    - 当 `meta_node_kind="WorkflowStepNode"` 时，交互节点 type 使用 "user_input"；无需用户输入的自动节点可使用 "none" 或领域外部源类型，如 "url"、"file"、"db"。
     - 当 `meta_node_kind="WorkflowFileNode"` 时，type 必须为 "user_file_input"。
     - 当 `meta_node_kind="WorkflowSkillNode"` 时，type 必须为 "skill"，并填写 skill_name（值为默认技能目录中的子目录名）。
-    - 当 `meta_node_kind="WorkflowOperationNode"` 时，type 可为 "none" 或领域外部源类型，如 "url"、"file"、"db"。
     - 若 type 为 "none"，desc 必须为 "no need for ext data"。
     - 示例：{"type":"user_input","desc":"user input income"}、{"type":"user_file_input","desc":"upload files for storage and downstream processing"}、{"type":"skill","skill_name":"baidu_search","desc":"search baidu for query results"}、{"type":"url","desc":"image generator api"}。
   - enable: 布尔值。
@@ -49,7 +48,7 @@
     {
       "name": "OtherNode",
       "type": "OtherNode",
-      "meta_node_kind": "WorkflowOperationNode",
+      "meta_node_kind": "WorkflowStepNode",
       "desc": "calculate the result of 2+2",
       "ext_data": {"type": "none", "desc": "no need for ext data"},
       "enable": true
@@ -67,7 +66,7 @@
     {
       "name": "NewNode",
       "type": "NewNode",
-      "meta_node_kind": "WorkflowOperationNode",
+      "meta_node_kind": "WorkflowStepNode",
       "desc": "calculate the result of 1+1",
       "ext_data": {"type": "none", "desc": "no need for ext data"},
       "enable": true,

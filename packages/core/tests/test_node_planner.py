@@ -132,7 +132,7 @@ def test_amend_graph_node_from_files_updates_graph_and_regenerates_node_plan(tmp
 					},
 					ensure_ascii=False,
 				),
-				"# Node Brief\n\n## What This Node Achieves\nCollects a query and locale, then uses the selected skill.\n\n## Core Functions\n- process_operation: runs the skill using the validated user input.\n",
+				"# Node Brief\n\n## What This Node Achieves\nCollects a query and locale, then uses the selected skill.\n\n## Core Functions\n- process_input: runs the skill using the validated user input.\n",
 			]
 		)
 	)
