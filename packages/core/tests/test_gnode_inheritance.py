@@ -1,4 +1,4 @@
-from ag_ui_workflow import WorkflowOperationNode
+from ag_ui_workflow import WorkflowStepNode
 
 from flowx_core.architect.graph_planner import GraphPlanner
 from flowx_core.architect.node_planner import NodePlanner
@@ -11,7 +11,7 @@ from flowx_core.demand_analyzer.requirement_disector import RequirementDisector
 from flowx_core.worker.main_writer import PromptMainFileCoder
 
 
-def test_planners_writers_and_auditors_subclass_workflow_operation_node() -> None:
+def test_planners_writers_and_auditors_subclass_workflow_step_node() -> None:
     instances = [
         GraphPlanner(client=object()),
         NodePlanner(client=object()),
@@ -25,4 +25,4 @@ def test_planners_writers_and_auditors_subclass_workflow_operation_node() -> Non
     ]
 
     for instance in instances:
-        assert isinstance(instance, WorkflowOperationNode)
+        assert isinstance(instance, WorkflowStepNode)

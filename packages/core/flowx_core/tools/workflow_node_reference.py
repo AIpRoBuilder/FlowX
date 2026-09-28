@@ -28,7 +28,6 @@ class WorkflowNodeReference:
 
 _WORKFLOW_NODE_CLASS_NAMES = (
 	"WorkflowStepNode",
-	"WorkflowOperationNode",
 	"WorkflowFileNode",
 	"WorkflowSkillNode",
 )
@@ -39,11 +38,6 @@ _META_NODE_KIND_TRAITS: dict[str, dict[str, Any]] = {
 		"capability_category": "input",
 		"recommended_ext_data_type": "user_input",
 		"supports_inputs_format": True,
-	},
-	"WorkflowOperationNode": {
-		"capability_category": "operation",
-		"recommended_ext_data_type": "none",
-		"supports_inputs_format": False,
 	},
 	"WorkflowFileNode": {
 		"capability_category": "file",
@@ -688,7 +682,7 @@ def resolve_workflow_node_reference(
 		if reference.recommended_ext_data_type == ext_type:
 			return reference
 
-	return meta_lookup["WorkflowOperationNode"]
+	return meta_lookup["WorkflowStepNode"]
 
 
 def canonical_meta_node_kind(*, meta_node_kind: str | None = None, ext_data: Any = None) -> str:

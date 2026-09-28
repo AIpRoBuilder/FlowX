@@ -11,7 +11,6 @@ def test_workflow_node_references_derive_traits_from_meta_node_kind() -> None:
 
     assert set(references) == {
         "WorkflowStepNode",
-        "WorkflowOperationNode",
         "WorkflowFileNode",
         "WorkflowSkillNode",
     }
@@ -24,13 +23,6 @@ def test_workflow_node_references_derive_traits_from_meta_node_kind() -> None:
     assert references["WorkflowStepNode"].subclass_implementation_methods == ("process_input",)
     assert references["WorkflowStepNode"].step_output_schema_methods == ("process_input",)
     assert references["WorkflowStepNode"].planner_hooks == ("process_input",)
-
-    assert references["WorkflowOperationNode"].capability_category == "operation"
-    assert references["WorkflowOperationNode"].recommended_ext_data_type == "none"
-    assert references["WorkflowOperationNode"].main_utility_methods == ("process_operation",)
-    assert references["WorkflowOperationNode"].subclass_implementation_methods == ("process_operation",)
-    assert references["WorkflowOperationNode"].step_output_schema_methods == ("process_operation",)
-    assert references["WorkflowOperationNode"].planner_hooks == ("process_operation",)
 
     assert references["WorkflowFileNode"].capability_category == "file"
     assert references["WorkflowFileNode"].recommended_ext_data_type == "user_file_input"
@@ -51,10 +43,6 @@ def test_workflow_node_references_derive_traits_from_meta_node_kind() -> None:
         references["WorkflowStepNode"].base_class,
         references["WorkflowStepNode"].subclass_implementation_methods,
     ) == ("process_input(user_input, dependency_results, session_state)",)
-    assert render_workflow_method_signatures(
-        references["WorkflowOperationNode"].base_class,
-        references["WorkflowOperationNode"].subclass_implementation_methods,
-    ) == ("process_operation(dependency_results, session_state)",)
     assert render_workflow_method_signatures(
         references["WorkflowFileNode"].base_class,
         references["WorkflowFileNode"].main_utility_methods,

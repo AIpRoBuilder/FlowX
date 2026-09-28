@@ -4,12 +4,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-from ag_ui_workflow import WorkflowOperationNode
+from ag_ui_workflow import StepRunOutput, WorkflowStepNode
 from pydaograph import CStatus  # pyright: ignore[reportMissingImports]
 
 
-class RunNodeTest(WorkflowOperationNode):
+class RunNodeTest(WorkflowStepNode):
     """Execute one generated node pytest file and persist its dedicated log."""
+
+    INPUT_REQUIRED = False
 
     def __init__(
         self,
@@ -34,7 +36,7 @@ class RunNodeTest(WorkflowOperationNode):
         self.timeout_expired = timeout_expired
         self.result: Dict[str, Any] | None = None
 
-    def run(self) -> CStatus:
+    def _execute(self) -> CStatus:
         node_started_at = datetime.now()
         returncode: int | None = None
         stdout_text = ""
@@ -101,3 +103,18 @@ class RunNodeTest(WorkflowOperationNode):
             "status_line": status_line,
         }
         return CStatus()
+
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        del user_input, dependency_results, session_state
+        status = self._execute()
+        if status.isErr() or self.result is None:
+            raise RuntimeError(status.getInfo())
+        return StepRunOutput(
+            card={"kind": "node-test", "status": self.result["status_line"]},
+            derived=dict(self.result),
+        )

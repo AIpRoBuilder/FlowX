@@ -7,13 +7,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, TYPE_CHECKING
 
-from ag_ui_workflow import WorkflowOperationNode
-from pydaograph import CStatus, GPipeline  # pyright: ignore[reportMissingImports]
+from ag_ui_workflow import StepRunOutput, WorkflowStepNode
 
 from flowx_core.llm_client.coder import MAX_TOKENS
 from flowx_core.runtime import RunNodeTest
 from flowx_core.tools.file_tools import compile_node_file_and_get_step_output_card_schema
 from flowx_core.tools.runnable_gnode import run_gnode_operation
+from flowx_core.tools.workflow_engine import (
+    build_workflow_config,
+    init_workflow_engine,
+    run_workflow_step,
+)
 from flowx_core.tools.workflow_node_reference import resolve_workflow_node_reference
 
 
@@ -158,20 +162,32 @@ class NodeGenerationWorker:
             raise RuntimeError(f"node generation failed for {self.node_name}: {exc}") from exc
 
 
-class _NodeGenerationNode(WorkflowOperationNode):
-    """Workflow operation wrapper for a cached generation worker."""
+class _NodeGenerationNode(WorkflowStepNode):
+    """Workflow step wrapper for a cached generation worker."""
+
+    INPUT_REQUIRED = False
 
     def __init__(self, worker: NodeGenerationWorker) -> None:
         super().__init__()
         self.worker = worker
 
-    def run(self) -> Any:
-        try:
-            self.worker.generate()
-            self.worker.builder._advance_progress(f"Generated node: {self.worker.node_name}")
-            return CStatus()
-        except Exception as exc:
-            return CStatus(1001, f"node generation failed for {self.worker.node_name}: {exc}")
+    def _generate(self) -> str:
+        generated_path = self.worker.generate()
+        self.worker.builder._advance_progress(f"Generated node: {self.worker.node_name}")
+        return generated_path
+
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        del user_input, dependency_results, session_state
+        generated_path = self._generate()
+        return StepRunOutput(
+            card={"kind": "node-generation", "status": "completed"},
+            derived={"generated_path": generated_path},
+        )
 
 
 @dataclass
@@ -428,9 +444,9 @@ class NodeBuildService:
         if not ordered_names:
             return []
 
-        pipeline = GPipeline()
         workers: Dict[str, NodeGenerationWorker] = {}
         pipeline_nodes: Dict[str, _NodeGenerationNode] = {}
+        dependencies: Dict[str, list[str]] = {}
         selected_names = set(ordered_names)
         total = len(ordered_names)
 
@@ -446,19 +462,17 @@ class NodeBuildService:
             pipeline_nodes[node_name] = _NodeGenerationNode(worker)
 
         for node_name in ordered_names:
-            dep_nodes = {
-                pipeline_nodes[dep_name]
+            dependencies[node_name] = [
+                dep_name
                 for dep_name in planned_graph.get_node_dependencies(node_name)
                 if dep_name in selected_names
-            }
-            status = pipeline.registerGElement(pipeline_nodes[node_name], dep_nodes, node_name, 1)
-            if status.isErr():
-                raise RuntimeError(f"registerGElement failed for {node_name}: {status.getInfo()}")
+            ]
 
         self.builder._start_progress(total)
-        process_status = pipeline.process()
-        if process_status.isErr():
-            raise RuntimeError(f"node generation pipeline failed: {process_status.getInfo()}")
+        config = build_workflow_config(pipeline_nodes, dependencies)
+        engine = init_workflow_engine(config)
+        for node_name in pipeline_nodes:
+            run_workflow_step(engine, node_name)
 
         return [
             self.builder.node_location_map[name]
@@ -1159,11 +1173,9 @@ class RuntimeService:
                     run_subprocess=self.builder._run_subprocess,
                     timeout_expired=self.builder._subprocess_timeout_expired(),
                 )
-                status = run_node_test.run()
-                if status.isErr() or run_node_test.result is None:
-                    raise RuntimeError(
-                        f"node test runner failed for {node_name}: {status.getInfo()}"
-                    )
+                run_node_test.process_input("", {}, {})
+                if run_node_test.result is None:
+                    raise RuntimeError(f"node test runner produced no result for {node_name}")
 
                 result_item = run_node_test.result
                 overall_ok = overall_ok and result_item["ok"]

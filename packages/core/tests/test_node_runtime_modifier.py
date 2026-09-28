@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from ag_ui_workflow import WorkflowOperationNode
+from ag_ui_workflow import WorkflowStepNode
 
 from flowx_core.runtime import RunNodeTest
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
@@ -16,7 +16,7 @@ from flowx_core.workflows.node_runtime_modifier import (
 
 class _TestWriter(GenerateNodeTestFile):
     def __init__(self) -> None:
-        WorkflowOperationNode.__init__(self)
+        WorkflowStepNode.__init__(self)
         self.calls: list[tuple[str, str]] = []
 
     def write_test_from_node_file(self, node_file_path: str, output_path: str) -> Path:
@@ -28,7 +28,7 @@ class _TestWriter(GenerateNodeTestFile):
 
 class _NodeWriter(AmendNodeFromTestLog):
     def __init__(self) -> None:
-        WorkflowOperationNode.__init__(self)
+        WorkflowStepNode.__init__(self)
         self.calls: list[dict[str, object]] = []
 
     def amend_code_with_feedback(
@@ -53,6 +53,9 @@ def test_node_runtime_modifier_stages_inherit_their_operational_components() -> 
     assert issubclass(GenerateNodeTestFile, PromptNodeTestFileCoder)
     assert issubclass(ExecuteNodeTest, RunNodeTest)
     assert issubclass(AmendNodeFromTestLog, PromptNodeFileCoderBase)
+    assert "process_input" in GenerateNodeTestFile.__dict__
+    assert "process_input" in ExecuteNodeTest.__dict__
+    assert "process_input" in AmendNodeFromTestLog.__dict__
 
 
 def test_node_runtime_modifier_generates_runs_and_amends_from_test_log(tmp_path: Path) -> None:

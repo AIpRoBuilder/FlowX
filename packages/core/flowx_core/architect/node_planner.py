@@ -2,7 +2,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-from pydaograph import CStatus, GElement, GPipeline
+from ag_ui_workflow import StepRunOutput, WorkflowStepNode
 
 from flowx_core._paths import bootstrap_package_root
 from flowx_core.tools.workflow_node_reference import (
@@ -17,13 +17,20 @@ ROOT_DIR = bootstrap_package_root(__file__)
 
 from flowx_core.llm_client.coder import Coder, MAX_TOKENS, append_instruction_block
 from flowx_core.tools.runnable_gnode import RunnableGNode, run_gnode_operation
+from flowx_core.tools.workflow_engine import (
+	build_workflow_config,
+	init_workflow_engine,
+	run_workflow_step,
+)
 
 
 def _method_list_text(method_signatures: list[str]) -> str:
 	return ", ".join(method_signatures) if method_signatures else "none"
 
 
-class _NodePlanElement(GElement):
+class _NodePlanElement(WorkflowStepNode):
+	INPUT_REQUIRED = False
+
 	def __init__(
 		self,
 		planner: "NodePlanner",
@@ -66,26 +73,29 @@ class _NodePlanElement(GElement):
 			f"{node_context}\n"
 		)
 
-	def run(self) -> CStatus:
-		try:
-			node_name = str(self.node.get("name", "")).strip() or f"Node{self.index}"
-			node_context     = self.planner._node_context(self.node, self.index)
-			node_file = self.target_dir / self.planner._node_filename(self.node, self.index)
+	def process_input(
+		self,
+		user_input: str,
+		dependency_results: dict[str, StepRunOutput],
+		session_state: dict[str, Any],
+	) -> StepRunOutput:
+		del user_input, dependency_results, session_state
+		node_name = str(self.node.get("name", "")).strip() or f"Node{self.index}"
+		node_context = self.planner._node_context(self.node, self.index)
+		node_file = self.target_dir / self.planner._node_filename(self.node, self.index)
 
-			user_prompt = self._build_node_prompt(self.requirement_text, node_context)
-			written = run_gnode_operation(
-				self.planner,
-				"code_to_file",
-				user_prompt,
-				str(node_file),
-				overwrite=self.overwrite,
-				temperature=self.temperature,
-				max_tokens=self.max_tokens,
-			)
-			self.outputs[node_name] = written
-			return CStatus()
-		except Exception as exc:
-			return CStatus(1001, f"node planning failed for index {self.index}: {exc}")
+		user_prompt = self._build_node_prompt(self.requirement_text, node_context)
+		written = run_gnode_operation(
+			self.planner,
+			"code_to_file",
+			user_prompt,
+			str(node_file),
+			overwrite=self.overwrite,
+			temperature=self.temperature,
+			max_tokens=self.max_tokens,
+		)
+		self.outputs[node_name] = written
+		return StepRunOutput(derived={"output_path": str(written)})
 
 
 @dataclass
@@ -482,9 +492,9 @@ class NodePlanner(RunnableGNode):
 		target_dir = Path(output_dir)
 		target_dir.mkdir(parents=True, exist_ok=True)
 
-		pipeline = GPipeline()
 		node_entries: list[tuple[int, dict[str, Any], str]] = []
 		elements: dict[str, _NodePlanElement] = {}
+		dependencies: dict[str, list[str]] = {}
 		node_outputs: dict[str, Path] = {}
 
 		for index, node in enumerate(nodes, start=1):
@@ -502,17 +512,15 @@ class NodePlanner(RunnableGNode):
 				outputs=node_outputs,
 			)
 
-		for index, node, node_name in node_entries:
+		for _index, node, node_name in node_entries:
 			depends = node.get("depends", [])
 			dep_names = depends if isinstance(depends, list) else []
-			dep_elements = {elements[dep_name] for dep_name in dep_names if dep_name in elements}
-			status = pipeline.registerGElement(elements[node_name], dep_elements, node_name, 1)
-			if status.isErr():
-				raise RuntimeError(f"registerGElement failed for {node_name}: {status.getInfo()}")
+			dependencies[node_name] = [dep_name for dep_name in dep_names if dep_name in elements]
 
-		process_status = pipeline.process()
-		if process_status.isErr():
-			raise RuntimeError(f"plan_each pipeline.process failed: {process_status.getInfo()}")
+		config = build_workflow_config(elements, dependencies)
+		engine = init_workflow_engine(config)
+		for node_name in elements:
+			run_workflow_step(engine, node_name)
 
 		output_paths: list[Path] = []
 		for index, _node, node_name in node_entries:
@@ -672,9 +680,7 @@ class NodePlanner(RunnableGNode):
 			max_tokens=max_tokens,
 			outputs=outputs,
 		)
-		status = element.run()
-		if status.isErr():
-			raise RuntimeError(f"node plan regeneration failed for '{node_name}': {status.getInfo()}")
+		element.process_input("", {}, {})
 
 		written = outputs.get(node_name)
 		if written is None:

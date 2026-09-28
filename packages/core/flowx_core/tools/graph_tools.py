@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Set, Tuple
 
-from pydaograph import GPipeline, GParam, register_class
+from pydaograph import GParam, register_class
 
 
 PIPELINE_ID_GPARAM_KEY = "pipeline.id"
@@ -22,7 +22,7 @@ class PipelineIdParam(GParam):
 
 
 def set_pipeline_id(
-    pipeline: GPipeline,
+    pipeline: Any,
     pipeline_id: str,
     key: str = PIPELINE_ID_GPARAM_KEY,
 ):

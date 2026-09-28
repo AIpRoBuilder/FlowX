@@ -651,10 +651,11 @@ def test_get_node_input_output_formats_collects_inputs_and_backend_card_schema(m
         encoding="utf-8",
     )
     (tmp_path / "Summarize.py").write_text(
-        "class Summarize(WorkflowOperationNode):\n"
+        "class Summarize(WorkflowStepNode):\n"
         "    STEP_ID = 'Summarize'\n"
         "    TITLE = 'Summarize'\n"
-        "    def process_operation(self, dependency_results, session_state):\n"
+        "    INPUT_REQUIRED = False\n"
+        "    def process_input(self, user_input, dependency_results, session_state):\n"
         "        return StepRunOutput(card={'kind': 'report', 'status': 'done'})\n",
         encoding="utf-8",
     )

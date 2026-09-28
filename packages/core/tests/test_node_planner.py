@@ -70,11 +70,11 @@ def test_node_context_omits_legacy_service_metadata(tmp_path) -> None:
 		1,
 	)
 
-	assert "- meta_node_kind: WorkflowOperationNode" in context
-	assert "recommended base class: WorkflowOperationNode" in context
-	assert "main utility methods: process_operation(dependency_results, session_state)" in context
-	assert "StepRunOutput schema methods: process_operation(dependency_results, session_state)" in context
-	assert "subclass implementation hooks: process_operation(dependency_results, session_state)" in context
+	assert "- meta_node_kind: WorkflowStepNode" in context
+	assert "recommended base class: WorkflowStepNode" in context
+	assert "main utility methods: process_input(user_input, dependency_results, session_state)" in context
+	assert "StepRunOutput schema methods: process_input(user_input, dependency_results, session_state)" in context
+	assert "subclass implementation hooks: process_input(user_input, dependency_results, session_state)" in context
 	assert "service_name" not in context
 	assert "- services:" not in context
 
