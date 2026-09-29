@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from ag_ui_workflow import WorkflowStepNode
 
 from flowx_core.runtime import RunNodeTest
@@ -19,7 +20,12 @@ class _TestWriter(GenerateNodeTestFile):
         WorkflowStepNode.__init__(self)
         self.calls: list[tuple[str, str]] = []
 
-    def write_test_from_node_file(self, node_file_path: str, output_path: str) -> Path:
+    def write_test_from_node_file(
+        self,
+        node_file_path: str,
+        output_path: str,
+        **_kwargs: object,
+    ) -> Path:
         self.calls.append((node_file_path, output_path))
         target = Path(output_path)
         target.write_text("def test_generated():\n    assert True\n", encoding="utf-8")
@@ -83,17 +89,21 @@ def test_node_runtime_modifier_generates_runs_and_amends_from_test_log(tmp_path:
         working_directory=str(tmp_path),
         python_command="/custom/python",
         timeout=15,
+        workflow_name="orders",
+        node_name="LogicalNode",
+        test_file_name="tests/orders/test_LogicalNode.py",
+        log_file_name="logs/orders/LogicalNode.log",
     )
 
     assert modifier.json_config()["nodes"][1]["depends"] == ["generate_node_test"]
     assert test_writer.calls == [
-        (str(node_file), str(tmp_path / "tests" / "test_ExampleNode.py"))
+        (str(node_file), str(tmp_path / "tests" / "orders" / "test_LogicalNode.py"))
     ]
     assert observed_command == [
         "/custom/python",
         "-m",
         "pytest",
-        str(tmp_path / "tests" / "test_ExampleNode.py"),
+        str(tmp_path / "tests" / "orders" / "test_LogicalNode.py"),
         "-q",
     ]
     assert context.test_result is not None
@@ -104,11 +114,14 @@ def test_node_runtime_modifier_generates_runs_and_amends_from_test_log(tmp_path:
             "code_path": str(node_file),
             "amendment": context.test_log,
             "graph_plan_path": str(tmp_path / "workflow.json"),
-            "current_node_name": "ExampleNode",
+            "current_node_name": "LogicalNode",
+            "temperature": 0.3,
         }
     ]
     assert Path(context.amended_node_file_path) == node_file
     assert node_file.read_text(encoding="utf-8") == "# amended node\n"
+    assert context.workflow_name == "orders"
+    assert context.node_name == "LogicalNode"
 
 
 def test_node_runtime_modifier_can_skip_every_stage(tmp_path: Path) -> None:
@@ -141,3 +154,23 @@ def test_node_runtime_modifier_can_skip_every_stage(tmp_path: Path) -> None:
     assert node_writer.calls == []
     assert Path(context.amended_node_file_path) == node_file
     assert node_file.read_text(encoding="utf-8") == "# original node\n"
+
+
+def test_node_runtime_modifier_requires_existing_test_when_generation_is_disabled(tmp_path: Path) -> None:
+    (tmp_path / "ExampleNode.py").write_text("# original node\n", encoding="utf-8")
+    test_writer = _TestWriter()
+    modifier = NodeRuntimeModifierPipeline(
+        node_test_writer=test_writer,
+        node_writer=_NodeWriter(),
+    )
+
+    with pytest.raises(FileNotFoundError, match="Skipped node test generation requires an existing test file"):
+        modifier.run(
+            node_file_name="ExampleNode.py",
+            workflow_graph={"nodes": [{"name": "ExampleNode", "depends": []}]},
+            working_directory=str(tmp_path),
+            skip_generate_node_test=True,
+            skip_amend_node=True,
+        )
+
+    assert test_writer.calls == []

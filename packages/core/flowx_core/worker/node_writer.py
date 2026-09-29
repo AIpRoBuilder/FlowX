@@ -172,6 +172,7 @@ class PromptNodeFileCoderBase(Coder):
     root_dir_path: str = ""
     context_text: str = ""
     ancestor_session_state_context_text: str = ""
+    additional_generation_context: str = ""
 
     def __post_init__(self) -> None:
         prompt_file = ROOT_DIR / self.prompt_path
@@ -373,6 +374,11 @@ class PromptNodeFileCoderBase(Coder):
                 f"\n\nReturn only runnable {language_clean} code for this node."
                 " Do not include markdown fences or explanation text."
             )
+        if self.additional_generation_context.strip():
+            user_prompt += (
+                "\n\nAdditional node-generation context (authoritative; preserve the current node contract):\n"
+                f"{self.additional_generation_context}\n"
+            )
 
         return user_prompt
 
@@ -463,6 +469,11 @@ class PromptNodeFileCoderBase(Coder):
                 "- If audit reports dependency_results_missing_dependency_keys or session_state_ancestor_key_invalid, treat missing variables as potential config variables.\n"
                 "- Add/ensure class-level DEFAULT_CONFIG = { ... } in the node file with placeholders for those missing keys.\n"
                 "- If the value is still missing/invalid after resolution attempts, return an explicit validation error.\n"
+            )
+        if self.additional_generation_context.strip():
+            user_prompt += (
+                "\n\nAdditional node-generation context (authoritative; preserve the current node contract):\n"
+                f"{self.additional_generation_context}\n"
             )
 
         return user_prompt

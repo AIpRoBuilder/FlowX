@@ -516,10 +516,12 @@ def _next_user_input_step(handle: Any) -> Optional[dict[str, Any]]:
 
 
 def _input_nodes_summary(handle: Any) -> list[dict[str, Any]]:
+    from flowx_core.tools.node_formats import collect_node_formats
+
     with _capture_builder_output("get_node_input_formats"):
-        formats = handle.builder.get_node_input_output_formats(
-            graph_plan_path=handle.graph_plan_path,
-            backend_language="python",
+        formats = collect_node_formats(
+            handle.builder,
+            handle.builder._load_planned_graph(handle.graph_plan_path),
         )
 
     nodes: list[dict[str, Any]] = []
@@ -675,13 +677,14 @@ def create_server() -> Any:
                     graph_plan_filename="workflow.json",
                     temperature=temperature,
                 )
-            with _capture_builder_output("create_workflow.update_backend_nodes"):
-                artifacts = handle.builder.update_backend_nodes(
+            with _capture_builder_output("create_workflow.generate_nodes"):
+                generated_paths = handle.builder.generate_nodes(
                     graph_plan_path=graph_path,
                     requirement_md_path=req_path,
-                    node_docs_dirname="node_docs",
                     language="python",
                     temperature=temperature,
+                    generate_markdowns=True,
+                    workflow_name=workflow,
                 )
             with _capture_builder_output("create_workflow.sync_workflow_json"):
                 workflow_json_path = handle.builder._sync_workflow_graph_json(
@@ -708,7 +711,11 @@ def create_server() -> Any:
                 "graph_plan_path": handle.graph_plan_path,
                 "workflow_json_path": workflow_json_path or handle.workflow_json_path,
                 "main_entrypoint": str(main_entrypoint) or handle.main_entrypoint_path,
-                "backend_nodes": artifacts.get("backend_nodes", {}),
+                "backend_nodes": {
+                    "existing": {},
+                    "generated": {Path(path).stem: path for path in generated_paths},
+                    "all": {Path(path).stem: path for path in generated_paths},
+                },
                 "input_nodes": input_nodes,
             }
 
@@ -749,21 +756,18 @@ def create_server() -> Any:
                     workflow_json_path=handle.workflow_json_path or handle.graph_plan_path or None,
                     temperature=temperature,
                 )
-            with _capture_builder_output("update_workflow_node.amend_node_markdown"):
-                node_doc_path = handle.builder.amend_node_markdown(
-                    node_name=node,
-                    amendment=amendment,
+            with _capture_builder_output("update_workflow_node.generate_node"):
+                regenerated_paths = handle.builder.generate_nodes(
                     requirement_md_path=handle.requirement_md_path or None,
                     graph_plan_path=amended_workflow_json_path or handle.graph_plan_path or None,
+                    node_names=[node],
                     temperature=temperature,
+                    generate_markdowns=True,
+                    markdown_amendments={node: amendment},
+                    workflow_name=handle.workflow_name,
                 )
-            with _capture_builder_output("update_workflow_node.generate_node"):
-                regenerated_paths = handle.builder._generate_selected_nodes(
-                    [node],
-                    language="python",
-                    temperature=temperature,
-                    reset_mappings=False,
-                )
+            generation_context = handle.builder._node_build_service.workflows[handle.workflow_name].context
+            node_doc_path = generation_context.artifacts[node]["node_markdown_path"]
             with _capture_builder_output("update_workflow_node.sync_workflow_json"):
                 workflow_json_path = handle.builder._sync_workflow_graph_json(
                     context_base_dir=handle.root_dir

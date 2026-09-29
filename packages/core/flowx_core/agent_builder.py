@@ -1,7 +1,6 @@
 from typing import Optional, List, Dict, Any, Mapping
 import os
 import subprocess
-import json
 from pathlib import Path
 
 from flowx_core.architect import GraphPlanner, NodePlanner, Graph
@@ -11,10 +10,11 @@ from flowx_core.builder_services import (
     GraphBuildService,
     MainEntrypointService,
     NodeBuildService,
+    NodeArtifactService,
     RuntimeService,
     build_steps_meta,
 )
-from flowx_core.llm_client.coder import MAX_TOKENS, compose_session_marking_prompt
+from flowx_core.llm_client.coder import compose_session_marking_prompt
 from flowx_core.worker.main_writer import PromptMainFileCoder
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import (
@@ -90,6 +90,7 @@ class AgentBuilder:
         self.output_auditor = OutputAuditor()
         self._graph_build_service = GraphBuildService(self)
         self._node_build_service = NodeBuildService(self)
+        self._node_artifact_service = NodeArtifactService(self)
         self._main_entrypoint_service = MainEntrypointService(self)
         self._runtime_service = RuntimeService(self)
 
@@ -164,14 +165,6 @@ class AgentBuilder:
     @node_doc_paths.setter
     def node_doc_paths(self, value: List[str]) -> None:
         self._session.node_doc_paths = value
-
-    @property
-    def last_amended_node_doc_path(self) -> Optional[str]:
-        return self._session.last_amended_node_doc_path
-
-    @last_amended_node_doc_path.setter
-    def last_amended_node_doc_path(self, value: Optional[str]) -> None:
-        self._session.last_amended_node_doc_path = value
 
     @property
     def log_path(self) -> Optional[str]:
@@ -289,6 +282,7 @@ class AgentBuilder:
             self.provider = provider
         self._logger.info("Resetting LLM configuration.")
         self._reset_llm_components()
+        self._node_artifact_service.modifiers.clear()
 
     def _make_node_coder(self, node_meta: Any) -> PromptNodeFileCoderBase:
         return self._component_factory.create_node_coder(
@@ -346,23 +340,6 @@ class AgentBuilder:
         requirement_path = Path(self.requirement_md_path).expanduser().resolve()
         return requirement_path.read_text(encoding="utf-8")
 
-    def _read_graph_plan_payload(self) -> Dict[str, Any]:
-        self._load_planned_graph()
-        graph_path = Path(self.graph_plan_path).expanduser().resolve()
-        return json.loads(graph_path.read_text(encoding="utf-8"))
-
-    def _build_filtered_graph_plan_payload(self, node_names: List[str]) -> Dict[str, Any]:
-        graph_payload = self._read_graph_plan_payload()
-        requested_names = {name for name in node_names if isinstance(name, str) and name.strip()}
-        nodes = graph_payload.get("nodes", []) if isinstance(graph_payload, dict) else []
-        if not isinstance(nodes, list):
-            raise ValueError("graph_plan JSON must contain a top-level 'nodes' list.")
-        graph_payload["nodes"] = [
-            node for node in nodes
-            if isinstance(node, Mapping) and str(node.get("name", "")).strip() in requested_names
-        ]
-        return graph_payload
-
     def _sync_workflow_graph_json(self, context_base_dir: Optional[str] = None) -> str:
         return self._main_entrypoint_service.sync_workflow_graph_json(
             context_base_dir=context_base_dir,
@@ -374,13 +351,6 @@ class AgentBuilder:
     @staticmethod
     def _supports_backend_node_tests(language: str = "python") -> bool:
         return get_language_extension(language) == ".py"
-
-    def _expected_backend_node_test_path(self, node_name: str, language: str = "python") -> Path:
-        if not self._supports_backend_node_tests(language):
-            raise ValueError(
-                f"single-node test generation is only supported for Python backend nodes, got: {language}"
-            )
-        return (self._resolve_backend_node_base_dir() / "tests" / f"test_{node_name}.py").resolve()
 
     def _ensure_node_coder(self, node_name: str) -> Optional[PromptNodeFileCoderBase]:
         if not node_name:
@@ -432,49 +402,6 @@ class AgentBuilder:
             str(self._expected_backend_node_path(node_name, language)),
         )
         return coder, self.node_location_map[node_name]
-
-    def _generate_selected_nodes(
-        self,
-        node_names: List[str],
-        *,
-        language: str = "python",
-        temperature: float = 0.35,
-        reset_mappings: bool = False,
-    ) -> List[str]:
-        return self._node_build_service.generate_selected_nodes(
-            node_names,
-            language=language,
-            temperature=temperature,
-            reset_mappings=reset_mappings,
-        )
-
-    def _generate_selected_node_tests(
-        self,
-        node_names: List[str],
-        *,
-        language: str = "python",
-        temperature: float = 0.2,
-    ) -> List[str]:
-        return self._node_build_service.generate_selected_node_tests(
-            node_names,
-            language=language,
-            temperature=temperature,
-        )
-
-    def _run_selected_node_tests(
-        self,
-        node_names: List[str],
-        *,
-        language: str = "python",
-        log_filename: str = "node_test_log.txt",
-        timeout: int = 60,
-    ) -> Dict[str, Any]:
-        return self._runtime_service.run_selected_node_tests(
-            node_names,
-            language=language,
-            log_filename=log_filename,
-            timeout=timeout,
-        )
 
     def _validate_generated_artifacts(
         self,
@@ -583,120 +510,57 @@ class AgentBuilder:
         requirement_md_path: Optional[str] = None,
         language: str = "python",
         temperature: float = 0.35,
-    ) -> List[str]:
-        return self._node_build_service.generate_nodes(
-            graph_plan_path=graph_plan_path,
-            requirement_md_path=requirement_md_path,
-            language=language,
-            temperature=temperature,
-        )
-
-    def generate_node_tests(
-        self,
-        graph_plan_path: Optional[str] = None,
-        backend_language: str = "python",
-        temperature: float = 0.2,
-    ) -> List[str]:
-        return self._node_build_service.generate_node_tests(
-            graph_plan_path=graph_plan_path,
-            backend_language=backend_language,
-            temperature=temperature,
-        )
-
-    def run_node_tests(
-        self,
-        graph_plan_path: Optional[str] = None,
         node_names: Optional[List[str]] = None,
-        backend_language: str = "python",
-        log_filename: str = "node_test_log.txt",
-        timeout: int = 60,
-    ) -> Dict[str, Any]:
-        """Run generated per-node pytest files and write summary plus per-node logs."""
-        return self._runtime_service.run_node_tests(
-            graph_plan_path=graph_plan_path,
-            node_names=node_names,
-            backend_language=backend_language,
-            log_filename=log_filename,
-            timeout=timeout,
-        )
-
-    def generate_node_markdowns(
-        self,
-        requirement_md_path: str,
-        graph_plan_path: str,
-        output_dirname: str = "node_docs",
-        temperature: float = 0.2,
+        run_nodes: Optional[List[str] | Mapping[str, bool]] = None,
+        generate_markdowns: bool = False,
+        markdown_amendments: Optional[Mapping[str, str]] = None,
+        node_amendments: Optional[Mapping[str, str]] = None,
+        workflow_requests: Optional[Mapping[str, Any]] = None,
+        workflow_registry: Optional[Mapping[str, Any]] = None,
+        workflow_name: str = "default",
     ) -> List[str]:
-        return self._node_build_service.generate_node_markdowns(
-            requirement_md_path=requirement_md_path,
+        if requirement_md_path:
+            self.requirement_md_path = requirement_md_path
+        if not self.requirement_md_path:
+            raise ValueError("requirement_md_path is not set. Call analyze_requirement(...) first or pass requirement_md_path.")
+        planned_graph = self._load_planned_graph(graph_plan_path)
+        context = self._node_build_service.get_or_create_workflow(workflow_name).run(
             graph_plan_path=graph_plan_path,
-            output_dirname=output_dirname,
-            temperature=temperature,
-        )
-
-    def update_nodes_plan(
-        self,
-        graph_plan_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        node_docs_dirname: str = "node_docs",
-        temperature: float = 0.2,
-        max_tokens: int = MAX_TOKENS,
-    ) -> Dict[str, Any]:
-        return self._node_build_service.update_nodes_plan(
-            graph_plan_path=graph_plan_path,
-            requirement_md_path=requirement_md_path,
-            node_docs_dirname=node_docs_dirname,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-
-    def update_backend_nodes(
-        self,
-        graph_plan_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        node_docs_dirname: str = "node_docs",
-        language: str = "python",
-        temperature: float = 0.3,
-    ) -> Dict[str, Any]:
-        return self._node_build_service.update_backend_nodes(
-            graph_plan_path=graph_plan_path,
-            requirement_md_path=requirement_md_path,
-            node_docs_dirname=node_docs_dirname,
+            requirement_md_path=self.requirement_md_path,
+            node_names=(
+                planned_graph.get_topological_sorted_nodes()
+                if node_names is None
+                else node_names
+            ),
+            run_nodes=run_nodes,
             language=language,
             temperature=temperature,
+            reset_mappings=node_names is None,
+            generate_markdowns=generate_markdowns,
+            markdown_amendments=markdown_amendments,
+            node_amendments=node_amendments,
+            workflow_requests=workflow_requests,
+            workflow_registry=workflow_registry,
         )
-
-    def get_node_input_output_formats(
-        self,
-        graph_plan_path: Optional[str] = None,
-        backend_language: str = "python",
-    ) -> Dict[str, Dict[str, Any]]:
-        return self._node_build_service.get_node_input_output_formats(
-            graph_plan_path=graph_plan_path,
-            backend_language=backend_language,
-        )
-
-    def update_nodes(
-        self,
-        graph_plan_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        node_docs_dirname: str = "node_docs",
-        language: str = "python",
-        temperature: float = 0.3,
-        context_base_dir: Optional[str] = None,
-        backend_port: int = 8000,
-        main_output_filename: str = "main.py",
-    ) -> Dict[str, Any]:
-        return self._node_build_service.update_nodes(
-            graph_plan_path=graph_plan_path,
-            requirement_md_path=requirement_md_path,
-            node_docs_dirname=node_docs_dirname,
-            language=language,
-            temperature=temperature,
-            context_base_dir=context_base_dir,
-            backend_port=backend_port,
-            main_output_filename=main_output_filename,
-        )
+        generated_paths = [
+            self.node_location_map[name]
+            for name in context.selected_node_names
+            if name in self.node_location_map
+        ]
+        if self._supports_backend_node_tests(language):
+            for node_name in context.selected_node_names:
+                self._node_artifact_service.run_modifier(
+                    workflow_name=workflow_name,
+                    node_name=node_name,
+                    graph_plan_path=context.graph_plan_path,
+                    generate_test=True,
+                    run_test=False,
+                    amend_node=False,
+                    temperature=temperature,
+                )
+        elif workflow_name == "default":
+            self.dynamic_graph_cache["node_tests"] = {}
+        return generated_paths
 
     def rerun_server(
         self,
@@ -712,30 +576,6 @@ class AgentBuilder:
             backend_language=backend_language,
             main_entrypoint_path=main_entrypoint_path,
             backend_port=backend_port,
-        )
-
-    def amend_node_markdown(
-        self,
-        node_name: str,
-        amendment: str,
-        existing_markdown_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        graph_plan_path: Optional[str] = None,
-        output_path: Optional[str] = None,
-        temperature: float = 0.2,
-        max_tokens: int = MAX_TOKENS,
-        overwrite: bool = True,
-    ) -> str:
-        return self._node_build_service.amend_node_markdown(
-            node_name=node_name,
-            amendment=amendment,
-            existing_markdown_path=existing_markdown_path,
-            requirement_md_path=requirement_md_path,
-            graph_plan_path=graph_plan_path,
-            output_path=output_path,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            overwrite=overwrite,
         )
 
     def _build_steps_meta(self, include_hidden_nodes: bool = False) -> List[Dict[str, Any]]:

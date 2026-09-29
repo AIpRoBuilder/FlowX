@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import flowx_core.agent_builder as agent_builder_module
 from flowx_core.agent_builder import AgentBuilder
+from flowx_core.tools.node_formats import collect_node_formats
+import flowx_core.workflows.node_runtime_modifier as node_runtime_modifier_module
 
 
 class _FakeComponent:
@@ -45,203 +47,19 @@ def test_builder_session_splits_artifact_and_runtime_state(monkeypatch, tmp_path
     builder.node_docs_dir = str(tmp_path / "node_docs")
     builder.log_path = str(tmp_path / "runtime.log")
     builder.backend_server_process = process
-    builder.dynamic_graph_cache["node_plans"] = {"NodeA": "NodeA.md"}
+    builder.dynamic_graph_cache["node_tests"] = {"NodeA": "test_NodeA.py"}
     builder.dynamic_graph_cache["server_runtime"] = {"pid": 99}
 
     assert builder.artifact_state.graph_plan_path == str(tmp_path / "workflow.json")
     assert builder.artifact_state.node_docs_dir == str(tmp_path / "node_docs")
     assert builder.runtime_state.log_path == str(tmp_path / "runtime.log")
     assert builder.runtime_state.backend_server_process is process
-    assert builder.artifact_state.dynamic_graph_cache["node_plans"] == {"NodeA": "NodeA.md"}
+    assert builder.artifact_state.dynamic_graph_cache["node_tests"] == {"NodeA": "test_NodeA.py"}
     assert builder.runtime_state.dynamic_graph_cache["server_runtime"] == {"pid": 99}
 
 
 def _write_graph(graph_path: Path, nodes: list[dict]) -> None:
     graph_path.write_text(json.dumps({"nodes": nodes}, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def test_update_nodes_plan_preserves_existing_files_and_generates_only_missing(monkeypatch, tmp_path):
-    builder = _make_builder(monkeypatch, tmp_path)
-
-    requirement_path = tmp_path / "requirement.md"
-    requirement_path.write_text("# Requirement\n", encoding="utf-8")
-    graph_path = tmp_path / "graph_plan.json"
-    _write_graph(
-        graph_path,
-        [
-            {
-                "name": "ExistingNode",
-                "type": "WorkflowStepNode",
-                "desc": "existing",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "none", "desc": "none"},
-            },
-            {
-                "name": "AddedNode",
-                "type": "WorkflowStepNode",
-                "desc": "added",
-                "enable": True,
-                "depends": ["ExistingNode"],
-                "ext_data": {"type": "none", "desc": "none"},
-            },
-            {
-                "name": "HiddenNode",
-                "type": "WorkflowStepNode",
-                "desc": "hidden",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "none", "desc": "none"},
-            },
-        ],
-    )
-
-    existing_plan_path = tmp_path / "node_docs" / "ExistingNode.md"
-    existing_plan_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_plan_path.write_text("existing plan\n", encoding="utf-8")
-
-    class _FakeNodePlanner:
-        def __init__(self):
-            self.plan_payloads = []
-
-        def plan_each(self, *, requirement_text, graph_plan_text, output_dir, **kwargs):
-            payload = json.loads(graph_plan_text)
-            self.plan_payloads.append(payload)
-            written = []
-            for node in payload["nodes"]:
-                path = Path(output_dir) / f"{node['name']}.md"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"# {node['name']}\n", encoding="utf-8")
-                written.append(path)
-            return written
-
-    builder.node_planner = _FakeNodePlanner()
-    builder.requirement_md_path = str(requirement_path)
-    builder.graph_plan_path = str(graph_path)
-
-    result = builder.update_nodes_plan()
-
-    assert existing_plan_path.read_text(encoding="utf-8") == "existing plan\n"
-    assert (tmp_path / "node_docs" / "AddedNode.md").is_file()
-    assert (tmp_path / "node_docs" / "HiddenNode.md").is_file()
-    assert [node["name"] for node in builder.node_planner.plan_payloads[0]["nodes"]] == ["AddedNode", "HiddenNode"]
-    assert result["node_plan"]["existing"] == {"ExistingNode": str(existing_plan_path)}
-    assert set(result["node_plan"]["generated"]) == {"AddedNode", "HiddenNode"}
-    assert "node_ui" not in result
-    assert set(builder.dynamic_graph_cache["node_plans"]) == {"ExistingNode", "AddedNode", "HiddenNode"}
-
-
-def test_update_nodes_generates_only_missing_backend_nodes(monkeypatch, tmp_path):
-    builder = _make_builder(monkeypatch, tmp_path)
-
-    requirement_path = tmp_path / "requirement.md"
-    requirement_path.write_text("# Requirement\n", encoding="utf-8")
-    graph_path = tmp_path / "graph_plan.json"
-    _write_graph(
-        graph_path,
-        [
-            {
-                "name": "ExistingNode",
-                "type": "WorkflowStepNode",
-                "desc": "existing",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "none", "desc": "none"},
-            },
-            {
-                "name": "AddedNode",
-                "type": "WorkflowStepNode",
-                "desc": "added",
-                "enable": True,
-                "depends": ["ExistingNode"],
-                "ext_data": {"type": "none", "desc": "none"},
-            },
-        ],
-    )
-
-    (tmp_path / "node_docs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
-
-    (tmp_path / "node_docs" / "ExistingNode.md").write_text("existing plan\n", encoding="utf-8")
-    (tmp_path / "ExistingNode.py").write_text("class ExistingNode: ...\n", encoding="utf-8")
-    (tmp_path / "tests" / "test_ExistingNode.py").write_text("def test_existing_node():\n    assert True\n", encoding="utf-8")
-
-    class _FakeNodePlanner:
-        def plan_each(self, *, requirement_text, graph_plan_text, output_dir, **kwargs):
-            payload = json.loads(graph_plan_text)
-            written = []
-            for node in payload["nodes"]:
-                path = Path(output_dir) / f"{node['name']}.md"
-                path.write_text(f"# {node['name']}\n", encoding="utf-8")
-                written.append(path)
-            return written
-
-    backend_calls = []
-    node_test_calls = []
-    main_calls = []
-
-    def fake_generate_selected_nodes(node_names, *, language="python", temperature=0.3, reset_mappings=False):
-        backend_calls.append(list(node_names))
-        written = []
-        for node_name in node_names:
-            path = tmp_path / f"{node_name}.py"
-            path.write_text(f"class {node_name}: ...\n", encoding="utf-8")
-            written.append(str(path))
-        builder.node_location_map = {Path(path).stem: path for path in written}
-        return written
-
-    def fake_generate_main_entrypoint(graph_plan_path, output_filename="main.py", fastapi_host="0.0.0.0", temperature=0.0, fastapi_port=8000):
-        main_calls.append(
-            {
-                "graph_plan_path": graph_plan_path,
-                "output_filename": output_filename,
-                "fastapi_port": fastapi_port,
-            }
-        )
-        output_path = Path(output_filename)
-        if not output_path.is_absolute():
-            output_path = tmp_path / output_path
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("print('main')\n", encoding="utf-8")
-        builder.main_output_path = str(output_path)
-        return str(output_path)
-
-    def fake_generate_selected_node_tests(node_names, *, language="python", temperature=0.2):
-        node_test_calls.append(list(node_names))
-        written = []
-        for node_name in node_names:
-            path = tmp_path / "tests" / f"test_{node_name}.py"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"def test_{node_name.lower()}():\n    assert True\n", encoding="utf-8")
-            written.append(str(path))
-        return written
-
-    builder.node_planner = _FakeNodePlanner()
-    builder._generate_selected_nodes = fake_generate_selected_nodes
-    builder._generate_selected_node_tests = fake_generate_selected_node_tests
-    builder.generate_main_entrypoint = fake_generate_main_entrypoint
-    builder.requirement_md_path = str(requirement_path)
-    builder.graph_plan_path = str(graph_path)
-
-    result = builder.update_nodes(backend_port=8123)
-
-    assert backend_calls == [["AddedNode"]]
-    assert node_test_calls == [["AddedNode"]]
-    assert (tmp_path / "ExistingNode.py").read_text(encoding="utf-8") == "class ExistingNode: ...\n"
-    assert set(result["backend_nodes"]["generated"]) == {"AddedNode"}
-    assert result["node_tests"]["existing"] == {"ExistingNode": str(tmp_path / "tests" / "test_ExistingNode.py")}
-    assert set(result["node_tests"]["generated"]) == {"AddedNode"}
-    assert main_calls == [
-        {
-            "graph_plan_path": str(graph_path),
-            "output_filename": str(tmp_path / "main.py"),
-            "fastapi_port": 8123,
-        }
-    ]
-    assert json.loads((tmp_path / "workflow.json").read_text(encoding="utf-8"))["nodes"][1]["name"] == "AddedNode"
-    assert set(builder.dynamic_graph_cache["backend_nodes"]) == {"ExistingNode", "AddedNode"}
-    assert set(builder.dynamic_graph_cache["node_tests"]) == {"ExistingNode", "AddedNode"}
-    assert "node_ui" not in result
 
 
 def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp_path):
@@ -294,24 +112,15 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
     fake_node_coder = _FakeNodeCoder()
     generated_test_calls = []
 
-    def fake_generate_selected_node_tests(node_names, *, language="python", temperature=0.2):
-        generated_test_calls.append(
-            {
-                "node_names": list(node_names),
-                "language": language,
-                "temperature": temperature,
-            }
-        )
-        written = []
-        for node_name in node_names:
-            path = graph_dir / "tests" / f"test_{node_name}.py"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"def test_{node_name.lower()}():\n    assert True\n", encoding="utf-8")
-            written.append(str(path.resolve()))
-        return written
+    def fake_run_modifier(**kwargs):
+        generated_test_calls.append(kwargs)
+        path = graph_dir / "tests" / f"test_{kwargs['node_name']}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"def test_{kwargs['node_name'].lower()}():\n    assert True\n", encoding="utf-8")
+        return SimpleNamespace(test_file_path=str(path.resolve()))
 
     builder._make_node_coder = lambda node_meta: fake_node_coder
-    builder._generate_selected_node_tests = fake_generate_selected_node_tests
+    builder._node_artifact_service.run_modifier = fake_run_modifier
     builder.node_auditor = type(
         "_FakeNodeAuditor",
         (),
@@ -334,17 +143,18 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
     ]
     assert generated_test_calls == [
         {
-            "node_names": ["GeneratedNode"],
-            "language": "python",
+            "node_name": "GeneratedNode",
+            "workflow_name": "default",
+            "graph_plan_path": str(graph_path.resolve()),
+            "generate_test": True,
+            "run_test": False,
+            "amend_node": False,
             "temperature": 0.35,
         }
     ]
     assert expected_path.is_file()
     assert (graph_dir / "tests" / "test_GeneratedNode.py").is_file()
     assert builder.node_location_map == {"GeneratedNode": str(expected_path)}
-    assert builder.dynamic_graph_cache["node_tests"] == {
-        "GeneratedNode": str((graph_dir / "tests" / "test_GeneratedNode.py").resolve())
-    }
 
 
 def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeypatch, tmp_path):
@@ -405,35 +215,42 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
     builder.requirement_md_path = str(requirement_path)
     builder.graph_plan_path = str(graph_path)
 
-    generated_paths = builder._node_build_service.run_node_generation_pipeline(
-        ["SecondNode", "FirstNode"],
+    workflow = builder._node_build_service.get_or_create_workflow("default")
+    first_context = workflow.run(
+        node_names=["SecondNode", "FirstNode"],
         language="python",
         temperature=0.35,
         reset_mappings=True,
+        generate_markdowns=False,
     )
 
-    first_worker = builder._node_build_service.nodes["FirstNode"]
-    second_worker = builder._node_build_service.nodes["SecondNode"]
+    first_generator = workflow.nodes["FirstNode"]
+    second_generator = workflow.nodes["SecondNode"]
 
-    rerun_paths = builder._node_build_service.run_node_generation_pipeline(
-        ["FirstNode"],
+    second_context = workflow.run(
+        node_names=["FirstNode"],
         language="python",
         temperature=0.1,
         reset_mappings=False,
+        generate_markdowns=False,
     )
 
     assert fake_node_coder.write_calls == ["FirstNode", "SecondNode", "FirstNode"]
-    assert list(builder._node_build_service.nodes) == ["FirstNode", "SecondNode"]
-    assert builder._node_build_service.nodes["FirstNode"] is first_worker
-    assert builder._node_build_service.nodes["SecondNode"] is second_worker
-    assert first_worker.temperature == 0.1
-    assert first_worker.node_index == 1
-    assert second_worker.node_index == 2
-    assert [Path(path).stem for path in generated_paths] == ["FirstNode", "SecondNode"]
-    assert [Path(path).stem for path in rerun_paths] == ["FirstNode"]
+    assert builder._node_build_service.get_or_create_workflow("default") is workflow
+    assert builder._node_build_service.get_or_create_workflow("separate") is not workflow
+    assert list(workflow.nodes) == ["FirstNode", "SecondNode"]
+    assert workflow.nodes["FirstNode"] is first_generator
+    assert workflow.nodes["SecondNode"] is second_generator
+    assert first_generator.total == 1
+    assert first_generator.node_index == 1
+    assert second_generator.node_index == 2
+    assert [Path(builder.node_location_map[name]).stem for name in first_context.selected_node_names] == [
+        "FirstNode", "SecondNode"
+    ]
+    assert second_context.selected_node_names == ["FirstNode"]
 
 
-def test_cached_node_worker_can_amend_from_log_prompt(monkeypatch, tmp_path):
+def test_cached_node_generator_can_amend_from_log_prompt(monkeypatch, tmp_path):
     project_root = tmp_path / "project_root"
     graph_dir = tmp_path / "graph_dir"
     builder = _make_builder(monkeypatch, project_root)
@@ -488,19 +305,18 @@ def test_cached_node_worker_can_amend_from_log_prompt(monkeypatch, tmp_path):
     builder.requirement_md_path = str(requirement_path)
     builder.graph_plan_path = str(graph_path)
 
-    generated_paths = builder._node_build_service.generate_selected_nodes(
-        ["GeneratedNode"],
+    workflow = builder._node_build_service.get_or_create_workflow()
+    context = workflow.run(
+        node_names=["GeneratedNode"],
         reset_mappings=True,
+        generate_markdowns=False,
     )
-    worker = builder._node_build_service.nodes["GeneratedNode"]
+    generator = workflow.nodes["GeneratedNode"]
 
-    worker._current_coder = None
-    worker._current_resolved_file_path = None
-    builder.node_coder_map = {}
+    generator._amend("Traceback from node test log", 0)
 
-    worker._amend("Traceback from node test log", 0)
-
-    assert generated_paths == [str((graph_dir / "GeneratedNode.py").resolve())]
+    assert context.selected_node_names == ["GeneratedNode"]
+    assert generator.last_generated_path == str((graph_dir / "GeneratedNode.py").resolve())
     assert fake_node_coder.amend_calls == [
         {
             "file_path": str((graph_dir / "GeneratedNode.py").resolve()),
@@ -514,6 +330,163 @@ def test_cached_node_worker_can_amend_from_log_prompt(monkeypatch, tmp_path):
             },
         }
     ]
+
+
+def test_node_artifact_service_routes_test_update_by_workflow_and_node_names(monkeypatch, tmp_path):
+    builder = _make_builder(monkeypatch, tmp_path)
+    graph_path = tmp_path / "workflow.json"
+    _write_graph(
+        graph_path,
+        [
+            {
+                "name": "ExampleNode",
+                "type": "WorkflowStepNode",
+                "desc": "example",
+                "enable": True,
+                "depends": [],
+                "ext_data": {"type": "none", "desc": "none"},
+            }
+        ],
+    )
+    node_path = tmp_path / "ExampleNode.py"
+    node_path.write_text("# source\n", encoding="utf-8")
+    builder.graph_plan_path = str(graph_path)
+    builder.node_location_map["ExampleNode"] = str(node_path)
+
+    modifiers = {}
+
+    class _FakeModifier:
+        def __init__(self):
+            self.node_test_writer = SimpleNamespace(root_dir_path="")
+            self.node_writer = SimpleNamespace(root_dir_path="")
+            self.calls = []
+
+        def run(self, **kwargs):
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                test_file_path=str(tmp_path / "tests" / "billing" / "test_ExampleNode.py"),
+                log_file_path=str(tmp_path / "logs" / "billing" / "ExampleNode_test.log"),
+                test_result={"node_name": "ExampleNode", "ok": False},
+                amended_node_file_path=str(node_path),
+                skipped_stages=[],
+            )
+
+    def get_modifier(workflow_name, node_name):
+        key = (workflow_name, node_name)
+        modifiers.setdefault(key, _FakeModifier())
+        workflow_modifiers = builder._node_artifact_service.modifiers.setdefault(workflow_name, {})
+        return workflow_modifiers.setdefault(node_name, modifiers[key])
+
+    builder._node_artifact_service.get_or_create_modifier = get_modifier
+
+    context = builder._node_artifact_service.run_modifier(
+        workflow_name="billing",
+        node_name="ExampleNode",
+        graph_plan_path=str(graph_path),
+        timeout=17,
+    )
+
+    modifier = modifiers[("billing", "ExampleNode")]
+    assert context.test_file_path == str(tmp_path / "tests" / "billing" / "test_ExampleNode.py")
+    assert context.log_file_path == str(tmp_path / "logs" / "billing" / "ExampleNode_test.log")
+    assert context.test_result == {"node_name": "ExampleNode", "ok": False}
+    assert context.amended_node_file_path == str(node_path)
+    assert modifier.calls[0]["workflow_name"] == "billing"
+    assert modifier.calls[0]["node_name"] == "ExampleNode"
+    assert modifier.calls[0]["test_file_name"] == "tests/billing/test_ExampleNode.py"
+    assert modifier.calls[0]["log_file_name"] == "logs/billing/ExampleNode_test.log"
+    assert modifier.calls[0]["timeout"] == 17
+    assert modifier.calls[0]["skip_generate_node_test"] is False
+    assert modifier.calls[0]["skip_run_node_test"] is False
+    assert modifier.calls[0]["skip_amend_node"] is False
+    assert builder._node_artifact_service.modifiers["billing"]["ExampleNode"] is modifier
+    assert builder.dynamic_graph_cache["workflow_node_tests"] == {
+        "billing": {
+            "ExampleNode": str(tmp_path / "tests" / "billing" / "test_ExampleNode.py")
+        }
+    }
+
+
+def test_named_node_test_update_uses_its_workflow_graph_and_node_file(monkeypatch, tmp_path):
+    builder = _make_builder(monkeypatch, tmp_path)
+    graph_node = {
+        "name": "SharedNode",
+        "type": "WorkflowStepNode",
+        "desc": "shared",
+        "enable": True,
+        "depends": [],
+        "ext_data": {"type": "none", "desc": "none"},
+    }
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    alpha_dir.mkdir()
+    beta_dir.mkdir()
+    alpha_graph = alpha_dir / "workflow.json"
+    beta_graph = beta_dir / "workflow.json"
+    _write_graph(alpha_graph, [graph_node])
+    _write_graph(beta_graph, [graph_node])
+    alpha_node = alpha_dir / "SharedNode.py"
+    beta_node = beta_dir / "SharedNode.py"
+    alpha_node.write_text("# alpha\n", encoding="utf-8")
+    beta_node.write_text("# beta\n", encoding="utf-8")
+
+    workflow = builder._node_build_service.get_or_create_workflow("alpha")
+    workflow._context = SimpleNamespace(
+        graph_plan_path=str(alpha_graph),
+        artifacts={"SharedNode": {"node_file_path": str(alpha_node)}},
+    )
+    builder.graph_plan_path = str(beta_graph)
+    builder.node_location_map["SharedNode"] = str(beta_node)
+
+    observed = []
+
+    class _FakeModifier:
+        node_test_writer = SimpleNamespace(root_dir_path="")
+        node_writer = SimpleNamespace(root_dir_path="")
+
+        def run(self, **kwargs):
+            observed.append(kwargs)
+            return SimpleNamespace(
+                test_file_path=str(alpha_dir / "tests" / "alpha" / "test_SharedNode.py"),
+                log_file_path=str(alpha_dir / "logs" / "alpha" / "SharedNode_test.log"),
+                test_result={"ok": True},
+                amended_node_file_path=str(alpha_node),
+                skipped_stages=[],
+            )
+
+    builder._node_artifact_service.get_or_create_modifier = lambda *_args: _FakeModifier()
+
+    builder._node_artifact_service.run_modifier(workflow_name="alpha", node_name="SharedNode")
+
+    assert observed[0]["node_file_name"] == str(alpha_node)
+    assert observed[0]["workflow_graph"] == str(alpha_graph)
+    assert builder.dynamic_graph_cache["workflow_node_tests"]["alpha"]["SharedNode"].startswith(str(alpha_dir))
+
+    builder._node_artifact_service.run_modifier(
+        workflow_name="alpha",
+        node_name="SharedNode",
+        generate_test=False,
+    )
+
+    assert observed[1]["skip_generate_node_test"] is True
+    assert observed[1]["skip_run_node_test"] is False
+    assert observed[1]["workflow_graph"] == str(alpha_graph)
+
+
+def test_node_artifact_service_caches_modifiers_by_workflow_and_node(monkeypatch, tmp_path):
+    builder = _make_builder(monkeypatch, tmp_path)
+    monkeypatch.setattr(node_runtime_modifier_module, "GenerateNodeTestFile", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(node_runtime_modifier_module, "AmendNodeFromTestLog", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(node_runtime_modifier_module, "NodeRuntimeModifierPipeline", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    service = builder._node_artifact_service
+    first = service.get_or_create_modifier("orders", "Collect")
+
+    assert service.get_or_create_modifier("orders", "Collect") is first
+    assert service.get_or_create_modifier("orders", "Publish") is not first
+    assert service.get_or_create_modifier("billing", "Collect") is not first
+    assert set(service.modifiers) == {"orders", "billing"}
+    assert set(service.modifiers["orders"]) == {"Collect", "Publish"}
 
 
 def test_sync_workflow_graph_json_does_not_duplicate_relative_root_dir(monkeypatch, tmp_path):
@@ -615,7 +588,7 @@ def test_write_main_entrypoint_does_not_duplicate_relative_root_dir(monkeypatch,
     assert Path(captured["output_path"]).resolve() == (project_dir / "main.py").resolve()
 
 
-def test_get_node_input_output_formats_collects_inputs_and_backend_card_schema(monkeypatch, tmp_path):
+def test_collect_node_formats_collects_inputs_and_backend_card_schema(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
 
     graph_path = tmp_path / "graph_plan.json"
@@ -662,7 +635,7 @@ def test_get_node_input_output_formats_collects_inputs_and_backend_card_schema(m
 
     builder.graph_plan_path = str(graph_path)
 
-    formats = builder.get_node_input_output_formats()
+    formats = collect_node_formats(builder, builder._load_planned_graph())
 
     assert formats == {
         "CollectInput": {
@@ -679,7 +652,6 @@ def test_get_node_input_output_formats_collects_inputs_and_backend_card_schema(m
             "backend_node_path": str(tmp_path / "Summarize.py"),
         },
     }
-    assert builder.dynamic_graph_cache["node_input_output_formats"] == formats
 
 
 def test_rerun_server_validates_artifacts_and_restarts_processes(monkeypatch, tmp_path):
@@ -789,10 +761,9 @@ def test_test_main_entrypoint_uses_selected_python_command(monkeypatch, tmp_path
     assert observed["timeout"] == 60
 
 
-def test_run_node_tests_uses_selected_python_command_and_writes_separate_node_logs(monkeypatch, tmp_path):
+def test_node_modifier_reuses_tests_and_repairs_only_failed_nodes(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
-
-    graph_path = tmp_path / "graph_plan.json"
+    graph_path = tmp_path / "workflow.json"
     _write_graph(
         graph_path,
         [
@@ -815,20 +786,18 @@ def test_run_node_tests_uses_selected_python_command_and_writes_separate_node_lo
         ],
     )
     builder.graph_plan_path = str(graph_path)
-
-    existing_test_path = tmp_path / "tests" / "test_ExistingNode.py"
-    added_test_path = tmp_path / "tests" / "test_AddedNode.py"
-    existing_test_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_test_path.write_text("def test_existing_node():\n    assert False\n", encoding="utf-8")
-    added_test_path.write_text("def test_added_node():\n    assert True\n", encoding="utf-8")
-    builder.dynamic_graph_cache["node_tests"] = {
-        "ExistingNode": str(existing_test_path),
-        "AddedNode": str(added_test_path),
-    }
+    for node_name in ("ExistingNode", "AddedNode"):
+        (tmp_path / f"{node_name}.py").write_text("# original\n", encoding="utf-8")
+        test_path = tmp_path / "tests" / f"test_{node_name}.py"
+        test_path.parent.mkdir(parents=True, exist_ok=True)
+        test_path.write_text("def test_node(): pass\n", encoding="utf-8")
+    cached_test = tmp_path / "tests" / "existing_custom.py"
+    (tmp_path / "tests" / "test_ExistingNode.py").rename(cached_test)
+    builder.dynamic_graph_cache["node_tests"] = {"ExistingNode": str(cached_test)}
 
     monkeypatch.setattr(agent_builder_module, "select_python_command", lambda: "/custom/python")
-
     observed_calls = []
+    amended = []
     subprocess_results = iter(
         [
             SimpleNamespace(returncode=1, stdout="F\n", stderr="AssertionError: boom\n"),
@@ -850,59 +819,67 @@ def test_run_node_tests_uses_selected_python_command_and_writes_separate_node_lo
 
     monkeypatch.setattr(agent_builder_module.subprocess, "run", fake_run)
 
-    result = builder.run_node_tests(
-        node_names=["AddedNode", "ExistingNode"],
-        log_filename="node_tests_log.txt",
-    )
+    from ag_ui_workflow import WorkflowStepNode
+
+    class TestWriter(node_runtime_modifier_module.GenerateNodeTestFile):
+        def __init__(self):
+            WorkflowStepNode.__init__(self)
+            self.root_dir_path = str(tmp_path)
+
+        def write_test_from_node_file(self, *_args, **_kwargs):
+            raise AssertionError("existing tests must be reused")
+
+    class NodeWriter(node_runtime_modifier_module.AmendNodeFromTestLog):
+        def __init__(self):
+            WorkflowStepNode.__init__(self)
+            self.root_dir_path = str(tmp_path)
+
+        def amend_code_with_feedback(self, code_path, amendment, **_kwargs):
+            amended.append(Path(code_path).name)
+            assert "AssertionError: boom" in amendment
+            Path(code_path).write_text("# repaired\n", encoding="utf-8")
+            return Path(code_path)
+
+    def modifier_for(_workflow_name, _node_name):
+        return node_runtime_modifier_module.NodeRuntimeModifierPipeline(
+            node_test_writer=TestWriter(),
+            node_writer=NodeWriter(),
+            run_subprocess=fake_run,
+            timeout_expired=TimeoutError,
+        )
+
+    builder._node_artifact_service.get_or_create_modifier = modifier_for
+    service = builder._node_artifact_service
+    result = {
+        name: service.run_modifier(workflow_name="default", node_name=name, generate_test=False)
+        for name in ("ExistingNode", "AddedNode")
+    }
 
     assert observed_calls == [
         {
-            "command": ["/custom/python", "-m", "pytest", str(existing_test_path.resolve()), "-q"],
+            "command": ["/custom/python", "-m", "pytest", str(cached_test), "-q"],
             "cwd": str(tmp_path),
             "capture_output": True,
             "text": True,
             "timeout": 60,
         },
         {
-            "command": ["/custom/python", "-m", "pytest", str(added_test_path.resolve()), "-q"],
+            "command": ["/custom/python", "-m", "pytest", str(tmp_path / "tests" / "test_AddedNode.py"), "-q"],
             "cwd": str(tmp_path),
             "capture_output": True,
             "text": True,
             "timeout": 60,
         },
     ]
-    assert result["ok"] is False
-    assert [item["node_name"] for item in result["results"]] == ["ExistingNode", "AddedNode"]
-    assert result["results"][0]["ok"] is False
-    assert result["results"][0]["stderr"] == "AssertionError: boom\n"
-    assert result["results"][1]["ok"] is True
-    assert result["results"][1]["stdout"] == ".\n1 passed in 0.01s\n"
-
-    summary_log_path = Path(result["log_path"])
-    log_dir_path = Path(result["log_dir"])
-    assert builder.log_path == str(summary_log_path)
-    assert summary_log_path.is_file()
-    assert log_dir_path.is_dir()
-    assert result["log_paths"] == {
-        "ExistingNode": result["results"][0]["log_path"],
-        "AddedNode": result["results"][1]["log_path"],
-    }
-
-    summary_log_text = summary_log_path.read_text(encoding="utf-8")
-    assert "Node test: ExistingNode" in summary_log_text
-    assert "Node test: AddedNode" in summary_log_text
-    assert str(log_dir_path) in summary_log_text
-
-    existing_node_log_path = Path(result["results"][0]["log_path"])
-    added_node_log_path = Path(result["results"][1]["log_path"])
-    assert existing_node_log_path.parent == log_dir_path
-    assert added_node_log_path.parent == log_dir_path
-    assert existing_node_log_path.is_file()
-    assert added_node_log_path.is_file()
-
-    existing_log_text = existing_node_log_path.read_text(encoding="utf-8")
-    added_log_text = added_node_log_path.read_text(encoding="utf-8")
-    assert "Node: ExistingNode" in existing_log_text
-    assert "AssertionError: boom" in existing_log_text
-    assert "Node: AddedNode" in added_log_text
-    assert "1 passed in 0.01s" in added_log_text
+    assert list(result) == ["ExistingNode", "AddedNode"]
+    assert result["ExistingNode"].test_result["ok"] is False
+    assert result["AddedNode"].test_result["ok"] is True
+    assert result["ExistingNode"].test_file_path == str(cached_test)
+    assert result["AddedNode"].test_file_path == str(tmp_path / "tests" / "test_AddedNode.py")
+    assert result["ExistingNode"].skipped_stages == ["generate_node_test"]
+    assert result["AddedNode"].skipped_stages == ["generate_node_test", "amend_node"]
+    assert amended == ["ExistingNode.py"]
+    assert (tmp_path / "ExistingNode.py").read_text(encoding="utf-8") == "# repaired\n"
+    assert (tmp_path / "AddedNode.py").read_text(encoding="utf-8") == "# original\n"
+    assert "AssertionError: boom" in Path(result["ExistingNode"].log_file_path).read_text(encoding="utf-8")
+    assert "1 passed in 0.01s" in Path(result["AddedNode"].log_file_path).read_text(encoding="utf-8")

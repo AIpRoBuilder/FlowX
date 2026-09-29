@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from functools import wraps
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable, Mapping
 
 from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
@@ -37,7 +39,15 @@ class NodeRuntimeModifierContext:
 		skip_generate_node_test: bool = False,
 		skip_run_node_test: bool = False,
 		skip_amend_node: bool = False,
+		workflow_name: str = "",
+		node_name: str = "",
+		test_temperature: float = 0.2,
+		amendment_temperature: float = 0.3,
 	) -> None:
+		self.workflow_name = workflow_name
+		self.node_name = node_name
+		self.test_temperature = test_temperature
+		self.amendment_temperature = amendment_temperature
 		self.node_file_name = node_file_name
 		self.workflow_graph = workflow_graph
 		self.test_file_name = test_file_name
@@ -54,6 +64,8 @@ class NodeRuntimeModifierContext:
 		self.test_result: dict[str, Any] | None = None
 		self.amended_node_file_path = ""
 		self.skipped_stages: list[str] = []
+		self.completed_stages: set[str] = set()
+		self.stage_lock = RLock()
 
 
 def _context_from_node(node: WorkflowStepNode) -> NodeRuntimeModifierContext:
@@ -61,6 +73,15 @@ def _context_from_node(node: WorkflowStepNode) -> NodeRuntimeModifierContext:
 	if not isinstance(context, NodeRuntimeModifierContext):
 		raise TypeError("node runtime modifier context is missing or has an unexpected type")
 	return context
+
+
+def _synchronized_stage(handler: Callable[..., StepRunOutput]) -> Callable[..., StepRunOutput]:
+	@wraps(handler)
+	def run(self: WorkflowStepNode, *args: Any, **kwargs: Any) -> StepRunOutput:
+		with _context_from_node(self).stage_lock:
+			return handler(self, *args, **kwargs)
+
+	return run
 
 
 def _resolve_path(path_value: str, working_directory: Path) -> Path:
@@ -73,6 +94,7 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 
 	__hash__ = object.__hash__
 
+	@_synchronized_stage
 	def process_input(
 		self,
 		user_input: str,
@@ -83,20 +105,33 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 		context = _context_from_node(self)
 		working_directory = Path(context.working_directory).expanduser().resolve()
 		node_path = _resolve_path(context.node_file_name, working_directory)
+		node_name = context.node_name or node_path.stem
 		test_path = _resolve_path(
-			context.test_file_name or str(Path("tests") / f"test_{node_path.stem}.py"),
+			context.test_file_name or str(Path("tests") / f"test_{node_name}.py"),
 			working_directory,
 		)
+		if "generate_node_test" in context.completed_stages:
+			return StepRunOutput(
+				card={"kind": "node-test-generation", "status": "completed"},
+				derived={"test_file_path": context.test_file_path},
+			)
 		if context.skip_generate_node_test:
 			context.skipped_stages.append("generate_node_test")
 			if not context.skip_run_node_test and not test_path.is_file():
 				raise FileNotFoundError(
 					f"Skipped node test generation requires an existing test file: {test_path}"
 				)
+			if test_path.is_file():
+				context.test_file_path = str(test_path.resolve())
 		else:
 			test_path.parent.mkdir(parents=True, exist_ok=True)
-			written_path = self.write_test_from_node_file(str(node_path), str(test_path))
+			written_path = self.write_test_from_node_file(
+				str(node_path),
+				str(test_path),
+				temperature=context.test_temperature,
+			)
 			context.test_file_path = str(Path(written_path).resolve())
+		context.completed_stages.add("generate_node_test")
 		return StepRunOutput(
 			card={"kind": "node-test-generation", "status": "completed"},
 			derived={"test_file_path": context.test_file_path},
@@ -106,6 +141,7 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 class ExecuteNodeTest(RunNodeTest):
 	"""Run the generated pytest module and retain its dedicated log."""
 
+	@_synchronized_stage
 	def process_input(
 		self,
 		user_input: str,
@@ -114,6 +150,10 @@ class ExecuteNodeTest(RunNodeTest):
 	) -> StepRunOutput:
 		del user_input, dependency_results, session_state
 		context = _context_from_node(self)
+		if "run_node_test" in context.completed_stages:
+			derived = dict(context.test_result or {})
+			derived["log_file_path"] = context.log_file_path
+			return StepRunOutput(card={"kind": "node-test", "status": "completed"}, derived=derived)
 		if context.skip_run_node_test:
 			context.skipped_stages.append("run_node_test")
 			if not context.skip_amend_node:
@@ -130,6 +170,7 @@ class ExecuteNodeTest(RunNodeTest):
 			context.log_file_path = str(self.log_path.resolve())
 			context.test_log = self.log_path.read_text(encoding="utf-8")
 			context.test_result = self.result
+		context.completed_stages.add("run_node_test")
 		derived = dict(context.test_result or {})
 		derived["log_file_path"] = context.log_file_path
 		return StepRunOutput(
@@ -149,6 +190,7 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 	def get_feedback_contract_text(self) -> str:
 		return "Preserve the existing AG-UI workflow node contract while applying the test feedback.\n"
 
+	@_synchronized_stage
 	def process_input(
 		self,
 		user_input: str,
@@ -159,7 +201,13 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 		context = _context_from_node(self)
 		working_directory = Path(context.working_directory).expanduser().resolve()
 		node_path = _resolve_path(context.node_file_name, working_directory)
-		if context.skip_amend_node:
+		node_name = context.node_name or node_path.stem
+		if "amend_node" in context.completed_stages:
+			return StepRunOutput(
+				card={"kind": "node-amendment", "status": "completed"},
+				derived={"amended_node_file_path": context.amended_node_file_path},
+			)
+		if context.skip_amend_node or (context.test_result is not None and context.test_result["ok"]):
 			context.skipped_stages.append("amend_node")
 			context.amended_node_file_path = str(node_path.resolve())
 		else:
@@ -172,9 +220,11 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 				str(node_path),
 				context.test_log,
 				graph_plan_path=str(graph_path),
-				current_node_name=node_path.stem,
+				current_node_name=node_name,
+				temperature=context.amendment_temperature,
 			)
 			context.amended_node_file_path = str(Path(amended_path).resolve())
+		context.completed_stages.add("amend_node")
 		return StepRunOutput(
 			card={"kind": "node-amendment", "status": "completed"},
 			derived={"amended_node_file_path": context.amended_node_file_path},
@@ -209,19 +259,20 @@ class NodeRuntimeModifierPipeline:
 		config = self.json_config()
 		working_directory = Path(context.working_directory)
 		node_path = _resolve_path(context.node_file_name, working_directory)
+		node_name = context.node_name or node_path.stem
 		test_path = _resolve_path(
-			context.test_file_name or str(Path("tests") / f"test_{node_path.stem}.py"),
+			context.test_file_name or str(Path("tests") / f"test_{node_name}.py"),
 			working_directory,
 		)
 		log_path = _resolve_path(
-			context.log_file_name or str(Path("logs") / f"{node_path.stem}_test.log"),
+			context.log_file_name or str(Path("logs") / f"{node_name}_test.log"),
 			working_directory,
 		)
 		context.test_file_path = str(test_path.resolve())
 		elements: dict[str, WorkflowStepNode] = {
 			"generate_node_test": self.node_test_writer,
 			"run_node_test": ExecuteNodeTest(
-				node_name=node_path.stem,
+				node_name=node_name,
 				test_path=test_path,
 				log_path=log_path,
 				command=[context.python_command or sys.executable, "-m", "pytest", str(test_path), "-q"],
@@ -243,6 +294,8 @@ class NodeRuntimeModifierPipeline:
 		engine = init_workflow_engine(engine_config)
 		for step_id in elements:
 			run_workflow_step(engine, step_id)
+			if step_id not in context.completed_stages:
+				elements[step_id].process_input("", {}, {})
 		return engine
 
 	def run(
@@ -258,12 +311,23 @@ class NodeRuntimeModifierPipeline:
 		skip_generate_node_test: bool = False,
 		skip_run_node_test: bool = False,
 		skip_amend_node: bool = False,
+		workflow_name: str = "",
+		node_name: str = "",
+		test_temperature: float = 0.2,
+		amendment_temperature: float = 0.3,
 	) -> NodeRuntimeModifierContext:
 		"""Generate, test, and amend one node; return paths, logs, and test data."""
 
 		workdir = Path(working_directory).expanduser().resolve()
 		if not workdir.is_dir():
 			raise NotADirectoryError(f"Working directory not found: {workdir}")
+		if skip_generate_node_test and not skip_run_node_test:
+			test_path = _resolve_path(
+				test_file_name or str(Path("tests") / f"test_{node_name or Path(node_file_name).stem}.py"),
+				workdir,
+			)
+			if not test_path.is_file():
+				raise FileNotFoundError(f"Skipped node test generation requires an existing test file: {test_path}")
 
 		if isinstance(workflow_graph, Mapping):
 			graph_path = workdir / "workflow.json"
@@ -281,8 +345,14 @@ class NodeRuntimeModifierPipeline:
 			skip_generate_node_test=skip_generate_node_test,
 			skip_run_node_test=skip_run_node_test,
 			skip_amend_node=skip_amend_node,
+			workflow_name=workflow_name,
+			node_name=node_name,
+			test_temperature=test_temperature,
+			amendment_temperature=amendment_temperature,
 		)
 		self._engine = self._build_engine(context)
+		if not skip_run_node_test and context.test_result is None:
+			raise RuntimeError(f"node test execution did not produce a result for {context.node_name or node_file_name}")
 		return context
 
 

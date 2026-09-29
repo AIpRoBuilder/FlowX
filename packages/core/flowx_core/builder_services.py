@@ -1,234 +1,17 @@
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, TYPE_CHECKING
 
-from ag_ui_workflow import StepRunOutput, WorkflowStepNode
-
-from flowx_core.llm_client.coder import MAX_TOKENS
-from flowx_core.runtime import RunNodeTest
-from flowx_core.tools.file_tools import compile_node_file_and_get_step_output_card_schema
 from flowx_core.tools.runnable_gnode import run_gnode_operation
-from flowx_core.tools.workflow_engine import (
-    build_workflow_config,
-    init_workflow_engine,
-    run_workflow_step,
-)
 from flowx_core.tools.workflow_node_reference import resolve_workflow_node_reference
 
 
 if TYPE_CHECKING:
     from flowx_core.agent_builder import AgentBuilder
-
-
-@dataclass
-class NodeGenerationWorker:
-    builder: "AgentBuilder"
-    node_name: str
-    total: int = 0
-    node_index: int = 0
-    language: str = "python"
-    temperature: float = 0.35
-    last_generated_path: Optional[str] = field(default=None, init=False, repr=False)
-    _current_node_meta: Any = field(default=None, init=False, repr=False)
-    _current_coder: Any = field(default=None, init=False, repr=False)
-    _current_resolved_file_path: Optional[str] = field(default=None, init=False, repr=False)
-
-    def configure(
-        self,
-        *,
-        total: int,
-        node_index: int,
-        language: str,
-        temperature: float,
-    ) -> "NodeGenerationWorker":
-        self.total = total
-        self.node_index = node_index
-        self.language = language
-        self.temperature = temperature
-        return self
-
-    def _audit(self) -> tuple[bool, list[Any]]:
-        return run_gnode_operation(
-            self.builder.node_auditor,
-            "audit_node_file",
-            self._current_resolved_file_path,
-            self._current_node_meta,
-            graph_plan_path=self.builder.graph_plan_path,
-        )
-
-    def _retry_log(self, amendment: str, _audit_round: int) -> None:
-        self.builder._logger.warning(
-            "[%s/%s] Node audit failed: %s. %s Applying amendment...",
-            self.node_index,
-            self.total,
-            self.node_name,
-            amendment,
-        )
-
-    def _ensure_amendment_context(self) -> None:
-        if self._current_coder is None:
-            self._current_coder = self.builder._ensure_node_coder(self.node_name)
-        if self._current_coder is None:
-            raise RuntimeError(f"unable to resolve coder for node {self.node_name}")
-
-        if not self._current_resolved_file_path:
-            self._current_resolved_file_path = self.builder.node_location_map.get(self.node_name)
-        if not self._current_resolved_file_path:
-            self._current_resolved_file_path = str(
-                self.builder._expected_backend_node_path(self.node_name, self.language)
-            )
-
-    def _amend(self, amendment: str, _audit_round: int = 0) -> None:
-        del _audit_round
-        self._ensure_amendment_context()
-        run_gnode_operation(
-            self._current_coder,
-            "amend_code_with_feedback",
-            self._current_resolved_file_path,
-            amendment,
-            graph_plan_path=self.builder.graph_plan_path or "",
-            requirement_md_path=self.builder.requirement_md_path or "",
-            current_node_name=self.node_name,
-            language=self.language,
-            temperature=self.temperature,
-        )
-
-    def generate(self) -> str:
-        try:
-            node_meta = self.builder.planned_graph.get_node_meta(self.node_name)
-            coder = self.builder._make_node_coder(node_meta)
-            self.builder._sync_node_coder_root_dir(coder)
-            target_path = self.builder._expected_backend_node_path(self.node_name, self.language)
-            self.builder._logger.info(
-                "[%s/%s] Generating node '%s' -> %s",
-                self.node_index,
-                self.total,
-                self.node_name,
-                target_path,
-            )
-
-            file_path = run_gnode_operation(
-                coder,
-                "write_node_from_requirement",
-                self.node_name,
-                node_meta,
-                self.builder.requirement_md_path,
-                str(target_path),
-                graph_plan_path=self.builder.graph_plan_path,
-                language=self.language,
-                temperature=self.temperature,
-            )
-            resolved_file_path = str(file_path)
-            self._current_node_meta = node_meta
-            self._current_coder = coder
-            self._current_resolved_file_path = resolved_file_path
-
-            repair_loop = self.builder._make_audit_repair_loop()
-
-            repair_loop.run(
-                audit=self._audit,
-                amend=self._amend,
-                failure_message_prefix=(
-                    f"node audit did not pass for {self.node_name} after "
-                    f"{repair_loop.max_attempts} attempt(s). Last feedback:\n"
-                ),
-                on_success=lambda _audit_round: self.builder._logger.info(
-                    "[%s/%s] Node audit passed: %s",
-                    self.node_index,
-                    self.total,
-                    self.node_name,
-                ),
-                on_retry=self._retry_log,
-            )
-
-            self.builder.node_coder_map[self.node_name] = coder
-            self.builder.node_location_map[self.node_name] = resolved_file_path
-            self.last_generated_path = resolved_file_path
-            return resolved_file_path
-        except Exception as exc:
-            self.builder._logger.error(
-                "[%s/%s] Node generation failed for %s: %s",
-                self.node_index,
-                self.total,
-                self.node_name,
-                exc,
-                exc_info=True,
-            )
-            raise RuntimeError(f"node generation failed for {self.node_name}: {exc}") from exc
-
-
-class _NodeGenerationNode(WorkflowStepNode):
-    """Workflow step wrapper for a cached generation worker."""
-
-    INPUT_REQUIRED = False
-
-    def __init__(self, worker: NodeGenerationWorker) -> None:
-        super().__init__()
-        self.worker = worker
-
-    def _generate(self) -> str:
-        generated_path = self.worker.generate()
-        self.worker.builder._advance_progress(f"Generated node: {self.worker.node_name}")
-        return generated_path
-
-    def process_input(
-        self,
-        user_input: str,
-        dependency_results: dict[str, StepRunOutput],
-        session_state: dict[str, Any],
-    ) -> StepRunOutput:
-        del user_input, dependency_results, session_state
-        generated_path = self._generate()
-        return StepRunOutput(
-            card={"kind": "node-generation", "status": "completed"},
-            derived={"generated_path": generated_path},
-        )
-
-
-@dataclass
-class NodeTestGenerationWorker:
-    builder: "AgentBuilder"
-    node_name: str
-    node_file_path: str
-    total: int
-    node_index: int
-    language: str
-    temperature: float
-
-    def run(self) -> str:
-        try:
-            test_coder = self.builder._make_node_test_coder()
-            target_path = self.builder._expected_backend_node_test_path(self.node_name, self.language)
-            self.builder._logger.info(
-                "[%s/%s] Generating node test '%s' -> %s",
-                self.node_index,
-                self.total,
-                self.node_name,
-                target_path,
-            )
-            file_path = run_gnode_operation(
-                test_coder,
-                "write_test_from_node_file",
-                self.node_file_path,
-                str(target_path),
-                temperature=self.temperature,
-            )
-            return str(file_path)
-        except Exception as exc:
-            self.builder._logger.error(
-                "[%s/%s] Node test generation failed for %s: %s",
-                self.node_index,
-                self.total,
-                self.node_name,
-                exc,
-                exc_info=True,
-            )
-            raise RuntimeError(f"node test generation failed for {self.node_name}: {exc}") from exc
 
 
 @dataclass
@@ -379,558 +162,170 @@ class GraphBuildService:
 
 @dataclass
 class NodeBuildService:
+    """Manage named, reusable node-generation workflows."""
+
     builder: "AgentBuilder"
-    nodes: Dict[str, NodeGenerationWorker] = field(default_factory=dict)
+    workflows: Dict[str, Any] = field(default_factory=dict)
 
-    def _resolve_requested_node_names(
-        self,
-        node_names: Optional[list[str]] = None,
-        *,
-        graph_plan_path: Optional[str] = None,
-    ) -> tuple[Any, list[str]]:
-        planned_graph = self.builder._load_planned_graph(graph_plan_path)
-        topological_names = planned_graph.get_topological_sorted_nodes()
+    def get_or_create_workflow(self, workflow_name: str = "default") -> Any:
+        if not isinstance(workflow_name, str) or not workflow_name.strip():
+            raise ValueError("workflow_name must be a non-empty string")
+        workflow_name = workflow_name.strip()
+        workflow = self.workflows.get(workflow_name)
+        if workflow is None:
+            from flowx_core.workflows.node_generation import NodeGenerationWorkflow
 
-        if node_names is None:
-            return planned_graph, topological_names
+            workflow = NodeGenerationWorkflow(self.builder)
+            self.workflows[workflow_name] = workflow
+        return workflow
 
-        requested_names = {name for name in node_names if isinstance(name, str) and name.strip()}
-        ordered_names = [name for name in topological_names if name in requested_names]
-        missing_names = requested_names.difference(ordered_names)
-        if missing_names:
-            raise ValueError(f"node(s) not found in graph plan: {sorted(missing_names)}")
-        return planned_graph, ordered_names
 
-    def get_or_create_node_worker(
-        self,
-        node_name: str,
-        *,
-        total: int,
-        node_index: int,
-        language: str,
-        temperature: float,
-    ) -> NodeGenerationWorker:
-        worker = self.nodes.get(node_name)
-        if worker is None:
-            worker = NodeGenerationWorker(
-                builder=self.builder,
-                node_name=node_name,
-            )
-            self.nodes[node_name] = worker
+@dataclass
+class NodeArtifactService:
+    """Create and run test-driven modifiers keyed by workflow and node name."""
 
-        return worker.configure(
-            total=total,
-            node_index=node_index,
-            language=language,
-            temperature=temperature,
-        )
+    builder: "AgentBuilder"
+    modifiers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def run_node_generation_pipeline(
-        self,
-        node_names: Optional[list[str]] = None,
-        *,
-        graph_plan_path: Optional[str] = None,
-        language: str = "python",
-        temperature: float = 0.35,
-        reset_mappings: bool = False,
-    ) -> list[str]:
-        planned_graph, ordered_names = self._resolve_requested_node_names(
-            node_names,
-            graph_plan_path=graph_plan_path,
-        )
-        if reset_mappings:
-            self.builder.node_coder_map = {}
-            self.builder.node_location_map = {}
-        if not ordered_names:
-            return []
-
-        workers: Dict[str, NodeGenerationWorker] = {}
-        pipeline_nodes: Dict[str, _NodeGenerationNode] = {}
-        dependencies: Dict[str, list[str]] = {}
-        selected_names = set(ordered_names)
-        total = len(ordered_names)
-
-        for index, node_name in enumerate(ordered_names, start=1):
-            worker = self.get_or_create_node_worker(
-                node_name,
-                total=total,
-                node_index=index,
-                language=language,
-                temperature=temperature,
-            )
-            workers[node_name] = worker
-            pipeline_nodes[node_name] = _NodeGenerationNode(worker)
-
-        for node_name in ordered_names:
-            dependencies[node_name] = [
-                dep_name
-                for dep_name in planned_graph.get_node_dependencies(node_name)
-                if dep_name in selected_names
-            ]
-
-        self.builder._start_progress(total)
-        config = build_workflow_config(pipeline_nodes, dependencies)
-        engine = init_workflow_engine(config)
-        for node_name in pipeline_nodes:
-            run_workflow_step(engine, node_name)
-
-        return [
-            self.builder.node_location_map[name]
-            for name in ordered_names
-            if name in self.builder.node_location_map
-        ]
-
-    def generate_selected_node_tests(
-        self,
-        node_names: list[str],
-        *,
-        language: str = "python",
-        temperature: float = 0.2,
-    ) -> list[str]:
-        if not self.builder._supports_backend_node_tests(language):
-            self.builder._logger.info(
-                "Skipping single-node test generation for unsupported backend language: %s",
-                language,
-            )
-            self.builder.dynamic_graph_cache["node_tests"] = {}
-            return []
-
-        planned_graph = self.builder._load_planned_graph()
-        requested_names = {name for name in node_names if isinstance(name, str) and name.strip()}
-        ordered_names = [
-            name for name in planned_graph.get_topological_sorted_nodes()
-            if name in requested_names
-        ]
-        missing_names = requested_names.difference(ordered_names)
-        if missing_names:
-            raise ValueError(f"node(s) not found in graph plan: {sorted(missing_names)}")
-        if not ordered_names:
-            self.builder.dynamic_graph_cache["node_tests"] = {}
-            return []
-
-        generated_map: Dict[str, str] = {}
-        total = len(ordered_names)
-        for index, name in enumerate(ordered_names, start=1):
-            node_file_path = self.builder.node_location_map.get(name)
-            if node_file_path:
-                resolved_node_path = self.builder._resolve_root_path(node_file_path)
-            else:
-                resolved_node_path = self.builder._expected_backend_node_path(name, language)
-            if not resolved_node_path.is_file():
-                raise FileNotFoundError(
-                    f"backend node file not found for single-node test generation: {resolved_node_path}"
-                )
-
-            generated_map[name] = NodeTestGenerationWorker(
-                builder=self.builder,
-                node_name=name,
-                node_file_path=str(resolved_node_path),
-                total=total,
-                node_index=index,
-                language=language,
-                temperature=temperature,
-            ).run()
-
-        current_map = self.builder.dynamic_graph_cache.get("node_tests", {})
-        merged_map = dict(current_map) if isinstance(current_map, Mapping) else {}
-        merged_map.update(generated_map)
-        self.builder.dynamic_graph_cache["node_tests"] = merged_map
-        return [generated_map[name] for name in ordered_names if name in generated_map]
-
-    def generate_selected_nodes(
-        self,
-        node_names: list[str],
-        *,
-        language: str = "python",
-        temperature: float = 0.35,
-        reset_mappings: bool = False,
-    ) -> list[str]:
-        return self.run_node_generation_pipeline(
-            node_names,
-            language=language,
-            temperature=temperature,
-            reset_mappings=reset_mappings,
-        )
-
-    def generate_nodes(
-        self,
-        graph_plan_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        language: str = "python",
-        temperature: float = 0.35,
-    ) -> list[str]:
-        if requirement_md_path:
-            self.builder.requirement_md_path = requirement_md_path
-        if not self.builder.requirement_md_path:
-            raise ValueError("requirement_md_path is not set. Call analyze_requirement(...) first or pass requirement_md_path.")
-        planned_graph = self.builder._load_planned_graph(graph_plan_path)
-        generated_paths = self.generate_selected_nodes(
-            planned_graph.get_topological_sorted_nodes(),
-            language=language,
-            temperature=temperature,
-            reset_mappings=True,
-        )
-        if self.builder._supports_backend_node_tests(language):
-            self.builder._generate_selected_node_tests(
-                planned_graph.get_topological_sorted_nodes(),
-                language=language,
-                temperature=temperature,
-            )
-            self.builder.dynamic_graph_cache["node_tests"] = {
-                node_name: str(self.builder._expected_backend_node_test_path(node_name, language))
-                for node_name in planned_graph.get_topological_sorted_nodes()
-                if self.builder._expected_backend_node_test_path(node_name, language).is_file()
-            }
-        else:
-            self.builder.dynamic_graph_cache["node_tests"] = {}
-        return generated_paths
-
-    def generate_node_tests(
-        self,
-        graph_plan_path: Optional[str] = None,
-        backend_language: str = "python",
-        temperature: float = 0.2,
-    ) -> list[str]:
-        planned_graph = self.builder._load_planned_graph(graph_plan_path)
-        generated_paths = self.builder._generate_selected_node_tests(
-            planned_graph.get_topological_sorted_nodes(),
-            language=backend_language,
-            temperature=temperature,
-        )
-        if self.builder._supports_backend_node_tests(backend_language):
-            self.builder.dynamic_graph_cache["node_tests"] = {
-                node_name: str(self.builder._expected_backend_node_test_path(node_name, backend_language))
-                for node_name in planned_graph.get_topological_sorted_nodes()
-                if self.builder._expected_backend_node_test_path(node_name, backend_language).is_file()
-            }
-        return generated_paths
-
-    def generate_node_markdowns(
-        self,
-        requirement_md_path: str,
-        graph_plan_path: str,
-        output_dirname: str = "node_docs",
-        temperature: float = 0.2,
-    ) -> list[str]:
-        output_dir = os.path.join(self.builder.root_dir, output_dirname)
-        self.builder._logger.info("Generating per-node markdown plans -> %s", output_dir)
-        node_doc_paths = run_gnode_operation(
-            self.builder.node_planner,
-            "plan_each_from_files",
-            requirement_md_path=requirement_md_path,
-            graph_plan_json_path=graph_plan_path,
-            output_dir=output_dir,
-            overwrite=True,
-            temperature=temperature,
-        )
-        self.builder.node_docs_dir = output_dir
-        self.builder.node_doc_paths = [str(path) for path in node_doc_paths]
-        return self.builder.node_doc_paths
-
-    def update_nodes_plan(
-        self,
-        graph_plan_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        node_docs_dirname: str = "node_docs",
-        temperature: float = 0.2,
-        max_tokens: int = MAX_TOKENS,
-    ) -> Dict[str, Any]:
-        requirement_text = self.builder._read_requirement_text(requirement_md_path)
-        planned_graph = self.builder._load_planned_graph(graph_plan_path)
-        node_names = planned_graph.get_topological_sorted_nodes()
-
-        node_docs_dir = self.builder._resolve_root_path(node_docs_dirname)
-        node_docs_dir.mkdir(parents=True, exist_ok=True)
-
-        existing_plan_map: Dict[str, str] = {}
-        missing_plan_names: list[str] = []
-        for node_name in node_names:
-            plan_path = node_docs_dir / f"{node_name}.md"
-            if plan_path.is_file():
-                existing_plan_map[node_name] = str(plan_path)
-            else:
-                missing_plan_names.append(node_name)
-
-        generated_plan_map: Dict[str, str] = {}
-        if missing_plan_names:
-            filtered_graph_plan = self.builder._build_filtered_graph_plan_payload(missing_plan_names)
-            generated_plan_paths = run_gnode_operation(
-                self.builder.node_planner,
-                "plan_each",
-                requirement_text=requirement_text,
-                graph_plan_text=json.dumps(filtered_graph_plan, ensure_ascii=False, indent=2),
-                output_dir=str(node_docs_dir),
-                overwrite=True,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            generated_plan_map = {Path(path).stem: str(path) for path in generated_plan_paths}
-
-        all_plan_map = {
-            node_name: str(node_docs_dir / f"{node_name}.md")
-            for node_name in node_names
-            if (node_docs_dir / f"{node_name}.md").is_file()
-        }
-
-        self.builder.node_docs_dir = str(node_docs_dir)
-        self.builder.node_doc_paths = [all_plan_map[node_name] for node_name in node_names if node_name in all_plan_map]
-
-        self.builder.dynamic_graph_cache["graph_nodes"] = node_names
-        self.builder.dynamic_graph_cache["graph_plan_path"] = str(Path(self.builder.graph_plan_path).expanduser().resolve())
-        self.builder.dynamic_graph_cache["node_plans"] = all_plan_map
-
-        return {
-            "graph_plan_path": self.builder.dynamic_graph_cache["graph_plan_path"],
-            "node_plan": {
-                "existing": existing_plan_map,
-                "generated": generated_plan_map,
-                "all": all_plan_map,
-            },
-        }
-
-    def update_backend_nodes(
-        self,
-        graph_plan_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        node_docs_dirname: str = "node_docs",
-        language: str = "python",
-        temperature: float = 0.3,
-    ) -> Dict[str, Any]:
-        plan_result = self.update_nodes_plan(
-            graph_plan_path=graph_plan_path,
-            requirement_md_path=requirement_md_path,
-            node_docs_dirname=node_docs_dirname,
-            temperature=temperature,
-        )
-        planned_graph = self.builder._load_planned_graph()
-        node_names = planned_graph.get_topological_sorted_nodes()
-
-        missing_plan_names = [node_name for node_name in node_names if node_name not in plan_result["node_plan"]["all"]]
-        if missing_plan_names:
-            raise FileNotFoundError(
-                "update_backend_nodes requires node plan artifacts before code generation. "
-                f"missing node plan files for: {missing_plan_names}"
-            )
-
-        existing_backend_map: Dict[str, str] = {}
-        missing_backend_names: list[str] = []
-        for node_name in node_names:
-            backend_path = self.builder._expected_backend_node_path(node_name, language)
-            if backend_path.is_file():
-                existing_backend_map[node_name] = str(backend_path)
-            else:
-                missing_backend_names.append(node_name)
-
-        generated_backend_paths = self.builder._generate_selected_nodes(
-            missing_backend_names,
-            language=language,
-            temperature=temperature,
-            reset_mappings=False,
-        )
-        generated_backend_map = {Path(path).stem: str(path) for path in generated_backend_paths}
-        all_backend_map = {
-            node_name: str(self.builder._expected_backend_node_path(node_name, language))
-            for node_name in node_names
-            if self.builder._expected_backend_node_path(node_name, language).is_file()
-        }
-        for node_name, node_path in all_backend_map.items():
-            self.builder.node_location_map.setdefault(node_name, node_path)
-
-        self.builder.dynamic_graph_cache["backend_nodes"] = all_backend_map
-
-        existing_test_map: Dict[str, str] = {}
-        generated_test_map: Dict[str, str] = {}
-        all_test_map: Dict[str, str] = {}
-        if self.builder._supports_backend_node_tests(language):
-            ordered_missing_test_names: list[str] = []
-            for node_name in node_names:
-                test_path = self.builder._expected_backend_node_test_path(node_name, language)
-                if test_path.is_file():
-                    existing_test_map[node_name] = str(test_path)
-                else:
-                    ordered_missing_test_names.append(node_name)
-
-            generated_test_paths = self.builder._generate_selected_node_tests(
-                ordered_missing_test_names,
-                language=language,
-                temperature=temperature,
-            )
-            generated_test_map = {
-                node_name: generated_test_path
-                for node_name, generated_test_path in zip(ordered_missing_test_names, generated_test_paths)
-            }
-            all_test_map = {
-                node_name: str(self.builder._expected_backend_node_test_path(node_name, language))
-                for node_name in node_names
-                if self.builder._expected_backend_node_test_path(node_name, language).is_file()
-            }
-
-        self.builder.dynamic_graph_cache["node_tests"] = all_test_map
-
-        return {
-            "node_plan": plan_result["node_plan"],
-            "backend_nodes": {
-                "existing": existing_backend_map,
-                "generated": generated_backend_map,
-                "all": all_backend_map,
-            },
-            "node_tests": {
-                "existing": existing_test_map,
-                "generated": generated_test_map,
-                "all": all_test_map,
-            },
-        }
-
-    def get_node_input_output_formats(
-        self,
-        graph_plan_path: Optional[str] = None,
-        backend_language: str = "python",
-    ) -> Dict[str, Dict[str, Any]]:
-        planned_graph = self.builder._load_planned_graph(graph_plan_path)
-        node_formats: Dict[str, Dict[str, Any]] = {}
-
-        for node_name in planned_graph.get_topological_sorted_nodes():
-            node_meta = planned_graph.get_node_meta(node_name)
-            inputs_format = node_meta.inputs_format if node_meta and getattr(node_meta, "inputs_format", None) else {}
-            if not isinstance(inputs_format, Mapping):
-                inputs_format = {}
-
-            normalized_inputs_format: Dict[str, str] = {}
-            for key, value in inputs_format.items():
-                field_name = str(key).strip()
-                field_type = str(value).strip().lower()
-                if field_name and field_type:
-                    normalized_inputs_format[field_name] = field_type
-
-            ext_data = node_meta.ext_data if node_meta and getattr(node_meta, "ext_data", None) else {}
-            if isinstance(ext_data, Mapping):
-                ext_type = str(ext_data.get("type", "none")).strip().lower()
-            else:
-                ext_type = str(ext_data).strip().lower() or "none"
-            if ext_type not in {"user_input", "skill"}:
-                normalized_inputs_format = {}
-
-            backend_path_value = self.builder.node_location_map.get(node_name)
-            if backend_path_value:
-                backend_path = self.builder._resolve_root_path(backend_path_value)
-            else:
-                backend_path = self.builder._expected_backend_node_path(node_name, backend_language)
-
-            backend_card_schema = None
-            backend_path_str: Optional[str] = None
-            if backend_path.is_file():
-                backend_card_schema = compile_node_file_and_get_step_output_card_schema(str(backend_path))
-                backend_path_str = str(backend_path)
-
-            node_formats[node_name] = {
-                "user_input_format": normalized_inputs_format,
-                "backend_output_card_format": backend_card_schema.get("card") if backend_card_schema else None,
-                "backend_node_path": backend_path_str,
-            }
-
-        self.builder.dynamic_graph_cache["node_input_output_formats"] = node_formats
-        return node_formats
-
-    def update_nodes(
-        self,
-        graph_plan_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        node_docs_dirname: str = "node_docs",
-        language: str = "python",
-        temperature: float = 0.3,
-        context_base_dir: Optional[str] = None,
-        backend_port: int = 8000,
-        main_output_filename: str = "main.py",
-    ) -> Dict[str, Any]:
-        backend_result = self.update_backend_nodes(
-            graph_plan_path=graph_plan_path,
-            requirement_md_path=requirement_md_path,
-            node_docs_dirname=node_docs_dirname,
-            language=language,
-            temperature=temperature,
-        )
-        workflow_json_path = self.builder._main_entrypoint_service.sync_workflow_graph_json(
-            context_base_dir=context_base_dir,
-        )
-
-        main_output_target = self.builder.main_output_path or os.path.join(self.builder.root_dir, main_output_filename)
-        main_output_path = self.builder.generate_main_entrypoint(
-            self.builder.graph_plan_path,
-            output_filename=str(main_output_target),
-            temperature=temperature,
-            fastapi_port=backend_port,
-        )
-
-        return {
-            "node_plan": backend_result["node_plan"],
-            "backend_nodes": backend_result["backend_nodes"],
-            "node_tests": backend_result["node_tests"],
-            "workflow_json_path": workflow_json_path,
-            "main_entrypoint": main_output_path,
-        }
-
-    def amend_node_markdown(
-        self,
-        node_name: str,
-        amendment: str,
-        existing_markdown_path: Optional[str] = None,
-        requirement_md_path: Optional[str] = None,
-        graph_plan_path: Optional[str] = None,
-        output_path: Optional[str] = None,
-        temperature: float = 0.2,
-        max_tokens: int = MAX_TOKENS,
-        overwrite: bool = True,
-    ) -> str:
+    def get_or_create_modifier(self, workflow_name: str, node_name: str) -> Any:
+        if not isinstance(workflow_name, str) or not workflow_name.strip():
+            raise ValueError("workflow_name must be a non-empty string")
         if not isinstance(node_name, str) or not node_name.strip():
-            raise ValueError("node_name must be a non-empty string.")
-        if not isinstance(amendment, str) or not amendment.strip():
-            raise ValueError("amendment must be a non-empty string.")
+            raise ValueError("node_name must be a non-empty string")
 
-        if requirement_md_path:
-            self.builder.requirement_md_path = requirement_md_path
-        if graph_plan_path:
-            self.builder.graph_plan_path = graph_plan_path
+        workflow_name = workflow_name.strip()
+        node_name = node_name.strip()
+        workflow_modifiers = self.modifiers.setdefault(workflow_name, {})
+        modifier = workflow_modifiers.get(node_name)
+        if modifier is None:
+            from flowx_core.workflows.node_runtime_modifier import (
+                AmendNodeFromTestLog,
+                GenerateNodeTestFile,
+                NodeRuntimeModifierPipeline,
+            )
 
-        if not self.builder.requirement_md_path:
-            raise ValueError("requirement_md_path is not set. Call analyze_requirement(...) first or pass requirement_md_path.")
-        if not self.builder.graph_plan_path:
-            raise ValueError("graph_plan_path is not set. Call plan_graph(...) first or pass graph_plan_path.")
+            root_dir_path = str(Path(self.builder.root_dir).expanduser().resolve())
+            node_test_writer = GenerateNodeTestFile(
+                api_key=self.builder.api_key,
+                model=self.builder.model,
+                provider=self.builder.provider,
+                root_dir_path=root_dir_path,
+                session_marking_prompt=self.builder.session_marking_prompt,
+            )
+            node_writer = AmendNodeFromTestLog(
+                api_key=self.builder.api_key,
+                model=self.builder.model,
+                provider=self.builder.provider,
+                root_dir_path=root_dir_path,
+                session_marking_prompt=self.builder.session_marking_prompt,
+            )
+            modifier = NodeRuntimeModifierPipeline(
+                node_test_writer=node_test_writer,
+                node_writer=node_writer,
+                run_subprocess=self.builder._run_subprocess,
+                timeout_expired=self.builder._subprocess_timeout_expired(),
+            )
+            workflow_modifiers[node_name] = modifier
+        return modifier
 
-        target_markdown_path = output_path or existing_markdown_path
-        if target_markdown_path is None:
-            target_markdown_path = os.path.join(self.builder.root_dir, "node_docs", f"{node_name}.md")
+    def run_modifier(
+        self,
+        *,
+        workflow_name: str,
+        node_name: str,
+        graph_plan_path: Optional[str] = None,
+        generate_test: bool = True,
+        run_test: bool = True,
+        amend_node: bool = True,
+        timeout: int = 60,
+        temperature: float = 0.2,
+        amendment_temperature: float = 0.3,
+    ) -> Any:
+        if not isinstance(workflow_name, str) or not workflow_name.strip():
+            raise ValueError("workflow_name must be a non-empty string")
+        if not isinstance(node_name, str) or not node_name.strip():
+            raise ValueError("node_name must be a non-empty string")
+        workflow_name = workflow_name.strip()
+        node_name = node_name.strip()
+        workflow = self.builder._node_build_service.workflows.get(workflow_name)
+        generation_context = workflow.context if workflow is not None else None
+        if graph_plan_path is None and workflow_name != "default":
+            if generation_context is None:
+                raise ValueError(
+                    f"graph_plan_path is required for workflow {workflow_name!r} before it has been generated"
+                )
+            graph_plan_path = generation_context.graph_plan_path
+        planned_graph = self.builder._load_planned_graph(graph_plan_path)
+        if node_name not in planned_graph.get_topological_sorted_nodes():
+            raise ValueError(f"node {node_name!r} not found in workflow {workflow_name!r}")
+        workflow_path = Path(self.builder.graph_plan_path).expanduser().resolve()
+        node_path_value = None
+        if generation_context is not None and Path(generation_context.graph_plan_path).resolve() == workflow_path:
+            node_path_value = generation_context.artifacts.get(node_name, {}).get("node_file_path")
+        if not node_path_value:
+            mapped_path = self.builder.node_location_map.get(node_name)
+            if mapped_path and self.builder._resolve_root_path(mapped_path).parent == workflow_path.parent:
+                node_path_value = mapped_path
+        node_path = (
+            self.builder._resolve_root_path(node_path_value)
+            if node_path_value
+            else workflow_path.parent / f"{node_name}.py"
+        )
+        if not node_path.is_file():
+            raise FileNotFoundError(
+                f"backend node file not found for workflow {workflow_name!r}, node {node_name!r}: {node_path}"
+            )
 
-        self.builder._logger.info("Amending node markdown '%s' -> %s", node_name, target_markdown_path)
-        amended_graph_path, amended_doc_path = run_gnode_operation(
-            self.builder.node_planner,
-            "amend_graph_node_from_files",
+        modifier = self.get_or_create_modifier(workflow_name, node_name)
+        root_dir_path = str(workflow_path.parent)
+        modifier.node_test_writer.root_dir_path = root_dir_path
+        modifier.node_writer.root_dir_path = root_dir_path
+        workflow_tests = self.builder.dynamic_graph_cache.get("workflow_node_tests", {})
+        test_paths = workflow_tests.get(workflow_name, {}) if isinstance(workflow_tests, Mapping) else {}
+        if workflow_name == "default" and not test_paths:
+            test_paths = self.builder.dynamic_graph_cache.get("node_tests", {})
+        cached_test_path = test_paths.get(node_name) if isinstance(test_paths, Mapping) else None
+        workflow_component = "".join(
+            character if character.isalnum() or character in {"-", "_", "."} else "_"
+            for character in workflow_name
+        ).strip("._") or "workflow"
+        default_test_name = (
+            str(Path("tests") / workflow_component / f"test_{node_name}.py")
+            if workflow_name != "default" else ""
+        )
+        context = modifier.run(
+            node_file_name=str(node_path),
+            workflow_graph=str(workflow_path),
+            working_directory=str(workflow_path.parent),
+            python_command=self.builder._select_python_command() if run_test else "",
+            timeout=timeout,
+            test_temperature=temperature,
+            amendment_temperature=amendment_temperature,
+            workflow_name=workflow_name,
             node_name=node_name,
-            user_prompt=amendment,
-            requirement_md_path=self.builder.requirement_md_path,
-            graph_plan_json_path=self.builder.graph_plan_path,
-            node_output_path=target_markdown_path,
-            overwrite=overwrite,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            test_file_name=str(cached_test_path) if not generate_test and cached_test_path else default_test_name,
+            log_file_name=(
+                str(Path("logs") / workflow_component / f"{node_name}_test.log")
+                if workflow_name != "default"
+                else ""
+            ),
+            skip_generate_node_test=not generate_test,
+            skip_run_node_test=not run_test,
+            skip_amend_node=not amend_node,
         )
-
-        self.builder.graph_plan_path = str(amended_graph_path)
-        self.builder.planned_graph = self.builder._instantiate_graph(self.builder.graph_plan_path)
-        run_gnode_operation(
-            self.builder.planner,
-            "_write_mermaid_from_graph_json",
-            Path(self.builder.graph_plan_path),
-        )
-
-        final_path = str(amended_doc_path)
-        self.builder.node_docs_dir = str(Path(final_path).parent)
-        existing_paths = list(self.builder.node_doc_paths or [])
-        expected_name = f"{node_name}.md"
-        updated_paths = [path for path in existing_paths if Path(path).name != expected_name]
-        updated_paths.append(final_path)
-        self.builder.node_doc_paths = updated_paths
-        self.builder.last_amended_node_doc_path = final_path
-        return final_path
+        if context.test_file_path:
+            workflow_maps = self.builder.dynamic_graph_cache.get("workflow_node_tests", {})
+            workflow_maps = dict(workflow_maps) if isinstance(workflow_maps, Mapping) else {}
+            test_map = workflow_maps.get(workflow_name, {})
+            test_map = dict(test_map) if isinstance(test_map, Mapping) else {}
+            test_map[node_name] = context.test_file_path
+            workflow_maps[workflow_name] = test_map
+            self.builder.dynamic_graph_cache["workflow_node_tests"] = workflow_maps
+            if workflow_name == "default":
+                self.builder.dynamic_graph_cache["node_tests"] = dict(test_map)
+        if context.amended_node_file_path:
+            self.builder.node_location_map[node_name] = context.amended_node_file_path
+        return context
 
 
 @dataclass
@@ -1082,127 +477,6 @@ class MainEntrypointService:
 class RuntimeService:
     builder: "AgentBuilder"
 
-    @staticmethod
-    def _sanitize_node_test_log_name(node_name: str) -> str:
-        safe_name = "".join(
-            char if char.isalnum() or char in {"-", "_", "."} else "_"
-            for char in str(node_name)
-        ).strip("._")
-        return safe_name or "node_test"
-
-    def run_selected_node_tests(
-        self,
-        node_names: list[str],
-        *,
-        language: str = "python",
-        log_filename: str = "node_test_log.txt",
-        timeout: int = 60,
-    ) -> Dict[str, Any]:
-        if not self.builder._supports_backend_node_tests(language):
-            raise ValueError(
-                f"single-node test execution is only supported for Python backend nodes, got: {language}"
-            )
-
-        planned_graph = self.builder._load_planned_graph()
-        requested_names = {name for name in node_names if isinstance(name, str) and name.strip()}
-        ordered_names = [
-            name for name in planned_graph.get_topological_sorted_nodes()
-            if name in requested_names
-        ]
-        missing_names = requested_names.difference(ordered_names)
-        if missing_names:
-            raise ValueError(f"node(s) not found in graph plan: {sorted(missing_names)}")
-
-        summary_log_path = Path(os.path.join(self.builder.root_dir, log_filename))
-        summary_log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_dir_name = summary_log_path.stem if summary_log_path.suffix else f"{summary_log_path.name}_logs"
-        log_dir_path = summary_log_path.parent / log_dir_name
-        log_dir_path.mkdir(parents=True, exist_ok=True)
-
-        self.builder.log_path = str(summary_log_path)
-        python_cmd = self.builder._select_python_command()
-        backend_cwd = str(self.builder._resolve_backend_node_base_dir())
-        cached_test_paths = self.builder.dynamic_graph_cache.get("node_tests", {})
-
-        results: list[Dict[str, Any]] = []
-        overall_ok = True
-
-        with open(summary_log_path, "w", encoding="utf-8") as log_file:
-            log_file.write("=== Node Test Run Log ===\n")
-            log_file.write(f"Test started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            log_file.write(f"Selected nodes: {ordered_names}\n")
-            log_file.write(f"Per-node log directory: {log_dir_path}\n")
-            log_file.write(f"{'=' * 50}\n\n")
-
-            if not ordered_names:
-                log_file.write("No node tests selected.\n")
-
-            total = len(ordered_names)
-            for index, node_name in enumerate(ordered_names, start=1):
-                if isinstance(cached_test_paths, Mapping) and node_name in cached_test_paths:
-                    resolved_test_path = self.builder._resolve_root_path(cached_test_paths[node_name])
-                else:
-                    resolved_test_path = self.builder._expected_backend_node_test_path(node_name, language)
-
-                if not resolved_test_path.is_file():
-                    raise FileNotFoundError(
-                        f"node test file not found for node '{node_name}': {resolved_test_path}"
-                    )
-
-                command = [python_cmd, "-m", "pytest", str(resolved_test_path), "-q"]
-                self.builder._logger.info(
-                    "[%s/%s] Running node test '%s' -> %s",
-                    index,
-                    total,
-                    node_name,
-                    resolved_test_path,
-                )
-
-                node_log_path = log_dir_path / f"{self._sanitize_node_test_log_name(node_name)}.txt"
-                log_file.write(f"[{index}/{total}] Node test: {node_name}\n")
-                log_file.write(f"Test file: {resolved_test_path}\n")
-                log_file.write(f"Log file: {node_log_path}\n")
-
-                run_node_test = RunNodeTest(
-                    node_name=node_name,
-                    test_path=resolved_test_path,
-                    log_path=node_log_path,
-                    command=command,
-                    cwd=backend_cwd,
-                    timeout=timeout,
-                    run_subprocess=self.builder._run_subprocess,
-                    timeout_expired=self.builder._subprocess_timeout_expired(),
-                )
-                run_node_test.process_input("", {}, {})
-                if run_node_test.result is None:
-                    raise RuntimeError(f"node test runner produced no result for {node_name}")
-
-                result_item = run_node_test.result
-                overall_ok = overall_ok and result_item["ok"]
-                log_file.write(f"Status: {result_item['status_line']}\n\n")
-                results.append(result_item)
-
-            log_file.write(f"{'=' * 50}\n")
-            log_file.write(f"Test ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-        self.builder._logger.info("Node test summary log written to: %s", self.builder.log_path)
-        self.builder._logger.info("Per-node test logs written to: %s", log_dir_path)
-        self.builder._logger.debug(
-            "Node test run completed for nodes=%s ok=%s",
-            ordered_names,
-            overall_ok,
-        )
-        return {
-            "ok": overall_ok,
-            "log_path": self.builder.log_path,
-            "log_dir": str(log_dir_path),
-            "log_paths": {
-                result_item["node_name"]: result_item["log_path"]
-                for result_item in results
-            },
-            "results": results,
-        }
-
     def stop_managed_server_process(self, process: Optional[Any]) -> None:
         if process is None:
             return
@@ -1271,26 +545,6 @@ class RuntimeService:
         }
         self.builder.dynamic_graph_cache["server_runtime"] = server_runtime
         return server_runtime
-
-    def run_node_tests(
-        self,
-        graph_plan_path: Optional[str] = None,
-        node_names: Optional[list[str]] = None,
-        backend_language: str = "python",
-        log_filename: str = "node_test_log.txt",
-        timeout: int = 60,
-    ) -> Dict[str, Any]:
-        planned_graph = self.builder._load_planned_graph(graph_plan_path)
-        selected_node_names = node_names
-        if selected_node_names is None:
-            selected_node_names = planned_graph.get_topological_sorted_nodes()
-
-        return self.run_selected_node_tests(
-            selected_node_names,
-            language=backend_language,
-            log_filename=log_filename,
-            timeout=timeout,
-        )
 
     def test_main_entrypoint(
         self,

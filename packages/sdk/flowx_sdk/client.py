@@ -92,12 +92,13 @@ class FlowXClient:
                 temperature=temperature,
             )
         )
-        builder.update_backend_nodes(
+        builder.generate_nodes(
             graph_plan_path=str(graph_path),
             requirement_md_path=str(requirement_path),
-            node_docs_dirname="node_docs",
             language="python",
             temperature=temperature,
+            generate_markdowns=True,
+            workflow_name=name,
         )
         workflow_json_path = Path(builder._sync_workflow_graph_json(context_base_dir=builder.root_dir))
         main_path = Path(
@@ -126,7 +127,8 @@ class FlowXClient:
         temperature: float = 0.2,
     ) -> Path:
         """Apply an amendment to one existing workflow node."""
-        builder = self.builder(workflow_name)
+        name = _normalize_name(workflow_name, "workflow_name")
+        builder = self.builder(name)
         node = _normalize_name(node_name, "node_name")
         prompt = str(amendment).strip()
         if not prompt:
@@ -136,18 +138,14 @@ class FlowXClient:
             workflow_json_path=builder.workflow_json_path or builder.graph_plan_path or None,
             temperature=temperature,
         )
-        builder.amend_node_markdown(
-            node_name=node,
-            amendment=prompt,
+        builder.generate_nodes(
             requirement_md_path=builder.requirement_md_path or None,
             graph_plan_path=updated_path or builder.graph_plan_path or None,
+            node_names=[node],
             temperature=temperature,
-        )
-        builder._generate_selected_nodes(
-            [node],
-            language="python",
-            temperature=temperature,
-            reset_mappings=False,
+            generate_markdowns=True,
+            markdown_amendments={node: prompt},
+            workflow_name=name,
         )
         return Path(builder._sync_workflow_graph_json(context_base_dir=builder.root_dir)).resolve()
 

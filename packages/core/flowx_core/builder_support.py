@@ -9,12 +9,8 @@ from flowx_core.tools.workflow_node_reference import resolve_workflow_node_refer
 
 def _default_artifact_dynamic_graph_cache() -> dict[str, Any]:
     return {
-        "graph_nodes": [],
-        "graph_plan_path": "",
-        "node_plans": {},
-        "backend_nodes": {},
         "node_tests": {},
-        "node_input_output_formats": {},
+        "workflow_node_tests": {},
     }
 
 
@@ -28,7 +24,6 @@ class ArtifactSessionState:
     main_output_path: Optional[str] = None
     node_docs_dir: Optional[str] = None
     node_doc_paths: list[str] = field(default_factory=list)
-    last_amended_node_doc_path: Optional[str] = None
     node_location_map: dict[str, str] = field(default_factory=dict)
     node_coder_map: dict[str, Any] = field(default_factory=dict)
 
@@ -160,14 +155,6 @@ class BuildSession:
     @node_doc_paths.setter
     def node_doc_paths(self, value: list[str]) -> None:
         self.artifacts.node_doc_paths = value
-
-    @property
-    def last_amended_node_doc_path(self) -> Optional[str]:
-        return self.artifacts.last_amended_node_doc_path
-
-    @last_amended_node_doc_path.setter
-    def last_amended_node_doc_path(self, value: Optional[str]) -> None:
-        self.artifacts.last_amended_node_doc_path = value
 
     @property
     def log_path(self) -> Optional[str]:
