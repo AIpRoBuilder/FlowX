@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import ast
 import inspect
@@ -12,6 +13,21 @@ from flowx_core.tools.workflow_node_reference import workflow_node_references
 # NOTE: ag_ui_workflow.nodes imports are done lazily inside functions below to
 # avoid circular imports (nodes.py imports parse_skill_md / extract_skill_commands
 # from this module).
+
+
+def parse_json_file(file_name: str | Path, directory: str | Path) -> Any:
+	"""Parse a JSON file located within ``directory``.
+
+	Raises:
+		ValueError: If ``file_name`` resolves outside ``directory``.
+	"""
+	directory_path = Path(directory).expanduser().resolve()
+	file_path = (directory_path / file_name).resolve()
+	try:
+		file_path.relative_to(directory_path)
+	except ValueError as exc:
+		raise ValueError(f"JSON file must be located under {directory_path}: {file_name}") from exc
+	return json.loads(file_path.read_text(encoding="utf-8"))
 
 
 def parse_skill_md(text: str) -> dict[str, str]:

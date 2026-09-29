@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping
 from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
 
 from flowx_core.runtime import RunNodeTest
+from flowx_core.tools.file_tools import parse_json_file
 from flowx_core.tools.workflow_engine import (
 	build_workflow_config,
 	init_workflow_engine,
@@ -194,30 +195,13 @@ class NodeRuntimeModifierPipeline:
 	def json_config() -> dict[str, Any]:
 		"""Return the topology definition for the three repair stages."""
 
-		return {
-			"nodes": [
-				{
-					"name": "generate_node_test",
-					"type": "GenerateNodeTestFile",
-					"meta_type": "WorkflowStepNode",
-					"loop": 1,
-				},
-				{
-					"name": "run_node_test",
-					"type": "ExecuteNodeTest",
-					"meta_type": "WorkflowStepNode",
-					"depends": ["generate_node_test"],
-					"loop": 1,
-				},
-				{
-					"name": "amend_node",
-					"type": "AmendNodeFromTestLog",
-					"meta_type": "WorkflowStepNode",
-					"depends": ["run_node_test"],
-					"loop": 1,
-				},
-			]
-		}
+		config = parse_json_file(
+			"node_runtime_modifier.json",
+			Path(__file__).with_name("configs"),
+		)
+		if not isinstance(config, dict):
+			raise TypeError("Node runtime modifier configuration must be a JSON object")
+		return config
 
 	def _build_engine(self, context: NodeRuntimeModifierContext) -> WorkflowEngine:
 		"""Build and run the configured workflow steps through ``WorkflowEngine``."""

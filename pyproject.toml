@@ -37,7 +37,7 @@ include = ["flowx_core*", "flowx_mcp*", "flowx_sdk*", "flowx_a2a*"]
 namespaces = true
 
 [tool.setuptools.package-data]
-"flowx_core" = ["**/*.md", "**/*.tmpl"]
+"flowx_core" = ["**/*.json", "**/*.md", "**/*.tmpl"]
 
 [tool.pytest.ini_options]
 pythonpath = ["packages/core", "packages/mcp", "packages/sdk", "packages/a2a"]

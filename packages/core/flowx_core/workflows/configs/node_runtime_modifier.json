@@ -1,0 +1,24 @@
+{
+  "nodes": [
+    {
+      "name": "generate_node_test",
+      "type": "GenerateNodeTestFile",
+      "meta_type": "WorkflowStepNode",
+      "loop": 1
+    },
+    {
+      "name": "run_node_test",
+      "type": "ExecuteNodeTest",
+      "meta_type": "WorkflowStepNode",
+      "depends": ["generate_node_test"],
+      "loop": 1
+    },
+    {
+      "name": "amend_node",
+      "type": "AmendNodeFromTestLog",
+      "meta_type": "WorkflowStepNode",
+      "depends": ["run_node_test"],
+      "loop": 1
+    }
+  ]
+}

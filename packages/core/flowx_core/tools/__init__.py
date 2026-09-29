@@ -13,6 +13,7 @@ from .file_tools import (
 	compile_node_file_and_get_derived_keys,
 	filter_merge_python_imports,
 	merge_text_files,
+	parse_json_file,
 )
 from .agent_builder_tools import (
 	get_language_extension,
@@ -31,6 +32,7 @@ __all__ = [
 	"is_weakly_connected",
 	"merge_text_files",
 	"filter_merge_python_imports",
+	"parse_json_file",
 	"compile_node_file_and_get_step_output_card_schema",
 	"compile_node_file_and_get_derived_keys",
 	"get_language_extension",
