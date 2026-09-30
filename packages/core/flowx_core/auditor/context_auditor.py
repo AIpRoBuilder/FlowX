@@ -14,6 +14,10 @@ class ContextAuditor(BaseAuditor):
 	"""Audit Python files to ensure a class exposes a ``desc`` attribute."""
 
 	def audit_context_file(self, file_path: str) -> tuple[bool, List[RuleViolation]]:
+		"""Backward-compatible name for the context audit."""
+		return self.audit_file(file_path)
+
+	def audit_file(self, file_path: str) -> tuple[bool, List[RuleViolation]]:
 		"""Check the file for classes that define a ``desc`` attribute.
 
 		Accepts either a class attribute (``desc = ...``) or an instance

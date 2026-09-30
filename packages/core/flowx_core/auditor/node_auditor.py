@@ -38,6 +38,15 @@ class NodeAuditor(BaseAuditor):
         node_meta: Optional[NodeMeta] = None,
         graph_plan_path: Optional[str] = None,
     ) -> tuple[bool, List[RuleViolation]]:
+        """Backward-compatible name for the node audit."""
+        return self.audit_file(file_path, node_meta=node_meta, graph_plan_path=graph_plan_path)
+
+    def audit_file(
+        self,
+        file_path: str,
+        node_meta: Optional[NodeMeta] = None,
+        graph_plan_path: Optional[str] = None,
+    ) -> tuple[bool, List[RuleViolation]]:
         """Audit a Python file and return whether it passes plus violations.
         
         Args:

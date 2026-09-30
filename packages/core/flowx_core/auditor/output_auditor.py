@@ -23,10 +23,14 @@ class OutputAuditor(BaseAuditor):
     """
 
     def audit_log_file(self, log_path: str) -> Tuple[bool, List[RuleViolation]]:
+        """Backward-compatible name for the log audit."""
+        return self.audit_file(log_path)
+
+    def audit_file(self, file_path: str) -> Tuple[bool, List[RuleViolation]]:
         """Return ``(ok, violations)`` for a log file.
 
         Args:
-            log_path: Path to the log file produced by
+            file_path: Path to the log file produced by
                 :py:meth:`ProjectCoder.test_main_entrypoint`.
 
         If the log contains no ``--- STDERR ---`` section the audit passes
@@ -34,7 +38,7 @@ class OutputAuditor(BaseAuditor):
         failures are converted into ``RuleViolation`` objects.
         """
 
-        path = Path(log_path)
+        path = Path(file_path)
         if not path.is_file():
             raise FileNotFoundError(f"Log file not found: {path}")
 

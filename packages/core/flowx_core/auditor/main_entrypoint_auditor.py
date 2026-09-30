@@ -15,6 +15,10 @@ class MainEntryPointAuditor(BaseAuditor):
 	RouteFunctionNode = Union[ast.FunctionDef, ast.AsyncFunctionDef]
 
 	def audit_main_entrypoint_file(self, file_path: str, nodes_root: str | None = None) -> tuple[bool, List[RuleViolation]]:
+		"""Backward-compatible name for the main entrypoint audit."""
+		return self.audit_file(file_path, nodes_root=nodes_root)
+
+	def audit_file(self, file_path: str, nodes_root: str | None = None) -> tuple[bool, List[RuleViolation]]:
 		# Ensure nodes_root is a string if provided
 		if nodes_root is not None:
 			nodes_root = str(nodes_root)
