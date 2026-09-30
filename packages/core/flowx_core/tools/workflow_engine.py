@@ -111,7 +111,7 @@ def run_workflow_step(
     """Run one engine step and return its successful status."""
 
     status = engine.run_step(step_id, user_input)
-    if status.isErr():
+    if not status.isOK():
         raise RuntimeError(f"workflow step '{step_id}' failed: {status.getInfo()}")
     return status
 

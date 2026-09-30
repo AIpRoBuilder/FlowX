@@ -1,5 +1,6 @@
 from typing import Any
 
+import pytest
 from ag_ui_workflow import StepRunOutput, WorkflowStepNode
 
 from flowx_core.tools.workflow_engine import (
@@ -55,3 +56,15 @@ def test_build_init_and_run_workflow_step() -> None:
     assert second.received["first"].derived == {"value": 2}
     assert engine.session.step_outputs["second"].derived == {"value": 5}
     assert engine.reset_session().step_outputs == {}
+
+
+def test_run_workflow_step_rejects_non_success_status() -> None:
+    class FailingStep(WorkflowStepNode):
+        INPUT_REQUIRED = False
+
+        def process_input(self, user_input, dependency_results, session_state):
+            raise ValueError("invalid output")
+
+    engine = init_workflow_engine(build_workflow_config({"broken": FailingStep()}, {"broken": []}))
+    with pytest.raises(RuntimeError, match="workflow step 'broken' failed"):
+        run_workflow_step(engine, "broken")

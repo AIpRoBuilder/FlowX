@@ -9,13 +9,16 @@ from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
 
+from flowx_core.architect.node_planner import NodePlanner
+from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.tools.node_formats import collect_node_formats
-from flowx_core.tools.runnable_gnode import run_gnode_operation
+from flowx_core.tools.runnable_gnode import RunnableGNode, run_gnode_operation
 from flowx_core.tools.workflow_engine import (
     build_workflow_config,
     init_workflow_engine,
     run_workflow_step,
 )
+from flowx_core.worker.node_writer import PromptNodeFileCoderBase
 
 
 WorkflowCallback = Callable[..., Any]
@@ -73,10 +76,8 @@ class NodeGenerationContext:
         return "\n".join(sections)
 
 
-class NodeGeneratorNode(WorkflowStepNode):
-    """One graph node's markdown/code generator and workflow extension point."""
-
-    INPUT_REQUIRED = False
+class _NodeGenerationStage:
+    """Request-scoped configuration shared by the three per-node workflow stages."""
 
     def __init__(
         self,
@@ -93,11 +94,6 @@ class NodeGeneratorNode(WorkflowStepNode):
         self.context = context
         self.total = total
         self.node_index = node_index
-        self.last_generated_path: str | None = None
-        self.last_generated_markdown_path: str | None = None
-        self._current_node_meta: Any = None
-        self._current_coder: Any = None
-        self._current_resolved_file_path: str | None = None
 
     def configure(
         self,
@@ -105,45 +101,21 @@ class NodeGeneratorNode(WorkflowStepNode):
         *,
         total: int,
         node_index: int,
-    ) -> "NodeGeneratorNode":
+    ) -> "_NodeGenerationStage":
         self.context = context
         self.total = total
         self.node_index = node_index
         return self
 
-    def _audit(self) -> tuple[bool, list[Any]]:
-        return run_gnode_operation(
-            self.builder.node_auditor,
-            "audit_node_file",
-            self._current_resolved_file_path,
-            self._current_node_meta,
-            graph_plan_path=self.context.graph_plan_path,
-        )
 
-    def _retry_log(self, amendment: str, _audit_round: int) -> None:
-        self.builder._logger.warning(
-            "[%s/%s] Node audit failed: %s. %s Applying amendment...",
-            self.node_index,
-            self.total,
-            self.node_name,
-            amendment,
-        )
+class NodePlanningNode(_NodeGenerationStage, NodePlanner):
+    """Produce or amend the markdown plan for a single graph node."""
 
-    def _amend(self, amendment: str, _audit_round: int = 0) -> None:
-        del _audit_round
-        if self._current_coder is None or not self._current_resolved_file_path:
-            raise RuntimeError(f"node generator is not initialized for {self.node_name}")
-        run_gnode_operation(
-            self._current_coder,
-            "amend_code_with_feedback",
-            self._current_resolved_file_path,
-            amendment,
-            graph_plan_path=self.context.graph_plan_path,
-            requirement_md_path=self.context.requirement_md_path,
-            current_node_name=self.node_name,
-            language=self.context.language,
-            temperature=self.context.temperature,
-        )
+    __hash__ = object.__hash__
+
+    def __post_init__(self) -> None:
+        # The builder owns the configured planner (including injected test doubles).
+        RunnableGNode.__init__(self)
 
     def _node_entry(self) -> dict[str, Any]:
         entry = self.context.raw_nodes.get(self.node_name)
@@ -154,8 +126,7 @@ class NodeGeneratorNode(WorkflowStepNode):
     def generate_node_markdown(self, markdown_path: Path, *, overwrite: bool = False) -> str:
         markdown_path.parent.mkdir(parents=True, exist_ok=True)
         if markdown_path.is_file() and not overwrite:
-            self.last_generated_markdown_path = str(markdown_path.resolve())
-            return self.last_generated_markdown_path
+            return str(markdown_path.resolve())
         generated_paths = run_gnode_operation(
             self.builder.node_planner,
             "plan_each",
@@ -171,8 +142,7 @@ class NodeGeneratorNode(WorkflowStepNode):
                 markdown_path.write_text(generated_path.read_text(encoding="utf-8"), encoding="utf-8")
         if not markdown_path.is_file():
             raise FileNotFoundError(f"node markdown generation did not produce {markdown_path}")
-        self.last_generated_markdown_path = str(markdown_path.resolve())
-        return self.last_generated_markdown_path
+        return str(markdown_path.resolve())
 
     def amend_node_markdown(self, markdown_path: Path, amendment: str) -> str:
         if not amendment.strip():
@@ -195,100 +165,139 @@ class NodeGeneratorNode(WorkflowStepNode):
             overwrite=True,
             temperature=min(self.context.temperature, 0.2),
         )
-        self.last_generated_markdown_path = str(markdown_path.resolve())
-        return self.last_generated_markdown_path
+        return str(markdown_path.resolve())
 
-    def generate(
+    def process_input(
         self,
-        *,
-        generation_context: str,
-        generate_markdown: bool,
-        markdown_path: Path,
-        markdown_amendment: str | None,
-        node_amendment: str | None,
-    ) -> str:
-        try:
-            node_meta = self.builder.planned_graph.get_node_meta(self.node_name)
-            if generate_markdown and not markdown_path.is_file():
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        del user_input, dependency_results, session_state
+        markdown_path = self.context.node_docs_dir / f"{self.node_name}.md"
+        if self.context.generate_markdowns and not markdown_path.is_file():
+            self.generate_node_markdown(markdown_path)
+        amendment = self.context.markdown_amendments.get(self.node_name)
+        if amendment:
+            if not markdown_path.is_file():
                 self.generate_node_markdown(markdown_path)
-            elif markdown_path.is_file():
-                self.last_generated_markdown_path = str(markdown_path.resolve())
-            if markdown_amendment:
-                if not markdown_path.is_file():
-                    self.generate_node_markdown(markdown_path)
-                self.amend_node_markdown(markdown_path, markdown_amendment)
+            self.amend_node_markdown(markdown_path, amendment)
+        path = str(markdown_path.resolve()) if markdown_path.is_file() else None
+        return StepRunOutput(derived={"markdown_path": path})
 
-            if markdown_path.is_file():
-                generation_context = (
-                    f"{generation_context}\n\nCurrent node markdown plan (authoritative for implementation):\n"
-                    f"{markdown_path.read_text(encoding='utf-8')}\n"
-                )
-            coder = self.builder._make_node_coder(node_meta)
-            self.builder._sync_node_coder_root_dir(coder)
-            coder.additional_generation_context = generation_context
-            target_path = self.builder._expected_backend_node_path(self.node_name, self.context.language)
-            self.builder._logger.info(
-                "[%s/%s] Generating node '%s' -> %s",
-                self.node_index,
-                self.total,
-                self.node_name,
-                target_path,
-            )
-            file_path = run_gnode_operation(
-                coder,
-                "write_node_from_requirement",
-                self.node_name,
-                node_meta,
-                self.context.requirement_md_path,
-                str(target_path),
-                graph_plan_path=self.context.graph_plan_path,
-                language=self.context.language,
-                temperature=self.context.temperature,
-            )
-            self._current_node_meta = node_meta
-            self._current_coder = coder
-            self._current_resolved_file_path = str(file_path)
-            if node_amendment:
-                self._amend(node_amendment)
 
-            repair_loop = self.builder._make_audit_repair_loop()
-            repair_loop.run(
-                audit=self._audit,
-                amend=self._amend,
-                failure_message_prefix=(
-                    f"node audit did not pass for {self.node_name} after "
-                    f"{repair_loop.max_attempts} attempt(s). Last feedback:\n"
-                ),
-                on_success=lambda _audit_round: self.builder._logger.info(
-                    "[%s/%s] Node audit passed: %s",
-                    self.node_index,
-                    self.total,
-                    self.node_name,
-                ),
-                on_retry=self._retry_log,
+class NodeWritingNode(_NodeGenerationStage, PromptNodeFileCoderBase):
+    """Generate node code using the metadata-selected specialist coder."""
+
+    __hash__ = object.__hash__
+
+    def __post_init__(self) -> None:
+        # Specialist coders are selected once the node metadata is known.
+        RunnableGNode.__init__(self)
+        self._current_coder: Any = None
+        self._current_node_meta: Any = None
+        self.last_generated_path: str | None = None
+
+    def get_node_contract_text(self) -> str:
+        return self._current_coder.get_node_contract_text()
+
+    def get_feedback_contract_text(self) -> str:
+        return self._current_coder.get_feedback_contract_text()
+
+    def _amend(self, amendment: str, _audit_round: int = 0) -> None:
+        del _audit_round
+        if self._current_coder is None or not self.last_generated_path:
+            raise RuntimeError(f"node writer is not initialized for {self.node_name}")
+        run_gnode_operation(
+            self._current_coder,
+            "amend_code_with_feedback",
+            self.last_generated_path,
+            amendment,
+            graph_plan_path=self.context.graph_plan_path,
+            requirement_md_path=self.context.requirement_md_path,
+            current_node_name=self.node_name,
+            language=self.context.language,
+            temperature=self.context.temperature,
+        )
+
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        del user_input, dependency_results, session_state
+        self.last_generated_path = None
+        self._current_coder = None
+        node_meta = self.builder.planned_graph.get_node_meta(self.node_name)
+        coder = self.builder._make_node_coder(node_meta)
+        self.builder._sync_node_coder_root_dir(coder)
+        current_index = self.context.node_names.index(self.node_name)
+        preceding_names = set(self.context.node_names[:current_index])
+        prior_artifacts = {
+            name: dict(artifact)
+            for name, artifact in self.context.artifacts.items()
+            if name in preceding_names
+        }
+        generation_context = self.context.render_generation_context(self.node_name, prior_artifacts)
+        markdown_path = self.context.node_docs_dir / f"{self.node_name}.md"
+        if markdown_path.is_file():
+            generation_context += (
+                "\n\nCurrent node markdown plan (authoritative for implementation):\n"
+                f"{markdown_path.read_text(encoding='utf-8')}\n"
             )
-            self.builder.node_coder_map[self.node_name] = coder
-            self.builder.node_location_map[self.node_name] = self._current_resolved_file_path
-            self.last_generated_path = self._current_resolved_file_path
-            if self.last_generated_markdown_path:
-                self.builder.node_docs_dir = str(Path(self.last_generated_markdown_path).parent)
-                paths = [
-                    path for path in (self.builder.node_doc_paths or [])
-                    if Path(path).name != Path(self.last_generated_markdown_path).name
-                ]
-                paths.append(self.last_generated_markdown_path)
-                self.builder.node_doc_paths = paths
-            return self.last_generated_path
-        except Exception as exc:
-            self.builder._logger.error(
-                "[%s/%s] Node generation failed for %s: %s",
-                self.node_index,
-                self.total,
-                self.node_name,
-                exc,
-                exc_info=True,
-            )
-            raise RuntimeError(f"node generation failed for {self.node_name}: {exc}") from exc
+        coder.additional_generation_context = generation_context
+        target_path = self.builder._expected_backend_node_path(self.node_name, self.context.language)
+        self.builder._logger.info(
+            "[%s/%s] Generating node '%s' -> %s",
+            self.node_index, self.total, self.node_name, target_path,
+        )
+        file_path = run_gnode_operation(
+            coder,
+            "write_node_from_requirement",
+            self.node_name,
+            node_meta,
+            self.context.requirement_md_path,
+            str(target_path),
+            graph_plan_path=self.context.graph_plan_path,
+            language=self.context.language,
+            temperature=self.context.temperature,
+        )
+        self._current_coder = coder
+        self._current_node_meta = node_meta
+        self.last_generated_path = str(file_path)
+        amendment = self.context.node_amendments.get(self.node_name)
+        if amendment:
+            self._amend(amendment)
+        return StepRunOutput(derived={"generated_path": self.last_generated_path})
+
+
+class NodeAuditingNode(_NodeGenerationStage, NodeAuditor):
+    """Audit, repair and publish the generated node as the final stage."""
+
+    def __init__(self, builder: Any, node_name: str, context: NodeGenerationContext, *, writer: NodeWritingNode, **kwargs: Any) -> None:
+        super().__init__(builder, node_name, context, **kwargs)
+        self.writer = writer
+        self.last_generated_path: str | None = None
+        self.last_audit_error: RuntimeError | None = None
+
+    def _audit(self) -> tuple[bool, list[Any]]:
+        return run_gnode_operation(
+            self.builder.node_auditor,
+            "audit_node_file",
+            self.writer.last_generated_path,
+            self.writer._current_node_meta,
+            graph_plan_path=self.context.graph_plan_path,
+        )
+
+    def _amend(self, amendment: str, _audit_round: int = 0) -> None:
+        self.writer._amend(amendment, _audit_round)
+
+    def _retry_log(self, amendment: str, _audit_round: int) -> None:
+        self.builder._logger.warning(
+            "[%s/%s] Node audit failed: %s. %s Applying amendment...",
+            self.node_index, self.total, self.node_name, amendment,
+        )
 
     def _requested_workflow_names(self) -> list[str]:
         request = self.context.workflow_requests.get(self.node_name)
@@ -330,25 +339,42 @@ class NodeGeneratorNode(WorkflowStepNode):
     ) -> StepRunOutput:
         del user_input, dependency_results, session_state
         node_name = self.node_name
-        current_index = self.context.node_names.index(node_name)
-        preceding_names = set(self.context.node_names[:current_index])
-        prior_artifacts = {
-            name: dict(artifact)
-            for name, artifact in self.context.artifacts.items()
-            if name in preceding_names
-        }
-        generation_context = self.context.render_generation_context(
-            node_name,
-            prior_artifacts,
-        )
-        generated_path = self.generate(
-            generation_context=generation_context,
-            generate_markdown=self.context.generate_markdowns,
-            markdown_path=self.context.node_docs_dir / f"{node_name}.md",
-            markdown_amendment=self.context.markdown_amendments.get(node_name),
-            node_amendment=self.context.node_amendments.get(node_name),
-        )
-        markdown_path = self.last_generated_markdown_path
+        self.last_generated_path = None
+        self.last_audit_error = None
+        generated_path = self.writer.last_generated_path
+        if generated_path is None or self.writer._current_coder is None:
+            raise RuntimeError(f"node writer did not produce a file for {node_name}")
+        repair_loop = self.builder._make_audit_repair_loop()
+        try:
+            repair_loop.run(
+                audit=self._audit,
+                amend=self._amend,
+                failure_message_prefix=(
+                    f"node audit did not pass for {node_name} after "
+                    f"{repair_loop.max_attempts} attempt(s). Last feedback:\n"
+                ),
+                on_success=lambda _audit_round: self.builder._logger.info(
+                    "[%s/%s] Node audit passed: %s",
+                    self.node_index, self.total, node_name,
+                ),
+                on_retry=self._retry_log,
+            )
+        except RuntimeError as exc:
+            self.last_audit_error = exc
+            raise
+        self.builder.node_coder_map[node_name] = self.writer._current_coder
+        self.builder.node_location_map[node_name] = generated_path
+        self.last_generated_path = generated_path
+        markdown_file = self.context.node_docs_dir / f"{node_name}.md"
+        markdown_path = str(markdown_file.resolve()) if markdown_file.is_file() else None
+        if markdown_path:
+            self.builder.node_docs_dir = str(markdown_file.parent)
+            paths = [
+                path for path in (self.builder.node_doc_paths or [])
+                if Path(path).name != markdown_file.name
+            ]
+            paths.append(markdown_path)
+            self.builder.node_doc_paths = paths
         artifact: dict[str, Any] = {
             "node_name": node_name,
             "node_file_path": generated_path,
@@ -376,10 +402,12 @@ class NodeGeneratorNode(WorkflowStepNode):
 
 @dataclass
 class NodeGenerationWorkflow:
-    """Build a topologically ordered workflow containing one generator per graph node."""
+    """Build a planner → writer → auditor pipeline for every selected graph node."""
 
     builder: Any
-    nodes: MutableMapping[str, NodeGeneratorNode] = field(default_factory=dict)
+    planners: MutableMapping[str, NodePlanningNode] = field(default_factory=dict)
+    writers: MutableMapping[str, NodeWritingNode] = field(default_factory=dict)
+    nodes: MutableMapping[str, NodeAuditingNode] = field(default_factory=dict)
     _engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
     _context: NodeGenerationContext | None = field(default=None, init=False, repr=False)
 
@@ -511,43 +539,68 @@ class NodeGenerationWorkflow:
         context.raw_nodes = raw_nodes
         context.skipped_node_names = [name for name in all_names if name not in set(ordered_names)]
         self._context = context
-        self._seed_existing_artifacts(context, all_names)
+        self._seed_existing_artifacts(context, context.skipped_node_names)
         if not ordered_names:
             self._engine = None
             return context
 
-        steps: dict[str, NodeGeneratorNode] = {}
+        steps: dict[str, WorkflowStepNode] = {}
         dependencies: dict[str, list[str]] = {}
-        for index, node_name in enumerate(ordered_names, start=1):
-            node = self.nodes.get(node_name)
-            if node is None:
-                node = NodeGeneratorNode(self.builder, node_name, context)
-                self.nodes[node_name] = node
-            steps[node_name] = node.configure(
-                context,
-                total=len(ordered_names),
-                node_index=index,
-            )
-
         selected_names = set(ordered_names)
         previous_selected: str | None = None
-        for node_name in ordered_names:
+        for index, node_name in enumerate(ordered_names, start=1):
+            planner = self.planners.get(node_name)
+            if planner is None:
+                planner = NodePlanningNode(self.builder, node_name, context)
+                self.planners[node_name] = planner
+            writer = self.writers.get(node_name)
+            if writer is None:
+                writer = NodeWritingNode(self.builder, node_name, context)
+                self.writers[node_name] = writer
+            auditor = self.nodes.get(node_name)
+            if auditor is None:
+                auditor = NodeAuditingNode(self.builder, node_name, context, writer=writer)
+                self.nodes[node_name] = auditor
+            for stage in (planner, writer, auditor):
+                stage.configure(context, total=len(ordered_names), node_index=index)
+
+            plan_id = f"{node_name}::plan"
+            write_id = f"{node_name}::write"
+            audit_id = f"{node_name}::audit"
+            steps[plan_id] = planner
+            steps[write_id] = writer
+            steps[audit_id] = auditor
             node_dependencies = [
-                dependency
+                f"{dependency}::audit"
                 for dependency in planned_graph.get_node_dependencies(node_name)
                 if dependency in selected_names
             ]
-            if previous_selected and previous_selected not in node_dependencies:
-                node_dependencies.append(previous_selected)
-            dependencies[node_name] = node_dependencies
+            if previous_selected and f"{previous_selected}::audit" not in node_dependencies:
+                node_dependencies.append(f"{previous_selected}::audit")
+            dependencies[plan_id] = node_dependencies
+            dependencies[write_id] = [plan_id]
+            dependencies[audit_id] = [write_id]
             previous_selected = node_name
 
         self.builder._start_progress(len(ordered_names))
         config = build_workflow_config(steps, dependencies)
         self._engine = init_workflow_engine(config)
-        for node_name in ordered_names:
-            run_workflow_step(self._engine, node_name)
+        for step_id in steps:
+            try:
+                run_workflow_step(self._engine, step_id)
+            except RuntimeError as exc:
+                if step_id.endswith("::audit"):
+                    auditor = self.nodes[step_id.removesuffix("::audit")]
+                    if auditor.last_audit_error is not None:
+                        raise auditor.last_audit_error from exc
+                raise
         return context
 
 
-__all__ = ["NodeGenerationContext", "NodeGeneratorNode", "NodeGenerationWorkflow"]
+__all__ = [
+    "NodeGenerationContext",
+    "NodePlanningNode",
+    "NodeWritingNode",
+    "NodeAuditingNode",
+    "NodeGenerationWorkflow",
+]
