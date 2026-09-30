@@ -1,7 +1,10 @@
-import json
 from types import SimpleNamespace
 
-from flowx_core.architect.node_planner import NodePlanner
+import pytest
+from ag_ui_workflow import StepRunOutput
+
+from flowx_core.architect.node_planner import NodePlanElement
+from flowx_core.llm_client.coder import Coder
 
 
 class _FakeCompletions:
@@ -29,9 +32,9 @@ def _write_skill(skills_root, skill_name: str, body: str = "# Skill\n\nsearch he
 def test_node_context_lists_selectable_types_and_skill_descriptions(tmp_path) -> None:
 	skills_root = tmp_path / "skills"
 	_write_skill(skills_root, "baidu_search", "# Skill\n\nBaidu search helper")
-	planner = NodePlanner(client=_FakeClient([]), skills_root_path=str(skills_root))
+	planner = NodePlanElement(client=_FakeClient([]), skills_root_path=str(skills_root))
 
-	context = planner._node_context(
+	context = planner.render_node_context(
 		{
 			"name": "SearchSkill",
 			"desc": "search for external data",
@@ -55,9 +58,9 @@ def test_node_context_lists_selectable_types_and_skill_descriptions(tmp_path) ->
 
 
 def test_node_context_omits_legacy_service_metadata(tmp_path) -> None:
-	planner = NodePlanner(client=_FakeClient([]), skills_root_path=str(tmp_path / "skills"))
+	planner = NodePlanElement(client=_FakeClient([]), skills_root_path=str(tmp_path / "skills"))
 
-	context = planner._node_context(
+	context = planner.render_node_context(
 		{
 			"name": "ComputeResult",
 			"desc": "compute the final score",
@@ -79,79 +82,164 @@ def test_node_context_omits_legacy_service_metadata(tmp_path) -> None:
 	assert "- services:" not in context
 
 
-def test_amend_graph_node_from_files_updates_graph_and_regenerates_node_plan(tmp_path) -> None:
-	requirement_path = tmp_path / "requirement.md"
-	requirement_path.write_text("# Requirement\n\nCollect a search query and call a skill.", encoding="utf-8")
-	skills_root = tmp_path / "skills"
-	_write_skill(skills_root, "baidu_search", "# Skill\n\nBaidu search helper")
+def test_plan_node_writes_only_requested_node(tmp_path) -> None:
+	output_path = tmp_path / "docs" / "Selected.md"
+	planner = NodePlanElement(client=_FakeClient(["# Node Brief\n\nSelected node"]),
+			session_marking_prompt="Use request-scoped IO")
 
-	graph_path = tmp_path / "graph_plan.json"
-	graph_path.write_text(
-		json.dumps(
-			{
-				"nodes": [
-					{
-						"name": "SearchSkill",
-						"type": "SearchSkill",
-						"desc": "search for data",
-						"enable": True,
-						"depends": [],
-						"ext_data": {
-							"type": "skill",
-							"desc": "search via skill",
-							"skill_name": "baidu_search",
-						},
-						"inputs_format": {"query": "string"},
-					}
-				]
-			},
-			ensure_ascii=False,
-			indent=2,
-		),
-		encoding="utf-8",
+	written = planner.plan_node(
+		{"name": "Selected", "desc": "process input", "ext_data": {"type": "none"}},
+		"# Requirements", output_path,
 	)
 
-	node_plan_path = tmp_path / "node_docs" / "SearchSkill.md"
-	planner = NodePlanner(
-		skills_root_path=str(skills_root),
-		client=_FakeClient(
-			[
-				json.dumps(
-					{
-						"name": "SearchSkill",
-						"type": "SearchSkill",
-						"desc": "collect query and search with optional locale",
-						"enable": True,
-						"depends": [],
-						"ext_data": {
-							"type": "skill",
-							"desc": "search via skill",
-							"skill_name": "baidu_search",
-						},
-						"inputs_format": {"query": "string", "locale": "string"},
-					},
-					ensure_ascii=False,
-				),
-				"# Node Brief\n\n## What This Node Achieves\nCollects a query and locale, then uses the selected skill.\n\n## Core Functions\n- process_input: runs the skill using the validated user input.\n",
-			]
-		)
+	assert written == output_path
+	assert output_path.read_text(encoding="utf-8") == "# Node Brief\n\nSelected node"
+	assert list(output_path.parent.iterdir()) == [output_path]
+	assert "Use request-scoped IO" in planner.system_prompt
+
+
+def test_node_plan_element_uses_inherited_coder(tmp_path) -> None:
+	client = _FakeClient(["# Node Brief"])
+	planner = NodePlanElement(
+		client=client, use_streaming=False,
+		session_marking_prompt="Keep plan files request scoped.",
 	)
 
-	amended_graph_path, regenerated_plan_path = planner.amend_graph_node_from_files(
-		node_name="SearchSkill",
-		user_prompt="Add locale as an optional user input field and update the description.",
-		requirement_md_path=str(requirement_path),
-		graph_plan_json_path=str(graph_path),
-		node_output_path=str(node_plan_path),
+	assert isinstance(planner, Coder)
+	assert NodePlanElement.code_to_file is Coder.code_to_file
+	assert planner.client is client
+	assert planner.system_prompt.count("Keep plan files request scoped.") == 1
+	assert not hasattr(planner, "_coder")
+	assert planner.plan_node({"name": "Task"}, "Requirements", tmp_path / "Task.md").read_text() == "# Node Brief"
+
+
+def test_plan_node_respects_overwrite_flag(tmp_path) -> None:
+	output_path = tmp_path / "Selected.md"
+	output_path.write_text("keep", encoding="utf-8")
+	planner = NodePlanElement(client=_FakeClient([]))
+
+	with pytest.raises(FileExistsError):
+		planner.plan_node({"name": "Selected"}, "requirements", output_path, overwrite=False)
+
+	assert output_path.read_text(encoding="utf-8") == "keep"
+
+
+def test_configured_node_plan_step_processes_one_node(tmp_path) -> None:
+	output_path = tmp_path / "Selected.md"
+	step = NodePlanElement(
+		client=_FakeClient(["# Node Brief"]),
+		node={"name": "Selected", "ext_data": {"type": "none"}},
+		requirement_text="Requirements", output_path=str(output_path),
 	)
 
-	amended_graph = json.loads(amended_graph_path.read_text(encoding="utf-8"))
-	amended_node = amended_graph["nodes"][0]
+	result = step.process_input("", {}, {})
 
-	assert amended_graph_path == graph_path
-	assert regenerated_plan_path == node_plan_path
-	assert amended_node["ext_data"]["type"] == "skill"
-	assert amended_node["ext_data"]["skill_name"] == "baidu_search"
-	assert amended_node["inputs_format"] == {"query": "string", "locale": "string"}
-	assert "collect query and search with optional locale" == amended_node["desc"]
-	assert "Collects a query and locale" in node_plan_path.read_text(encoding="utf-8")
+	assert result.derived["output_path"] == str(output_path)
+	assert output_path.read_text(encoding="utf-8") == "# Node Brief"
+
+
+def test_process_input_includes_only_direct_dependency_plans(tmp_path) -> None:
+	class RecordingCompletions(_FakeCompletions):
+		def create(self, **kwargs):
+			self.prompt = kwargs["messages"][-1]["content"]
+			return super().create(**kwargs)
+
+	completion = RecordingCompletions(["# Node Brief"])
+	client = SimpleNamespace(chat=SimpleNamespace(completions=completion))
+	upstream = tmp_path / "Upstream.md"
+	upstream.write_text("Upstream result", encoding="utf-8")
+	unrelated = tmp_path / "Unrelated.md"
+	unrelated.write_text("Unrelated result", encoding="utf-8")
+	step = NodePlanElement(
+		client=client, node={"name": "Target", "depends": ["Upstream"]},
+		requirement_text="Requirements", output_path=str(tmp_path / "Target.md"),
+	)
+
+	step.process_input("", {
+		"Upstream::audit": StepRunOutput(derived={"markdown_path": str(upstream)}),
+		"Unrelated::audit": StepRunOutput(derived={"markdown_path": str(unrelated)}),
+	}, {})
+
+	assert "Upstream result" in completion.prompt
+	assert "Unrelated result" not in completion.prompt
+
+
+def test_process_input_amends_existing_node_plan_with_dependencies(tmp_path) -> None:
+	plan = tmp_path / "Target.md"
+	plan.write_text("Original plan", encoding="utf-8")
+	upstream = tmp_path / "Upstream.md"
+	upstream.write_text("Upstream result", encoding="utf-8")
+
+	class RecordingCompletions(_FakeCompletions):
+		def create(self, **kwargs):
+			self.prompt = kwargs["messages"][-1]["content"]
+			return super().create(**kwargs)
+
+	completion = RecordingCompletions(["Amended plan"])
+	client = SimpleNamespace(chat=SimpleNamespace(completions=completion))
+	step = NodePlanElement(
+		client=client, node={"name": "Target", "depends": ["Upstream"]},
+		requirement_text="Requirements", output_path=str(plan), amendment="Make it shorter",
+	)
+	result = step.process_input("", {
+		"Upstream::audit": StepRunOutput(derived={"markdown_path": str(upstream)}),
+	}, {})
+
+	assert plan.read_text(encoding="utf-8") == "Amended plan"
+	assert "Original plan" in completion.prompt
+	assert "Upstream result" in completion.prompt
+	assert "Make it shorter" in completion.prompt
+	assert result.derived["markdown_path"] == str(plan.resolve())
+
+
+def test_process_input_generates_missing_plan_before_amending(tmp_path) -> None:
+	plan = tmp_path / "Target.md"
+	step = NodePlanElement(
+		client=_FakeClient(["Initial plan", "Amended plan"]),
+		node={"name": "Target"}, requirement_text="Requirements",
+		output_path=str(plan), amendment="Refine the brief",
+	)
+
+	result = step.process_input("", {}, {})
+
+	assert plan.read_text(encoding="utf-8") == "Amended plan"
+	assert result.derived["markdown_path"] == str(plan.resolve())
+
+
+def test_process_input_skips_generation_when_disabled(tmp_path) -> None:
+	plan = tmp_path / "Target.md"
+	step = NodePlanElement(
+		client=_FakeClient([]), node={"name": "Target"},
+		output_path=str(plan), generate_markdown=False,
+	)
+
+	result = step.process_input("", {}, {})
+
+	assert result.derived["markdown_path"] is None
+	assert not plan.exists()
+
+
+def test_process_input_dispatches_amendment_from_session_state(tmp_path) -> None:
+	plan = tmp_path / "Target.md"
+	plan.write_text("Original plan", encoding="utf-8")
+	step = NodePlanElement(
+		client=_FakeClient(["Updated plan"]), node={"name": "Target"},
+		output_path=str(plan),
+	)
+	plan_request = {
+		"generate_markdown": False, "amendment": "Improve the brief",
+	}
+
+	result = step.process_input("", {}, {"node_plan_request": plan_request})
+
+	assert plan.read_text(encoding="utf-8") == "Updated plan"
+	assert result.derived["markdown_path"] == str(plan.resolve())
+
+
+def test_process_input_rejects_invalid_session_state_request(tmp_path) -> None:
+	step = NodePlanElement(
+		client=_FakeClient([]), node={"name": "Target"},
+		output_path=str(tmp_path / "Target.md"),
+	)
+	with pytest.raises(TypeError, match="string amendment"):
+		step.process_input("", {}, {"node_plan_request": {"amendment": 123}})

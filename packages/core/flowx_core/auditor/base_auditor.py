@@ -4,15 +4,16 @@ import ast
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
+from ag_ui_workflow import WorkflowStepNode
+
 from flowx_core.auditor.data import RuleViolation
-from flowx_core.tools.runnable_gnode import RunnableGNode
 
 
-class BaseAuditor(RunnableGNode):
+class BaseAuditor(WorkflowStepNode):
 	"""Audit classes to ensure self.method() calls are defined on the class."""
 
 	def __init__(self) -> None:
-		RunnableGNode.__init__(self)
+		super().__init__()
 		# Predefined methods that are allowed even if not defined on the class.
 		default_white_list = {"createGParam", "getGParam"}
 		self.white_list: Set[str] = set(default_white_list)

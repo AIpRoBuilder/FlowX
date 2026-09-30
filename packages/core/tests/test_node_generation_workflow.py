@@ -18,7 +18,7 @@ class _FakeComponent:
 def _make_builder(monkeypatch, root: Path) -> AgentBuilder:
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     return AgentBuilder(api_key="key", model="model", provider="provider", root_dir=str(root))
 
@@ -67,22 +67,14 @@ def test_node_generation_workflow_carries_prior_artifacts_and_routes_requested_w
     builder.requirement_md_path = str(requirement_path)
     builder.graph_plan_path = str(graph_path)
 
-    class _FakeNodePlanner:
-        def plan_each(self, *, requirement_text, graph_plan_text, output_dir, **kwargs):
-            selected_node = json.loads(graph_plan_text)["nodes"][0]
-            path = Path(output_dir) / f"{selected_node['name']}.md"
+    class _FakeNodePlanElement:
+        def process_input(self, user_input, dependency_results, session_state):
+            path = Path(self.output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"# {selected_node['name']} plan\n{requirement_text}", encoding="utf-8")
-            return [path]
+            path.write_text(f"# {self.node['name']} plan\n{self.requirement_text}", encoding="utf-8")
+            return node_generation.StepRunOutput(derived={"markdown_path": str(path.resolve())})
 
-        def _node_context(self, node, index):
-            return f"### Node {index}: {node['name']}"
-
-        def code_to_file(self, prompt, file_path, **kwargs):
-            Path(file_path).write_text(prompt, encoding="utf-8")
-            return Path(file_path)
-
-    builder.node_planner = _FakeNodePlanner()
+    builder.node_planner = _FakeNodePlanElement()
     generated_prompt_contexts: dict[str, str] = {}
 
     class _FakeNodeCoder:
@@ -163,12 +155,12 @@ def test_node_generation_has_three_ordered_stages_and_publishes_repaired_code(
     monkeypatch.setattr(node_generation, "build_workflow_config", capture_config)
 
     class FakePlanner:
-        def plan_each(self, *, graph_plan_text, output_dir, **kwargs):
-            name = json.loads(graph_plan_text)["nodes"][0]["name"]
+        def process_input(self, user_input, dependency_results, session_state):
+            name = self.node["name"]
             events.append(f"{name}:plan")
-            path = Path(output_dir) / f"{name}.md"
+            path = Path(self.output_path)
             path.write_text(f"# {name} plan", encoding="utf-8")
-            return [path]
+            return node_generation.StepRunOutput(derived={"markdown_path": str(path.resolve())})
 
     builder.node_planner = FakePlanner()
 

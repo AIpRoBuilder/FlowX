@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from flowx_core.tools.runnable_gnode import RunnableGNode
+from ag_ui_workflow import WorkflowStepNode
 
 from flowx_core.logging_utils import get_logger
 
@@ -175,7 +175,7 @@ class _StreamingCodeFenceStripper:
 
 
 @dataclass
-class Coder(RunnableGNode):
+class Coder(WorkflowStepNode):
     """Use a language model to generate code and write it to a file."""
 
     provider: str = "openai"  # "openai", "zhipu", "deepseek", "qwen", or "111api"
@@ -195,16 +195,16 @@ class Coder(RunnableGNode):
     use_streaming: bool = True
     session_marking_prompt: str = ""
 
-    def __post_init__(self) -> None:
-        RunnableGNode.__init__(self)
+    def __post_init__(self, *, initialize_client: bool = True) -> None:
+        WorkflowStepNode.__init__(self)
         self.system_prompt = append_instruction_block(
             self.system_prompt,
             self.session_marking_prompt,
         )
         self.timeout = self.timeout if self.timeout is not None else _resolve_timeout(self.provider)
 
-        # Allow dependency injection of a preconfigured client for tests.
-        if self.client is None:
+        # Injected clients need no setup; template-only subclasses can skip client creation.
+        if initialize_client and self.client is None:
             if self.provider == "openai":
                 if OpenAI is None:
                     raise ImportError(

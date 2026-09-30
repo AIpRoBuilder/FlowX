@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -5,7 +6,7 @@ import pytest
 import flowx_core.agent_builder as agent_builder_module
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.architect.graph import NodeMeta
-from flowx_core.architect.node_planner import NodePlanner
+from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.llm_client.coder import compose_session_marking_prompt
 from flowx_core.tools.workflow_node_reference import (
     render_workflow_method_signatures,
@@ -48,54 +49,65 @@ class _FakePlanner:
     def amend_file_with_feedback(self, graph_plan_path, amendment, temperature=0.35):
         self.amend_calls.append((graph_plan_path, amendment, temperature))
 
+    def process_input(self, user_input, dependency_results, session_state):
+        del user_input, dependency_results
+        request = session_state["graph_planner"]
+        if request["action"] == "plan":
+            self.plan_from_file(request["requirement_md_path"], request["output_path"])
+        else:
+            self.amend_file_with_feedback(
+                request["graph_json_path"],
+                request["amendment"],
+                temperature=request.get("temperature", 0.35),
+            )
 
-def test_build_user_prompt_includes_cron_trigger_requirements(tmp_path):
+
+def test_main_writer_always_renders_step_execution_route(tmp_path):
     writer = PromptMainFileCoder(client=_FakeClient())
+    package_dir = tmp_path / "example_agent_output"
+    package_dir.mkdir()
+    graph_path = tmp_path / "graph_plan.json"
+    graph_path.write_text(json.dumps({"nodes": [{"name": name} for name in ("CollectInput", "ProcessInput")]}))
+    for name in ("CollectInput", "ProcessInput"):
+        (package_dir / f"{name}.py").write_text(f"class {name}: pass\n")
 
-    prompt = writer._build_user_prompt(
-        project_root_path=tmp_path,
-        graph_plan_json_path=tmp_path / "graph_plan.json",
-        node_class_names=["CollectInput", "ProcessInput"],
-        nodes_package_name="example_agent_output",
+    output = writer.write_main_entrypoint(
+        project_root_path=str(tmp_path),
+        graph_plan_json_path=str(graph_path),
+        output_path=str(package_dir / "main.py"),
         fastapi_host="0.0.0.0",
         fastapi_port=8000,
-        uvicorn_reload=False,
-        requirement_analysis_result={
-            "is_cron_task": True,
-            "task_type": "cron",
-            "crontab_expression": "0 9 * * *",
-        },
-    )
+    ).read_text(encoding="utf-8")
 
-    assert '@app.post("/cron/start")' in prompt
-    assert '@app.post("/api/run-step")' not in prompt
-    assert "_run_all_steps_events" in prompt
-    assert "asyncio.create_task" in prompt
+    assert '@app.post("/api/run-step")' in output
 
 
 def test_build_user_prompt_requires_uvicorn_launcher(tmp_path):
     writer = PromptMainFileCoder(client=_FakeClient())
+    package_dir = tmp_path / "example_agent_output"
+    package_dir.mkdir()
+    graph_path = tmp_path / "graph_plan.json"
+    graph_path.write_text(json.dumps({"nodes": [{"name": "CollectInput"}]}))
+    (package_dir / "CollectInput.py").write_text("class CollectInput: pass\n")
 
-    prompt = writer._build_user_prompt(
-        project_root_path=tmp_path,
-        graph_plan_json_path=tmp_path / "graph_plan.json",
-        node_class_names=["CollectInput"],
-        nodes_package_name="example_agent_output",
+    output = writer.write_main_entrypoint(
+        project_root_path=str(tmp_path),
+        graph_plan_json_path=str(graph_path),
+        output_path=str(package_dir / "main.py"),
         fastapi_host="127.0.0.1",
         fastapi_port=9000,
         uvicorn_reload=True,
-        requirement_analysis_result=None,
-    )
+    ).read_text(encoding="utf-8")
 
-    assert "uvicorn" in prompt
-    assert "if __name__ == \"__main__\":" in prompt
-    assert "uvicorn.run(app" in prompt
+    assert "uvicorn" in output
+    assert "if __name__ == \"__main__\":" in output
+    assert "uvicorn.run(app" in output
 
 
 def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
 
     builder = AgentBuilder(
@@ -150,7 +162,7 @@ def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tm
 def test_agent_builder_make_node_coder_passes_session_marking_prompt(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "WorkflowStepNodeCoder", _FakeComponent)
 
@@ -179,7 +191,7 @@ def test_agent_builder_make_node_coder_passes_session_marking_prompt(monkeypatch
 def test_agent_builder_make_node_coder_routes_automatic_step(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "WorkflowStepNodeCoder", _FakeComponent)
 
@@ -204,7 +216,7 @@ def test_agent_builder_make_node_coder_routes_automatic_step(monkeypatch, tmp_pa
 
 
 def test_node_planner_system_prompt_includes_session_marking_prompt():
-    planner = NodePlanner(
+    planner = NodePlanElement(
         client=_FakeClient(),
         session_marking_prompt=compose_session_marking_prompt(
             "Keep node brief examples request scoped."
@@ -243,7 +255,7 @@ def test_node_writer_contract_text_uses_reference_hook_signatures() -> None:
 def test_agent_builder_defaults_max_audit_rounds_to_seven(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
 
     builder = AgentBuilder(
@@ -259,7 +271,7 @@ def test_agent_builder_defaults_max_audit_rounds_to_seven(monkeypatch, tmp_path)
 def test_plan_graph_stops_after_configured_max_audit_rounds(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakePlanner)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "Graph", lambda path: SimpleNamespace(path=path))
 

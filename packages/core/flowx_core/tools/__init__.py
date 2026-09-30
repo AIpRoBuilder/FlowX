@@ -19,7 +19,7 @@ from .agent_builder_tools import (
 	get_language_extension,
 	select_python_command,
 )
-from .text_tools import normalize_requirement_analysis_result, truncate_context
+from .text_tools import truncate_context
 
 __all__ = [
 	"PIPELINE_ID_GPARAM_KEY",
@@ -37,6 +37,5 @@ __all__ = [
 	"compile_node_file_and_get_derived_keys",
 	"get_language_extension",
 	"select_python_command",
-	"normalize_requirement_analysis_result",
 	"truncate_context",
 ]

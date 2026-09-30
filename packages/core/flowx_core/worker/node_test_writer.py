@@ -4,7 +4,9 @@ import ast
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from ag_ui_workflow import StepRunOutput
 
 from flowx_core._paths import bootstrap_package_root
 
@@ -105,6 +107,45 @@ class PromptNodeTestFileCoder(Coder):
         )
         super().__post_init__()
 
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        """Write or amend a node test using a session-state request."""
+        del user_input, dependency_results
+        request = session_state.get("node_test_writer")
+        if not isinstance(request, Mapping):
+            raise ValueError("session_state['node_test_writer'] must be a write or amend request")
+
+        action_key = f"{type(self).__name__}::action"
+        action = session_state.get(action_key)
+        if action not in ("write", "amend"):
+            raise ValueError(f"{action_key} must be 'write' or 'amend'")
+
+        node_file_path = request.get("node_file_path")
+        output_path = request.get("output_path")
+        if not isinstance(node_file_path, str) or not node_file_path.strip():
+            raise ValueError("node_test_writer node_file_path must be a non-empty string")
+        if not isinstance(output_path, str) or not output_path.strip():
+            raise ValueError("node_test_writer output_path must be a non-empty string")
+
+        options = {
+            "overwrite": request.get("overwrite", True),
+            "temperature": request.get("temperature", 0.2),
+            "max_tokens": request.get("max_tokens", MAX_TOKENS),
+        }
+        if action == "write":
+            written = self.write_test_from_node_file(node_file_path, output_path, **options)
+        else:
+            amendment = request.get("amendment")
+            if not isinstance(amendment, str) or not amendment.strip():
+                raise ValueError("amend requires a non-empty amendment")
+            written = self.amend_test_with_feedback(node_file_path, output_path, amendment, **options)
+
+        return StepRunOutput(derived={"test_file_path": str(written)})
+
     def _build_user_prompt(self, node_file_path: str) -> str:
         path = Path(node_file_path).expanduser().resolve()
         if not path.exists():
@@ -174,6 +215,38 @@ class PromptNodeTestFileCoder(Coder):
 
         return self.code_to_file(
             self._build_user_prompt(node_file_path),
+            str(target_path),
+            overwrite=overwrite,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    def amend_test_with_feedback(
+        self,
+        node_file_path: str,
+        output_path: str,
+        amendment: str,
+        *,
+        overwrite: bool = True,
+        temperature: float = 0.2,
+        max_tokens: int = MAX_TOKENS,
+    ) -> Path:
+        """Revise an existing test against the current node implementation."""
+        target_path = Path(output_path)
+        if target_path.suffix.lower() != ".py":
+            target_path = target_path.with_suffix(".py")
+        if not target_path.is_file():
+            raise FileNotFoundError(f"Test file not found: {target_path}")
+
+        prompt = (
+            f"{self._build_user_prompt(node_file_path)}\n\n"
+            "Amend the existing pytest module below using the feedback. "
+            "Preserve valid tests and return only the complete updated Python test code.\n"
+            f"Existing test code:\n{target_path.read_text(encoding='utf-8')}\n\n"
+            f"Feedback:\n{amendment}\n"
+        )
+        return self.code_to_file(
+            prompt,
             str(target_path),
             overwrite=overwrite,
             temperature=temperature,

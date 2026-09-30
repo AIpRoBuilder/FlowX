@@ -1,8 +1,8 @@
-import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 
-from croniter import croniter
+from ag_ui_workflow import StepRunOutput
 
 from flowx_core._paths import bootstrap_package_root
 from flowx_core.tools.workflow_node_reference import render_workflow_step_meta_catalog
@@ -13,27 +13,11 @@ ROOT_DIR = bootstrap_package_root(__file__)
 from flowx_core.llm_client.coder import Coder, MAX_TOKENS
 
 
-def _load_json_object(text: str) -> dict:
-	"""Parse a JSON object, tolerating extra wrapper text around it."""
-
-	try:
-		return json.loads(text)
-	except json.JSONDecodeError:
-		start = text.find("{")
-		end = text.rfind("}")
-		if start == -1 or end == -1 or end <= start:
-			raise
-		return json.loads(text[start : end + 1])
-
-
 @dataclass
 class RequirementAnalysisResult:
-	"""Artifacts and metadata produced from requirement analysis."""
+	"""Artifact produced from requirement analysis."""
 
 	output_path: Path
-	is_cron_task: bool
-	task_type: str
-	crontab_expression: str | None = None
 
 
 @dataclass
@@ -55,51 +39,42 @@ class RequirementDisector(Coder):
 		)
 		super().__post_init__()
 
-	def _classify_cron_task(
+	def process_input(
 		self,
-		user_prompt: str,
-		requirement_analysis: str,
-		*,
-		temperature: float,
-		max_tokens: int,
-	) -> dict:
-		"""Use the LLM to classify whether the requirement describes a cron task."""
+		user_input: str,
+		dependency_results: dict[str, StepRunOutput],
+		session_state: dict[str, Any],
+	) -> StepRunOutput:
+		"""Write or amend requirement analysis from a session-state request."""
+		del dependency_results
+		request = session_state.get("requirement_disector")
+		if not isinstance(request, Mapping):
+			raise ValueError("session_state['requirement_disector'] must be a write or amend request")
 
-		classification_prompt = (
-			"判断下面的用户需求和需求分析是否描述了一个定时任务。"
-			"如果是定时任务，task_type 必须返回 cron，并尽量返回标准 5 段 crontab 表达式。"
-			"如果无法确定具体调度，请根据语义给出最合理的 crontab；若不是定时任务，crontab_expression 返回 null。\n\n"
-			"只返回 JSON，不要添加额外说明。JSON Schema:"
-			'{"is_cron_task": boolean, "task_type": string, "crontab_expression": string | null}\n\n'
-			f"用户需求:\n{user_prompt}\n\n"
-			f"需求分析:\n{requirement_analysis}\n"
-		)
-		response_text = self.generate_code(
-			classification_prompt,
-			temperature=temperature,
-			max_tokens=max_tokens,
-		)
-		payload = _load_json_object(response_text)
-		is_cron_task = bool(payload.get("is_cron_task"))
-		task_type = str(payload.get("task_type") or "cron" if is_cron_task else "general").strip()
-		crontab_expression = payload.get("crontab_expression")
-		if isinstance(crontab_expression, str):
-			crontab_expression = crontab_expression.strip() or None
-		else:
-			crontab_expression = None
+		action_key = f"{type(self).__name__}::action"
+		action = session_state.get(action_key)
+		if action not in ("write", "amend"):
+			raise ValueError(f"{action_key} must be 'write' or 'amend'")
 
-		if is_cron_task:
-			task_type = "cron"
-			if crontab_expression and not croniter.is_valid(crontab_expression):
-				crontab_expression = None
-		else:
-			crontab_expression = None
-
-		return {
-			"is_cron_task": is_cron_task,
-			"task_type": task_type or ("cron" if is_cron_task else "general"),
-			"crontab_expression": crontab_expression,
+		output_path = request.get("output_path")
+		if not isinstance(output_path, str) or not output_path.strip():
+			raise ValueError("requirement_disector output_path must be a non-empty string")
+		options = {
+			"overwrite": request.get("overwrite", True),
+			"temperature": request.get("temperature", 0.2),
+			"max_tokens": request.get("max_tokens", MAX_TOKENS),
 		}
+		if action == "write":
+			requirement_text = request.get("requirement_text", user_input)
+			if not isinstance(requirement_text, str) or not requirement_text.strip():
+				raise ValueError("write requires non-empty requirement_text or user_input")
+			result = self.analyze(requirement_text, output_path, **options)
+		else:
+			amendment = request.get("amendment")
+			if not isinstance(amendment, str) or not amendment.strip():
+				raise ValueError("amend requires a non-empty amendment")
+			result = self.amend_analysis(output_path, amendment, **options)
+		return StepRunOutput(derived={"requirement_md_path": str(result.output_path)})
 
 	def analyze(
 		self,
@@ -110,7 +85,7 @@ class RequirementDisector(Coder):
 		temperature: float = 0.2,
 		max_tokens: int = MAX_TOKENS,
 	) -> RequirementAnalysisResult:
-		"""Call the LLM, persist the requirements analysis, and classify cron metadata."""
+		"""Call the LLM and persist the requirements analysis."""
 
 		target_path = Path(output_path)
 		if target_path.suffix.lower() != ".md":
@@ -123,11 +98,35 @@ class RequirementDisector(Coder):
 			temperature=temperature,
 			max_tokens=max_tokens,
 		)
-		requirement_analysis = written_path.read_text(encoding="utf-8")
-		classification = self._classify_cron_task(
-			user_prompt,
-			requirement_analysis,
+		return RequirementAnalysisResult(output_path=written_path)
+
+	def amend_analysis(
+		self,
+		output_path: str,
+		amendment: str,
+		*,
+		overwrite: bool = True,
+		temperature: float = 0.2,
+		max_tokens: int = MAX_TOKENS,
+	) -> RequirementAnalysisResult:
+		"""Update an existing requirement analysis using feedback."""
+		target_path = Path(output_path)
+		if target_path.suffix.lower() != ".md":
+			target_path = target_path.with_suffix(".md")
+		if not target_path.is_file():
+			raise FileNotFoundError(f"Requirement analysis not found: {target_path}")
+
+		prompt = (
+			"Revise the existing requirement analysis according to the feedback. "
+			"Preserve valid requirements and return only the complete updated Markdown.\n\n"
+			f"Existing analysis:\n{target_path.read_text(encoding='utf-8')}\n\n"
+			f"Feedback:\n{amendment}\n"
+		)
+		written_path = self.code_to_file(
+			prompt,
+			str(target_path),
+			overwrite=overwrite,
 			temperature=temperature,
 			max_tokens=max_tokens,
 		)
-		return RequirementAnalysisResult(output_path=written_path, **classification)
+		return RequirementAnalysisResult(output_path=written_path)

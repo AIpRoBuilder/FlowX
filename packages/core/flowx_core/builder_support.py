@@ -17,7 +17,6 @@ def _default_artifact_dynamic_graph_cache() -> dict[str, Any]:
 @dataclass
 class ArtifactSessionState:
     requirement_md_path: Optional[str] = None
-    requirement_analysis_result: Optional[dict[str, Any]] = None
     graph_plan_path: Optional[str] = None
     planned_graph: Any = None
     workflow_json_path: Optional[str] = None
@@ -99,14 +98,6 @@ class BuildSession:
     @requirement_md_path.setter
     def requirement_md_path(self, value: Optional[str]) -> None:
         self.artifacts.requirement_md_path = value
-
-    @property
-    def requirement_analysis_result(self) -> Optional[dict[str, Any]]:
-        return self.artifacts.requirement_analysis_result
-
-    @requirement_analysis_result.setter
-    def requirement_analysis_result(self, value: Optional[dict[str, Any]]) -> None:
-        self.artifacts.requirement_analysis_result = value
 
     @property
     def graph_plan_path(self) -> Optional[str]:

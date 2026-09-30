@@ -16,7 +16,7 @@ class _FakeComponent:
 def _make_builder(monkeypatch, tmp_path: Path) -> AgentBuilder:
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     return AgentBuilder(
         api_key="key",
@@ -492,7 +492,7 @@ def test_node_artifact_service_caches_modifiers_by_workflow_and_node(monkeypatch
 def test_sync_workflow_graph_json_does_not_duplicate_relative_root_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
 
     project_dir = tmp_path / "demo_resume_workflow"
@@ -532,7 +532,7 @@ def test_sync_workflow_graph_json_does_not_duplicate_relative_root_dir(monkeypat
 def test_write_main_entrypoint_does_not_duplicate_relative_root_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanner", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
 
     project_dir = tmp_path / "demo_resume_workflow"
@@ -564,15 +564,14 @@ def test_write_main_entrypoint_does_not_duplicate_relative_root_dir(monkeypatch,
     captured = {}
 
     class _FakeMainWriter:
-        def write_main_entrypoint(self, **kwargs):
-            captured.update(kwargs)
-            output_path = Path(kwargs["output_path"])
+        def process_input(self, _user_input, _dependency_results, session_state):
+            request = session_state["main_entrypoint"]
+            assert request["action"] == "write"
+            captured.update(request)
+            output_path = Path(request["output_path"])
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text("print('main')\n", encoding="utf-8")
-            return output_path
-
-        def amend_code_with_feedback(self, *_args, **_kwargs):
-            raise AssertionError("Main entrypoint amendment should not run in this test.")
+            return SimpleNamespace(derived={"main_entrypoint_path": str(output_path)})
 
     builder.main_writer = _FakeMainWriter()
     builder.main_entry_auditor = SimpleNamespace(

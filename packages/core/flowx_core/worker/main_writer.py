@@ -6,17 +6,16 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from textwrap import dedent
 from typing import Any, Mapping, Optional, Sequence
 
+from ag_ui_workflow import StepRunOutput
+
 from flowx_core._paths import bootstrap_package_root
-from flowx_core.tools.runnable_gnode import RunnableGNode
 
 
 ROOT_DIR = bootstrap_package_root(__file__)
 
-from flowx_core.llm_client.coder import MAX_TOKENS
-from flowx_core.tools.text_tools import normalize_requirement_analysis_result
+from flowx_core.llm_client.coder import Coder, MAX_TOKENS
 
 
 def _stringify_modules(module_names: Optional[Sequence[str]]) -> str:
@@ -53,21 +52,15 @@ class _MainEntrypointRenderContext:
     fastapi_host: str
     fastapi_port: int
     uvicorn_reload: bool
-    requirement_analysis_result: dict[str, Any] | None
 
 
 @dataclass
-class PromptMainFileCoder(RunnableGNode):
+class PromptMainFileCoder(Coder):
     """Render an AG-UI lifecycle FastAPI backend entrypoint from a template."""
 
-    provider: str = "openai"
-    model: str = "gpt-4.1-mini"
-    api_key: Optional[str] = None
-    openai_base_url: Optional[str] = None
+    INPUT_REQUIRED = False
+
     system_prompt: str = ""
-    timeout: float | None = None
-    client: object | None = None
-    session_marking_prompt: str = ""
     template_path: str = "worker/templates/pydaograph_main.py.tmpl"
     _template_source: str = field(init=False, repr=False)
     _render_context_by_target: dict[Path, _MainEntrypointRenderContext] = field(
@@ -77,19 +70,73 @@ class PromptMainFileCoder(RunnableGNode):
     )
 
     def __post_init__(self) -> None:
-        RunnableGNode.__init__(self)
         template_file = ROOT_DIR / self.template_path
         if not template_file.exists():
             raise FileNotFoundError(f"Main entrypoint template not found: {template_file}")
         self._template_source = template_file.read_text(encoding="utf-8")
+        # Entrypoint generation is template-only and must not require LLM credentials.
+        super().__post_init__(initialize_client=False)
 
-    @staticmethod
-    def _write_text_file(text: str, file_path: Path, *, overwrite: bool) -> Path:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        if file_path.exists() and not overwrite:
-            raise FileExistsError(f"File already exists and overwrite is False: {file_path}")
-        file_path.write_text(text, encoding="utf-8")
-        return file_path
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        """Run a write/amend request from session_state using upstream graph output if needed."""
+        del user_input
+        request = session_state.get("main_entrypoint")
+        if not isinstance(request, Mapping):
+            raise ValueError("session_state['main_entrypoint'] must be a write or amend request")
+
+        action_key = f"{type(self).__name__}::action"
+        action = session_state.get(action_key)
+        output_path = request.get("output_path")
+        if action not in ("write", "amend"):
+            raise ValueError(f"{action_key} must be 'write' or 'amend'")
+        if not isinstance(output_path, str) or not output_path.strip():
+            raise ValueError("main_entrypoint output_path must be a non-empty string")
+
+        if action == "write":
+            graph_path = request.get("graph_plan_json_path")
+            if not graph_path:
+                graph_paths = {
+                    result.derived.get("graph_plan_json_path")
+                    for result in dependency_results.values()
+                    if isinstance(result.derived, dict)
+                    and isinstance(result.derived.get("graph_plan_json_path"), str)
+                    and result.derived["graph_plan_json_path"]
+                }
+                if len(graph_paths) != 1:
+                    raise ValueError("write requires exactly one graph_plan_json_path from the request or dependencies")
+                graph_path = graph_paths.pop()
+            if not isinstance(graph_path, str) or not graph_path.strip():
+                raise ValueError("graph_plan_json_path must be a non-empty string")
+            project_root = request.get("project_root_path")
+            if not isinstance(project_root, str) or not project_root.strip():
+                raise ValueError("write requires a non-empty project_root_path")
+            written = self.write_main_entrypoint(
+                project_root_path=project_root,
+                graph_plan_json_path=graph_path,
+                output_path=output_path,
+                fastapi_host=request.get("fastapi_host", "0.0.0.0"),
+                fastapi_port=request.get("fastapi_port", 8000),
+                uvicorn_reload=request.get("uvicorn_reload", False),
+                overwrite=request.get("overwrite", True),
+                temperature=request.get("temperature", 0.2),
+            )
+        else:
+            amendment = request.get("amendment")
+            if not isinstance(amendment, str) or not amendment.strip():
+                raise ValueError("amend requires a non-empty amendment")
+            written = self.amend_code_with_feedback(
+                output_path,
+                amendment,
+                language=request.get("language", "python"),
+                overwrite=request.get("overwrite", True),
+                temperature=request.get("temperature", 0.2),
+            )
+        return StepRunOutput(derived={"main_entrypoint_path": str(written)})
 
     @staticmethod
     def _render_relative_path_expr(base_expr: str, *, base_dir: Path, target_path: Path) -> str:
@@ -166,239 +213,7 @@ class PromptMainFileCoder(RunnableGNode):
     def _format_step_chain_items(node_class_names: Sequence[str]) -> str:
         return "\n".join(f"    {class_name}.step_meta()," for class_name in node_class_names)
 
-    @staticmethod
-    def _build_non_cron_sections() -> dict[str, str]:
-        return {
-            "__CRON_IMPORTS__": "",
-            "__CRON_STATE__": "",
-            "__CRON_MODELS__": "",
-            "__CRON_HELPERS__": "",
-            "__RESET_SESSION_EXTRAS__": "",
-            "__EXECUTION_ROUTE__": dedent(
-                '''
-                @app.post("/api/run-step")
-                def run_step(payload: RunStepInput) -> StreamingResponse:
-                    engine = _get_engine(payload.sessionId)
-                    step_meta = next(
-                        (s for s in STEP_CHAIN if _meta_field(s, "id") == payload.stepId), None
-                    )
-                    if step_meta is None:
-                        raise HTTPException(
-                            status_code=404, detail=f"Unknown stepId: {payload.stepId}"
-                        )
-
-                    step_id = _meta_field(step_meta, "id")
-                    ext_data = _meta_field(step_meta, "extData")
-                    ext_type = ext_data.get("type") if isinstance(ext_data, Mapping) else None
-
-                    if ext_type == "user_file_input":
-                        if payload.file_path is not None:
-                            normalized_input: Any = {"file_path": payload.file_path}
-                        else:
-                            normalized_input = payload.input
-                    else:
-                        normalized_input = payload.input
-
-                    return StreamingResponse(
-                        engine._run_step_events(step_id, normalized_input),
-                        media_type="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-                    )
-                '''
-            ).strip(),
-        }
-
-    @staticmethod
-    def _build_cron_sections(cron_meta: Mapping[str, Any]) -> dict[str, str]:
-        task_type_literal = repr(str(cron_meta.get("task_type") or "cron"))
-        cron_expression_literal = repr(cron_meta.get("crontab_expression"))
-
-        cron_state = dedent(
-            '''
-            CRON_CONFIG = {
-                "isCronTask": True,
-                "taskType": __TASK_TYPE__,
-                "crontabExpression": __CRON_EXPRESSION__,
-            }
-            CRON_TASKS: dict[str, asyncio.Task[None]] = {}
-            CRON_STATUS: dict[str, dict[str, Any]] = {}
-            '''
-        ).strip()
-
-        cron_models = dedent(
-            '''
-
-
-            class CronPreviewInput(BaseModel):
-                crontabExpression: str
-
-
-            class CronStartInput(BaseModel):
-                sessionId: str | None = None
-            '''
-        ).rstrip()
-
-        cron_helpers = dedent(
-            '''
-
-
-            def _validate_crontab_expression(crontab_expression: str) -> str:
-                normalized = crontab_expression.strip()
-                if not normalized:
-                    raise ValueError("crontabExpression is required")
-                croniter(normalized, datetime.now())
-                return normalized
-
-
-            def _preview_cron_runs(crontab_expression: str, *, count: int = 5) -> list[str]:
-                normalized = _validate_crontab_expression(crontab_expression)
-                iterator = croniter(normalized, datetime.now())
-                return [iterator.get_next(datetime).isoformat() for _ in range(count)]
-            '''
-        ).rstrip()
-
-        execution_route = dedent(
-            '''
-            @app.get("/api/cron-config")
-            def get_cron_config() -> dict[str, Any]:
-                return dict(CRON_CONFIG)
-
-
-            @app.post("/api/cron-preview")
-            def cron_preview(payload: CronPreviewInput) -> dict[str, Any]:
-                try:
-                    next_run_times = _preview_cron_runs(payload.crontabExpression)
-                except Exception as exc:
-                    return {
-                        "ok": False,
-                        "error": str(exc),
-                        "nextRunTimes": [],
-                    }
-                return {
-                    "ok": True,
-                    "error": None,
-                    "nextRunTimes": next_run_times,
-                }
-
-
-            @app.post("/cron/start")
-            def start_cron(payload: CronStartInput | None = None) -> dict[str, Any]:
-                session_id = payload.sessionId if payload and payload.sessionId else "cron-default"
-                expression = _validate_crontab_expression(CRON_CONFIG.get("crontabExpression") or "")
-                engine = _get_engine(session_id)
-
-                active_task = CRON_TASKS.get(session_id)
-                if active_task is not None and not active_task.done():
-                    status = CRON_STATUS.get(session_id, {})
-                    return {
-                        "ok": True,
-                        "running": True,
-                        "sessionId": session_id,
-                        "taskType": CRON_CONFIG["taskType"],
-                        "crontabExpression": expression,
-                        "lastRunAt": status.get("lastRunAt"),
-                        "nextRunAt": status.get("nextRunAt"),
-                        "message": "Cron runner already active.",
-                    }
-
-                status = CRON_STATUS.setdefault(
-                    session_id,
-                    {
-                        "running": True,
-                        "sessionId": session_id,
-                        "taskType": CRON_CONFIG["taskType"],
-                        "crontabExpression": expression,
-                        "lastRunAt": None,
-                        "nextRunAt": None,
-                    },
-                )
-                status.update(
-                    {
-                        "running": True,
-                        "sessionId": session_id,
-                        "taskType": CRON_CONFIG["taskType"],
-                        "crontabExpression": expression,
-                    }
-                )
-
-                async def _run_periodic() -> None:
-                    try:
-                        while True:
-                            now = datetime.now()
-                            next_run = croniter(expression, now).get_next(datetime)
-                            status["nextRunAt"] = next_run.isoformat()
-                            wait_seconds = max((next_run - now).total_seconds(), 0.0)
-                            if wait_seconds:
-                                await asyncio.sleep(wait_seconds)
-
-                            events = engine._run_all_steps_events()
-                            if hasattr(events, "__aiter__"):
-                                async for _ in events:
-                                    pass
-                            else:
-                                for _ in events:
-                                    pass
-
-                            status["lastRunAt"] = datetime.now().isoformat()
-                    except asyncio.CancelledError:
-                        raise
-                    finally:
-                        status["running"] = False
-                        CRON_TASKS.pop(session_id, None)
-
-                CRON_TASKS[session_id] = asyncio.create_task(_run_periodic())
-                return {
-                    "ok": True,
-                    "running": True,
-                    "sessionId": session_id,
-                    "taskType": CRON_CONFIG["taskType"],
-                    "crontabExpression": expression,
-                    "lastRunAt": status.get("lastRunAt"),
-                    "nextRunAt": status.get("nextRunAt"),
-                }
-            '''
-        ).strip()
-
-        reset_session_extras = "\n".join(
-            f"    {line}" if line else line
-            for line in dedent(
-                '''
-                cron_task = CRON_TASKS.pop(payload.sessionId, None)
-                if cron_task is not None and not cron_task.done():
-                    cron_task.cancel()
-                CRON_STATUS.pop(payload.sessionId, None)
-                '''
-            ).strip().splitlines()
-        )
-
-        replace_map = {
-            "__TASK_TYPE__": task_type_literal,
-            "__CRON_EXPRESSION__": cron_expression_literal,
-        }
-
-        def _replace_placeholders(text: str) -> str:
-            result = text
-            for placeholder, value in replace_map.items():
-                result = result.replace(placeholder, value)
-            return result
-
-        return {
-            "__CRON_IMPORTS__": "import asyncio\nfrom datetime import datetime\n\nfrom croniter import croniter\n\n",
-            "__CRON_STATE__": _replace_placeholders(cron_state),
-            "__CRON_MODELS__": _replace_placeholders(cron_models),
-            "__CRON_HELPERS__": _replace_placeholders(cron_helpers),
-            "__RESET_SESSION_EXTRAS__": reset_session_extras,
-            "__EXECUTION_ROUTE__": _replace_placeholders(execution_route),
-        }
-
     def _build_main_source(self, context: _MainEntrypointRenderContext) -> str:
-        cron_meta = normalize_requirement_analysis_result(context.requirement_analysis_result)
-        sections = (
-            self._build_cron_sections(cron_meta or {})
-            if cron_meta and cron_meta["is_cron_task"]
-            else self._build_non_cron_sections()
-        )
-
         replacements = {
             "__NODES_PACKAGE_NAME__": context.nodes_package_name,
             "__NODE_IMPORTS__": self._format_node_imports(context.node_class_names),
@@ -417,42 +232,12 @@ class PromptMainFileCoder(RunnableGNode):
             "__UVICORN_HOST__": repr(context.fastapi_host),
             "__UVICORN_PORT__": str(context.fastapi_port),
             "__UVICORN_RELOAD__": repr(context.uvicorn_reload),
-            **sections,
         }
 
         source = self._template_source
         for placeholder, value in replacements.items():
             source = source.replace(placeholder, value)
         return source
-
-    def _build_user_prompt(
-        self,
-        *,
-        project_root_path: Path,
-        graph_plan_json_path: Path,
-        node_class_names: Sequence[str],
-        nodes_package_name: str,
-        fastapi_host: str,
-        fastapi_port: int,
-        uvicorn_reload: bool,
-        requirement_analysis_result: Mapping[str, Any] | None = None,
-    ) -> str:
-        context = _MainEntrypointRenderContext(
-            project_root_path=project_root_path,
-            graph_plan_json_path=graph_plan_json_path,
-            output_path=project_root_path / "main.py",
-            node_class_names=tuple(node_class_names),
-            nodes_package_name=nodes_package_name,
-            fastapi_host=fastapi_host,
-            fastapi_port=fastapi_port,
-            uvicorn_reload=uvicorn_reload,
-            requirement_analysis_result=(
-                dict(requirement_analysis_result)
-                if isinstance(requirement_analysis_result, Mapping)
-                else None
-            ),
-        )
-        return self._build_main_source(context)
 
     def write_nodes_package_init(
         self,
@@ -497,7 +282,7 @@ class PromptMainFileCoder(RunnableGNode):
             ]
         )
 
-        return self._write_text_file("\n".join(lines), init_path, overwrite=overwrite)
+        return self.write_code_to_file("\n".join(lines), str(init_path), overwrite=overwrite)
 
     def write_main_entrypoint(
         self,
@@ -505,7 +290,6 @@ class PromptMainFileCoder(RunnableGNode):
         project_root_path: str,
         graph_plan_json_path: str,
         output_path: str,
-        requirement_analysis_result: Mapping[str, Any] | None = None,
         fastapi_host: str = "0.0.0.0",
         fastapi_port: int = 8000,
         uvicorn_reload: bool = False,
@@ -548,15 +332,10 @@ class PromptMainFileCoder(RunnableGNode):
             fastapi_host=fastapi_host,
             fastapi_port=fastapi_port,
             uvicorn_reload=uvicorn_reload,
-            requirement_analysis_result=(
-                dict(requirement_analysis_result)
-                if isinstance(requirement_analysis_result, Mapping)
-                else None
-            ),
         )
 
         source = self._build_main_source(context)
-        written_path = self._write_text_file(source, target_path, overwrite=overwrite)
+        written_path = self.write_code_to_file(source, str(target_path), overwrite=overwrite)
         self._render_context_by_target[written_path.resolve()] = context
         return written_path
 
@@ -624,10 +403,9 @@ class PromptMainFileCoder(RunnableGNode):
             fastapi_host=previous_context.fastapi_host,
             fastapi_port=previous_context.fastapi_port,
             uvicorn_reload=previous_context.uvicorn_reload,
-            requirement_analysis_result=previous_context.requirement_analysis_result,
         )
 
         source = self._build_main_source(refreshed_context)
-        written_path = self._write_text_file(source, resolved_target, overwrite=overwrite)
+        written_path = self.write_code_to_file(source, str(resolved_target), overwrite=overwrite)
         self._render_context_by_target[written_path.resolve()] = refreshed_context
         return written_path

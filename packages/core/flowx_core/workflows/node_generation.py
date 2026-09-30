@@ -9,10 +9,9 @@ from typing import Any, Callable, Mapping, MutableMapping, Sequence
 
 from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
 
-from flowx_core.architect.node_planner import NodePlanner
+from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.tools.node_formats import collect_node_formats
-from flowx_core.tools.runnable_gnode import RunnableGNode, run_gnode_operation
 from flowx_core.tools.workflow_engine import (
     build_workflow_config,
     init_workflow_engine,
@@ -108,14 +107,14 @@ class _NodeGenerationStage:
         return self
 
 
-class NodePlanningNode(_NodeGenerationStage, NodePlanner):
+class NodePlanningNode(_NodeGenerationStage, NodePlanElement):
     """Produce or amend the markdown plan for a single graph node."""
 
     __hash__ = object.__hash__
 
     def __post_init__(self) -> None:
         # The builder owns the configured planner (including injected test doubles).
-        RunnableGNode.__init__(self)
+        WorkflowStepNode.__init__(self)
 
     def _node_entry(self) -> dict[str, Any]:
         entry = self.context.raw_nodes.get(self.node_name)
@@ -123,67 +122,31 @@ class NodePlanningNode(_NodeGenerationStage, NodePlanner):
             raise ValueError(f"node {self.node_name!r} was not found in the graph plan")
         return dict(entry)
 
-    def generate_node_markdown(self, markdown_path: Path, *, overwrite: bool = False) -> str:
-        markdown_path.parent.mkdir(parents=True, exist_ok=True)
-        if markdown_path.is_file() and not overwrite:
-            return str(markdown_path.resolve())
-        generated_paths = run_gnode_operation(
-            self.builder.node_planner,
-            "plan_each",
-            requirement_text=self.context.requirement_text,
-            graph_plan_text=json.dumps({"nodes": [self._node_entry()]}, ensure_ascii=False, indent=2),
-            output_dir=str(markdown_path.parent),
-            overwrite=True,
-            temperature=min(self.context.temperature, 0.2),
-        )
-        if generated_paths:
-            generated_path = Path(generated_paths[0]).expanduser().resolve()
-            if generated_path != markdown_path.resolve() and generated_path.is_file():
-                markdown_path.write_text(generated_path.read_text(encoding="utf-8"), encoding="utf-8")
-        if not markdown_path.is_file():
-            raise FileNotFoundError(f"node markdown generation did not produce {markdown_path}")
-        return str(markdown_path.resolve())
-
-    def amend_node_markdown(self, markdown_path: Path, amendment: str) -> str:
-        if not amendment.strip():
-            raise ValueError("markdown amendment must be a non-empty string")
-        if not markdown_path.is_file():
-            raise FileNotFoundError(f"node markdown file not found: {markdown_path}")
-        prompt = (
-            "Amend only this node's implementation markdown. Keep it concise and retain the required Node Brief sections.\n"
-            f"Global requirement analysis:\n{self.context.requirement_text}\n\n"
-            f"Node context:\n{self.builder.node_planner._node_context(self._node_entry(), 1)}\n\n"
-            f"Existing node markdown:\n{markdown_path.read_text(encoding='utf-8')}\n\n"
-            f"Amendment instructions:\n{amendment}\n"
-            "Return only the complete amended markdown, without commentary outside the document.\n"
-        )
-        run_gnode_operation(
-            self.builder.node_planner,
-            "code_to_file",
-            prompt,
-            str(markdown_path),
-            overwrite=True,
-            temperature=min(self.context.temperature, 0.2),
-        )
-        return str(markdown_path.resolve())
-
     def process_input(
         self,
         user_input: str,
         dependency_results: dict[str, StepRunOutput],
         session_state: dict[str, Any],
     ) -> StepRunOutput:
-        del user_input, dependency_results, session_state
         markdown_path = self.context.node_docs_dir / f"{self.node_name}.md"
-        if self.context.generate_markdowns and not markdown_path.is_file():
-            self.generate_node_markdown(markdown_path)
-        amendment = self.context.markdown_amendments.get(self.node_name)
-        if amendment:
-            if not markdown_path.is_file():
-                self.generate_node_markdown(markdown_path)
-            self.amend_node_markdown(markdown_path, amendment)
-        path = str(markdown_path.resolve()) if markdown_path.is_file() else None
-        return StepRunOutput(derived={"markdown_path": path})
+        amendment = self.context.markdown_amendments.get(self.node_name, "")
+        if not amendment and (markdown_path.is_file() or not self.context.generate_markdowns):
+            return StepRunOutput(derived={"markdown_path": str(markdown_path.resolve()) if markdown_path.is_file() else None})
+        planner = self.builder.node_planner
+        planner.node = self._node_entry()
+        planner.requirement_text = self.context.requirement_text
+        planner.output_path = str(markdown_path)
+        planner.index = self.context.node_names.index(self.node_name) + 1
+        planner.temperature = min(self.context.temperature, 0.2)
+        session_state["node_plan_request"] = {
+            "generate_markdown": self.context.generate_markdowns,
+            "amendment": amendment,
+        }
+        return planner.process_input(
+            user_input,
+            dependency_results,
+            session_state,
+        )
 
 
 class NodeWritingNode(_NodeGenerationStage, PromptNodeFileCoderBase):
@@ -193,7 +156,7 @@ class NodeWritingNode(_NodeGenerationStage, PromptNodeFileCoderBase):
 
     def __post_init__(self) -> None:
         # Specialist coders are selected once the node metadata is known.
-        RunnableGNode.__init__(self)
+        WorkflowStepNode.__init__(self)
         self._current_coder: Any = None
         self._current_node_meta: Any = None
         self.last_generated_path: str | None = None
@@ -208,9 +171,7 @@ class NodeWritingNode(_NodeGenerationStage, PromptNodeFileCoderBase):
         del _audit_round
         if self._current_coder is None or not self.last_generated_path:
             raise RuntimeError(f"node writer is not initialized for {self.node_name}")
-        run_gnode_operation(
-            self._current_coder,
-            "amend_code_with_feedback",
+        self._current_coder.amend_code_with_feedback(
             self.last_generated_path,
             amendment,
             graph_plan_path=self.context.graph_plan_path,
@@ -252,9 +213,7 @@ class NodeWritingNode(_NodeGenerationStage, PromptNodeFileCoderBase):
             "[%s/%s] Generating node '%s' -> %s",
             self.node_index, self.total, self.node_name, target_path,
         )
-        file_path = run_gnode_operation(
-            coder,
-            "write_node_from_requirement",
+        file_path = coder.write_node_from_requirement(
             self.node_name,
             node_meta,
             self.context.requirement_md_path,
@@ -282,9 +241,7 @@ class NodeAuditingNode(_NodeGenerationStage, NodeAuditor):
         self.last_audit_error: RuntimeError | None = None
 
     def _audit(self) -> tuple[bool, list[Any]]:
-        return run_gnode_operation(
-            self.builder.node_auditor,
-            "audit_node_file",
+        return self.builder.node_auditor.audit_node_file(
             self.writer.last_generated_path,
             self.writer._current_node_meta,
             graph_plan_path=self.context.graph_plan_path,

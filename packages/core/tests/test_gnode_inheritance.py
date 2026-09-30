@@ -1,7 +1,7 @@
 from ag_ui_workflow import WorkflowStepNode
 
 from flowx_core.architect.graph_planner import GraphPlanner
-from flowx_core.architect.node_planner import NodePlanner
+from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.context_auditor import ContextAuditor
 from flowx_core.auditor.graph_json_auditor import GraphJsonAuditor
 from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
@@ -14,7 +14,7 @@ from flowx_core.worker.main_writer import PromptMainFileCoder
 def test_planners_writers_and_auditors_subclass_workflow_step_node() -> None:
     instances = [
         GraphPlanner(client=object()),
-        NodePlanner(client=object()),
+        NodePlanElement(client=object()),
         RequirementDisector(client=object()),
         PromptMainFileCoder(),
         ContextAuditor(),

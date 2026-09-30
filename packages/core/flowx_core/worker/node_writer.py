@@ -4,13 +4,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from ag_ui_workflow import StepRunOutput
+
 from flowx_core._paths import bootstrap_package_root
 
 
 ROOT_DIR = bootstrap_package_root(__file__)
 
 from flowx_core.llm_client.coder import Coder, MAX_TOKENS
-from flowx_core.context_builder.context import GraphContextBuilder
 from flowx_core.architect.graph import Graph, NodeMeta
 from flowx_core.tools.file_tools import compile_node_file_and_get_derived_keys
 from flowx_core.tools.workflow_node_reference import (
@@ -56,6 +57,22 @@ def _build_ancestor_session_state_context(graph_plan_path: str, node_name: str) 
         return ""
 
     return f"- {node_name}: {', '.join(session_state_keys)}"
+
+
+def _render_dependency_results_context(dependency_results: dict[str, StepRunOutput]) -> str:
+    return "\n".join(
+        f"- {name}: {json.dumps(dict(result.derived), ensure_ascii=False, default=str)}"
+        for name, result in dependency_results.items()
+        if isinstance(result.derived, Mapping)
+    )
+
+
+def _render_session_state_context(session_state: dict[str, Any]) -> str:
+    values = {
+        key: value for key, value in session_state.items()
+        if key != "node_writer" and not key.endswith("::action")
+    }
+    return json.dumps(values, ensure_ascii=False, default=str) if values else ""
 
 
 def _extract_declared_dependencies_from_code(source: str) -> list[str]:
@@ -188,6 +205,75 @@ class PromptNodeFileCoderBase(Coder):
         )
         super().__post_init__()
 
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        """Dispatch a node write or amendment from the session request and live upstream state."""
+        del user_input
+        request = session_state.get("node_writer")
+        if not isinstance(request, Mapping):
+            raise ValueError("session_state['node_writer'] must be a write or amend request")
+
+        action_key = f"{type(self).__name__}::action"
+        action = session_state.get(action_key)
+        if action not in ("write", "amend"):
+            raise ValueError(f"{action_key} must be 'write' or 'amend'")
+
+        dependency_context = _render_dependency_results_context(dependency_results)
+        ancestor_context = _render_session_state_context(session_state)
+        graph_plan_path = request.get("graph_plan_path", "")
+        language = request.get("language", "python")
+        overwrite = request.get("overwrite", True)
+        max_tokens = request.get("max_tokens", MAX_TOKENS)
+
+        if action == "write":
+            node_name = request.get("node_name")
+            requirement_path = request.get("requirement_md_path")
+            output_path = request.get("output_path")
+            if not isinstance(node_name, str) or not node_name.strip():
+                raise ValueError("write requires a non-empty node_name")
+            if not isinstance(requirement_path, str) or not requirement_path.strip():
+                raise ValueError("write requires a non-empty requirement_md_path")
+            if not isinstance(output_path, str) or not output_path.strip():
+                raise ValueError("write requires a non-empty output_path")
+
+            node_meta = request.get("node_meta")
+            if isinstance(node_meta, Mapping):
+                node_meta = NodeMeta.from_dict(node_meta)
+            if node_meta is None and graph_plan_path:
+                node_meta = Graph(graph_plan_path).get_node_meta(node_name)
+            if not isinstance(node_meta, NodeMeta):
+                raise ValueError("write requires node_meta or a graph_plan_path containing node_name")
+
+            written = self.write_node_from_requirement(
+                node_name, node_meta, requirement_path, output_path,
+                graph_plan_path=graph_plan_path, language=language,
+                overwrite=overwrite, temperature=request.get("temperature", 0.2),
+                max_tokens=max_tokens, dependency_context=dependency_context,
+                ancestor_session_state_context=ancestor_context,
+            )
+        else:
+            code_path = request.get("code_path", request.get("output_path"))
+            amendment = request.get("amendment")
+            if not isinstance(code_path, str) or not code_path.strip():
+                raise ValueError("amend requires a non-empty code_path")
+            if not isinstance(amendment, str) or not amendment.strip():
+                raise ValueError("amend requires a non-empty amendment")
+            written = self.amend_code_with_feedback(
+                code_path, amendment,
+                graph_plan_path=graph_plan_path,
+                current_node_name=request.get("node_name", ""),
+                language=language, overwrite=overwrite,
+                temperature=request.get("temperature", 0.3),
+                max_tokens=max_tokens, dependency_context=dependency_context,
+                ancestor_session_state_context=ancestor_context,
+            )
+
+        return StepRunOutput(derived={"generated_path": str(written)})
+
     @staticmethod
     def _language_extension(language: str) -> str:
         language_clean = language.strip().lower() if language else "python"
@@ -250,6 +336,8 @@ class PromptNodeFileCoderBase(Coder):
         graph_plan_path: str,
         language_clean: str,
         node_contract_text: str,
+        dependency_context: str | None = None,
+        ancestor_session_state_context: str | None = None,
     ) -> str:
         selected_reference = resolve_workflow_node_reference(
             meta_node_kind=node_meta.meta_node_kind or None,
@@ -321,53 +409,33 @@ class PromptNodeFileCoderBase(Coder):
                 f"{node_markdown_reference}\n\n"
             )
 
-        self.context_text = ""
-        self.ancestor_session_state_context_text = ""
-
-        dependency_context = _build_dependency_derived_context(
-            node_dir=Path(output_path).expanduser().resolve().parent,
-            dependency_names=list(node_meta.depends or []),
-        )
+        if dependency_context is None:
+            dependency_context = _build_dependency_derived_context(
+                node_dir=Path(output_path).expanduser().resolve().parent,
+                dependency_names=list(node_meta.depends or []),
+            )
+        self.context_text = dependency_context
         if dependency_context:
             user_prompt += (
-                "\n\nDependency derived keys from existing dependency files "
-                "(parsed via compile_node_file_and_get_derived_keys, authoritative):\n"
+                "\n\nDependency derived context (authoritative):\n"
                 f"{dependency_context}\n"
-                "- Strict rule: any key read from dependency_results[dep].derived must come only from the keys listed in this dependency_context.\n"
-                "- Never access or invent dependency derived keys outside this dependency_context.\n"
+                "- Read dependency_results only from the dependency ids and derived keys listed here.\n"
+                "- Never invent dependency derived keys outside this context.\n"
             )
 
-        ancestor_session_state_context = _build_ancestor_session_state_context(
-            graph_plan_path=graph_plan_path,
-            node_name=node_name,
-        )
+        if ancestor_session_state_context is None:
+            ancestor_session_state_context = _build_ancestor_session_state_context(
+                graph_plan_path=graph_plan_path,
+                node_name=node_name,
+            )
         self.ancestor_session_state_context_text = ancestor_session_state_context
         if ancestor_session_state_context:
             user_prompt += (
-                "\n\nAncestor session_state keys from node files "
-                "(via get_ancestor_session_state_keys, authoritative):\n"
+                "\n\nAncestor session_state context (authoritative):\n"
                 f"{ancestor_session_state_context}\n"
-                "- Strict rule: any key read/write in session_state must come only from this ancestor_session_state_context.\n"
-                "- Never read/write or invent session_state keys outside this ancestor_session_state_context.\n"
-                "- For missing allowed keys, use safe fallback handling and explicit validation errors when still unresolved.\n"
+                "- Read only the available session_state keys listed here; do not invent upstream keys.\n"
+                "- New keys may be written when needed for cross-step state; validate missing required values.\n"
             )
-
-        if graph_plan_path:
-            context_builder = GraphContextBuilder(root_path=self.root_dir_path, language=language_clean)
-            context_builder.search(current_node_name=node_name, graph_plan_path=graph_plan_path)
-
-            context_text = context_builder.build(limit=5)
-            self.context_text = context_text or ""
-            if context_text:
-                user_prompt += (
-                    "\n\nDependency context from GraphContextBuilder (authoritative):\n"
-                    "- Infer each dependency node's STEP_ID and available derived keys from this context.\n"
-                    "- Prefer using the context node's derived key-values as the first-choice upstream fields.\n"
-                    f"- In {selected_subclass_hook}, extract upstream variables from dependency_results using only those dependency STEP_IDs and derived keys.\n"
-                    "- First resolve required values from dependency_results/session_state; if still unresolved, use safe fallback handling and then validate/fail clearly when still missing.\n"
-                    "- Avoid guessed upstream field names; if a needed key is uncertain, use safe fallback handling without TODO markers.\n\n"
-                    f"{context_text}"
-                )
 
         if user_prompt.strip():
             user_prompt += (
@@ -394,6 +462,8 @@ class PromptNodeFileCoderBase(Coder):
         overwrite: bool = True,
         temperature: float = 0.2,
         max_tokens: int = MAX_TOKENS,
+        dependency_context: str | None = None,
+        ancestor_session_state_context: str | None = None,
     ) -> Path:
         requirement_path = Path(requirement_md_path)
         if not requirement_path.exists():
@@ -418,6 +488,8 @@ class PromptNodeFileCoderBase(Coder):
             graph_plan_path=graph_plan_path,
             language_clean=language_clean,
             node_contract_text=self.get_node_contract_text(),
+            dependency_context=dependency_context,
+            ancestor_session_state_context=ancestor_session_state_context,
         )
 
         target_path = Path(output_path)
@@ -490,6 +562,8 @@ class PromptNodeFileCoderBase(Coder):
         overwrite: bool = True,
         temperature: float = 0.3,
         max_tokens: int = MAX_TOKENS,
+        dependency_context: str | None = None,
+        ancestor_session_state_context: str | None = None,
     ) -> Path:
         del requirement_md_path
         language_clean = language.strip().lower() if language else "python"
@@ -512,48 +586,32 @@ class PromptNodeFileCoderBase(Coder):
             contract_text=contract_text,
         )
 
-        dependency_names = _extract_declared_dependencies_from_code(original_code)
-        dependency_context = _build_dependency_derived_context(
-            node_dir=target_path.parent.resolve(),
-            dependency_names=dependency_names,
-        )
+        if dependency_context is None:
+            dependency_names = _extract_declared_dependencies_from_code(original_code)
+            dependency_context = _build_dependency_derived_context(
+                node_dir=target_path.parent.resolve(),
+                dependency_names=dependency_names,
+            )
+        self.context_text = dependency_context
         if dependency_context:
             user_prompt += (
-                "\n\nDependency derived keys from existing dependency files "
-                "(parsed via compile_node_file_and_get_derived_keys, authoritative):\n"
+                "\n\nDependency derived context (authoritative):\n"
                 f"{dependency_context}\n"
+                "- Read only the listed dependency ids and derived keys; do not invent upstream fields.\n"
             )
 
-        if graph_plan_path:
-            context_builder = GraphContextBuilder(root_path=self.root_dir_path, language=language_clean)
-            context_builder.search(current_node_name=inferred_node_name, graph_plan_path=graph_plan_path)
-            self.context_text = context_builder.build(limit=5) or ""
-
-        if self.context_text.strip():
-            user_prompt += (
-                "\n\nDependency context from GraphContextBuilder (authoritative):\n"
-                "- Infer each dependency node's STEP_ID and available derived keys from this context.\n"
-                "- Prefer using the context node's derived key-values as the first-choice upstream fields.\n"
-                "- In the selected subclass hook or inherited runtime path, extract upstream variables from dependency_results using only those dependency STEP_IDs and derived keys.\n"
-                "- Strict rule: node's get keys from derived must strictly come from dependency_context; do not access derived keys outside dependency_context.\n"
-                "- First resolve required values from dependency_results/session_state; if still unresolved, use safe fallback handling and then validate/fail clearly when still missing.\n"
-                "- Avoid guessed upstream field names; if a needed key is uncertain, use safe fallback handling without TODO markers.\n\n"
-                f"{self.context_text}\n"
-            )
-
-        if graph_plan_path:
-            self.ancestor_session_state_context_text = _build_ancestor_session_state_context(
+        if ancestor_session_state_context is None:
+            ancestor_session_state_context = _build_ancestor_session_state_context(
                 graph_plan_path=graph_plan_path,
                 node_name=inferred_node_name,
             )
-
-        if self.ancestor_session_state_context_text.strip():
+        self.ancestor_session_state_context_text = ancestor_session_state_context
+        if ancestor_session_state_context:
             user_prompt += (
-                "\n\nAncestor session_state keys from node files "
-                "(via get_ancestor_session_state_keys, authoritative):\n"
-                f"{self.ancestor_session_state_context_text}\n"
-                "- Strict rule: node's get keys from session_state must strictly come from ancestor_session_state_context.\n"
-                "- Never read/write session_state keys outside ancestor_session_state_context unless amendment explicitly adds and justifies a new key.\n"
+                "\n\nAncestor session_state context (authoritative):\n"
+                f"{ancestor_session_state_context}\n"
+                "- Read only the available session_state keys listed here; do not invent upstream keys.\n"
+                "- New keys may be written when the amendment requires cross-step state.\n"
             )
 
         return self.code_to_file(
@@ -583,6 +641,8 @@ class WorkflowFileNodeCoder(PromptNodeFileCoderBase):
         graph_plan_path: str,
         language_clean: str,
         node_contract_text: str,
+        dependency_context: str | None = None,
+        ancestor_session_state_context: str | None = None,
     ) -> str:
         base_prompt = super()._build_requirement_prompt(
             node_name=node_name,
@@ -593,6 +653,8 @@ class WorkflowFileNodeCoder(PromptNodeFileCoderBase):
             graph_plan_path=graph_plan_path,
             language_clean=language_clean,
             node_contract_text=node_contract_text,
+            dependency_context=dependency_context,
+            ancestor_session_state_context=ancestor_session_state_context,
         )
 
         ext_data = node_meta.ext_data if isinstance(node_meta.ext_data, Mapping) else {}
@@ -710,6 +772,8 @@ class WorkflowSkillNodeCoder(PromptNodeFileCoderBase):
         graph_plan_path: str,
         language_clean: str,
         node_contract_text: str,
+        dependency_context: str | None = None,
+        ancestor_session_state_context: str | None = None,
     ) -> str:
         base_prompt = super()._build_requirement_prompt(
             node_name=node_name,
@@ -720,6 +784,8 @@ class WorkflowSkillNodeCoder(PromptNodeFileCoderBase):
             graph_plan_path=graph_plan_path,
             language_clean=language_clean,
             node_contract_text=node_contract_text,
+            dependency_context=dependency_context,
+            ancestor_session_state_context=ancestor_session_state_context,
         )
 
         skills_root = self._default_skills_root()

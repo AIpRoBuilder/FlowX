@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-__CRON_IMPORTS__import sys
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -36,7 +36,6 @@ ENGINES: dict[str, WorkflowEngine] = {}
 STEP_CHAIN = [
 __STEP_CHAIN_ITEMS__
 ]
-__CRON_STATE__
 
 
 class RunStepInput(BaseModel):
@@ -55,7 +54,6 @@ class ResetSessionOutput(BaseModel):
     sessionId: str
     threadId: str
     runId: str
-__CRON_MODELS__
 
 
 def _meta_field(meta: Any, key: str, default: Any = None) -> Any:
@@ -74,7 +72,6 @@ def _get_engine(session_id: str) -> WorkflowEngine:
     )
     ENGINES[session_id] = engine
     return engine
-__CRON_HELPERS__
 
 
 @app.get("/")
@@ -82,14 +79,37 @@ def index() -> dict[str, str | bool]:
     return {"ok": True, "service": "ag-ui-lifecycle-backend"}
 
 
-__EXECUTION_ROUTE__
+@app.post("/api/run-step")
+def run_step(payload: RunStepInput) -> StreamingResponse:
+    engine = _get_engine(payload.sessionId)
+    step_meta = next(
+        (s for s in STEP_CHAIN if _meta_field(s, "id") == payload.stepId), None
+    )
+    if step_meta is None:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown stepId: {payload.stepId}"
+        )
+
+    step_id = _meta_field(step_meta, "id")
+    ext_data = _meta_field(step_meta, "extData")
+    ext_type = ext_data.get("type") if isinstance(ext_data, Mapping) else None
+
+    if ext_type == "user_file_input" and payload.file_path is not None:
+        normalized_input: Any = {"file_path": payload.file_path}
+    else:
+        normalized_input = payload.input
+
+    return StreamingResponse(
+        engine._run_step_events(step_id, normalized_input),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
 
 
 @app.post("/api/reset-session", response_model=ResetSessionOutput)
 def reset_session(payload: ResetSessionInput) -> ResetSessionOutput:
     engine = _get_engine(payload.sessionId)
     engine.reset_session()
-__RESET_SESSION_EXTRAS__
     return ResetSessionOutput(
         ok=True,
         sessionId=payload.sessionId,

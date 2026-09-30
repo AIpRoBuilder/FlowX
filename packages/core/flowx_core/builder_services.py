@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, TYPE_CHECKING
 
-from flowx_core.tools.runnable_gnode import run_gnode_operation
 from flowx_core.tools.workflow_node_reference import resolve_workflow_node_reference
 
 
@@ -26,7 +25,6 @@ class GraphBuildService:
     ) -> str:
         if requirement_file:
             self.builder.requirement_md_path = requirement_file
-            self.builder.requirement_analysis_result = None
             self.builder._logger.info("Using existing requirement file -> %s", requirement_file)
             return requirement_file
 
@@ -37,14 +35,14 @@ class GraphBuildService:
             len(requirement_text or ""),
             out_path,
         )
-        result = run_gnode_operation(self.builder.analyzer, "analyze", requirement_text or "", out_path)
-        self.builder.requirement_md_path = str(result.output_path)
-        self.builder.requirement_analysis_result = {
-            "output_path": str(result.output_path),
-            "is_cron_task": result.is_cron_task,
-            "task_type": result.task_type,
-            "crontab_expression": result.crontab_expression,
-        }
+        result = self.builder.analyzer.process_input(
+            requirement_text or "",
+            {},
+            {"RequirementDisector::action": "write", "requirement_disector": {
+                "output_path": out_path,
+            }},
+        )
+        self.builder.requirement_md_path = result.derived["requirement_md_path"]
         return self.builder.requirement_md_path
 
     def plan_graph(
@@ -60,29 +58,33 @@ class GraphBuildService:
 
         self.builder.graph_plan_path = os.path.join(self.builder.root_dir, graph_plan_filename)
         self.builder._logger.info("Planning graph -> %s", self.builder.graph_plan_path)
-        run_gnode_operation(
-            self.builder.planner,
-            "plan_from_file",
-            self.builder.requirement_md_path,
-            self.builder.graph_plan_path,
+        self.builder.planner.process_input(
+            "",
+            {},
+            {"GraphPlanner::action": "write", "graph_planner": {
+                "requirement_md_path": self.builder.requirement_md_path,
+                "output_path": self.builder.graph_plan_path,
+            }},
         )
 
         repair_loop = self.builder._make_audit_repair_loop()
 
         def _audit() -> tuple[bool, list[Any]]:
             self.builder.planned_graph = self.builder._instantiate_graph(self.builder.graph_plan_path)
-            return run_gnode_operation(self.builder.graph_auditor, "audit_graph_json", self.builder.planned_graph)
+            return self.builder.graph_auditor.audit_graph_json(self.builder.planned_graph)
 
         def _retry_log(amendment: str, _audit_round: int) -> None:
             self.builder._logger.warning("Graph audit failed. Applying amendment %s...", amendment)
 
         def _amend(amendment: str, _audit_round: int) -> None:
-            run_gnode_operation(
-                self.builder.planner,
-                "amend_file_with_feedback",
-                self.builder.graph_plan_path,
-                amendment,
-                temperature=temperature,
+            self.builder.planner.process_input(
+                "",
+                {},
+                {"GraphPlanner::action": "amend", "graph_planner": {
+                    "graph_json_path": self.builder.graph_plan_path,
+                    "amendment": amendment,
+                    "temperature": temperature,
+                }},
             )
 
         repair_loop.run(
@@ -95,11 +97,7 @@ class GraphBuildService:
             on_success=lambda _audit_round: self.builder._logger.info("Graph plan audit passed."),
             on_retry=_retry_log,
         )
-        run_gnode_operation(
-            self.builder.planner,
-            "_write_mermaid_from_graph_json",
-            Path(self.builder.graph_plan_path),
-        )
+        self.builder.planner._write_mermaid_from_graph_json(Path(self.builder.graph_plan_path))
         return self.builder.graph_plan_path
 
     def amend_graph(
@@ -115,30 +113,34 @@ class GraphBuildService:
         if not isinstance(amendment, str) or not amendment.strip():
             raise ValueError("amendment must be a non-empty string.")
 
-        run_gnode_operation(
-            self.builder.planner,
-            "amend_file_with_feedback",
-            self.builder.graph_plan_path,
-            amendment,
-            temperature=temperature,
+        self.builder.planner.process_input(
+            "",
+            {},
+            {"GraphPlanner::action": "amend", "graph_planner": {
+                "graph_json_path": self.builder.graph_plan_path,
+                "amendment": amendment,
+                "temperature": temperature,
+            }},
         )
 
         repair_loop = self.builder._make_audit_repair_loop()
 
         def _audit() -> tuple[bool, list[Any]]:
             self.builder.planned_graph = self.builder._instantiate_graph(self.builder.graph_plan_path)
-            return run_gnode_operation(self.builder.graph_auditor, "audit_graph_json", self.builder.planned_graph)
+            return self.builder.graph_auditor.audit_graph_json(self.builder.planned_graph)
 
         def _retry_log(_amendment: str, _audit_round: int) -> None:
             self.builder._logger.warning("Graph amendment audit failed. Applying amendment...")
 
         def _amend(next_amendment: str, _audit_round: int) -> None:
-            run_gnode_operation(
-                self.builder.planner,
-                "amend_file_with_feedback",
-                self.builder.graph_plan_path,
-                next_amendment,
-                temperature=temperature,
+            self.builder.planner.process_input(
+                "",
+                {},
+                {"GraphPlanner::action": "amend", "graph_planner": {
+                    "graph_json_path": self.builder.graph_plan_path,
+                    "amendment": next_amendment,
+                    "temperature": temperature,
+                }},
             )
 
         repair_loop.run(
@@ -152,11 +154,7 @@ class GraphBuildService:
             on_retry=_retry_log,
         )
 
-        run_gnode_operation(
-            self.builder.planner,
-            "_write_mermaid_from_graph_json",
-            Path(self.builder.graph_plan_path),
-        )
+        self.builder.planner._write_mermaid_from_graph_json(Path(self.builder.graph_plan_path))
         return self.builder.graph_plan_path
 
 
@@ -423,24 +421,23 @@ class MainEntrypointService:
 
         self.builder.main_output_path = self._resolve_managed_path(output_filename)
         self.builder._logger.info("Generating main entrypoint -> %s", self.builder.main_output_path)
-        run_gnode_operation(
-            self.builder.main_writer,
-            "write_main_entrypoint",
-            project_root_path=self.builder.root_dir,
-            graph_plan_json_path=selected_graph_plan_path,
-            output_path=self.builder.main_output_path,
-            requirement_analysis_result=self.builder.requirement_analysis_result,
-            fastapi_host=fastapi_host,
-            fastapi_port=fastapi_port,
-            temperature=temperature,
+        self.builder.main_writer.process_input(
+            "",
+            {},
+            {"PromptMainFileCoder::action": "write", "main_entrypoint": {
+                "project_root_path": self.builder.root_dir,
+                "graph_plan_json_path": selected_graph_plan_path,
+                "output_path": self.builder.main_output_path,
+                "fastapi_host": fastapi_host,
+                "fastapi_port": fastapi_port,
+                "temperature": temperature,
+            }},
         )
 
         repair_loop = self.builder._make_audit_repair_loop()
 
         def _audit() -> tuple[bool, list[Any]]:
-            return run_gnode_operation(
-                self.builder.main_entry_auditor,
-                "audit_main_entrypoint_file",
+            return self.builder.main_entry_auditor.audit_main_entrypoint_file(
                 str(self.builder.main_output_path),
                 str(self.builder.root_dir),
             )
@@ -450,13 +447,15 @@ class MainEntrypointService:
             self.builder._logger.warning("Main entrypoint audit failed. Applying amendment...")
 
         def _amend(amendment: str, _audit_round: int) -> None:
-            run_gnode_operation(
-                self.builder.main_writer,
-                "amend_code_with_feedback",
-                self.builder.main_output_path,
-                amendment,
-                language="python",
-                temperature=0.2,
+            self.builder.main_writer.process_input(
+                "",
+                {},
+                {"PromptMainFileCoder::action": "amend", "main_entrypoint": {
+                    "output_path": self.builder.main_output_path,
+                    "amendment": amendment,
+                    "language": "python",
+                    "temperature": 0.2,
+                }},
             )
 
         repair_loop.run(
@@ -599,7 +598,7 @@ class RuntimeService:
         return self.amend_by_log(self.builder.log_path)
 
     def amend_by_log(self, log_path: str) -> bool:
-        ok, violations = run_gnode_operation(self.builder.output_auditor, "audit_log_file", log_path)
+        ok, violations = self.builder.output_auditor.audit_log_file(log_path)
         if not ok:
             for violation in violations:
                 fname = violation.rule
@@ -613,9 +612,7 @@ class RuntimeService:
                 try:
                     self.builder._logger.warning("Applying amendment to %s: %s", fname, detail)
                     current_node_name = Path(target_path).stem
-                    run_gnode_operation(
-                        coder,
-                        "amend_code_with_feedback",
+                    coder.amend_code_with_feedback(
                         target_path,
                         detail,
                         graph_plan_path=self.builder.graph_plan_path or "",

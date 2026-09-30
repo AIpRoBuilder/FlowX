@@ -3,7 +3,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from flowx_core.architect import GraphPlanner, NodePlanner, Graph
+from flowx_core.architect import GraphPlanner, NodePlanElement, Graph
 from flowx_core.auditor import GraphJsonAuditor, NodeAuditor, MainEntryPointAuditor, OutputAuditor
 from flowx_core.builder_support import AuditRepairLoop, BuildSession, BuilderComponentFactory
 from flowx_core.builder_services import (
@@ -109,14 +109,6 @@ class AgentBuilder:
     @requirement_md_path.setter
     def requirement_md_path(self, value: Optional[str]) -> None:
         self._session.requirement_md_path = value
-
-    @property
-    def requirement_analysis_result(self) -> Optional[Dict[str, Any]]:
-        return self._session.requirement_analysis_result
-
-    @requirement_analysis_result.setter
-    def requirement_analysis_result(self, value: Optional[Dict[str, Any]]) -> None:
-        self._session.requirement_analysis_result = value
 
     @property
     def graph_plan_path(self) -> Optional[str]:
@@ -248,7 +240,7 @@ class AgentBuilder:
             session_marking_prompt=self.session_marking_prompt,
             analyzer_cls=RequirementDisector,
             planner_cls=GraphPlanner,
-            node_planner_cls=NodePlanner,
+            node_planner_cls=NodePlanElement,
             main_writer_cls=PromptMainFileCoder,
             workflow_step_node_coder_cls=WorkflowStepNodeCoder,
             workflow_file_node_coder_cls=WorkflowFileNodeCoder,

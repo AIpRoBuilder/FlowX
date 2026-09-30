@@ -217,13 +217,12 @@ class MainEntryPointAuditor(BaseAuditor):
 			)
 
 		run_step_fn = self._find_route_function(tree, method="post", path="/api/run-step")
-		cron_start_fn = self._find_route_function(tree, method="post", path="/cron/start")
-		if run_step_fn is None and cron_start_fn is None:
+		if run_step_fn is None:
 			violations.append(
 				RuleViolation(
 					class_name="(file)",
 					rule="execution_route_missing",
-					detail="Missing execution route: expected POST '/api/run-step' or POST '/cron/start'.",
+					detail="Missing execution route: expected POST '/api/run-step'.",
 					lineno=1,
 				)
 			)
@@ -235,25 +234,6 @@ class MainEntryPointAuditor(BaseAuditor):
 						rule="run_step_streaming_response_missing",
 						detail="'/api/run-step' should return StreamingResponse.",
 						lineno=run_step_fn.lineno,
-					)
-				)
-		if cron_start_fn is not None:
-			if not self._function_calls_attr(cron_start_fn, "_run_all_steps_events"):
-				violations.append(
-					RuleViolation(
-						class_name="(file)",
-						rule="cron_start_events_call_missing",
-						detail="'/cron/start' should call engine._run_all_steps_events(...).",
-						lineno=cron_start_fn.lineno,
-					)
-				)
-			if not self._function_calls_attr(cron_start_fn, "create_task"):
-				violations.append(
-					RuleViolation(
-						class_name="(file)",
-						rule="cron_start_background_task_missing",
-						detail="'/cron/start' should start the periodic cron runner with asyncio.create_task(...).",
-						lineno=cron_start_fn.lineno,
 					)
 				)
 		if run_step_fn is not None:

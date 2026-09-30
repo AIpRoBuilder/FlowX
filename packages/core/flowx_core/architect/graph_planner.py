@@ -1,7 +1,10 @@
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from ag_ui_workflow import StepRunOutput
 
 from flowx_core._paths import bootstrap_package_root
 from flowx_core.tools.workflow_node_reference import (
@@ -492,6 +495,64 @@ class GraphPlanner(Coder):
 		graph_path = Path(result_path)
 		self._normalize_ext_data_in_file(graph_path)
 		return result_path
+
+	def process_input(
+		self,
+		user_input: str,
+		dependency_results: dict[str, StepRunOutput],
+		session_state: dict[str, Any],
+	) -> StepRunOutput:
+		"""Plan or amend the graph according to the request in session state."""
+		del user_input, dependency_results
+		request = session_state.get("graph_planner")
+		if not isinstance(request, Mapping):
+			raise ValueError("session_state['graph_planner'] must be a plan or amend request")
+
+		action_key = f"{type(self).__name__}::action"
+		action = session_state.get(action_key)
+		if action == "write":
+			requirement_text = request.get("requirement_text")
+			if requirement_text is None:
+				requirement_path = request.get("requirement_md_path")
+				if not isinstance(requirement_path, str) or not requirement_path.strip():
+					raise ValueError("write requires requirement_text or requirement_md_path")
+				path = Path(requirement_path).expanduser()
+				if not path.is_file():
+					raise FileNotFoundError(f"Requirement file not found: {path}")
+				requirement_text = path.read_text(encoding="utf-8")
+			if not isinstance(requirement_text, str) or not requirement_text.strip():
+				raise ValueError("write requires non-empty requirement_text")
+
+			output_path = request.get("output_path")
+			if not isinstance(output_path, str) or not output_path.strip():
+				raise ValueError("write requires a non-empty output_path")
+			result_path = self.plan(
+				requirement_text,
+				output_path,
+				overwrite=request.get("overwrite", True),
+				temperature=request.get("temperature", 0.2),
+				max_tokens=request.get("max_tokens", MAX_TOKENS),
+			)
+		elif action == "amend":
+			graph_json_path = request.get("graph_json_path")
+			amendment = request.get("amendment")
+			if not isinstance(graph_json_path, str) or not graph_json_path.strip():
+				raise ValueError("amend requires a non-empty graph_json_path")
+			if not isinstance(amendment, str) or not amendment.strip():
+				raise ValueError("amend requires a non-empty amendment")
+			result_path = self.amend_file_with_feedback(
+				graph_json_path,
+				amendment,
+				overwrite=request.get("overwrite", True),
+				temperature=request.get("temperature", 0.2),
+				max_tokens=request.get("max_tokens", MAX_TOKENS),
+			)
+		else:
+			raise ValueError(f"{action_key} must be 'write' or 'amend'")
+
+		return StepRunOutput(
+			derived={"graph_plan_json_path": str(Path(result_path).expanduser().resolve())}
+		)
 
 	def amend_file_with_feedback(
 		self,
