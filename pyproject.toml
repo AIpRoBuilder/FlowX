@@ -28,8 +28,12 @@ classifiers = [
 flowx-mcp = "flowx_mcp.server:main"
 flowx-a2a = "flowx_a2a.server:main"
 
+[project.urls]
+Repository = "https://github.com/AIpRoBuilder/FlowX"
+"Attribution and provenance" = "https://github.com/AIpRoBuilder/FlowX/blob/main/docs/PROVENANCE.md"
+
 [tool.setuptools]
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 
 [tool.setuptools.packages.find]
 where = ["packages/core", "packages/mcp", "packages/sdk", "packages/a2a"]

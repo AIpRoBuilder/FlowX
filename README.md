@@ -25,6 +25,10 @@ FlowX provides that **Generative Workflow layer**: agents generate a workflow gr
 
 **Describe → Generate → Inspect → Run → Refine → Reuse.**
 
+**Original upstream:** [AIpRoBuilder/FlowX](https://github.com/AIpRoBuilder/FlowX) ·
+[Attribution notice](NOTICE) · [Source provenance and verification](docs/PROVENANCE.md).
+FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
+
 <p align="center">
   <img src="assets/generative-workflow-demo.gif" alt="45-second illustrative FlowX walkthrough in a Codex-style desktop interface: project and thread navigation on the left, a continuous conversation with per-node result cards and a bottom composer, and a narrow workflow inspector on the right." width="1120" />
 </p>

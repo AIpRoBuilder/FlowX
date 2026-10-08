@@ -1,0 +1,4 @@
+include LICENSE NOTICE AGENTS.md
+include provenance/source-manifest.json
+include docs/PROVENANCE.md
+include tools/provenance.py

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "origin_id": "urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466",
+  "upstream_repository": "https://github.com/AIpRoBuilder/FlowX",
+  "license": "Apache-2.0",
+  "python_ast_version": "3.10",
+  "scope": "Selected upstream files, not the whole project or any user's identity.",
+  "files": {
+    "LICENSE": {
+      "sha256": "608283f5c1b8ebebf6f63448cc0c840aabf6eb488bea43a7cccfde2741814fa8"
+    },
+    "NOTICE": {
+      "sha256": "0d12a1cde458924329f7a27a261e75acbdd2ec95b453b4660678da336c255b19"
+    },
+    "AGENTS.md": {
+      "sha256": "c7a8887dbbcc6155b7be91a45cd75e530873eb04810ec92a4af81ba5d6edcdc0"
+    },
+    "pyproject.toml": {
+      "sha256": "44942adbe840eb9ac4be6e6823f1b3461a2eab01dee59b5ff44f8a4753292195"
+    },
+    "MANIFEST.in": {
+      "sha256": "8f16b2738341e717494298bf81cbeac67fcd26c3f3e42ae417c559c2d57487a6"
+    },
+    "packages/core/flowx_core/__init__.py": {
+      "sha256": "718daf15905520c10f25183b24645fd26fa1af7b992233023cc566437ffd68ec",
+      "python_ast_sha256": "6e288e47071540757564c90fd4d76c63d0a7fd89a45f90b877ba829a761b3441"
+    },
+    "packages/core/flowx_core/provenance.py": {
+      "sha256": "679ab2005a9239c3f474cf744c0d0bb8b589c9a8e2d3fba4d5e1ecfcbf489c26",
+      "python_ast_sha256": "8542d8586e78194e1ee8c7e7228c679be64281ac1130fb71da7f1ed2fe3d8a78"
+    },
+    "packages/core/flowx_core/agent_builder.py": {
+      "sha256": "293d0a65b9ee8928c1ad01ffebbb6f3f94c627bba79f0781af808c8bcd8c7000",
+      "python_ast_sha256": "e1b69a790b521c2b050a7eec07ae5df7000741dd8eee16a7cabba45dd0e6a404"
+    },
+    "packages/core/flowx_core/builder_services.py": {
+      "sha256": "cae330a7bfab696cd78ac1b40a76cfb76407af8691f8106bef2217364dd51b40",
+      "python_ast_sha256": "85055e1031dfc0028f7c12c34de033328d355d7659ae9f510c69bf4a272928ee"
+    },
+    "packages/mcp/flowx_mcp/server.py": {
+      "sha256": "451b4e7ee56b8affa302f4de79c5a9a6e7306c0c6ac3c450d146e87017dca645",
+      "python_ast_sha256": "41a472c00950069167c0e0651e5408a61f2ba85df2c5caf3175a17f2c68fc326"
+    },
+    "packages/sdk/flowx_sdk/client.py": {
+      "sha256": "0eab76b202685529844ddc7c2a0618a138048cae1825e380010740de3daa27de",
+      "python_ast_sha256": "9eed06c08a27ddc95bf1d03a467572c55b8bc997628189db213d04c3c63891fd"
+    },
+    "packages/a2a/flowx_a2a/server.py": {
+      "sha256": "34519557dd54b703803310ff735f67750df6343c775a2eb2414c970d4f52f263",
+      "python_ast_sha256": "5f19b348359d06c77c786faf8a3ca8c1681be04357316d865323c24cb67be499"
+    },
+    "tools/provenance.py": {
+      "sha256": "f3f06e4a9d2fa5d688e542b296759a6d3b6862733964b7c23f511d17b09ed6af",
+      "python_ast_sha256": "c15f6727f498a2ebdee2b0abeeb2c7066e0388c69696ddf94137fd6848a3e975"
+    }
+  }
+}
