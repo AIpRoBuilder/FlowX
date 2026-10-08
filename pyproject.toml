@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flowx"
 version = "0.2.0"
-description = "Agent workflow compiler with MCP, SDK, and A2A interfaces"
+description = "Generative Workflow layer for AI Agents with MCP, SDK, and A2A interfaces"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

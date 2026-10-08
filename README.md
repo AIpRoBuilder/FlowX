@@ -2,11 +2,14 @@
 
 <div align="center">
   <h1>FlowX</h1>
-  <p><strong>Workflow compiler and evolution loop for AI agents.</strong></p>
+  <p><strong>FlowX is building the Generative Workflow layer for AI Agents.</strong></p>
+  <p>From user intent to executable, inspectable, evolving workflows.</p>
   <p>
+    <a href="#see-the-idea-in-45-seconds">See the idea</a> ·
+    <a href="#quickstart">Quickstart</a> ·
     <a href="https://modelcontextprotocol.io">Model Context Protocol</a> ·
-    <a href="#python-flowx_sdk">Python SDK</a> ·
-    <a href="#flowx_a2a-server">A2A</a> ·
+    <a href="#python-sdk">Python SDK</a> ·
+    <a href="#a2a-server">A2A</a> ·
     <a href="https://github.com/AIpRoBuilder/ag_ui_worflow">ag_ui_workflow</a>
   </p>
   <p>
@@ -16,16 +19,46 @@
   </p>
 </div>
 
-FlowX is an agent workflow compiler that turns natural-language requirements into runnable workflow artifacts and keeps those workflows editable after the first generation pass. Its in-repository `core` package owns agent planning, generation, auditing, and runtime support; MCP, Python SDK, and A2A adapters share that same flowx_core.
+An intelligent UI should do more than display an answer. It should help an agent turn a user's intent into a process that can actually run—and adapt when the intent changes.
 
-FlowX packages workflow creation, updates, startup, debugging, and step execution into a single local loop. An agent can describe the task, generate the workflow, revise node logic, restart the backend, inspect inputs, and run steps without leaving the same conversation.
+FlowX provides that **Generative Workflow layer**: agents generate a workflow graph, node implementations, and a runnable backend from natural language, then inspect, execute, and refine those artifacts through the same conversation. The workflow becomes a reusable process, not just a one-off response or a static plan.
+
+**Describe → Generate → Inspect → Run → Refine → Reuse.**
+
+<p align="center">
+  <img src="assets/generative-workflow-demo.gif" alt="45-second illustrative FlowX walkthrough in a Codex-style desktop interface: project and thread navigation on the left, a continuous conversation with per-node result cards and a bottom composer, and a narrow workflow inspector on the right." width="1120" />
+</p>
+
+*Illustrative walkthrough, not a live recording. Your existing agent remains the assistant; FlowX provides its workflow capability behind the conversation. Messages and per-node cards illustrate what the host UI can render, independent of transport. FlowX does not bundle this interface or automatically generate these card layouts. Generation and execution times are illustrative. See the [storyboard and rendering instructions](assets/README-demo.md).*
+
+## The workflow layer behind intelligent UIs
+
+**Generative UI shapes the interaction. Generative Workflow shapes the execution.** FlowX focuses on the latter: the explicit process an agent can build, run, and change behind a chat, a task panel, or another intelligent interface.
+
+| Layer | Responsibility |
+| --- | --- |
+| Intelligent UI / agent client | Capture intent and present progress, inputs, and results. The host application owns the interface. |
+| **FlowX: Generative Workflow** | Turn intent into workflow artifacts; expose tools to inspect, execute, and refine them. |
+| Workflow runtime | Execute generated nodes in a FastAPI backend using [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow); expose step events over AG-UI SSE. |
+
+FlowX is model- and UI-agnostic. Connect an MCP-capable agent client, call the Python SDK, or delegate workflow generation over A2A. A custom frontend can consume the generated backend's events; rendering those events remains the frontend's responsibility. No dedicated integration with a particular model or intelligent UI is implied.
+
+### What ships today
+
+| Capability | What the agent can do |
+| --- | --- |
+| Intent → executable workflow | Generate a workflow graph, node documentation, Python node code, and a backend entry point. |
+| Inspectable artifacts | Read the graph, node inputs, source files, and execution results instead of relying on an opaque plan. |
+| Conversational refinement | Apply a follow-up change prompt to existing nodes, then reload the backend to run the updated workflow. |
+| A local execution loop | Start, inspect, run, reload, and stop workflow backends through MCP. |
+| Reusable workflow files | Keep generated artifacts on disk and discover or reopen workflows for later runs and updates. |
 
 > [!NOTE]
-> FlowX is designed for local stdio deployments. The same MCP session can create workflows, update backend artifacts, restart the generated FastAPI service, and run workflow steps end to end.
+> The primary interactive path is local stdio MCP. The SDK exposes workflow generation and node updates; the A2A adapter currently exposes non-streaming workflow generation. FlowX is a workflow layer, not a hosted UI product.
 
 ## Installation
 
-FlowX requires Python 3.10 or later. Installing the project includes the FlowX core, MCP adapter, SDK, and A2A adapter.
+Add the Generative Workflow layer to your agent environment. FlowX requires Python 3.10 or later; one installation includes the shared core, MCP adapter, Python SDK, and A2A adapter.
 
 ### Install from Git
 
@@ -104,6 +137,8 @@ For source-checkout execution, FlowX automatically discovers each `packages/*` c
 
 ## Quickstart
 
+The fastest way to try the describe → generate → run → refine loop is through a local MCP-capable agent client.
+
 ### 1. Configure FlowX
 
 ```bash
@@ -158,7 +193,7 @@ If your environment is isolated behind Poetry or uv, set the command to `poetry`
 
 ### Python SDK
 
-Use the SDK when FlowX is called directly from a Python agent rather than over a transport protocol:
+Embed workflow generation directly in a Python agent or the backend behind your own intelligent UI, without an MCP transport:
 
 ```python
 from flowx_sdk import FlowXClient
@@ -173,7 +208,7 @@ print(artifacts.workflow_json_path)
 
 ### A2A server
 
-Start the non-streaming Agent2Agent endpoint with:
+Let another agent delegate workflow generation to FlowX through the non-streaming Agent2Agent endpoint:
 
 ```bash
 flowx-a2a --host 127.0.0.1 --port 8001
@@ -183,32 +218,56 @@ It serves an A2A agent card at `/.well-known/agent-card.json` and JSON-RPC at `/
 
 ### 4. Create a workflow from chat
 
-```text
-Use flowx to create a workflow named screenshot_triage.
+Start with the same support-ticket intent shown in the walkthrough:
 
-Build a workflow that accepts a screenshot, extracts visible issues, and returns
-a structured report with severity, location, and next-action suggestions.
+```text
+Use flowx to create a workflow named ticket_triage.
+
+Build a workflow that accepts a support ticket, classifies its category,
+assigns a priority, and drafts a reply. Name the reply node draft_reply.
+Return the category, priority, and draft reply as structured output.
 ```
 
-## Why FlowX?
+### 5. Run, refine, and reuse
 
-FlowX sits between reusable agent skills and executable workflow runtime. A skill stays descriptive; FlowX turns it into explicit nodes, code, tool wiring, and a managed backend that can be rerun and refined.
+Follow up in the same conversation:
 
-| Capability | What it means in practice |
-| --- | --- |
-| Conversational workflow compilation | Turn a requirement into `workflow.json`, node implementations, and a runnable `main.py`. |
-| Workflow evolution | Apply follow-up change prompts to existing nodes instead of rebuilding the workflow from scratch. |
-| MCP-native runtime loop | Start, reload, inspect, and run the generated backend from the same chat surface. |
-| Artifact-level control | Read, replace, upload, or delete workflow files when the agent needs direct file access. |
+```text
+Inspect ticket_triage's graph and input formats, then start its backend.
+Run this ticket through the workflow: "Billing is broken. Our whole team is blocked."
+
+Update the draft_reply node: for urgent tickets, include an escalation note.
+Reload the workflow backend and rerun the ticket with a fresh session.
+```
+
+The client uses `get_workflow_json` and `get_node_input_formats` to discover the generated graph and inputs, `start_backend` and `run_workflow_step` to execute its steps, and `update_workflow_node` followed by `reload_workflow` to apply a refinement. Exact step IDs and payloads come from the generated workflow—not from a fixed demo schema.
+
+This is the distinction: the agent does not only answer the ticket. It builds and evolves the process for handling the next one.
 
 ## Architecture
 
-FlowX has four cooperating package components: `core` (agent and compiler), `mcp` (MCP port), `flowx_sdk` (Python SDK), and `flowx_a2a` (A2A port). They share a compilation pipeline that continuously regenerates workflow artifacts.
+The Generative Workflow layer has one shared core and three agent-facing interfaces: `flowx_core` plans, generates, and audits artifacts; `flowx_mcp`, `flowx_sdk`, and `flowx_a2a` make those capabilities available to different agent hosts. The generated runtime sits beneath that layer; the intelligent UI sits above it.
+
+```mermaid
+flowchart TB
+  UI["Intelligent UI / agent host"] --> MCP["Local MCP: generate, inspect, run, refine"]
+  UI --> SDK["Python SDK: generate and update"]
+  PEER["Peer agent"] --> A2A["A2A: delegate generation"]
+  MCP --> CORE["FlowX · Generative Workflow layer"]
+  SDK --> CORE
+  A2A --> CORE
+  CORE --> FILES["Workflow graph + node code + backend"]
+  FILES --> RUNTIME["FastAPI + ag_ui_workflow runtime"]
+  MCP -->|"manage backend / run steps"| RUNTIME
+  RUNTIME -->|"results via MCP"| MCP
+  RUNTIME -.->|"AG-UI SSE to a custom frontend"| UI
+  MCP -->|"follow-up changes"| CORE
+```
 
 ### Runtime topology
 
 <div align="center">
-  <img src="assets/architecture.png" alt="FlowX runtime architecture" width="460" height="400" />
+  <img src="assets/architecture.png" alt="Local MCP topology connecting the FlowX generation core and generated workflow backend" width="460" height="400" />
 </div>
 
 - `flowx_mcp.server` exposes the tool surface over stdio through FastMCP.
@@ -217,9 +276,9 @@ FlowX has four cooperating package components: `core` (agent and compiler), `mcp
 - The generated `main.py` runs as a managed FastAPI subprocess per workflow.
 - `run_workflow_step` communicates with the backend over HTTP and parses AG-UI SSE events back into MCP responses.
 
-### Compilation pipeline
+### From intent to workflow artifacts
 
-The artifact flow below is mirrored from [assets/architecture.mmd](assets/architecture.mmd).
+Workflow compilation is the mechanism behind the Generative Workflow layer. Planning and code generation turn intent into artifacts; audits provide feedback during generation and runtime checks. The artifact flow below is mirrored from [assets/architecture.mmd](assets/architecture.mmd).
 
 ```mermaid
 flowchart LR
@@ -241,6 +300,8 @@ flowchart LR
 ```
 
 ## Tool surface
+
+These MCP tools let the host agent operate the workflow layer from the same conversation. UI rendering is deliberately left to the host.
 
 | Category | Tool | Purpose |
 | --- | --- | --- |
@@ -264,7 +325,7 @@ flowchart LR
 
 ## Example workflows
 
-The prompts below are ready to paste into an MCP client that is already connected to your local `flowx` server. Each example creates a workflow that can then be reloaded, rerun, and refined through follow-up prompts.
+Different intents, the same workflow layer: analysis, file transformation, and information collection can each become an executable process. Paste the prompts below into an MCP client connected to your local `flowx` server, then inspect, run, and refine the generated workflow. The screenshots are example outputs, not a bundled FlowX UI; external data sources may require their own access and dependencies.
 
 <details>
 <summary><strong>Example workflow prompts</strong></summary>
@@ -567,7 +628,7 @@ Use flowx to build a crawler workflow that finds the founders of n AI startups t
 
 ## Contact
 
-If you are interested in using FlowX or co-building it, contact me at [peterxcx@gmail.com](mailto:peterxcx@gmail.com).
+Interested in building the Generative Workflow layer for AI Agents—or connecting it to an intelligent UI? Get in touch at [peterxcx@gmail.com](mailto:peterxcx@gmail.com).
 
 WeChat QR code:
 
