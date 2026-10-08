@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, TYPE_CHECKING
+from typing import Any, Dict, Mapping, Optional, Sequence, TYPE_CHECKING
 
+from flowx_core.architect.graph import Graph, NodeMeta
+from flowx_core.tools.agent_builder_tools import get_language_extension
 from flowx_core.tools.workflow_node_reference import resolve_workflow_node_reference
+from flowx_core.workflows.node_generation import (
+    NodeGenerationContext,
+    NodeGenerationWorkflow,
+    WorkflowCallback,
+)
 
 
 if TYPE_CHECKING:
@@ -160,22 +168,233 @@ class GraphBuildService:
 
 @dataclass
 class NodeBuildService:
-    """Manage named, reusable node-generation workflows."""
+    """Run node generation per request, using one single-node workflow per meta_node_kind."""
 
     builder: "AgentBuilder"
-    workflows: Dict[str, Any] = field(default_factory=dict)
+    workflows: Dict[str, NodeGenerationWorkflow] = field(default_factory=dict)  # keyed by meta_node_kind
+    contexts: Dict[str, NodeGenerationContext] = field(default_factory=dict)  # keyed by workflow_name
 
-    def get_or_create_workflow(self, workflow_name: str = "default") -> Any:
+    @staticmethod
+    def _normalize_requested_names(
+        all_names: list[str],
+        node_names: Sequence[str] | None,
+        run_nodes: Sequence[str] | Mapping[str, bool] | None,
+    ) -> list[str]:
+        requested = set(all_names if node_names is None else node_names)
+        unknown = requested.difference(all_names)
+        if unknown:
+            raise ValueError(f"node(s) not found in graph plan: {sorted(unknown)}")
+        if run_nodes is None:
+            selected = requested
+        elif isinstance(run_nodes, Mapping):
+            unknown_run_names = set(run_nodes).difference(all_names)
+            if unknown_run_names:
+                raise ValueError(f"node(s) not found in graph plan: {sorted(unknown_run_names)}")
+            selected = requested.intersection(name for name, should_run in run_nodes.items() if should_run)
+        else:
+            run_set = set(run_nodes)
+            unknown_run_names = run_set.difference(all_names)
+            if unknown_run_names:
+                raise ValueError(f"node(s) not found in graph plan: {sorted(unknown_run_names)}")
+            selected = requested.intersection(run_set)
+        return [name for name in all_names if name in selected]
+
+    @staticmethod
+    def _raw_node_map(graph_payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        nodes = graph_payload.get("nodes", [])
+        if not isinstance(nodes, list):
+            raise ValueError("graph_plan JSON must contain a top-level 'nodes' list")
+        result: dict[str, dict[str, Any]] = {}
+        for entry in nodes:
+            if not isinstance(entry, Mapping):
+                continue
+            name = str(entry.get("name", "")).strip()
+            if name:
+                result[name] = dict(entry)
+        return result
+
+    @staticmethod
+    def _expected_node_path(graph_plan_path: str, node_name: str, language: str) -> Path:
+        return Path(graph_plan_path).parent / f"{node_name}{get_language_extension(language)}"
+
+    def _node_path(self, graph_plan_path: str, node_name: str, language: str) -> Path:
+        location = self.builder.node_location_map.get(node_name)
+        if location:
+            return self.builder._resolve_root_path(location)
+        return self._expected_node_path(graph_plan_path, node_name, language)
+
+    def _seed_existing_artifacts(
+        self,
+        context: NodeGenerationContext,
+        ordered_names: list[str],
+    ) -> None:
+        for name in ordered_names:
+            markdown_path = context.node_docs_dir / f"{name}.md"
+            node_path = self._node_path(context.graph_plan_path, name, context.language)
+            if markdown_path.is_file() or node_path.is_file():
+                context.artifacts[name] = {
+                    "node_name": name,
+                    "node_file_path": str(node_path) if node_path.is_file() else "",
+                    "node_markdown_path": str(markdown_path) if markdown_path.is_file() else "",
+                    "node_file": node_path.read_text(encoding="utf-8") if node_path.is_file() else "",
+                    "node_markdown": markdown_path.read_text(encoding="utf-8") if markdown_path.is_file() else "",
+                    "node_formats": dict(context.node_formats.get(name, {})),
+                }
+
+    def _collect_node_formats(self, graph: Graph, language: str) -> dict[str, dict[str, Any]]:
+        from flowx_core.tools.file_tools import compile_node_file_and_get_step_output_card_schema
+
+        formats: dict[str, dict[str, Any]] = {}
+        for name in graph.get_topological_sorted_nodes():
+            meta = graph.get_node_meta(name)
+            ext_data = meta.ext_data or {}
+            ext_type = str(ext_data.get("type", "none") if isinstance(ext_data, Mapping) else ext_data).strip().lower()
+            inputs = meta.inputs_format or {}
+            path = self._node_path(str(graph.graph_json_path), name, language)
+            schema = compile_node_file_and_get_step_output_card_schema(str(path)) if path.is_file() else None
+            formats[name] = {
+                "user_input_format": {
+                    str(key).strip(): str(value).strip().lower()
+                    for key, value in inputs.items() if str(key).strip() and str(value).strip()
+                } if ext_type in {"user_input", "skill"} else {},
+                "backend_output_card_format": schema.get("card") if schema else None,
+                "backend_node_path": str(path) if path.is_file() else None,
+            }
+        return formats
+
+    def _run_requested_workflows(self, context: NodeGenerationContext, node_name: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        request = context.workflow_requests.get(node_name)
+        if request is None or request is False:
+            return {}
+        if request is True:
+            names = list(context.workflow_registry)
+        elif isinstance(request, str):
+            names = [request]
+        elif isinstance(request, Sequence) and not isinstance(request, (str, bytes)):
+            names = [str(item) for item in request]
+        else:
+            raise TypeError(f"workflow request for {node_name!r} must be a bool, name, or sequence of names")
+        unknown = set(names).difference(context.workflow_registry)
+        if unknown:
+            raise ValueError(f"unknown workflow(s) requested for {node_name}: {sorted(unknown)}")
+        return {
+            name: context.workflow_registry[name](
+                node_name=node_name, artifact=dict(artifact), context=context,
+            )
+            for name in names
+        }
+
+    def _publish_node(self, context: NodeGenerationContext, node_name: str, generated_path: str) -> None:
+        markdown_file = context.node_docs_dir / f"{node_name}.md"
+        markdown_path = str(markdown_file.resolve()) if markdown_file.is_file() else None
+        artifact: dict[str, Any] = {
+            "node_name": node_name,
+            "node_file_path": generated_path,
+            "node_markdown_path": markdown_path,
+            "node_file": Path(generated_path).read_text(encoding="utf-8") if Path(generated_path).is_file() else "",
+            "node_markdown": markdown_file.read_text(encoding="utf-8") if markdown_path else "",
+            "node_formats": dict(context.node_formats.get(node_name, {})),
+        }
+        artifact["workflow_outputs"] = self._run_requested_workflows(context, node_name, artifact)
+        self.builder.node_location_map[node_name] = generated_path
+        context.artifacts[node_name] = artifact
+        if markdown_path:
+            self.builder.node_docs_dir = str(Path(markdown_path).parent)
+            self.builder.node_doc_paths = [
+                path for path in (self.builder.node_doc_paths or [])
+                if Path(path).name != Path(markdown_path).name
+            ] + [markdown_path]
+        self.builder._advance_progress(f"Generated node: {node_name}")
+
+    def _workflow_for(self, node_meta: NodeMeta) -> NodeGenerationWorkflow:
+        """Pick the coder subclass from meta_node_kind/ext_data via the factory and store one workflow per kind."""
+
+        meta_node_kind = resolve_workflow_node_reference(
+            meta_node_kind=node_meta.meta_node_kind or None,
+            ext_data=node_meta.ext_data,
+        ).meta_node_kind
+        workflow = self.workflows.get(meta_node_kind)
+        if workflow is None:
+            workflow = self.workflows[meta_node_kind] = NodeGenerationWorkflow(
+                meta_node_kind=meta_node_kind,
+                node_planner=self.builder.node_planner,
+                node_coder=self.builder._make_node_coder(node_meta),
+                node_auditor=self.builder.node_auditor,
+            )
+        workflow.node_planner = self.builder.node_planner
+        workflow.node_auditor = self.builder.node_auditor
+        return workflow
+
+    def run(
+        self,
+        *,
+        workflow_name: str = "default",
+        graph_plan_path: str | None = None,
+        requirement_md_path: str | None = None,
+        node_names: Sequence[str] | None = None,
+        run_nodes: Sequence[str] | Mapping[str, bool] | None = None,
+        language: str = "python",
+        temperature: float = 0.35,
+        node_docs_dirname: str = "node_docs",
+        generate_markdowns: bool = True,
+        markdown_amendments: Mapping[str, str] | None = None,
+        node_amendments: Mapping[str, str] | None = None,
+        workflow_requests: Mapping[str, Any] | None = None,
+        workflow_registry: Mapping[str, WorkflowCallback] | None = None,
+        reset_mappings: bool = False,
+    ) -> NodeGenerationContext:
         if not isinstance(workflow_name, str) or not workflow_name.strip():
             raise ValueError("workflow_name must be a non-empty string")
         workflow_name = workflow_name.strip()
-        workflow = self.workflows.get(workflow_name)
-        if workflow is None:
-            from flowx_core.workflows.node_generation import NodeGenerationWorkflow
+        selected_graph_path = Path(graph_plan_path or self.builder.graph_plan_path or "").expanduser().resolve()
+        planned_graph = Graph(str(selected_graph_path))
+        graph_payload = json.loads(selected_graph_path.read_text(encoding="utf-8"))
+        raw_nodes = self._raw_node_map(graph_payload)
+        all_names = planned_graph.get_topological_sorted_nodes()
+        ordered_names = self._normalize_requested_names(all_names, node_names, run_nodes)
 
-            workflow = NodeGenerationWorkflow(self.builder)
-            self.workflows[workflow_name] = workflow
-        return workflow
+        requirement_path = Path(requirement_md_path or self.builder.requirement_md_path or "").expanduser().resolve()
+        requirement_text = requirement_path.read_text(encoding="utf-8")
+        if reset_mappings:
+            self.builder.node_location_map.clear()
+
+        docs_dir = self.builder._resolve_root_path(node_docs_dirname)
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            formats = self._collect_node_formats(planned_graph, language)
+        except Exception:
+            formats = {}
+
+        context = NodeGenerationContext(
+            graph_plan_path=str(selected_graph_path),
+            requirement_md_path=str(requirement_path),
+            requirement_text=requirement_text,
+            node_names=all_names,
+            selected_node_names=ordered_names,
+            language=language,
+            temperature=temperature,
+            node_docs_dir=docs_dir,
+            generate_markdowns=generate_markdowns,
+            markdown_amendments=markdown_amendments or {},
+            node_amendments=node_amendments or {},
+            workflow_requests=workflow_requests or {},
+            workflow_registry=workflow_registry or {},
+            node_formats=formats,
+        )
+        context.raw_nodes = raw_nodes
+        context.skipped_node_names = [name for name in all_names if name not in set(ordered_names)]
+        self.contexts[workflow_name] = context
+        self._seed_existing_artifacts(context, context.skipped_node_names)
+        if not ordered_names:
+            return context
+
+        self.builder._start_progress(len(ordered_names))
+        for node_name in ordered_names:
+            node_meta = planned_graph.get_node_meta(node_name)
+            target_path = self._node_path(context.graph_plan_path, node_name, language)
+            generated_path = self._workflow_for(node_meta).run(context, node_meta, node_name, target_path)
+            self._publish_node(context, node_name, generated_path)
+        return context
 
 
 @dataclass
@@ -214,7 +433,6 @@ class NodeArtifactService:
                 api_key=self.builder.api_key,
                 model=self.builder.model,
                 provider=self.builder.provider,
-                root_dir_path=root_dir_path,
                 session_marking_prompt=self.builder.session_marking_prompt,
             )
             modifier = NodeRuntimeModifierPipeline(
@@ -245,8 +463,7 @@ class NodeArtifactService:
             raise ValueError("node_name must be a non-empty string")
         workflow_name = workflow_name.strip()
         node_name = node_name.strip()
-        workflow = self.builder._node_build_service.workflows.get(workflow_name)
-        generation_context = workflow.context if workflow is not None else None
+        generation_context = self.builder._node_build_service.contexts.get(workflow_name)
         if graph_plan_path is None and workflow_name != "default":
             if generation_context is None:
                 raise ValueError(
@@ -277,7 +494,6 @@ class NodeArtifactService:
         modifier = self.get_or_create_modifier(workflow_name, node_name)
         root_dir_path = str(workflow_path.parent)
         modifier.node_test_writer.root_dir_path = root_dir_path
-        modifier.node_writer.root_dir_path = root_dir_path
         workflow_tests = self.builder.dynamic_graph_cache.get("workflow_node_tests", {})
         test_paths = workflow_tests.get(workflow_name, {}) if isinstance(workflow_tests, Mapping) else {}
         if workflow_name == "default" and not test_paths:

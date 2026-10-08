@@ -212,7 +212,7 @@ def test_agent_builder_make_node_coder_routes_automatic_step(monkeypatch, tmp_pa
         )
     )
 
-    assert coder.kwargs["root_dir_path"] == str(tmp_path)
+    assert "root_dir_path" not in coder.kwargs
 
 
 def test_node_planner_system_prompt_includes_session_marking_prompt():

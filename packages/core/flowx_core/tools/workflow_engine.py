@@ -11,7 +11,8 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
-from pydaograph import CStatus, register_class
+
+from pydaograph import CStatus, GPipeline, register_class
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,41 @@ def init_workflow_engine(
     return engine
 
 
+def init_pipeline_engine(
+    steps: Mapping[str, WorkflowStepNode],
+    dependencies: Mapping[str, Iterable[str]],
+    *,
+    thread_id: str | None = None,
+) -> WorkflowEngine:
+    """Register steps on a ``GPipeline`` (in dependency order) and pass it to ``WorkflowEngine``."""
+
+    pipeline = GPipeline()
+    elements: dict[str, WorkflowStepNode] = {}
+    steps_meta: list[dict[str, Any]] = []
+    for step_id, step in steps.items():
+        step_dependencies = list(dependencies.get(step_id, ()))
+        missing = [dependency for dependency in step_dependencies if dependency not in elements]
+        if missing:
+            raise ValueError(f"step '{step_id}' depends on unregistered step(s): {missing}")
+        step_class = _step_adapter_class(step_id, step_dependencies, step)
+        element = step_class()
+        status = pipeline.registerGElement(
+            element, {elements[dependency] for dependency in step_dependencies}, step_id, 1,
+        )
+        if status.isErr():
+            raise RuntimeError(f"registerGElement failed for {step_id}: {status.getInfo()}")
+        elements[step_id] = element
+        steps_meta.append(step_class.step_meta())
+    engine = WorkflowEngine(
+        pipeline=pipeline,
+        steps_meta=steps_meta,
+        thread_id=thread_id or f"flowx-{uuid.uuid4().hex}",
+    )
+    # Python must keep the registered elements alive for the native pipeline.
+    setattr(engine, "_flowx_step_elements", tuple(elements.values()))
+    return engine
+
+
 def run_workflow_step(
     engine: WorkflowEngine,
     step_id: str,
@@ -119,6 +155,7 @@ def run_workflow_step(
 __all__ = [
     "WorkflowEngineConfig",
     "build_workflow_config",
+    "init_pipeline_engine",
     "init_workflow_engine",
     "run_workflow_step",
 ]

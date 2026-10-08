@@ -186,10 +186,6 @@ def _reference_primary_method_signature(reference, method_names: tuple[str, ...]
 @dataclass
 class PromptNodeFileCoderBase(Coder):
     prompt_path: str = "worker/prompts/pydaograph_node_prompt.md"
-    root_dir_path: str = ""
-    context_text: str = ""
-    ancestor_session_state_context_text: str = ""
-    additional_generation_context: str = ""
 
     def __post_init__(self) -> None:
         prompt_file = ROOT_DIR / self.prompt_path
@@ -228,6 +224,8 @@ class PromptNodeFileCoderBase(Coder):
         language = request.get("language", "python")
         overwrite = request.get("overwrite", True)
         max_tokens = request.get("max_tokens", MAX_TOKENS)
+        root_dir_path = request.get("root_dir_path", "")
+        additional_generation_context = request.get("additional_generation_context", "")
 
         if action == "write":
             node_name = request.get("node_name")
@@ -254,6 +252,8 @@ class PromptNodeFileCoderBase(Coder):
                 overwrite=overwrite, temperature=request.get("temperature", 0.2),
                 max_tokens=max_tokens, dependency_context=dependency_context,
                 ancestor_session_state_context=ancestor_context,
+                root_dir_path=root_dir_path,
+                additional_generation_context=additional_generation_context,
             )
         else:
             code_path = request.get("code_path", request.get("output_path"))
@@ -270,6 +270,7 @@ class PromptNodeFileCoderBase(Coder):
                 temperature=request.get("temperature", 0.3),
                 max_tokens=max_tokens, dependency_context=dependency_context,
                 ancestor_session_state_context=ancestor_context,
+                additional_generation_context=additional_generation_context,
             )
 
         return StepRunOutput(derived={"generated_path": str(written)})
@@ -338,7 +339,10 @@ class PromptNodeFileCoderBase(Coder):
         node_contract_text: str,
         dependency_context: str | None = None,
         ancestor_session_state_context: str | None = None,
+        root_dir_path: str = "",
+        additional_generation_context: str = "",
     ) -> str:
+        del root_dir_path
         selected_reference = resolve_workflow_node_reference(
             meta_node_kind=node_meta.meta_node_kind or None,
             ext_data=node_meta.ext_data,
@@ -414,7 +418,6 @@ class PromptNodeFileCoderBase(Coder):
                 node_dir=Path(output_path).expanduser().resolve().parent,
                 dependency_names=list(node_meta.depends or []),
             )
-        self.context_text = dependency_context
         if dependency_context:
             user_prompt += (
                 "\n\nDependency derived context (authoritative):\n"
@@ -428,7 +431,6 @@ class PromptNodeFileCoderBase(Coder):
                 graph_plan_path=graph_plan_path,
                 node_name=node_name,
             )
-        self.ancestor_session_state_context_text = ancestor_session_state_context
         if ancestor_session_state_context:
             user_prompt += (
                 "\n\nAncestor session_state context (authoritative):\n"
@@ -442,10 +444,10 @@ class PromptNodeFileCoderBase(Coder):
                 f"\n\nReturn only runnable {language_clean} code for this node."
                 " Do not include markdown fences or explanation text."
             )
-        if self.additional_generation_context.strip():
+        if additional_generation_context.strip():
             user_prompt += (
                 "\n\nAdditional node-generation context (authoritative; preserve the current node contract):\n"
-                f"{self.additional_generation_context}\n"
+                f"{additional_generation_context}\n"
             )
 
         return user_prompt
@@ -464,6 +466,8 @@ class PromptNodeFileCoderBase(Coder):
         max_tokens: int = MAX_TOKENS,
         dependency_context: str | None = None,
         ancestor_session_state_context: str | None = None,
+        root_dir_path: str = "",
+        additional_generation_context: str = "",
     ) -> Path:
         requirement_path = Path(requirement_md_path)
         if not requirement_path.exists():
@@ -490,6 +494,8 @@ class PromptNodeFileCoderBase(Coder):
             node_contract_text=self.get_node_contract_text(),
             dependency_context=dependency_context,
             ancestor_session_state_context=ancestor_session_state_context,
+            root_dir_path=root_dir_path,
+            additional_generation_context=additional_generation_context,
         )
 
         target_path = Path(output_path)
@@ -510,6 +516,7 @@ class PromptNodeFileCoderBase(Coder):
         amendment: str,
         language_clean: str,
         contract_text: str,
+        additional_generation_context: str = "",
     ) -> str:
         state_routing_policy_text = (
             "State routing policy (authoritative):\n"
@@ -542,10 +549,10 @@ class PromptNodeFileCoderBase(Coder):
                 "- Add/ensure class-level DEFAULT_CONFIG = { ... } in the node file with placeholders for those missing keys.\n"
                 "- If the value is still missing/invalid after resolution attempts, return an explicit validation error.\n"
             )
-        if self.additional_generation_context.strip():
+        if additional_generation_context.strip():
             user_prompt += (
                 "\n\nAdditional node-generation context (authoritative; preserve the current node contract):\n"
-                f"{self.additional_generation_context}\n"
+                f"{additional_generation_context}\n"
             )
 
         return user_prompt
@@ -564,6 +571,7 @@ class PromptNodeFileCoderBase(Coder):
         max_tokens: int = MAX_TOKENS,
         dependency_context: str | None = None,
         ancestor_session_state_context: str | None = None,
+        additional_generation_context: str = "",
     ) -> Path:
         del requirement_md_path
         language_clean = language.strip().lower() if language else "python"
@@ -584,6 +592,7 @@ class PromptNodeFileCoderBase(Coder):
             amendment=amendment,
             language_clean=language_clean,
             contract_text=contract_text,
+            additional_generation_context=additional_generation_context,
         )
 
         if dependency_context is None:
@@ -592,7 +601,6 @@ class PromptNodeFileCoderBase(Coder):
                 node_dir=target_path.parent.resolve(),
                 dependency_names=dependency_names,
             )
-        self.context_text = dependency_context
         if dependency_context:
             user_prompt += (
                 "\n\nDependency derived context (authoritative):\n"
@@ -605,7 +613,6 @@ class PromptNodeFileCoderBase(Coder):
                 graph_plan_path=graph_plan_path,
                 node_name=inferred_node_name,
             )
-        self.ancestor_session_state_context_text = ancestor_session_state_context
         if ancestor_session_state_context:
             user_prompt += (
                 "\n\nAncestor session_state context (authoritative):\n"
@@ -643,6 +650,8 @@ class WorkflowFileNodeCoder(PromptNodeFileCoderBase):
         node_contract_text: str,
         dependency_context: str | None = None,
         ancestor_session_state_context: str | None = None,
+        root_dir_path: str = "",
+        additional_generation_context: str = "",
     ) -> str:
         base_prompt = super()._build_requirement_prompt(
             node_name=node_name,
@@ -655,6 +664,8 @@ class WorkflowFileNodeCoder(PromptNodeFileCoderBase):
             node_contract_text=node_contract_text,
             dependency_context=dependency_context,
             ancestor_session_state_context=ancestor_session_state_context,
+            root_dir_path=root_dir_path,
+            additional_generation_context=additional_generation_context,
         )
 
         ext_data = node_meta.ext_data if isinstance(node_meta.ext_data, Mapping) else {}
@@ -741,10 +752,10 @@ class WorkflowSkillNodeCoder(PromptNodeFileCoderBase):
     default_skills_dirname: str = "skills"
     skills_root_path: str = ""
 
-    def _default_skills_root(self) -> Path:
+    def _default_skills_root(self, root_dir_path: str) -> Path:
         return _resolve_named_root(
             configured_root_path=self.skills_root_path,
-            root_dir_path=self.root_dir_path,
+            root_dir_path=root_dir_path,
             default_dirname=self.default_skills_dirname,
         )
 
@@ -774,6 +785,8 @@ class WorkflowSkillNodeCoder(PromptNodeFileCoderBase):
         node_contract_text: str,
         dependency_context: str | None = None,
         ancestor_session_state_context: str | None = None,
+        root_dir_path: str = "",
+        additional_generation_context: str = "",
     ) -> str:
         base_prompt = super()._build_requirement_prompt(
             node_name=node_name,
@@ -786,9 +799,11 @@ class WorkflowSkillNodeCoder(PromptNodeFileCoderBase):
             node_contract_text=node_contract_text,
             dependency_context=dependency_context,
             ancestor_session_state_context=ancestor_session_state_context,
+            root_dir_path=root_dir_path,
+            additional_generation_context=additional_generation_context,
         )
 
-        skills_root = self._default_skills_root()
+        skills_root = self._default_skills_root(root_dir_path)
         skill_name = self._extract_skill_name(node_meta)
         skill_markdown = self._read_skill_markdown(skills_root, skill_name)
         skill_using, skill_examples = self._extract_skill_sections(skill_markdown)

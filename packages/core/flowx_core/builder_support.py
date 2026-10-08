@@ -246,7 +246,7 @@ class BuilderComponentFactory:
             main_writer=main_writer,
         )
 
-    def create_node_coder(self, node_meta: Any, *, root_dir_path: str) -> Any:
+    def create_node_coder(self, node_meta: Any) -> Any:
         ext_data = node_meta.ext_data if node_meta and hasattr(node_meta, "ext_data") else None
         meta_node_kind = getattr(node_meta, "meta_node_kind", None) if node_meta is not None else None
         reference = resolve_workflow_node_reference(
@@ -258,7 +258,6 @@ class BuilderComponentFactory:
             "api_key": self.api_key,
             "model": self.model,
             "provider": self.provider,
-            "root_dir_path": root_dir_path,
             "session_marking_prompt": self.session_marking_prompt,
         }
 

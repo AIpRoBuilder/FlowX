@@ -2,15 +2,28 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from ag_ui_workflow import WorkflowStepNode
 import flowx_core.agent_builder as agent_builder_module
 from flowx_core.agent_builder import AgentBuilder
+from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.tools.node_formats import collect_node_formats
+from flowx_core.worker.node_writer import WorkflowStepNodeCoder
 import flowx_core.workflows.node_runtime_modifier as node_runtime_modifier_module
 
 
 class _FakeComponent:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+
+
+class _FakeWriter(WorkflowStepNodeCoder):
+    def __post_init__(self):
+        WorkflowStepNode.__init__(self)
+
+
+class _FakeAuditor(NodeAuditor):
+    def audit_file(self, file_path, node_meta=None, graph_plan_path=None):
+        return True, []
 
 
 def _make_builder(monkeypatch, tmp_path: Path) -> AgentBuilder:
@@ -85,9 +98,9 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
         ],
     )
 
-    class _FakeNodeCoder:
+    class _FakeNodeCoder(_FakeWriter):
         def __init__(self):
-            self.root_dir_path = ""
+            super().__init__()
             self.write_calls = []
 
         def write_node_from_requirement(self, node_name, node_meta, requirement_md_path, output_path, **kwargs):
@@ -96,7 +109,7 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
                     "node_name": node_name,
                     "requirement_md_path": requirement_md_path,
                     "output_path": output_path,
-                    "root_dir_path": self.root_dir_path,
+                    "root_dir_path": kwargs["root_dir_path"],
                 }
             )
             target_path = Path(output_path)
@@ -121,11 +134,7 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
 
     builder._make_node_coder = lambda node_meta: fake_node_coder
     builder._node_artifact_service.run_modifier = fake_run_modifier
-    builder.node_auditor = type(
-        "_FakeNodeAuditor",
-        (),
-        {"audit_node_file": staticmethod(lambda *args, **kwargs: (True, []))},
-    )()
+    builder.node_auditor = _FakeAuditor()
     builder.requirement_md_path = str(requirement_path)
     builder.graph_plan_path = str(graph_path)
 
@@ -188,8 +197,9 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
         ],
     )
 
-    class _FakeNodeCoder:
+    class _FakeNodeCoder(_FakeWriter):
         def __init__(self):
+            super().__init__()
             self.root_dir_path = ""
             self.write_calls = []
 
@@ -207,16 +217,13 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
 
     fake_node_coder = _FakeNodeCoder()
     builder._make_node_coder = lambda node_meta: fake_node_coder
-    builder.node_auditor = type(
-        "_FakeNodeAuditor",
-        (),
-        {"audit_node_file": staticmethod(lambda *args, **kwargs: (True, []))},
-    )()
+    builder.node_auditor = _FakeAuditor()
     builder.requirement_md_path = str(requirement_path)
     builder.graph_plan_path = str(graph_path)
 
-    workflow = builder._node_build_service.get_or_create_workflow("default")
-    first_context = workflow.run(
+    service = builder._node_build_service
+    first_context = service.run(
+        workflow_name="default",
         node_names=["SecondNode", "FirstNode"],
         language="python",
         temperature=0.35,
@@ -224,10 +231,11 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
         generate_markdowns=False,
     )
 
-    first_generator = workflow.nodes["FirstNode"]
-    second_generator = workflow.nodes["SecondNode"]
+    first_generator = service.workflows["WorkflowStepNode"]
+    second_generator = service.workflows["WorkflowStepNode"]
 
-    second_context = workflow.run(
+    second_context = service.run(
+        workflow_name="default",
         node_names=["FirstNode"],
         language="python",
         temperature=0.1,
@@ -236,14 +244,11 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
     )
 
     assert fake_node_coder.write_calls == ["FirstNode", "SecondNode", "FirstNode"]
-    assert builder._node_build_service.get_or_create_workflow("default") is workflow
-    assert builder._node_build_service.get_or_create_workflow("separate") is not workflow
-    assert list(workflow.nodes) == ["FirstNode", "SecondNode"]
-    assert workflow.nodes["FirstNode"] is first_generator
-    assert workflow.nodes["SecondNode"] is second_generator
-    assert first_generator.total == 1
-    assert first_generator.node_index == 1
-    assert second_generator.node_index == 2
+    assert list(service.workflows) == ["WorkflowStepNode"]
+    assert service.workflows["WorkflowStepNode"] is first_generator
+    assert service.workflows["WorkflowStepNode"] is second_generator
+    assert first_generator.node_auditor is builder.node_auditor
+    assert second_generator.node_auditor is builder.node_auditor
     assert [Path(builder.node_location_map[name]).stem for name in first_context.selected_node_names] == [
         "FirstNode", "SecondNode"
     ]
@@ -273,8 +278,9 @@ def test_cached_node_generator_can_amend_from_log_prompt(monkeypatch, tmp_path):
         ],
     )
 
-    class _FakeNodeCoder:
+    class _FakeNodeCoder(_FakeWriter):
         def __init__(self):
+            super().__init__()
             self.root_dir_path = ""
             self.amend_calls = []
 
@@ -297,26 +303,25 @@ def test_cached_node_generator_can_amend_from_log_prompt(monkeypatch, tmp_path):
 
     fake_node_coder = _FakeNodeCoder()
     builder._make_node_coder = lambda node_meta: fake_node_coder
-    builder.node_auditor = type(
-        "_FakeNodeAuditor",
-        (),
-        {"audit_node_file": staticmethod(lambda *args, **kwargs: (True, []))},
-    )()
+    builder.node_auditor = _FakeAuditor()
     builder.requirement_md_path = str(requirement_path)
     builder.graph_plan_path = str(graph_path)
 
-    workflow = builder._node_build_service.get_or_create_workflow()
-    context = workflow.run(
+    service = builder._node_build_service
+    context = service.run(
         node_names=["GeneratedNode"],
         reset_mappings=True,
         generate_markdowns=False,
     )
-    generator = workflow.nodes["GeneratedNode"]
-
-    generator._amend("Traceback from node test log", 0)
+    coder = service.workflows["WorkflowStepNode"].node_coder
+    coder.amend_code_with_feedback(
+        builder.node_location_map["GeneratedNode"], "Traceback from node test log",
+        graph_plan_path=str(graph_path), requirement_md_path=str(requirement_path),
+        current_node_name="GeneratedNode", language="python", temperature=0.35,
+    )
 
     assert context.selected_node_names == ["GeneratedNode"]
-    assert generator.last_generated_path == str((graph_dir / "GeneratedNode.py").resolve())
+    assert builder.node_location_map["GeneratedNode"] == str((graph_dir / "GeneratedNode.py").resolve())
     assert fake_node_coder.amend_calls == [
         {
             "file_path": str((graph_dir / "GeneratedNode.py").resolve()),
@@ -430,8 +435,7 @@ def test_named_node_test_update_uses_its_workflow_graph_and_node_file(monkeypatc
     alpha_node.write_text("# alpha\n", encoding="utf-8")
     beta_node.write_text("# beta\n", encoding="utf-8")
 
-    workflow = builder._node_build_service.get_or_create_workflow("alpha")
-    workflow._context = SimpleNamespace(
+    builder._node_build_service.contexts["alpha"] = SimpleNamespace(
         graph_plan_path=str(alpha_graph),
         artifacts={"SharedNode": {"node_file_path": str(alpha_node)}},
     )

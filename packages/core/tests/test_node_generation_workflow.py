@@ -1,18 +1,35 @@
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
+from ag_ui_workflow import WorkflowStepNode
 
 import flowx_core.agent_builder as agent_builder_module
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.auditor.data import RuleViolation
+from flowx_core.auditor.node_auditor import NodeAuditor
+from flowx_core.worker.node_writer import WorkflowStepNodeCoder
 from flowx_core.workflows import node_generation
+from flowx_core.architect.node_planner import NodePlanElement
 
 
 class _FakeComponent:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+
+
+class _FakeWriter(WorkflowStepNodeCoder):
+    def __post_init__(self):
+        WorkflowStepNode.__init__(self)
+
+
+class _FakeAuditor(NodeAuditor):
+    def __init__(self, audit):
+        super().__init__()
+        self._audit = audit
+
+    def audit_file(self, file_path, node_meta=None, graph_plan_path=None):
+        return self._audit(file_path, node_meta, graph_plan_path=graph_plan_path)
 
 
 def _make_builder(monkeypatch, root: Path) -> AgentBuilder:
@@ -21,6 +38,43 @@ def _make_builder(monkeypatch, root: Path) -> AgentBuilder:
     monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     return AgentBuilder(api_key="key", model="model", provider="provider", root_dir=str(root))
+
+
+def test_node_build_service_runs_single_node_workflow_per_kind(monkeypatch, tmp_path: Path) -> None:
+    builder = _make_builder(monkeypatch, tmp_path)
+    graph_path = tmp_path / "workflow.json"
+    graph_path.write_text(json.dumps({"nodes": [
+        {"name": "Standalone", "type": "WorkflowStepNode", "desc": "standalone",
+         "depends": [], "ext_data": {"type": "none"}},
+    ]}), encoding="utf-8")
+    requirement_path = tmp_path / "requirement.md"
+    requirement_path.write_text("Build standalone node", encoding="utf-8")
+
+    class Planner(NodePlanElement):
+        def __post_init__(self):
+            WorkflowStepNode.__init__(self)
+
+        def code_to_file(self, prompt, path, **kwargs):
+            Path(path).write_text("# Standalone plan", encoding="utf-8")
+            return Path(path)
+
+    class Coder(_FakeWriter):
+        def code_to_file(self, prompt, path, **kwargs):
+            Path(path).write_text("class Standalone: pass\n", encoding="utf-8")
+            return Path(path)
+
+    builder.graph_plan_path = str(graph_path)
+    builder.requirement_md_path = str(requirement_path)
+    builder.node_planner = Planner()
+    builder._make_node_coder = lambda _meta: Coder()
+    builder.node_auditor = _FakeAuditor(lambda *_args, **_kwargs: (True, []))
+    service = builder._node_build_service
+    context = service.run()
+
+    assert context.selected_node_names == ["Standalone"]
+    assert context.artifacts["Standalone"]["node_markdown"] == "# Standalone plan"
+    assert context.artifacts["Standalone"]["node_file"] == "class Standalone: pass\n"
+    assert service.workflows["WorkflowStepNode"]._engine.session.step_outputs["node_audit"].derived["ok"] is True
 
 
 def test_node_generation_workflow_carries_prior_artifacts_and_routes_requested_workflows(
@@ -71,19 +125,20 @@ def test_node_generation_workflow_carries_prior_artifacts_and_routes_requested_w
         def process_input(self, user_input, dependency_results, session_state):
             path = Path(self.output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"# {self.node['name']} plan\n{self.requirement_text}", encoding="utf-8")
+            request = session_state["node_plan_request"]
+            path.write_text(
+                f"# {request['node']['name']} plan\n{request['requirement_text']}", encoding="utf-8"
+            )
             return node_generation.StepRunOutput(derived={"markdown_path": str(path.resolve())})
 
     builder.node_planner = _FakeNodePlanElement()
     generated_prompt_contexts: dict[str, str] = {}
 
-    class _FakeNodeCoder:
-        root_dir_path = ""
-
+    class _FakeNodeCoder(_FakeWriter):
         def write_node_from_requirement(
             self, node_name, node_meta, requirement_md_path, output_path, **kwargs
         ):
-            generated_prompt_contexts[node_name] = self.additional_generation_context
+            generated_prompt_contexts[node_name] = kwargs["additional_generation_context"]
             path = Path(output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(f"# generated {node_name}\n", encoding="utf-8")
@@ -93,19 +148,16 @@ def test_node_generation_workflow_carries_prior_artifacts_and_routes_requested_w
             raise AssertionError("unexpected audit repair")
 
     builder._make_node_coder = lambda _meta: _FakeNodeCoder()
-    builder.node_auditor = SimpleNamespace(
-        audit_node_file=lambda *_args, **_kwargs: (True, [])
-    )
-    workflow = builder._node_build_service.get_or_create_workflow("default")
-
+    builder.node_auditor = _FakeAuditor(lambda *_args, **_kwargs: (True, []))
+    service = builder._node_build_service
     invoked_workflows: list[str] = []
 
-    def run_review(*, node_name, artifact, context, builder):
+    def run_review(*, node_name, artifact, context):
         invoked_workflows.append(node_name)
         assert artifact["node_file_path"].endswith("Publish.py")
         return {"reviewed": True}
 
-    context = workflow.run(
+    context = service.run(
         graph_plan_path=str(graph_path),
         requirement_md_path=str(requirement_path),
         run_nodes={"Collect": True, "Transform": False, "Publish": True},
@@ -119,7 +171,6 @@ def test_node_generation_workflow_carries_prior_artifacts_and_routes_requested_w
     assert set(context.artifacts) == {"Collect", "Publish"}
     assert Path(context.artifacts["Collect"]["node_markdown_path"]).is_file()
     assert Path(context.artifacts["Collect"]["node_file_path"]).is_file()
-    assert "# Collect plan" in generated_prompt_contexts["Collect"]
     assert "# generated Collect" in generated_prompt_contexts["Publish"]
     assert "# Collect plan" in generated_prompt_contexts["Publish"]
     assert "Build a small data pipeline." in generated_prompt_contexts["Publish"]
@@ -129,7 +180,7 @@ def test_node_generation_workflow_carries_prior_artifacts_and_routes_requested_w
     assert context.artifacts["Publish"]["workflow_outputs"] == {"review": {"reviewed": True}}
 
 
-def test_node_generation_has_three_ordered_stages_and_publishes_repaired_code(
+def test_node_generation_has_three_ordered_stages_and_publishes_explicit_amendment(
     monkeypatch, tmp_path: Path
 ) -> None:
     builder = _make_builder(monkeypatch, tmp_path)
@@ -146,17 +197,18 @@ def test_node_generation_has_three_ordered_stages_and_publishes_repaired_code(
     builder.graph_plan_path = str(graph_path)
     events: list[str] = []
     configs = []
-    real_build_config = node_generation.build_workflow_config
+    real_init_engine = node_generation.init_pipeline_engine
 
     def capture_config(steps, dependencies):
         configs.append((dict(steps), dict(dependencies)))
-        return real_build_config(steps, dependencies)
+        return real_init_engine(steps, dependencies)
 
-    monkeypatch.setattr(node_generation, "build_workflow_config", capture_config)
+    monkeypatch.setattr(node_generation, "init_pipeline_engine", capture_config)
+    (tmp_path / "Second.py").write_text("# existing Second", encoding="utf-8")
 
     class FakePlanner:
         def process_input(self, user_input, dependency_results, session_state):
-            name = self.node["name"]
+            name = session_state["node_plan_request"]["node"]["name"]
             events.append(f"{name}:plan")
             path = Path(self.output_path)
             path.write_text(f"# {name} plan", encoding="utf-8")
@@ -164,9 +216,7 @@ def test_node_generation_has_three_ordered_stages_and_publishes_repaired_code(
 
     builder.node_planner = FakePlanner()
 
-    class FakeCoder:
-        root_dir_path = ""
-
+    class FakeCoder(_FakeWriter):
         def write_node_from_requirement(self, name, _meta, _requirement, output_path, **kwargs):
             events.append(f"{name}:write")
             path = Path(output_path)
@@ -175,8 +225,9 @@ def test_node_generation_has_three_ordered_stages_and_publishes_repaired_code(
 
         def amend_code_with_feedback(self, file_path, feedback, **kwargs):
             events.append("Second:repair")
-            assert "bad_code" in feedback
+            assert feedback == "Apply requested fix"
             Path(file_path).write_text("# repaired Second", encoding="utf-8")
+            return Path(file_path)
 
     builder._make_node_coder = lambda _meta: FakeCoder()
 
@@ -187,35 +238,27 @@ def test_node_generation_has_three_ordered_stages_and_publishes_repaired_code(
             return False, [RuleViolation(class_name=name, rule="bad_code", detail="repair needed", lineno=1)]
         return True, []
 
-    builder.node_auditor = SimpleNamespace(audit_node_file=audit)
-    workflow = builder._node_build_service.get_or_create_workflow("stages")
-    context = workflow.run(workflow_requests={"Second": "review"}, workflow_registry={
+    builder.node_auditor = _FakeAuditor(audit)
+    service = builder._node_build_service
+    context = service.run(workflow_name="stages", node_amendments={"Second": "Apply requested fix"}, workflow_requests={"Second": "review"}, workflow_registry={
         "review": lambda *, artifact, **kwargs: events.append("Second:review") or artifact["node_file"]
     })
 
-    steps, dependencies = configs[0]
-    assert list(steps) == [
-        "First::plan", "First::write", "First::audit",
-        "Second::plan", "Second::write", "Second::audit",
-    ]
-    assert dependencies["First::write"] == ["First::plan"]
-    assert dependencies["First::audit"] == ["First::write"]
-    assert dependencies["Second::plan"] == ["First::audit"]
-    assert dependencies["Second::audit"] == ["Second::write"]
+    for steps, dependencies in configs:
+        assert list(steps) == ["node_plan", "node_generate", "node_audit"]
+        assert dependencies == {"node_generate": ["node_plan"], "node_audit": ["node_generate"]}
     assert events == [
         "First:plan", "First:write", "First:audit",
-        "Second:plan", "Second:write", "Second:audit", "Second:repair",
-        "Second:audit", "Second:review",
+        "Second:plan", "Second:repair", "Second:audit", "Second:review",
     ]
     assert context.artifacts["Second"]["node_file"] == "# repaired Second"
     assert context.artifacts["Second"]["workflow_outputs"] == {"review": "# repaired Second"}
-    assert builder.node_coder_map["Second"] is workflow.writers["Second"]._current_coder
-    assert builder.node_location_map["Second"] == workflow.nodes["Second"].last_generated_path
+    assert service.workflows["WorkflowStepNode"].node_coder is not None
+    assert builder.node_location_map["Second"] == context.artifacts["Second"]["node_file_path"]
 
 
 def test_failed_audit_does_not_publish_generated_node(monkeypatch, tmp_path: Path) -> None:
     builder = _make_builder(monkeypatch, tmp_path)
-    builder.max_audit_rounds = 1
     requirement_path = tmp_path / "requirement.md"
     requirement_path.write_text("Generate a step", encoding="utf-8")
     graph_path = tmp_path / "workflow.json"
@@ -226,24 +269,27 @@ def test_failed_audit_does_not_publish_generated_node(monkeypatch, tmp_path: Pat
     builder.requirement_md_path = str(requirement_path)
     builder.graph_plan_path = str(graph_path)
 
-    class FakeCoder:
-        root_dir_path = ""
-
+    class FakeCoder(_FakeWriter):
         def write_node_from_requirement(self, name, _meta, _requirement, output_path, **kwargs):
             path = Path(output_path)
             path.write_text("# invalid", encoding="utf-8")
             return path
 
     builder._make_node_coder = lambda _meta: FakeCoder()
-    builder.node_auditor = SimpleNamespace(audit_node_file=lambda *_args, **_kwargs: (
-        False, [RuleViolation(class_name="Broken", rule="bad_code", detail="invalid", lineno=1)]
-    ))
-    workflow = builder._node_build_service.get_or_create_workflow("failed")
+    audit_calls = []
+
+    def audit(*_args, **_kwargs):
+        audit_calls.append(1)
+        return False, [RuleViolation(class_name="Broken", rule="bad_code", detail="invalid", lineno=1)]
+
+    builder.node_auditor = _FakeAuditor(audit)
+    service = builder._node_build_service
 
     with pytest.raises(RuntimeError, match="bad_code"):
-        workflow.run(generate_markdowns=False, reset_mappings=True)
+        service.run(workflow_name="failed", generate_markdowns=False, reset_mappings=True)
 
-    assert workflow.context is not None
-    assert "Broken" not in workflow.context.artifacts
+    assert service.contexts["failed"] is not None
+    assert "Broken" not in service.contexts["failed"].artifacts
     assert "Broken" not in builder.node_location_map
     assert "Broken" not in builder.node_coder_map
+    assert audit_calls == [1]

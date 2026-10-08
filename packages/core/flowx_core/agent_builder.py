@@ -275,12 +275,10 @@ class AgentBuilder:
         self._logger.info("Resetting LLM configuration.")
         self._reset_llm_components()
         self._node_artifact_service.modifiers.clear()
+        self._node_build_service.workflows.clear()
 
     def _make_node_coder(self, node_meta: Any) -> PromptNodeFileCoderBase:
-        return self._component_factory.create_node_coder(
-            node_meta,
-            root_dir_path=self.root_dir,
-        )
+        return self._component_factory.create_node_coder(node_meta)
 
     def _make_node_test_coder(self) -> PromptNodeTestFileCoder:
         return PromptNodeTestFileCoder(
@@ -301,10 +299,6 @@ class AgentBuilder:
         if self.graph_plan_path:
             return Path(self.graph_plan_path).expanduser().resolve().parent
         return Path(self.root_dir).expanduser().resolve()
-
-    def _sync_node_coder_root_dir(self, coder: PromptNodeFileCoderBase) -> None:
-        if hasattr(coder, "root_dir_path"):
-            coder.root_dir_path = str(self._resolve_backend_node_base_dir())
 
     def _load_planned_graph(self, graph_plan_path: Optional[str] = None) -> Graph:
         if graph_plan_path:
@@ -359,7 +353,6 @@ class AgentBuilder:
         if node_meta is None:
             return None
         coder = self._make_node_coder(node_meta)
-        self._sync_node_coder_root_dir(coder)
         self.node_coder_map[node_name] = coder
         return coder
 
@@ -516,7 +509,8 @@ class AgentBuilder:
         if not self.requirement_md_path:
             raise ValueError("requirement_md_path is not set. Call analyze_requirement(...) first or pass requirement_md_path.")
         planned_graph = self._load_planned_graph(graph_plan_path)
-        context = self._node_build_service.get_or_create_workflow(workflow_name).run(
+        context = self._node_build_service.run(
+            workflow_name=workflow_name,
             graph_plan_path=graph_plan_path,
             requirement_md_path=self.requirement_md_path,
             node_names=(

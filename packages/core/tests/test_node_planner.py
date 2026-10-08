@@ -46,7 +46,6 @@ def test_node_context_lists_selectable_types_and_skill_descriptions(tmp_path) ->
 			},
 			"inputs_format": {"query": "string"},
 		},
-		1,
 	)
 
 	assert "- selectable node types:" in context
@@ -70,7 +69,6 @@ def test_node_context_omits_legacy_service_metadata(tmp_path) -> None:
 				"desc": "no need for ext data",
 			},
 		},
-		1,
 	)
 
 	assert "- meta_node_kind: WorkflowStepNode" in context
@@ -127,18 +125,18 @@ def test_plan_node_respects_overwrite_flag(tmp_path) -> None:
 def test_configured_node_plan_step_processes_one_node(tmp_path) -> None:
 	output_path = tmp_path / "Selected.md"
 	step = NodePlanElement(
-		client=_FakeClient(["# Node Brief"]),
-		node={"name": "Selected", "ext_data": {"type": "none"}},
-		requirement_text="Requirements", output_path=str(output_path),
+		client=_FakeClient(["# Node Brief"]), output_path=str(output_path),
 	)
 
-	result = step.process_input("", {}, {})
+	result = step.process_input("", {}, {"node_plan_request": {
+		"node": {"name": "Selected", "ext_data": {"type": "none"}}, "requirement_text": "Requirements",
+	}})
 
 	assert result.derived["output_path"] == str(output_path)
 	assert output_path.read_text(encoding="utf-8") == "# Node Brief"
 
 
-def test_process_input_includes_only_direct_dependency_plans(tmp_path) -> None:
+def test_process_input_uses_dependencies_from_plan_request(tmp_path) -> None:
 	class RecordingCompletions(_FakeCompletions):
 		def create(self, **kwargs):
 			self.prompt = kwargs["messages"][-1]["content"]
@@ -146,29 +144,21 @@ def test_process_input_includes_only_direct_dependency_plans(tmp_path) -> None:
 
 	completion = RecordingCompletions(["# Node Brief"])
 	client = SimpleNamespace(chat=SimpleNamespace(completions=completion))
-	upstream = tmp_path / "Upstream.md"
-	upstream.write_text("Upstream result", encoding="utf-8")
-	unrelated = tmp_path / "Unrelated.md"
-	unrelated.write_text("Unrelated result", encoding="utf-8")
-	step = NodePlanElement(
-		client=client, node={"name": "Target", "depends": ["Upstream"]},
-		requirement_text="Requirements", output_path=str(tmp_path / "Target.md"),
-	)
+	step = NodePlanElement(client=client, output_path=str(tmp_path / "Target.md"))
 
 	step.process_input("", {
-		"Upstream::audit": StepRunOutput(derived={"markdown_path": str(upstream)}),
-		"Unrelated::audit": StepRunOutput(derived={"markdown_path": str(unrelated)}),
-	}, {})
+		"Upstream::audit": StepRunOutput(derived={"markdown_path": str(tmp_path / "Ignored.md")}),
+	}, {"node_plan_request": {
+		"node": {"name": "Target", "depends": ["Upstream"]}, "requirement_text": "Requirements",
+		"dependencies": "Upstream result",
+	}})
 
 	assert "Upstream result" in completion.prompt
-	assert "Unrelated result" not in completion.prompt
 
 
 def test_process_input_amends_existing_node_plan_with_dependencies(tmp_path) -> None:
 	plan = tmp_path / "Target.md"
 	plan.write_text("Original plan", encoding="utf-8")
-	upstream = tmp_path / "Upstream.md"
-	upstream.write_text("Upstream result", encoding="utf-8")
 
 	class RecordingCompletions(_FakeCompletions):
 		def create(self, **kwargs):
@@ -177,13 +167,11 @@ def test_process_input_amends_existing_node_plan_with_dependencies(tmp_path) -> 
 
 	completion = RecordingCompletions(["Amended plan"])
 	client = SimpleNamespace(chat=SimpleNamespace(completions=completion))
-	step = NodePlanElement(
-		client=client, node={"name": "Target", "depends": ["Upstream"]},
-		requirement_text="Requirements", output_path=str(plan), amendment="Make it shorter",
-	)
-	result = step.process_input("", {
-		"Upstream::audit": StepRunOutput(derived={"markdown_path": str(upstream)}),
-	}, {})
+	step = NodePlanElement(client=client, output_path=str(plan))
+	result = step.process_input("", {}, {"node_plan_request": {
+		"node": {"name": "Target", "depends": ["Upstream"]}, "requirement_text": "Requirements",
+		"dependencies": "Upstream result", "amendment": "Make it shorter",
+	}})
 
 	assert plan.read_text(encoding="utf-8") == "Amended plan"
 	assert "Original plan" in completion.prompt
@@ -195,12 +183,12 @@ def test_process_input_amends_existing_node_plan_with_dependencies(tmp_path) -> 
 def test_process_input_generates_missing_plan_before_amending(tmp_path) -> None:
 	plan = tmp_path / "Target.md"
 	step = NodePlanElement(
-		client=_FakeClient(["Initial plan", "Amended plan"]),
-		node={"name": "Target"}, requirement_text="Requirements",
-		output_path=str(plan), amendment="Refine the brief",
+		client=_FakeClient(["Initial plan", "Amended plan"]), output_path=str(plan),
 	)
 
-	result = step.process_input("", {}, {})
+	result = step.process_input("", {}, {"node_plan_request": {
+		"node": {"name": "Target"}, "requirement_text": "Requirements", "amendment": "Refine the brief",
+	}})
 
 	assert plan.read_text(encoding="utf-8") == "Amended plan"
 	assert result.derived["markdown_path"] == str(plan.resolve())
@@ -208,12 +196,11 @@ def test_process_input_generates_missing_plan_before_amending(tmp_path) -> None:
 
 def test_process_input_skips_generation_when_disabled(tmp_path) -> None:
 	plan = tmp_path / "Target.md"
-	step = NodePlanElement(
-		client=_FakeClient([]), node={"name": "Target"},
-		output_path=str(plan), generate_markdown=False,
-	)
+	step = NodePlanElement(client=_FakeClient([]), output_path=str(plan))
 
-	result = step.process_input("", {}, {})
+	result = step.process_input("", {}, {"node_plan_request": {
+		"node": {"name": "Target"}, "generate_markdown": False,
+	}})
 
 	assert result.derived["markdown_path"] is None
 	assert not plan.exists()
@@ -222,12 +209,9 @@ def test_process_input_skips_generation_when_disabled(tmp_path) -> None:
 def test_process_input_dispatches_amendment_from_session_state(tmp_path) -> None:
 	plan = tmp_path / "Target.md"
 	plan.write_text("Original plan", encoding="utf-8")
-	step = NodePlanElement(
-		client=_FakeClient(["Updated plan"]), node={"name": "Target"},
-		output_path=str(plan),
-	)
+	step = NodePlanElement(client=_FakeClient(["Updated plan"]), output_path=str(plan))
 	plan_request = {
-		"generate_markdown": False, "amendment": "Improve the brief",
+		"node": {"name": "Target"}, "generate_markdown": False, "amendment": "Improve the brief",
 	}
 
 	result = step.process_input("", {}, {"node_plan_request": plan_request})
@@ -237,9 +221,6 @@ def test_process_input_dispatches_amendment_from_session_state(tmp_path) -> None
 
 
 def test_process_input_rejects_invalid_session_state_request(tmp_path) -> None:
-	step = NodePlanElement(
-		client=_FakeClient([]), node={"name": "Target"},
-		output_path=str(tmp_path / "Target.md"),
-	)
+	step = NodePlanElement(client=_FakeClient([]), output_path=str(tmp_path / "Target.md"))
 	with pytest.raises(TypeError, match="string amendment"):
-		step.process_input("", {}, {"node_plan_request": {"amendment": 123}})
+		step.process_input("", {}, {"node_plan_request": {"node": {"name": "Target"}, "amendment": 123}})

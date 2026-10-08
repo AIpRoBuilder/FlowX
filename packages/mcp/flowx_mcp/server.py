@@ -766,7 +766,7 @@ def create_server() -> Any:
                     markdown_amendments={node: amendment},
                     workflow_name=handle.workflow_name,
                 )
-            generation_context = handle.builder._node_build_service.workflows[handle.workflow_name].context
+            generation_context = handle.builder._node_build_service.contexts[handle.workflow_name]
             node_doc_path = generation_context.artifacts[node]["node_markdown_path"]
             with _capture_builder_output("update_workflow_node.sync_workflow_json"):
                 workflow_json_path = handle.builder._sync_workflow_graph_json(

@@ -41,15 +41,10 @@ class NodePlanElement(Coder):
 	prompt_path: str = "architect/prompts/node_planner_prompt.md"
 	default_skills_dirname: str = "skills"
 	skills_root_path: str = ""
-	node: Optional[dict[str, Any]] = None
-	requirement_text: str = ""
 	output_path: Optional[str] = None
-	index: int = 1
 	overwrite: bool = True
 	temperature: float = 0.2
 	max_tokens: int = MAX_TOKENS
-	amendment: str = ""
-	generate_markdown: bool = True
 
 	def __post_init__(self) -> None:
 		prompt_file = ROOT_DIR / self.prompt_path
@@ -92,14 +87,13 @@ class NodePlanElement(Coder):
 		requirement_text: str,
 		output_path: str | Path,
 		*,
-		index: int = 1,
 		overwrite: bool = True,
 		temperature: float = 0.2,
 		max_tokens: int = MAX_TOKENS,
 		dependencies: str = "",
 	) -> Path:
 		"""Write the brief for one node to the requested path."""
-		prompt = self._build_node_prompt(requirement_text, self.render_node_context(node, index), dependencies)
+		prompt = self._build_node_prompt(requirement_text, self.render_node_context(node), dependencies)
 		return self.code_to_file(
 			prompt,
 			str(output_path),
@@ -115,7 +109,6 @@ class NodePlanElement(Coder):
 		output_path: str | Path,
 		amendment: str,
 		*,
-		index: int = 1,
 		temperature: float = 0.2,
 		max_tokens: int = MAX_TOKENS,
 		dependencies: str = "",
@@ -129,7 +122,7 @@ class NodePlanElement(Coder):
 		prompt = (
 			"Amend only this node's implementation markdown. Keep it concise and retain the required Node Brief sections.\n"
 			f"Global requirement analysis:\n{requirement_text}\n\n"
-			f"Node context:\n{self.render_node_context(node, index)}\n\n"
+			f"Node context:\n{self.render_node_context(node)}\n\n"
 			f"{dependencies}"
 			f"Existing node markdown:\n{path.read_text(encoding='utf-8')}\n\n"
 			f"Amendment instructions:\n{amendment}\n"
@@ -143,56 +136,47 @@ class NodePlanElement(Coder):
 			max_tokens=max_tokens,
 		)
 
-	def _dependency_plan_context(self, dependency_results: dict[str, StepRunOutput]) -> str:
-		"""Read only direct graph dependencies, not ordering-only workflow edges."""
-		depends = self.node.get("depends", []) if isinstance(self.node, dict) else []
-		if not isinstance(depends, list):
-			return ""
-		sections: list[str] = []
-		for name in depends:
-			if not isinstance(name, str):
-				continue
-			result = dependency_results.get(f"{name}::audit") or dependency_results.get(name)
-			if result is None or not isinstance(result.derived, dict):
-				continue
-			plan_path = result.derived.get("markdown_path") or result.derived.get("output_path")
-			if not isinstance(plan_path, str) or not Path(plan_path).is_file():
-				continue
-			sections.append(f"### {name}\n{Path(plan_path).read_text(encoding='utf-8')}")
-		if not sections:
-			return ""
-		return "Upstream node plans (dependency results):\n" + "\n\n".join(sections) + "\n\n"
-
 	def process_input(
 		self,
 		user_input: str,
 		dependency_results: dict[str, StepRunOutput],
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
-		del user_input
-		if self.node is None or self.output_path is None:
-			raise ValueError("Configure node and output_path before running the node plan step.")
+		del user_input, dependency_results
+		if self.output_path is None:
+			raise ValueError("Configure output_path before running the node plan step.")
 		plan_request = session_state.get("node_plan_request")
-		if plan_request is not None and not isinstance(plan_request, dict):
+		if not isinstance(plan_request, dict):
 			raise TypeError("node_plan_request must be a dictionary")
-		plan_request = plan_request or {}
-		generate_markdown = plan_request.get("generate_markdown", self.generate_markdown)
-		amendment = plan_request.get("amendment", self.amendment)
-		if not isinstance(generate_markdown, bool) or not isinstance(amendment, str):
-			raise TypeError("node_plan_request requires a boolean generate_markdown and string amendment")
+		node = plan_request.get("node")
+		if not isinstance(node, dict):
+			raise ValueError("node_plan_request requires a node dictionary")
+		requirement_text = plan_request.get("requirement_text", "")
+		generate_markdown = plan_request.get("generate_markdown", True)
+		amendment = plan_request.get("amendment", "")
+		dependencies = plan_request.get("dependencies", "")
+		if (
+			not isinstance(requirement_text, str)
+			or not isinstance(generate_markdown, bool)
+			or not isinstance(amendment, str)
+			or not isinstance(dependencies, str)
+		):
+			raise TypeError(
+				"node_plan_request requires string requirement_text, boolean generate_markdown, "
+				"string amendment and string dependencies"
+			)
 		path = Path(self.output_path)
-		dependencies = self._dependency_plan_context(dependency_results)
 		if not path.is_file() and (generate_markdown or amendment):
 			self.plan_node(
-				self.node, self.requirement_text, path,
-				index=self.index, overwrite=self.overwrite,
+				node, requirement_text, path,
+				overwrite=self.overwrite,
 				temperature=self.temperature, max_tokens=self.max_tokens,
 				dependencies=dependencies,
 			)
 		if amendment:
 			self.amend_node_plan(
-				self.node, self.requirement_text, path, amendment,
-				index=self.index, temperature=self.temperature,
+				node, requirement_text, path, amendment,
+				temperature=self.temperature,
 				max_tokens=self.max_tokens, dependencies=dependencies,
 			)
 		return StepRunOutput(derived={
@@ -323,8 +307,8 @@ class NodePlanElement(Coder):
 			"note": note,
 		}
 
-	def render_node_context(self, node: dict[str, Any], index: int = 1) -> str:
-		name = str(node.get("name", "")).strip() or f"Node{index}"
+	def render_node_context(self, node: dict[str, Any]) -> str:
+		name = str(node.get("name", "")).strip() or "Node"
 		desc = str(node.get("desc", "")).strip()
 		depends = node.get("depends", [])
 		if not isinstance(depends, list):
@@ -342,7 +326,7 @@ class NodePlanElement(Coder):
 			skill_name_val = str(ext_data.get("skill_name", "")).strip()
 
 		ctx_lines = [
-			f"### Node {index}: {name}",
+			f"### Node: {name}",
 			f"- desc: {desc}",
 			f"- depends: {', '.join(depends) if depends else 'none'}",
 			f"- meta_node_kind: {profile['metaNodeKind']}",

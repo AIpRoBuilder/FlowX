@@ -55,8 +55,8 @@ def test_process_input_writes_with_all_live_context(tmp_path, monkeypatch, coder
     assert '"two": 2' in prompts[0]
     assert '"token": "persisted"' in prompts[0]
     assert '"session_id": "request-123"' in prompts[0]
-    assert '"node_writer"' not in coder.ancestor_session_state_context_text
-    assert '::action"' not in coder.ancestor_session_state_context_text
+    assert '"node_writer"' not in prompts[0]
+    assert '::action"' not in prompts[0]
     assert "GraphContextBuilder" not in prompts[0]
 
 
