@@ -1,18 +1,27 @@
-"""Dependency-aware workflow for generating and amending graph nodes."""
+"""Dependency-aware workflow for generating and amending graph nodes.
+
+Modified: construct exact concrete classes with instance-only scoped settings.
+"""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ag_ui_workflow import StepRunOutput, WorkflowEngine
+from ag_ui_workflow import RunResult, WorkflowEngine, WorkflowStepNode
 
 from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.architect.graph import NodeMeta
-from flowx_core.tools.workflow_engine import init_pipeline_engine, run_workflow_step
+from flowx_core.tools._node_settings import node_settings
+from flowx_core.tools.file_tools import parse_json_file
+from flowx_core.tools.workflow_engine import (
+    close_workflow_engine,
+    init_workflow_engine,
+    run_workflow,
+)
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
 
 
@@ -79,14 +88,49 @@ class NodeGenerationWorkflow:
     node_coder: PromptNodeFileCoderBase
     node_auditor: NodeAuditor
     _engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
+    _last_result: RunResult | None = field(default=None, init=False, repr=False)
+    _node_classes: dict[str, type[WorkflowStepNode]] = field(default_factory=dict, init=False, repr=False)
 
-    def init_node_engine(self, needs_plan: bool) -> WorkflowEngine:
-        steps: dict[str, Any] = {"node_plan": self.node_planner} if needs_plan else {}
-        steps.update(node_generate=self.node_coder, node_audit=self.node_auditor)
-        return init_pipeline_engine(
-            steps,
-            {"node_generate": ["node_plan"] if needs_plan else [], "node_audit": ["node_generate"]},
-        )
+    def __post_init__(self) -> None:
+        # Build before publishing this workflow to concurrent callers. The pool
+        # owns run concurrency; no lazy first-run initialization race is needed.
+        self.init_node_engine()
+
+    @staticmethod
+    def json_config() -> dict[str, Any]:
+        """Load the generation topology and pool_size from workflow JSON."""
+        config = parse_json_file("node_generation.json", Path(__file__).with_name("configs"))
+        if not isinstance(config, dict):
+            raise TypeError("Node generation configuration must be a JSON object")
+        return config
+
+    def init_node_engine(self) -> WorkflowEngine:
+        """Build once from exact classes and shallow dataclass settings snapshots.
+
+        Later component replacements or instance monkeypatches cannot change
+        native pool nodes. Per-request settings belong in the request state.
+        """
+        if self._engine is None:
+            NODES = (type(self.node_planner), type(self.node_coder), type(self.node_auditor))
+            NODE_CLASSES = {node.STEP_ID: node for node in NODES}
+            settings = {
+                component.STEP_ID: {
+                    setting.name: getattr(component, setting.name)
+                    for setting in fields(component) if setting.init
+                }
+                for component in (self.node_planner, self.node_coder, self.node_auditor)
+                if is_dataclass(component)
+            }
+            settings.setdefault(self.node_auditor.STEP_ID, {})["white_list"] = set(self.node_auditor.white_list)
+            self._node_classes = NODE_CLASSES
+            with node_settings(settings):
+                self._engine = init_workflow_engine(NODE_CLASSES, self.json_config())
+        return self._engine
+
+    def close(self) -> None:
+        """Release the native pool when this workflow is no longer needed."""
+        if self._engine is not None:
+            close_workflow_engine(self._engine)
 
     @staticmethod
     def build_plan_request(context: NodeGenerationContext, node_name: str) -> dict[str, Any]:
@@ -96,6 +140,8 @@ class NodeGenerationWorkflow:
             "requirement_text": context.requirement_text,
             "generate_markdown": context.generate_markdowns and not markdown_file.is_file(),
             "amendment": context.markdown_amendments.get(node_name, ""),
+            "output_path": str(markdown_file),
+            "temperature": min(context.temperature, 0.2),
         }
 
     def build_node_request(
@@ -128,7 +174,7 @@ class NodeGenerationWorkflow:
                 "root_dir_path": str(Path(context.graph_plan_path).parent),
                 "additional_generation_context": generation_context,
             },
-            f"{type(self.node_coder).__name__}::action": action,
+            f"{self._node_classes['node_generate'].__name__}::action": action,
             "auditor": {
                 "file_path": str(target_path), "node_meta": node_meta,
                 "graph_plan_path": context.graph_plan_path,
@@ -144,18 +190,20 @@ class NodeGenerationWorkflow:
     ) -> str:
         """Generate and audit one node, returning the generated file path."""
 
+        self._last_result = None
         plan_request = self.build_plan_request(context, node_name)
         needs_plan = plan_request["generate_markdown"] or bool(plan_request["amendment"])
-        self.node_planner.output_path = str(context.node_docs_dir / f"{node_name}.md")
-        self.node_planner.temperature = min(context.temperature, 0.2)
-        engine = self._engine = self.init_node_engine(needs_plan)
-        engine.session.state.update(
-            self.build_node_request(context, node_meta, node_name, target_path, plan_request)
+        run_result = run_workflow(
+            self.init_node_engine(),
+            session_state=self.build_node_request(
+                context, node_meta, node_name, target_path, plan_request,
+            ),
+            skipped_steps=() if needs_plan else ("node_plan",),
         )
-        for step in engine.steps_meta:
-            run_workflow_step(engine, step["id"])
-
-        outputs = engine.session.step_outputs
+        # Diagnostic only: never read this shared last-completion slot to return
+        # a request's own outputs when other pool slots may finish concurrently.
+        self._last_result = run_result
+        outputs = run_result.outputs
         result = outputs["node_audit"].derived
         if not result["ok"]:
             feedback = "\n".join(

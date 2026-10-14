@@ -2,13 +2,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-10-13: reconcile input metadata with generated node constants without importing them.
+# Modified 2026-10-13: serialize cached pool ownership during creation and cleanup.
 from __future__ import annotations
 
+import ast
 import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Mapping, Optional, Sequence, TYPE_CHECKING
 
 from flowx_core.architect.graph import Graph, NodeMeta
@@ -177,6 +181,8 @@ class NodeBuildService:
     builder: "AgentBuilder"
     workflows: Dict[str, NodeGenerationWorkflow] = field(default_factory=dict)  # keyed by meta_node_kind
     contexts: Dict[str, NodeGenerationContext] = field(default_factory=dict)  # keyed by workflow_name
+    # Guard cache ownership only; native pools manage execution concurrency.
+    _cache_lock: Any = field(default_factory=Lock, init=False, repr=False, compare=False)
 
     @staticmethod
     def _normalize_requested_names(
@@ -317,17 +323,25 @@ class NodeBuildService:
             meta_node_kind=node_meta.meta_node_kind or None,
             ext_data=node_meta.ext_data,
         ).meta_node_kind
-        workflow = self.workflows.get(meta_node_kind)
-        if workflow is None:
-            workflow = self.workflows[meta_node_kind] = NodeGenerationWorkflow(
-                meta_node_kind=meta_node_kind,
-                node_planner=self.builder.node_planner,
-                node_coder=self.builder._make_node_coder(node_meta),
-                node_auditor=self.builder.node_auditor,
-            )
-        workflow.node_planner = self.builder.node_planner
-        workflow.node_auditor = self.builder.node_auditor
-        return workflow
+        with self._cache_lock:
+            workflow = self.workflows.get(meta_node_kind)
+            if workflow is None:
+                workflow = self.workflows[meta_node_kind] = NodeGenerationWorkflow(
+                    meta_node_kind=meta_node_kind,
+                    node_planner=self.builder.node_planner,
+                    node_coder=self.builder._make_node_coder(node_meta),
+                    node_auditor=self.builder.node_auditor,
+                )
+            workflow.node_planner = self.builder.node_planner
+            workflow.node_auditor = self.builder.node_auditor
+            return workflow
+
+    def close(self) -> None:
+        """Release and clear owned pools, waiting for any cache construction."""
+        with self._cache_lock:
+            for workflow in self.workflows.values():
+                workflow.close()
+            self.workflows.clear()
 
     def run(
         self,
@@ -407,6 +421,16 @@ class NodeArtifactService:
 
     builder: "AgentBuilder"
     modifiers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Guard cache ownership only; native pools manage execution concurrency.
+    _cache_lock: Any = field(default_factory=Lock, init=False, repr=False, compare=False)
+
+    def close(self) -> None:
+        """Release and clear owned pools, waiting for any cache construction."""
+        with self._cache_lock:
+            for modifiers in self.modifiers.values():
+                for modifier in modifiers.values():
+                    modifier.close()
+            self.modifiers.clear()
 
     def get_or_create_modifier(self, workflow_name: str, node_name: str) -> Any:
         if not isinstance(workflow_name, str) or not workflow_name.strip():
@@ -416,37 +440,38 @@ class NodeArtifactService:
 
         workflow_name = workflow_name.strip()
         node_name = node_name.strip()
-        workflow_modifiers = self.modifiers.setdefault(workflow_name, {})
-        modifier = workflow_modifiers.get(node_name)
-        if modifier is None:
-            from flowx_core.workflows.node_runtime_modifier import (
-                AmendNodeFromTestLog,
-                GenerateNodeTestFile,
-                NodeRuntimeModifierPipeline,
-            )
+        with self._cache_lock:
+            workflow_modifiers = self.modifiers.setdefault(workflow_name, {})
+            modifier = workflow_modifiers.get(node_name)
+            if modifier is None:
+                from flowx_core.workflows.node_runtime_modifier import (
+                    AmendNodeFromTestLog,
+                    GenerateNodeTestFile,
+                    NodeRuntimeModifierPipeline,
+                )
 
-            root_dir_path = str(Path(self.builder.root_dir).expanduser().resolve())
-            node_test_writer = GenerateNodeTestFile(
-                api_key=self.builder.api_key,
-                model=self.builder.model,
-                provider=self.builder.provider,
-                root_dir_path=root_dir_path,
-                session_marking_prompt=self.builder.session_marking_prompt,
-            )
-            node_writer = AmendNodeFromTestLog(
-                api_key=self.builder.api_key,
-                model=self.builder.model,
-                provider=self.builder.provider,
-                session_marking_prompt=self.builder.session_marking_prompt,
-            )
-            modifier = NodeRuntimeModifierPipeline(
-                node_test_writer=node_test_writer,
-                node_writer=node_writer,
-                run_subprocess=self.builder._run_subprocess,
-                timeout_expired=self.builder._subprocess_timeout_expired(),
-            )
-            workflow_modifiers[node_name] = modifier
-        return modifier
+                root_dir_path = str(Path(self.builder.root_dir).expanduser().resolve())
+                node_test_writer = GenerateNodeTestFile(
+                    api_key=self.builder.api_key,
+                    model=self.builder.model,
+                    provider=self.builder.provider,
+                    root_dir_path=root_dir_path,
+                    session_marking_prompt=self.builder.session_marking_prompt,
+                )
+                node_writer = AmendNodeFromTestLog(
+                    api_key=self.builder.api_key,
+                    model=self.builder.model,
+                    provider=self.builder.provider,
+                    session_marking_prompt=self.builder.session_marking_prompt,
+                )
+                modifier = NodeRuntimeModifierPipeline(
+                    node_test_writer=node_test_writer,
+                    node_writer=node_writer,
+                    run_subprocess=self.builder._run_subprocess,
+                    timeout_expired=self.builder._subprocess_timeout_expired(),
+                )
+                workflow_modifiers[node_name] = modifier
+            return modifier
 
     def run_modifier(
         self,
@@ -846,6 +871,41 @@ class RuntimeService:
         return ok
 
 
+def _declared_step_metadata(node_path: Path, node_name: str) -> dict[str, Any]:
+    """Read literal node constants without triggering skill installs or module side effects."""
+    try:
+        tree = ast.parse(node_path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeError):
+        return {}
+    node_class = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == node_name), None)
+    if node_class is None:
+        return {}
+    fields = {"STEP_ID": "id", "TITLE": "title", "PROMPT": "prompt", "DEPENDENCIES": "dependencies", "INPUT_REQUIRED": "inputRequired"}
+    metadata: dict[str, Any] = {}
+    for statement in node_class.body:
+        if isinstance(statement, ast.Assign):
+            targets, value = statement.targets, statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets, value = [statement.target], statement.value
+        else:
+            continue
+        for target in targets:
+            if not isinstance(target, ast.Name) or target.id not in fields or value is None:
+                continue
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, TypeError, SyntaxError):
+                continue
+            field = fields[target.id]
+            if field == "inputRequired" and isinstance(parsed, bool):
+                metadata[field] = parsed
+            elif field == "dependencies" and isinstance(parsed, (list, tuple)) and all(isinstance(dep, str) for dep in parsed):
+                metadata[field] = list(parsed)
+            elif field in {"id", "title", "prompt"} and isinstance(parsed, str):
+                metadata[field] = parsed
+    return metadata
+
+
 def build_steps_meta(builder: "AgentBuilder", include_hidden_nodes: bool = False) -> list[dict[str, Any]]:
     planned_graph = builder._load_planned_graph()
     steps_meta: list[dict[str, Any]] = []
@@ -863,14 +923,21 @@ def build_steps_meta(builder: "AgentBuilder", include_hidden_nodes: bool = False
         )
         prompt = str(getattr(node_meta, "desc", "") or "").strip() or reference.summary
         ext_data = getattr(node_meta, "ext_data", None)
+        ext_type = str(ext_data.get("type", "none") if isinstance(ext_data, Mapping) else ext_data or "none").strip().lower()
+        input_required = reference.input_required
+        if reference.meta_node_kind == "WorkflowStepNode":
+            input_required = ext_type == "user_input"
+        backend_path = builder.node_location_map.get(node_name)
+        node_path = builder._resolve_root_path(backend_path) if backend_path else builder._expected_backend_node_path(node_name)
+        declared = _declared_step_metadata(node_path, node_name)
 
         steps_meta.append(
             {
-                "id": node_name,
-                "title": node_name,
-                "prompt": prompt,
-                "dependencies": list(getattr(node_meta, "depends", []) or []),
-                "inputRequired": bool(reference.input_required),
+                "id": declared.get("id", node_name),
+                "title": declared.get("title", node_name),
+                "prompt": declared.get("prompt", prompt),
+                "dependencies": declared.get("dependencies", list(getattr(node_meta, "depends", []) or [])),
+                "inputRequired": declared.get("inputRequired", bool(input_required)),
                 "nodeKind": str(reference.capability_category or "operation"),
                 "extData": ext_data if isinstance(ext_data, Mapping) else (ext_data or {}),
                 "metaNodeKind": str(reference.meta_node_kind or ""),

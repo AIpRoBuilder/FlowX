@@ -1,3 +1,5 @@
+# Modified 2026-10-13: generated entrypoint assertions use native JSON/configured pools.
+# Modified 2026-10-14: assert the NODES tuple and reusable STEP_ID class map.
 import json
 from types import SimpleNamespace
 
@@ -52,7 +54,7 @@ class _FakePlanner:
     def process_input(self, user_input, dependency_results, session_state):
         del user_input, dependency_results
         request = session_state["graph_planner"]
-        if request["action"] == "plan":
+        if session_state["GraphPlanner::action"] == "write":
             self.plan_from_file(request["requirement_md_path"], request["output_path"])
         else:
             self.amend_file_with_feedback(
@@ -80,6 +82,24 @@ def test_main_writer_always_renders_step_execution_route(tmp_path):
     ).read_text(encoding="utf-8")
 
     assert '@app.post("/api/run-step")' in output
+    assert "WorkflowPipelinePool(" in output
+    assert "pipeline_json=_build_pipeline_json()," in output
+    assert 'size=workflow_config["pool_size"],' in output
+    assert 'workflow_config.setdefault("pool_size", 4)' in output
+    assert "NODES = (\n    CollectInput,\n    ProcessInput,\n)" in output
+    assert output.count("{node.STEP_ID: node for node in NODES}") == 1
+    assert "NODE_CLASSES = {node.STEP_ID: node for node in NODES}" in output
+    assert "for node in NODES:" in output
+    assert "node_classes=NODE_CLASSES," in output
+    assert "register_class" not in output
+    assert "nodes=_ordered_node_classes()" not in output
+    assert "FLOWX_WORKFLOW_POOL_SIZE" not in output
+    assert "engine.events(request_id, {step_id: normalized_input})" in output
+    assert "lifespan=lifespan" in output
+    assert "_run_step_events" not in output
+    assert "pipeline_json_path=" not in output
+    assert "thread_id=" not in output
+    compile(output, "main.py", "exec")
 
 
 def test_build_user_prompt_requires_uvicorn_launcher(tmp_path):
@@ -102,6 +122,8 @@ def test_build_user_prompt_requires_uvicorn_launcher(tmp_path):
     assert "uvicorn" in output
     assert "if __name__ == \"__main__\":" in output
     assert "uvicorn.run(app" in output
+    assert "NODES = (\n    CollectInput,\n)" in output
+    compile(output, "main.py", "exec")
 
 
 def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tmp_path):

@@ -1,11 +1,22 @@
-"""Offline coverage for the template-backed Coder subclass."""
+"""Offline coverage for the template-backed Coder subclass.
 
+Modified 2026-10-13: explicit JSON class maps, binary file transport, and native wait gates.
+Modified 2026-10-14: distinguish node tuples from STEP_ID maps and verify pool map identity.
+"""
+
+import importlib.util
+import base64
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from ag_ui_workflow import StepRunOutput
+from fastapi.testclient import TestClient
 
+from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
 from flowx_core.llm_client.coder import Coder
 from flowx_core.builder_services import MainEntrypointService
 from flowx_core.builder_support import AuditRepairLoop
@@ -57,6 +68,8 @@ def test_main_writer_renders_and_refreshes_template_without_llm(tmp_path) -> Non
 
     assert writer.amend_code_with_feedback(str(main_path), "Refresh imports") == main_path
     assert "Publish.step_meta()" in main_path.read_text(encoding="utf-8")
+    assert "from .Publish import Publish" in (package_dir / "__init__.py").read_text(encoding="utf-8")
+    assert MainEntryPointAuditor().audit_file(str(main_path)) == (True, [])
 
 
 def test_main_writer_renders_step_route_without_scheduling_code(tmp_path) -> None:
@@ -162,3 +175,543 @@ def test_builder_service_routes_generation_and_audit_repair_through_process_inpu
     assert requests[0][1]["graph_plan_json_path"] == str(graph_path)
     assert "missing" in requests[1][1]["amendment"]
     assert "Collect.step_meta()" in (package_dir / "main.py").read_text(encoding="utf-8")
+
+
+def _render_backend(tmp_path, sources=None, *, workflow_config=None):
+    package_dir = tmp_path / f"generated_nodes_{uuid4().hex}"
+    package_dir.mkdir()
+    if sources is None:
+        sources = {
+            name: f'''class {name}:
+    STEP_ID = {step_id!r}
+    DEPENDENCIES = []
+
+    @classmethod
+    def step_meta(cls):
+        return {{"id": cls.STEP_ID, "metaNodeKind": {ext_type!r}}}
+'''
+            for name, step_id, ext_type in (
+            ("Collect", "collect", "WorkflowStepNode"),
+            ("Upload", "upload", "WorkflowFileNode"),
+            )
+        }
+    for name, source in sources.items():
+        (package_dir / f"{name}.py").write_text(source, encoding="utf-8")
+    graph_path = tmp_path / "workflow.json"
+    # FlowX planning JSON is deliberately not a native pydaograph pipeline document.
+    planning_config = {"nodes": [
+        {"name": name, "type": "", "meta_type": "GCondition", "loop": 99,
+         "depends": ["planning-only-dependency"]}
+        for name in sources
+    ] + [{"name": "Disabled", "enable": False}]}
+    if workflow_config is not None:
+        planning_config.update(workflow_config)
+    graph_path.write_text(json.dumps(planning_config), encoding="utf-8")
+    return PromptMainFileCoder().write_main_entrypoint(
+        project_root_path=str(tmp_path),
+        graph_plan_json_path=str(graph_path),
+        output_path=str(package_dir / "main.py"),
+    )
+
+
+@pytest.fixture
+def generated_backend(tmp_path, monkeypatch):
+    path = _render_backend(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    spec = importlib.util.spec_from_file_location(f"entrypoint_{uuid4().hex}", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    try:
+        yield module
+    finally:
+        for name in list(sys.modules):
+            if name == path.parent.name or name.startswith(path.parent.name + "."):
+                sys.modules.pop(name, None)
+
+
+def _install_strict_runtime(module, monkeypatch):
+    calls = []
+    pools, engines = [], []
+
+    class Pool:
+        def __init__(self, *, pipeline_json, node_classes, size):
+            assert isinstance(pipeline_json, str)
+            assert node_classes is module.NODE_CLASSES
+            assert isinstance(node_classes, dict)
+            self.pipeline_json, self.size = pipeline_json, size
+            self.node_classes = node_classes
+            self.graph = json.loads(pipeline_json)
+            assert set(self.graph) == {"nodes"}
+            assert set(node_classes) == {node["name"] for node in self.graph["nodes"]}
+            for node in self.graph["nodes"]:
+                assert set(node) == {"name", "type", "depends", "meta_type", "loop"}
+                assert node_classes[node["name"]].__name__ == node["type"]
+                assert node["meta_type"] == "GNode" and node["loop"] == 1
+            self.closed = False
+            pools.append(self)
+
+        def close(self):
+            calls.append(("pool.close",))
+            self.closed = True
+
+    class Engine:
+        def __init__(self, *, graph_config_id, steps_meta, pool):
+            self.graph_config_id, self.steps_meta, self.pool = graph_config_id, steps_meta, pool
+            engines.append(self)
+
+        def events(self, request_id, inputs):
+            calls.append(("events", request_id, inputs))
+            yield 'data: {"type":"RUN_FINISHED"}\n\n'
+
+        def close(self, request_id=None):
+            calls.append(("engine.close", request_id))
+
+    monkeypatch.setattr(module, "WorkflowPipelinePool", Pool)
+    monkeypatch.setattr(module, "WorkflowEngine", Engine)
+    return SimpleNamespace(calls=calls, pools=pools, engines=engines)
+
+
+def test_generated_routes_preserve_inputs_and_rotate_request_ids(generated_backend, monkeypatch, tmp_path):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    workflow_config = json.loads(module.PIPELINE_JSON_PATH.read_text(encoding="utf-8"))
+    workflow_config["pool_size"] = 2
+    module.PIPELINE_JSON_PATH.write_text(json.dumps(workflow_config), encoding="utf-8")
+    monkeypatch.setenv("FLOWX_WORKFLOW_POOL_SIZE", "not-an-integer")
+    with TestClient(module.app) as client:
+        assert client.get("/").json()["ok"] is True
+        first = client.post("/api/run-step", json={"sessionId": "a", "stepId": "collect", "input": {"value": "Ada"}})
+        assert first.status_code == 200
+        assert first.headers["content-type"].startswith("text/event-stream")
+        assert first.headers["cache-control"] == "no-cache"
+        assert first.headers["connection"] == "keep-alive"
+        request_a = module.SESSION_REQUESTS["a"]
+        assert runtime.calls[-1] == ("events", request_a, {"collect": {"value": "Ada"}})
+
+        upload_path = tmp_path / "input.txt"
+        upload_path.write_bytes(b"uploaded content")
+        client.post("/api/run-step", json={"sessionId": "a", "stepId": "upload", "file_path": str(upload_path), "input": "ignored"})
+        assert runtime.calls[-1] == ("events", request_a, {"upload": b"uploaded content"})
+        client.post("/api/run-step", json={"sessionId": "b", "stepId": "upload", "input": {"base64": ""}})
+        request_b = module.SESSION_REQUESTS["b"]
+        assert request_b != request_a
+        assert runtime.calls[-1] == ("events", request_b, {"upload": b""})
+        client.post("/api/run-step", json={"sessionId": "b", "stepId": "collect"})
+        assert runtime.calls[-1] == ("events", request_b, {"collect": None})
+
+        reset = client.post("/api/reset-session", json={"sessionId": "a"}).json()
+        assert reset == {"ok": True, "sessionId": "a", "threadId": module.GRAPH_CONFIG_ID, "runId": module.SESSION_REQUESTS["a"]}
+        assert reset["runId"] != request_a
+        assert runtime.calls[-1] == ("engine.close", request_a)
+        assert module.SESSION_REQUESTS["b"] == request_b
+        client.post("/api/run-step", json={"sessionId": "a", "stepId": "collect", "input": "new"})
+        assert runtime.calls[-1] == ("events", reset["runId"], {"collect": "new"})
+
+        before = list(runtime.calls)
+        unknown_reset = client.post("/api/reset-session", json={"sessionId": "unseen"})
+        assert unknown_reset.status_code == 200
+        assert runtime.calls == before  # No engine.close(None), which would cancel everyone.
+        bad_step = client.post("/api/run-step", json={"sessionId": "invalid", "stepId": "missing"})
+        assert bad_step.status_code == 404
+        assert "invalid" not in module.SESSION_REQUESTS
+        assert runtime.calls == before
+        assert len(runtime.pools) == len(runtime.engines) == 1
+        assert runtime.pools[0].size == 2
+        assert runtime.pools[0].graph == {"nodes": [
+            {"name": "collect", "type": "Collect", "depends": [], "meta_type": "GNode", "loop": 1},
+            {"name": "upload", "type": "Upload", "depends": [], "meta_type": "GNode", "loop": 1},
+        ]}
+        assert runtime.pools[0].node_classes == {"collect": module.Collect, "upload": module.Upload}
+        assert not runtime.pools[0].closed
+
+    assert runtime.calls[-2:] == [("engine.close", None), ("pool.close",)]
+    assert runtime.pools[0].closed
+    assert module.ENGINE is None
+    assert module.SESSION_REQUESTS == {}
+
+
+@pytest.mark.parametrize("config,expected_size", [({}, 4), ({"pool_size": 1}, 1), ({"pool_size": 3}, 3)])
+def test_generated_pool_reads_config_once_at_startup(generated_backend, monkeypatch, config, expected_size):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    module.PIPELINE_JSON_PATH.write_text(json.dumps(config), encoding="utf-8")
+    read_text = type(module.PIPELINE_JSON_PATH).read_text
+    reads = []
+
+    def tracked_read(path, *args, **kwargs):
+        if path == module.PIPELINE_JSON_PATH:
+            reads.append(path)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(module.PIPELINE_JSON_PATH), "read_text", tracked_read)
+    monkeypatch.setenv("FLOWX_WORKFLOW_POOL_SIZE", "100")
+    with TestClient(module.app) as client:
+        assert reads == [module.PIPELINE_JSON_PATH]
+        assert runtime.pools[0].size == expected_size
+        # Routes and resets use the startup snapshot, even if the file changes.
+        module.PIPELINE_JSON_PATH.write_text('{"pool_size": false}', encoding="utf-8")
+        assert client.post("/api/run-step", json={"sessionId": "a", "stepId": "collect"}).status_code == 200
+        assert client.post("/api/reset-session", json={"sessionId": "a"}).status_code == 200
+        assert reads == [module.PIPELINE_JSON_PATH]
+        assert len(runtime.pools) == 1 and runtime.pools[0].size == expected_size
+    assert reads == [module.PIPELINE_JSON_PATH]
+
+
+@pytest.mark.parametrize("pool_size", [True, False, 0, -1, 1.5, 2.0, "2", "", None, [], {}])
+def test_generated_pool_rejects_invalid_config_size(generated_backend, monkeypatch, pool_size):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    module.PIPELINE_JSON_PATH.write_text(json.dumps({"pool_size": pool_size}), encoding="utf-8")
+    with pytest.raises(ValueError, match="pool_size must be a positive integer"):
+        with TestClient(module.app):
+            pass
+    assert runtime.pools == runtime.engines == []
+    assert module.PIPELINE_POOL is None
+
+
+@pytest.mark.parametrize("config", [[], None, "planning", 4])
+def test_generated_pool_requires_config_object(generated_backend, monkeypatch, config):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    module.PIPELINE_JSON_PATH.write_text(json.dumps(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="config must be a JSON object"):
+        with TestClient(module.app):
+            pass
+    assert runtime.pools == runtime.engines == []
+
+
+def test_generated_json_pool_uses_step_id_class_map_without_global_registration(generated_backend, monkeypatch):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    assert isinstance(module.NODES, tuple)
+    assert module.NODES == (module.Collect, module.Upload)
+    assert module.NODE_CLASSES == {node.STEP_ID: node for node in module.NODES}
+    with TestClient(module.app):
+        assert runtime.pools[0].node_classes is module.NODE_CLASSES
+        assert runtime.pools[0].node_classes == {"collect": module.Collect, "upload": module.Upload}
+        assert runtime.pools[0].graph["nodes"][0]["type"] == "Collect"
+        assert not hasattr(module, "register_class")
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({"base64": "AAH/"}, b"\x00\x01\xff"),
+    ({"content_base64": ""}, b""),
+    ({"data": "data:application/octet-stream;base64,AAH/"}, b"\x00\x01\xff"),
+    ({"files": [{"base64": "AAH/"}]}, b"\x00\x01\xff"),
+    ({"uploads": [{"base64": "AAH/"}]}, b"\x00\x01\xff"),
+    (None, None),
+])
+def test_generated_file_route_decodes_one_upload(generated_backend, monkeypatch, payload, expected):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    with TestClient(module.app) as client:
+        response = client.post("/api/run-step", json={"sessionId": "file", "stepId": "upload", "input": payload})
+        assert response.status_code == 200
+        assert runtime.calls[-1] == ("events", module.SESSION_REQUESTS["file"], {"upload": expected})
+
+
+@pytest.mark.parametrize("payload", [
+    {"files": []}, {"files": [None]}, {"files": [{"base64": ""}, {"base64": ""}]},
+    {"uploads": "not-a-list"}, {"base64": "!not base64"},
+    {"data": "data:text/plain,not-base64"}, {"path": ""}, {"path": 1}, {},
+])
+def test_generated_file_route_rejects_bad_upload_before_starting_run(generated_backend, monkeypatch, payload):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    with TestClient(module.app) as client:
+        response = client.post("/api/run-step", json={"sessionId": "file", "stepId": "upload", "input": payload})
+        assert response.status_code == 422
+        assert runtime.calls == []
+        assert "file" not in module.SESSION_REQUESTS
+
+
+def test_generated_file_route_reports_missing_path(generated_backend, monkeypatch, tmp_path):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    with TestClient(module.app) as client:
+        response = client.post("/api/run-step", json={
+            "sessionId": "file", "stepId": "upload", "file_path": str(tmp_path / "missing"),
+        })
+        assert response.status_code == 422
+        assert runtime.calls == []
+        assert "file" not in module.SESSION_REQUESTS
+
+
+def test_generated_backend_requires_lifespan_and_never_rebuilds_pool(generated_backend, monkeypatch):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    client = TestClient(module.app)
+    assert client.post("/api/run-step", json={"sessionId": "a", "stepId": "collect"}).status_code == 503
+    assert client.post("/api/reset-session", json={"sessionId": "a"}).status_code == 503
+    assert runtime.pools == runtime.engines == []
+    with client:
+        assert module.ENGINE is runtime.engines[0]
+    assert client.post("/api/run-step", json={"sessionId": "a", "stepId": "collect"}).status_code == 503
+    with pytest.raises(RuntimeError, match="once per process"):
+        with TestClient(module.app):
+            pass
+    assert len(runtime.pools) == len(runtime.engines) == 1
+
+
+def test_generated_lifespan_closes_pool_when_engine_startup_fails(generated_backend, monkeypatch):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+
+    def fail_engine(**kwargs):
+        raise ValueError("engine startup failed")
+
+    monkeypatch.setattr(module, "WorkflowEngine", fail_engine)
+    with pytest.raises(ValueError, match="engine startup failed"):
+        with TestClient(module.app):
+            pass
+    assert runtime.calls == [("pool.close",)]
+    assert runtime.pools[0].closed
+
+
+def test_generated_lifespan_closes_pool_even_if_engine_close_fails(generated_backend, monkeypatch):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    with pytest.raises(RuntimeError, match="engine close failed"):
+        with TestClient(module.app):
+            def fail_close():
+                runtime.calls.append(("engine.close.failed",))
+                raise RuntimeError("engine close failed")
+            runtime.engines[0].close = fail_close
+    assert runtime.calls == [("engine.close.failed",), ("pool.close",)]
+
+
+@pytest.mark.parametrize("nodes,expected", [
+    ([SimpleNamespace(STEP_ID="b", DEPENDENCIES=["a"]), SimpleNamespace(STEP_ID="a", DEPENDENCIES=[])], ["a", "b"]),
+    ([SimpleNamespace(STEP_ID="a", DEPENDENCIES=["missing"])], None),
+    ([SimpleNamespace(STEP_ID="a", DEPENDENCIES=["b"]), SimpleNamespace(STEP_ID="b", DEPENDENCIES=["a"])], None),
+    ([SimpleNamespace(STEP_ID="a", DEPENDENCIES=[]), SimpleNamespace(STEP_ID="a", DEPENDENCIES=[])], None),
+    ([SimpleNamespace(STEP_ID="", DEPENDENCIES=[])], None),
+    ([SimpleNamespace(STEP_ID=" ", DEPENDENCIES=[])], None),
+    ([SimpleNamespace(STEP_ID=None, DEPENDENCIES=[])], None),
+    ([SimpleNamespace(STEP_ID="a", DEPENDENCIES=["a"])], None),
+    ([SimpleNamespace(STEP_ID="a", DEPENDENCIES="a")], None),
+    ([SimpleNamespace(STEP_ID="a", DEPENDENCIES=[None])], None),
+])
+def test_generated_pool_node_ordering(generated_backend, monkeypatch, nodes, expected):
+    monkeypatch.setattr(generated_backend, "NODES", tuple(nodes))
+    if expected is None:
+        with pytest.raises(ValueError):
+            generated_backend._ordered_node_classes()
+    else:
+        assert [node.STEP_ID for node in generated_backend._ordered_node_classes()] == expected
+
+
+@pytest.mark.parametrize("dependencies", [["missing"], ["upload"]])
+def test_generated_invalid_dag_fails_before_registration_or_pool(generated_backend, monkeypatch, dependencies):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    monkeypatch.setattr(module.Collect, "DEPENDENCIES", dependencies)
+    monkeypatch.setattr(module.Upload, "DEPENDENCIES", ["collect"])
+    with pytest.raises(ValueError, match="cycle|unknown STEP_ID"):
+        with TestClient(module.app):
+            pass
+    assert runtime.pools == runtime.engines == []
+
+
+def test_generated_native_json_uses_class_step_ids_and_dependencies(generated_backend, monkeypatch):
+    module = generated_backend
+    runtime = _install_strict_runtime(module, monkeypatch)
+    monkeypatch.setattr(module.Upload, "DEPENDENCIES", ["collect"])
+    monkeypatch.setattr(module, "NODES", (module.Upload, module.Collect))
+    monkeypatch.setattr(module, "NODE_CLASSES", {node.STEP_ID: node for node in module.NODES})
+    with TestClient(module.app):
+        assert runtime.pools[0].graph == {"nodes": [
+            {"name": "collect", "type": "Collect", "depends": [], "meta_type": "GNode", "loop": 1},
+            {"name": "upload", "type": "Upload", "depends": ["collect"], "meta_type": "GNode", "loop": 1},
+        ]}
+        assert runtime.pools[0].node_classes == {"collect": module.Collect, "upload": module.Upload}
+
+
+def _gated_node_source(name, step_id, dependency):
+    return f'''from ag_ui_workflow import WorkflowStepNode, StepRunOutput
+
+class {name}(WorkflowStepNode):
+    STEP_ID = {step_id!r}
+    DEPENDENCIES = [{dependency!r}]
+    executed = []
+
+    def __init__(self):
+        super().__init__()
+        self.setWaitFunc(self.wait_function)
+
+    def wait_function(self) -> bool:
+        param = self.get_workflow_param()
+        with param.condition:
+            if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
+                return True
+            value = param.inputs.get(self.STEP_ID)
+            ready = isinstance(value, str) and bool(value.strip())
+            param.set_state(self.STEP_ID, "running" if ready else "awaiting_input")
+            return ready
+
+    def process_input(self, user_input, dependency_results, session_state):
+        self.executed.append((self.get_workflow_param().request_id, user_input))
+        return StepRunOutput(derived={{"value": user_input}})
+'''
+
+
+def test_generated_template_executes_real_nodes_and_reuses_native_pool(tmp_path):
+    sources = {
+        "Finish": '''from ag_ui_workflow import WorkflowStepNode, StepRunOutput
+class Finish(WorkflowStepNode):
+    STEP_ID = "finish"
+    DEPENDENCIES = ["confirm"]
+    INPUT_REQUIRED = False
+    def process_input(self, user_input, dependency_results, session_state):
+        return StepRunOutput(derived={"confirmed": dependency_results["confirm"].derived["value"]})
+''',
+        "Confirm": _gated_node_source("Confirm", "confirm", "ask"),
+        "Ask": _gated_node_source("Ask", "ask", "prepare"),
+        "Prepare": '''from ag_ui_workflow import WorkflowStepNode, StepRunOutput
+class Prepare(WorkflowStepNode):
+    STEP_ID = "prepare"
+    DEPENDENCIES = []
+    INPUT_REQUIRED = True  # Metadata does not install a wait callback.
+    executed = []
+    def process_input(self, user_input, dependency_results, session_state):
+        self.executed.append(self.get_workflow_param().request_id)
+        return StepRunOutput(derived={"ready": True})
+''',
+    }
+    path = _render_backend(tmp_path, sources, workflow_config={"pool_size": 2})
+    assert MainEntryPointAuditor().audit_file(str(path)) == (True, [])
+    # Native bindings do not support pool recreation; isolate this process-lifetime test.
+    script = f'''import importlib.util
+import json
+import os
+import sys
+from fastapi.testclient import TestClient
+from pydaograph import GElement
+sys.path.insert(0, {str(tmp_path)!r})
+spec = importlib.util.spec_from_file_location("generated_main", {str(path)!r})
+main = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = main
+spec.loader.exec_module(main)
+assert all(node.__name__ not in GElement.registeredClasses() for node in main.NODES)
+real_pool = main.WorkflowPipelinePool
+pool_sources = []
+def checked_pool(*, pipeline_json, node_classes, size):
+    pool_sources.append((json.loads(pipeline_json), size))
+    assert size == 2
+    assert pool_sources[-1][0] == {{"nodes": [
+        {{"name": "prepare", "type": "Prepare", "depends": [], "meta_type": "GNode", "loop": 1}},
+        {{"name": "ask", "type": "Ask", "depends": ["prepare"], "meta_type": "GNode", "loop": 1}},
+        {{"name": "confirm", "type": "Confirm", "depends": ["ask"], "meta_type": "GNode", "loop": 1}},
+        {{"name": "finish", "type": "Finish", "depends": ["confirm"], "meta_type": "GNode", "loop": 1}},
+    ]}}
+    assert node_classes is main.NODE_CLASSES
+    assert node_classes == {{node.STEP_ID: node for node in main.NODES}}
+    assert all(node.__name__ not in GElement.registeredClasses() for node in main.NODES)
+    return real_pool(pipeline_json=pipeline_json, node_classes=node_classes, size=size)
+main.WorkflowPipelinePool = checked_pool
+os.environ["FLOWX_WORKFLOW_POOL_SIZE"] = "not-an-integer"
+with TestClient(main.app) as client:
+    pool = main.PIPELINE_POOL
+    assert pool is not None
+    def post(session, step, value=None):
+        response = client.post("/api/run-step", json={{"sessionId": session, "stepId": step, "input": value}})
+        assert response.status_code == 200, response.text
+        return response.text
+    assert "input_required" in post("a", "ask")
+    request_a = main.SESSION_REQUESTS["a"]
+    future = main.ENGINE._runs[request_a].future
+    assert main.Prepare.executed == [request_a]
+    assert main.Ask.executed == []
+    assert 'confirm' in post("a", "ask", "Ada")
+    assert main.ENGINE._runs[request_a].future is future
+    assert main.Prepare.executed == [request_a]
+    assert main.Ask.executed == [(request_a, "Ada")]
+    assert main.ENGINE.awaiting_input(request_a) == "confirm"
+    assert "input_required" in post("b", "ask")
+    request_b = main.SESSION_REQUESTS["b"]
+    reset = client.post("/api/reset-session", json={{"sessionId": "a"}}).json()
+    assert reset["threadId"] == main.GRAPH_CONFIG_ID
+    assert reset["runId"] != request_a
+    assert request_a not in main.ENGINE._runs
+    assert main.ENGINE.awaiting_input(request_b) == "ask"
+    assert main.PIPELINE_POOL is pool and not pool.closed
+    assert "confirm" in post("b", "ask", "Bob")
+    assert '"confirmed":"yes"' in post("b", "confirm", "yes").replace(" ", "")
+    assert request_b not in main.ENGINE._runs
+    assert "confirm" in post("a", "ask", "Grace")
+    assert main.Ask.executed[-1] == (reset["runId"], "Grace")
+    # Leave a real native wait gate active; lifespan must cancel it before pool.close().
+    assert main.ENGINE.awaiting_input(reset["runId"]) == "confirm"
+assert pool.closed
+assert len(pool_sources) == 1
+assert main.ENGINE is None
+assert main.SESSION_REQUESTS == {{}}
+print("REAL_ENTRYPOINT_OK")
+'''
+    result = subprocess.run([sys.executable, "-c", script], cwd=str(tmp_path), capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REAL_ENTRYPOINT_OK" in result.stdout
+
+
+def test_generated_template_runs_real_bytes_file_node(tmp_path):
+    sources = {
+        "Upload": '''from ag_ui_workflow import WorkflowFileNode, StepRunOutput
+class Upload(WorkflowFileNode):
+    STEP_ID = "upload"
+    DEPENDENCIES = []
+    def __init__(self):
+        super().__init__()
+        self.setWaitFunc(self.wait_function)
+    def wait_function(self):
+        param = self.get_workflow_param()
+        with param.condition:
+            if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
+                return True
+            ready = isinstance(param.inputs.get(self.STEP_ID), (bytes, bytearray))
+            param.set_state(self.STEP_ID, "running" if ready else "awaiting_input")
+            return ready
+    def process_input(self, file_bytes, dependency_results, session_state):
+        assert isinstance(file_bytes, bytes)
+        return StepRunOutput(derived={"hex": file_bytes.hex(), "length": len(file_bytes)})
+''',
+    }
+    path = _render_backend(tmp_path, sources)
+    assert MainEntryPointAuditor().audit_file(str(path)) == (True, [])
+    upload_path = tmp_path / "binary.data"
+    upload_path.write_bytes(b"\x00\x01\xff")
+    encoded_upload = base64.b64encode(upload_path.read_bytes()).decode()
+    script = f'''import importlib.util
+import json
+import sys
+from fastapi.testclient import TestClient
+sys.path.insert(0, {str(tmp_path)!r})
+spec = importlib.util.spec_from_file_location("generated_file_main", {str(path)!r})
+main = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = main
+spec.loader.exec_module(main)
+assert isinstance(main.NODES, tuple)
+assert main.NODES == (main.Upload,)
+assert main.NODE_CLASSES == {{"upload": main.Upload}}
+assert main.STEP_CHAIN[0]["metaNodeKind"] == "WorkflowFileNode"
+assert "extData" not in main.STEP_CHAIN[0]
+with TestClient(main.app) as client:
+    def post(session, **kwargs):
+        response = client.post("/api/run-step", json={{"sessionId": session, "stepId": "upload", **kwargs}})
+        assert response.status_code == 200, response.text
+        return [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+    assert any(event.get("name") == "input_required" for event in post("path"))
+    pool = main.PIPELINE_POOL
+    events = post("path", file_path={str(upload_path)!r})
+    assert events[-1]["result"]["final"] == {{"hex": "0001ff", "length": 3}}, events
+    events = post("base64", input={{"base64": {encoded_upload!r}}})
+    assert events[-1]["result"]["final"]["hex"] == "0001ff", events
+    events = post("empty", input={{"base64": ""}})
+    assert events[-1]["result"]["final"] == {{"hex": "", "length": 0}}, events
+    assert main.PIPELINE_POOL is pool
+assert pool.closed
+print("REAL_FILE_NODE_OK")
+'''
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REAL_FILE_NODE_OK" in result.stdout

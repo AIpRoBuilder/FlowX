@@ -1,4 +1,5 @@
 # Graph Planner Prompt
+Modified 2026-10-13: request-scoped nodes complete once; do not promise native repeated execution.
 作为一个agent流程架构专家
 目标：根据输入的《需求分析》Markdown，生成一个用于编排的 JSON 图计划，仅输出 JSON 内容。
 
@@ -23,15 +24,15 @@
     - 若 type 为 "none"，desc 必须为 "no need for ext data"。
     - 示例：{"type":"user_input","desc":"user input income"}、{"type":"user_file_input","desc":"upload files for storage and downstream processing"}、{"type":"skill","skill_name":"baidu_search","desc":"search baidu for query results"}、{"type":"url","desc":"image generator api"}。
   - enable: 布尔值。
-  - loop: 整数，默认 1；若未提及循环可省略。
-    - 若某节点需要执行多次以更新节点状态，必须显式设置 loop > 1。
+  - loop: 整数，只允许 1；可省略。当前运行时每个节点在一次请求中只完成一次。
+    - 需要多次处理时，在节点处理方法内部实现有限循环，或启动新请求；不要设置 loop > 1 来更新已完成节点。
     - 示例：
       {
         "name": "UserInput",
         "type": "UserInput",
         "meta_node_kind": "WorkflowStepNode",
         "desc": "接收用户输入的目标用户画像与教学大纲文本",
-        "loop": 2,
+        "loop": 1,
         "ext_data": {
           "type": "user_input",
           "desc": "输入目标用户画像和教学大纲文本"
@@ -60,7 +61,7 @@
       "desc": "calculate the result of 1+2 plus or minus the result from the previous node",
       "ext_data": {"type": "user_input", "desc": "need to get user's choice to either plus or minus the result from previous node"},
       "enable": true,
-      "loop": 2,
+      "loop": 1,
       "depends": ["OtherNode"]
     },
     {

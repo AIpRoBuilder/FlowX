@@ -1,11 +1,16 @@
+"""Modified: test constructor-injected native workers and cached pool cleanup."""
+
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 from ag_ui_workflow import WorkflowStepNode
 import flowx_core.agent_builder as agent_builder_module
 from flowx_core.agent_builder import AgentBuilder
+from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.node_auditor import NodeAuditor
+from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.node_formats import collect_node_formats
 from flowx_core.worker.node_writer import WorkflowStepNodeCoder
 import flowx_core.workflows.node_runtime_modifier as node_runtime_modifier_module
@@ -16,9 +21,24 @@ class _FakeComponent:
         self.kwargs = kwargs
 
 
+@dataclass
 class _FakeWriter(WorkflowStepNodeCoder):
+    write_calls: list = field(default_factory=list)
+    amend_calls: list = field(default_factory=list)
+
     def __post_init__(self):
+        apply_node_settings(self)
         WorkflowStepNode.__init__(self)
+
+
+class _FakePlanner(NodePlanElement):
+    def __post_init__(self):
+        apply_node_settings(self)
+        WorkflowStepNode.__init__(self)
+
+    def code_to_file(self, prompt, path, **kwargs):
+        Path(path).write_text("# Node plan", encoding="utf-8")
+        return Path(path)
 
 
 class _FakeAuditor(NodeAuditor):
@@ -29,7 +49,7 @@ class _FakeAuditor(NodeAuditor):
 def _make_builder(monkeypatch, tmp_path: Path) -> AgentBuilder:
     monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
+    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakePlanner)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     return AgentBuilder(
         api_key="key",
@@ -37,6 +57,20 @@ def _make_builder(monkeypatch, tmp_path: Path) -> AgentBuilder:
         provider="provider",
         root_dir=str(tmp_path),
     )
+
+
+def test_builder_close_releases_cached_workflows_and_modifiers(monkeypatch, tmp_path):
+    builder = _make_builder(monkeypatch, tmp_path)
+    closed = []
+    builder._node_build_service.workflows["step"] = SimpleNamespace(close=lambda: closed.append("workflow"))
+    builder._node_artifact_service.modifiers["default"] = {
+        "node": SimpleNamespace(close=lambda: closed.append("modifier")),
+    }
+    builder.close()
+    builder.close()
+    assert closed == ["workflow", "modifier"]
+    assert builder._node_build_service.workflows == {}
+    assert builder._node_artifact_service.modifiers == {}
 
 
 def test_builder_progress_logs_to_runtime_file(monkeypatch, tmp_path):
@@ -99,10 +133,6 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
     )
 
     class _FakeNodeCoder(_FakeWriter):
-        def __init__(self):
-            super().__init__()
-            self.write_calls = []
-
         def write_node_from_requirement(self, node_name, node_meta, requirement_md_path, output_path, **kwargs):
             self.write_calls.append(
                 {
@@ -164,6 +194,7 @@ def test_generate_nodes_writes_backend_files_next_to_graph_plan(monkeypatch, tmp
     assert expected_path.is_file()
     assert (graph_dir / "tests" / "test_GeneratedNode.py").is_file()
     assert builder.node_location_map == {"GeneratedNode": str(expected_path)}
+    builder.close()
 
 
 def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeypatch, tmp_path):
@@ -198,11 +229,6 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
     )
 
     class _FakeNodeCoder(_FakeWriter):
-        def __init__(self):
-            super().__init__()
-            self.root_dir_path = ""
-            self.write_calls = []
-
         def write_node_from_requirement(self, node_name, node_meta, requirement_md_path, output_path, **kwargs):
             self.write_calls.append(node_name)
             target_path = Path(output_path)
@@ -253,6 +279,7 @@ def test_node_build_service_reuses_cached_workers_in_generation_pipeline(monkeyp
         "FirstNode", "SecondNode"
     ]
     assert second_context.selected_node_names == ["FirstNode"]
+    builder.close()
 
 
 def test_cached_node_generator_can_amend_from_log_prompt(monkeypatch, tmp_path):
@@ -279,11 +306,6 @@ def test_cached_node_generator_can_amend_from_log_prompt(monkeypatch, tmp_path):
     )
 
     class _FakeNodeCoder(_FakeWriter):
-        def __init__(self):
-            super().__init__()
-            self.root_dir_path = ""
-            self.amend_calls = []
-
         def write_node_from_requirement(self, node_name, node_meta, requirement_md_path, output_path, **kwargs):
             target_path = Path(output_path)
             target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +357,7 @@ def test_cached_node_generator_can_amend_from_log_prompt(monkeypatch, tmp_path):
             },
         }
     ]
+    builder.close()
 
 
 def test_node_artifact_service_routes_test_update_by_workflow_and_node_names(monkeypatch, tmp_path):
@@ -570,7 +593,7 @@ def test_write_main_entrypoint_does_not_duplicate_relative_root_dir(monkeypatch,
     class _FakeMainWriter:
         def process_input(self, _user_input, _dependency_results, session_state):
             request = session_state["main_entrypoint"]
-            assert request["action"] == "write"
+            assert session_state["PromptMainFileCoder::action"] == "write"
             captured.update(request)
             output_path = Path(request["output_path"])
             output_path.parent.mkdir(parents=True, exist_ok=True)

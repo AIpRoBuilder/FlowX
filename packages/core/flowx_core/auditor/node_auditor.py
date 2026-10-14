@@ -1,3 +1,8 @@
+"""Modified: audit undecorated nodes and require the abstract file-processing hook.
+
+Modified: fixed automatic-stage metadata and explicit scoped instance initialization.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -9,6 +14,7 @@ from pydaograph import GParam
 from flowx_core.auditor.data import RuleViolation
 from flowx_core.auditor.base_auditor import BaseAuditor
 from flowx_core.architect.graph import Graph, NodeMeta
+from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.file_tools import compile_node_file_and_get_derived_keys
 from flowx_core.tools.workflow_node_reference import (
     resolve_workflow_node_reference,
@@ -26,11 +32,14 @@ WORKFLOW_NODE_BASE_NAMES = {
 class NodeAuditor(BaseAuditor):
     """Audit node classes for required methods without calling an LLM."""
 
-    def __post_init__(self) -> None:  # pragma: no cover - deterministic setup
-        # Skip the base class client bootstrapping; audits are local and deterministic.
-        default_white_list = {"createGParam", "getGParam"}
-        self.white_list: Set[str] = set(default_white_list)
-        return
+    STEP_ID = "node_audit"
+    DEPENDENCIES = ["node_generate"]
+    INPUT_REQUIRED = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        apply_node_settings(self)
+        self.white_list = set(self.white_list)
 
     def audit_node_file(
         self,
@@ -104,19 +113,11 @@ class NodeAuditor(BaseAuditor):
                 elif isinstance(base, ast.Attribute) and base.attr == "GParam":
                     subclass_names.add(cls.name)
 
-        workflow_node_subclasses = self._collect_local_workflow_node_subclasses(class_defs)
-
         for cls in class_defs:
-            self._check_workflow_node_subclass_register_class(
-                cls,
-                workflow_node_subclasses,
-                violations,
-            )
-            self._check_registered_class_name_matches_file_prefix(cls, path, violations)
-            self._check_clone(cls, violations)
+            self._check_node_class_name_matches_file_prefix(cls, path, violations)
             self._check_init(cls, violations)
             self._check_step_id_matches_class_name(cls, violations)
-            self._check_file_node_no_build_step_output(cls, violations)
+            self._check_file_node_process_input(cls, violations)
             self._check_workflow_step_output_dependency_results(cls, path, violations)
             self._check_session_state_reads_use_ancestor_keys(
                 cls=cls,
@@ -147,54 +148,14 @@ class NodeAuditor(BaseAuditor):
                     )
                 )
 
-    def _check_clone(self, cls: ast.ClassDef, violations: List[RuleViolation]) -> None:
-        if not self._is_registered_class(cls):
-            return
-
-        method = self._get_method(cls, "clone")
-        if method is None:
-            violations.append(
-                RuleViolation(
-                    class_name=cls.name,
-                    rule="clone_missing",
-                    detail="Missing def clone(self) that returns self.",
-                    lineno=cls.lineno,
-                )
-            )
-            return
-
-        if len(method.args.args) != 1:
-            violations.append(
-                RuleViolation(
-                    class_name=cls.name,
-                    rule="clone_signature",
-                    detail="clone must accept only self.",
-                    lineno=method.lineno,
-                )
-            )
-
-        returns_self = any(
-            isinstance(node, ast.Return) and isinstance(node.value, ast.Name) and node.value.id == "self"
-            for node in method.body
-        )
-        if not returns_self:
-            violations.append(
-                RuleViolation(
-                    class_name=cls.name,
-                    rule="clone_return",
-                    detail="clone must return self.",
-                    lineno=method.lineno,
-                )
-            )
-
-    def _check_registered_class_name_matches_file_prefix(
+    def _check_node_class_name_matches_file_prefix(
         self,
         cls: ast.ClassDef,
         file_path: Path,
         violations: List[RuleViolation],
     ) -> None:
-        """Ensure registered class name matches the filename prefix (stem)."""
-        if not self._is_registered_class(cls):
+        """Ensure node class names match the filename prefix (stem)."""
+        if not self._is_node_class(cls):
             return
 
         expected_class_name = file_path.stem
@@ -204,7 +165,7 @@ class NodeAuditor(BaseAuditor):
                     class_name=cls.name,
                     rule="class_name_file_prefix_mismatch",
                     detail=(
-                        f"Registered class name must match file prefix '{expected_class_name}', "
+                        f"Node class name must match file prefix '{expected_class_name}', "
                         f"got '{cls.name}'."
                     ),
                     lineno=cls.lineno,
@@ -212,8 +173,8 @@ class NodeAuditor(BaseAuditor):
             )
 
     def _check_init(self, cls: ast.ClassDef, violations: List[RuleViolation]) -> None:
-        """Ensure registered classes implement `init(self) -> CStatus`."""
-        if not self._is_registered_class(cls):
+        """Validate an optional node `init(self) -> CStatus` override."""
+        if not self._is_node_class(cls):
             return
 
         method = self._get_method(cls, "init")
@@ -239,9 +200,7 @@ class NodeAuditor(BaseAuditor):
                 )
 
     def _check_step_id_matches_class_name(self, cls: ast.ClassDef, violations: List[RuleViolation]) -> None:
-        """Ensure registered WorkflowStepNode classes define STEP_ID equal to class name."""
-        if not self._is_registered_class(cls):
-            return
+        """Ensure WorkflowStep-family classes define STEP_ID equal to class name."""
         if not self._is_workflow_step_node_subclass(cls):
             return
 
@@ -310,23 +269,24 @@ class NodeAuditor(BaseAuditor):
     def _is_workflow_file_node_subclass(self, cls: ast.ClassDef) -> bool:
         return self._is_direct_or_attr_base_subclass(cls, {"WorkflowFileNode"})
 
-    def _check_file_node_no_build_step_output(self, cls: ast.ClassDef, violations: List[RuleViolation]) -> None:
-        if not self._is_registered_class(cls):
-            return
+    def _check_file_node_process_input(self, cls: ast.ClassDef, violations: List[RuleViolation]) -> None:
+        """Reject file subclasses that leave the runtime's abstract hook unimplemented."""
         if not self._is_workflow_file_node_subclass(cls):
             return
 
-        method = self._get_method(cls, "build_step_output")
-        if method is not None:
+        method = self._get_method(cls, "process_input")
+        if method is None:
             violations.append(
                 RuleViolation(
                     class_name=cls.name,
-                    rule="workflow_file_node_build_step_output_not_allowed",
+                    rule="workflow_file_node_process_input_missing",
                     detail=(
-                        "WorkflowFileNode subclasses must not implement build_step_output; "
-                        "use base WorkflowFileNode output behavior."
+                        "WorkflowFileNode is abstract; implement synchronous "
+                        "process_input(self, file_bytes: bytes, dependency_results, session_state) "
+                        "returning StepRunOutput. File processing and any required persistence "
+                        "belong to this hook, not inherited storage behavior."
                     ),
-                    lineno=method.lineno,
+                    lineno=cls.lineno,
                 )
             )
 
@@ -353,7 +313,7 @@ class NodeAuditor(BaseAuditor):
         node_file_path: Path,
         violations: List[RuleViolation],
     ) -> None:
-        if not self._is_registered_class(cls):
+        if not self._is_node_class(cls):
             return
 
         for method_name in self._workflow_step_output_method_names_for_class(cls):
@@ -458,14 +418,12 @@ class NodeAuditor(BaseAuditor):
         """Ensure DEPENDENCIES class attribute matches node_meta.depends.
 
         Rules:
-        - If node_meta is provided and the class is a registered WorkflowStep-family node,
+        - If node_meta is provided and the class is a WorkflowStep-family node,
           a ``DEPENDENCIES`` class attribute must be defined.
         - Its value must be a list of string literals equal to ``node_meta.depends``
           (order-sensitive).
         """
         if node_meta is None:
-            return
-        if not self._is_registered_class(cls):
             return
         if not self._is_workflow_step_node_subclass(cls):
             return
@@ -550,7 +508,7 @@ class NodeAuditor(BaseAuditor):
         if node_meta is None or node_meta.ext_data is None:
             return
 
-        if not self._is_registered_class(cls):
+        if not self._is_node_class(cls):
             return
 
         method = self._get_method(cls, "getExtData")
@@ -573,7 +531,7 @@ class NodeAuditor(BaseAuditor):
         """Enforce the required workflow base class from canonical node metadata."""
         if node_meta is None:
             return
-        if not self._is_registered_class(cls):
+        if not self._is_node_class(cls):
             return
 
         ext_type = ""
@@ -1116,8 +1074,6 @@ class NodeAuditor(BaseAuditor):
         violations: List[RuleViolation],
         graph_plan_path: Optional[str],
     ) -> None:
-        if not self._is_registered_class(cls):
-            return
         if not self._is_workflow_step_node_subclass(cls):
             return
 
@@ -1279,58 +1235,9 @@ class NodeAuditor(BaseAuditor):
             return True
         return False
 
-    def _collect_local_workflow_node_subclasses(self, class_defs: List[ast.ClassDef]) -> Set[str]:
-        """Collect classes derived from an ag_ui_workflow node base."""
-        workflow_node_subclasses: Set[str] = set()
-        unresolved = {cls.name: cls for cls in class_defs}
-
-        while unresolved:
-            progressed = False
-            for class_name, cls in list(unresolved.items()):
-                if self._has_workflow_node_ancestor(cls, workflow_node_subclasses):
-                    workflow_node_subclasses.add(class_name)
-                    unresolved.pop(class_name, None)
-                    progressed = True
-
-            if not progressed:
-                break
-
-        return workflow_node_subclasses
-
-    def _has_workflow_node_ancestor(
-        self,
-        cls: ast.ClassDef,
-        known_workflow_node_subclasses: Set[str],
-    ) -> bool:
-        for base in cls.bases:
-            if isinstance(base, ast.Name):
-                if base.id in WORKFLOW_NODE_BASE_NAMES or base.id in known_workflow_node_subclasses:
-                    return True
-            elif isinstance(base, ast.Attribute):
-                if base.attr in WORKFLOW_NODE_BASE_NAMES or base.attr in known_workflow_node_subclasses:
-                    return True
-        return False
-
-    def _check_workflow_node_subclass_register_class(
-        self,
-        cls: ast.ClassDef,
-        workflow_node_subclasses: Set[str],
-        violations: List[RuleViolation],
-    ) -> None:
-        """Ensure every local workflow node subclass has a @register_class decorator."""
-        if cls.name not in workflow_node_subclasses:
-            return
-        if self._is_registered_class(cls):
-            return
-
-        violations.append(
-            RuleViolation(
-                class_name=cls.name,
-                rule="workflow_node_subclass_missing_register_class",
-                detail="Workflow node subclasses must be decorated with @register_class.",
-                lineno=cls.lineno,
-            )
-        )
+    def _is_node_class(self, cls: ast.ClassDef) -> bool:
+        """Select workflow nodes without requiring a legacy registration decorator."""
+        return self._is_workflow_step_node_subclass(cls) or self._is_registered_class(cls)
 
     def _is_registered_class(self, cls: ast.ClassDef) -> bool:
         for decorator in cls.decorator_list:

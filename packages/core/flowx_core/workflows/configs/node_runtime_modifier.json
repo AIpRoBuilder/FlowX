@@ -1,24 +1,8 @@
 {
+  "pool_size": 1,
   "nodes": [
-    {
-      "name": "generate_node_test",
-      "type": "GenerateNodeTestFile",
-      "meta_type": "WorkflowStepNode",
-      "loop": 1
-    },
-    {
-      "name": "run_node_test",
-      "type": "ExecuteNodeTest",
-      "meta_type": "WorkflowStepNode",
-      "depends": ["generate_node_test"],
-      "loop": 1
-    },
-    {
-      "name": "amend_node",
-      "type": "AmendNodeFromTestLog",
-      "meta_type": "WorkflowStepNode",
-      "depends": ["run_node_test"],
-      "loop": 1
-    }
+    {"name": "generate_node_test"},
+    {"name": "run_node_test", "depends": ["generate_node_test"]},
+    {"name": "amend_node", "depends": ["run_node_test"]}
   ]
 }

@@ -8,6 +8,8 @@ of chunk objects.
 
 For OpenAI-compatible gateways such as D-API, set ``openai_base_url`` or
 the ``OPENAI_BASE_URL`` environment variable.
+
+Modified: apply scoped settings once and preserve configured concrete pooled-node prompts.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from typing import Any, Iterator, Optional
 from ag_ui_workflow import WorkflowStepNode
 
 from flowx_core.logging_utils import get_logger
+from flowx_core.tools._node_settings import apply_node_settings
 
 try:  # Optional dependency for OpenAI-compatible clients (OpenAI + DeepSeek)
     from openai import OpenAI
@@ -196,11 +199,11 @@ class Coder(WorkflowStepNode):
     session_marking_prompt: str = ""
 
     def __post_init__(self, *, initialize_client: bool = True) -> None:
+        apply_node_settings(self)
         WorkflowStepNode.__init__(self)
-        self.system_prompt = append_instruction_block(
-            self.system_prompt,
-            self.session_marking_prompt,
-        )
+        marking = (self.session_marking_prompt or "").strip()
+        if marking and not (self.system_prompt or "").rstrip().endswith(marking):
+            self.system_prompt = append_instruction_block(self.system_prompt, marking)
         self.timeout = self.timeout if self.timeout is not None else _resolve_timeout(self.provider)
 
         # Injected clients need no setup; template-only subclasses can skip client creation.

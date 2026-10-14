@@ -1,0 +1,8 @@
+{
+  "pool_size": 1,
+  "nodes": [
+    {"name": "node_plan"},
+    {"name": "node_generate", "depends": ["node_plan"]},
+    {"name": "node_audit", "depends": ["node_generate"]}
+  ]
+}

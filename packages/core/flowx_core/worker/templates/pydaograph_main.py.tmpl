@@ -1,18 +1,27 @@
+# Modified 2026-10-13: explicit JSON class maps and bytes-only file-node transport.
+# Modified 2026-10-14: separate the NODES tuple from the reusable NODE_CLASSES map.
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import sys
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, AsyncIterator
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ag_ui_workflow import WorkflowEngine
+from ag_ui_workflow import WorkflowEngine, WorkflowPipelinePool
 
 from __NODES_PACKAGE_NAME__ import (
 __NODE_IMPORTS__
@@ -28,14 +37,103 @@ for _env_candidate in (_HERE / ".env", _PROJECT_ROOT / ".env"):
         load_dotenv(dotenv_path=_env_candidate, override=False)
 
 
-app = FastAPI(title="AG-UI Lifecycle Backend - __APP_NAME__")
-
 PIPELINE_JSON_PATH = __PIPELINE_JSON_EXPR__
-ENGINES: dict[str, WorkflowEngine] = {}
+GRAPH_CONFIG_ID = "__NODES_PACKAGE_NAME__"
+PIPELINE_POOL: WorkflowPipelinePool | None = None
+ENGINE: WorkflowEngine | None = None
+SESSION_REQUESTS: dict[str, str] = {}
+_REQUEST_LOCK = Lock()
+
+NODES = (
+__NODE_CLASS_ITEMS__
+)
+NODE_CLASSES = {node.STEP_ID: node for node in NODES}
 
 STEP_CHAIN = [
 __STEP_CHAIN_ITEMS__
 ]
+
+
+def _ordered_node_classes() -> list[type]:
+    """Validate the class-defined DAG before passing it to the native constructor."""
+    pending: dict[str, type] = {}
+    for node in NODES:
+        step_id = node.STEP_ID
+        if not isinstance(step_id, str) or not step_id.strip() or step_id in pending:
+            raise ValueError("Workflow nodes must have unique, non-empty STEP_ID values")
+        dependencies = node.DEPENDENCIES
+        if not isinstance(dependencies, (list, tuple)) or any(
+            not isinstance(dep, str) or not dep.strip() for dep in dependencies
+        ):
+            raise ValueError("Workflow node DEPENDENCIES must contain STEP_ID strings")
+        pending[step_id] = node
+    for node in pending.values():
+        if set(node.DEPENDENCIES) - pending.keys():
+            raise ValueError("Workflow node dependencies contain an unknown STEP_ID")
+    ordered: list[type] = []
+    resolved: set[str] = set()
+    while pending:
+        ready = [node for node in pending.values() if set(node.DEPENDENCIES) <= resolved]
+        if not ready:
+            raise ValueError("Workflow node dependencies contain a cycle or an unknown STEP_ID")
+        for node in ready:
+            ordered.append(node)
+            resolved.add(node.STEP_ID)
+            del pending[node.STEP_ID]
+    return ordered
+
+
+def _build_pipeline_json() -> str:
+    """FlowX planning types are not native factory names; use imported classes."""
+    ordered = _ordered_node_classes()
+    nodes = []
+    for node in ordered:
+        nodes.append({
+            "name": node.STEP_ID,
+            "type": node.__name__,
+            "depends": list(node.DEPENDENCIES),
+            "meta_type": "GNode",
+            "loop": 1,
+        })
+    return json.dumps({"nodes": nodes})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    global ENGINE, PIPELINE_POOL
+    # Native pipelines must not be repeatedly created/destroyed in one process.
+    if PIPELINE_POOL is not None:
+        raise RuntimeError("Workflow lifespan can only be started once per process")
+    workflow_config = json.loads(PIPELINE_JSON_PATH.read_text(encoding="utf-8"))
+    if not isinstance(workflow_config, dict):
+        raise ValueError("Workflow config must be a JSON object")
+    workflow_config.setdefault("pool_size", 4)
+    pool_size = workflow_config["pool_size"]
+    if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
+        raise ValueError("Workflow pool_size must be a positive integer")
+    PIPELINE_POOL = WorkflowPipelinePool(
+        pipeline_json=_build_pipeline_json(),
+        node_classes=NODE_CLASSES,
+        size=workflow_config["pool_size"],
+    )
+    try:
+        ENGINE = WorkflowEngine(
+            graph_config_id=GRAPH_CONFIG_ID,
+            steps_meta=STEP_CHAIN,
+            pool=PIPELINE_POOL,
+        )
+        yield
+    finally:
+        try:
+            if ENGINE is not None:
+                await run_in_threadpool(ENGINE.close)
+        finally:
+            await run_in_threadpool(PIPELINE_POOL.close)
+            ENGINE = None
+            SESSION_REQUESTS.clear()
+
+
+app = FastAPI(title="AG-UI Lifecycle Backend - __APP_NAME__", lifespan=lifespan)
 
 
 class RunStepInput(BaseModel):
@@ -62,16 +160,55 @@ def _meta_field(meta: Any, key: str, default: Any = None) -> Any:
     return getattr(meta, key, default)
 
 
-def _get_engine(session_id: str) -> WorkflowEngine:
-    if session_id in ENGINES:
-        return ENGINES[session_id]
-    engine = WorkflowEngine(
-        pipeline_json_path=str(PIPELINE_JSON_PATH),
-        steps_meta=STEP_CHAIN,
-        thread_id=f"thread-{session_id}",
-    )
-    ENGINES[session_id] = engine
-    return engine
+def _get_engine() -> WorkflowEngine:
+    if ENGINE is None:
+        raise HTTPException(status_code=503, detail="Workflow backend is not running")
+    return ENGINE
+
+
+def _get_request_id(session_id: str) -> str:
+    with _REQUEST_LOCK:
+        if session_id not in SESSION_REQUESTS:
+            SESSION_REQUESTS[session_id] = str(uuid4())
+        return SESSION_REQUESTS[session_id]
+
+
+def _file_input_bytes(value: Any) -> bytes | None:
+    """Decode one HTTP upload; storage and business processing belong to the node."""
+    if value is None:
+        return None  # A missing input lets the subclass's wait gate report a pause.
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        value = {"file_path": value}
+    if not isinstance(value, Mapping):
+        raise HTTPException(status_code=422, detail="File input requires one file_path or base64 payload")
+    for key in ("files", "uploads"):
+        if key in value:
+            uploads = value[key]
+            if not isinstance(uploads, list) or len(uploads) != 1 or uploads[0] is None:
+                raise HTTPException(status_code=422, detail="File nodes accept exactly one upload per input")
+            return _file_input_bytes(uploads[0])
+    for key in ("file_path", "filePath", "path"):
+        if key in value:
+            path = value[key]
+            if not isinstance(path, str) or not path.strip():
+                raise HTTPException(status_code=422, detail="file_path must be a non-empty string")
+            try:
+                return Path(path).expanduser().read_bytes()
+            except OSError as exc:
+                raise HTTPException(status_code=422, detail="Unable to read the input file") from exc
+    encoded = value.get("base64", value.get("content_base64", value.get("data")))
+    if not isinstance(encoded, str):
+        raise HTTPException(status_code=422, detail="File input requires one file_path or base64 payload")
+    if encoded.startswith("data:"):
+        prefix, separator, encoded = encoded.partition(",")
+        if not separator or not prefix.endswith(";base64"):
+            raise HTTPException(status_code=422, detail="Invalid base64 data URL")
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid base64 file input") from exc
 
 
 @app.get("/")
@@ -81,7 +218,6 @@ def index() -> dict[str, str | bool]:
 
 @app.post("/api/run-step")
 def run_step(payload: RunStepInput) -> StreamingResponse:
-    engine = _get_engine(payload.sessionId)
     step_meta = next(
         (s for s in STEP_CHAIN if _meta_field(s, "id") == payload.stepId), None
     )
@@ -91,16 +227,18 @@ def run_step(payload: RunStepInput) -> StreamingResponse:
         )
 
     step_id = _meta_field(step_meta, "id")
-    ext_data = _meta_field(step_meta, "extData")
-    ext_type = ext_data.get("type") if isinstance(ext_data, Mapping) else None
-
-    if ext_type == "user_file_input" and payload.file_path is not None:
-        normalized_input: Any = {"file_path": payload.file_path}
+    if _meta_field(step_meta, "metaNodeKind") == "WorkflowFileNode":
+        normalized_input: Any = _file_input_bytes(
+            {"file_path": payload.file_path} if payload.file_path is not None else payload.input
+        )
     else:
         normalized_input = payload.input
 
+    engine = _get_engine()
+    request_id = _get_request_id(payload.sessionId)
+    # Subclasses install their own setWaitFunc callbacks; the engine never does.
     return StreamingResponse(
-        engine._run_step_events(step_id, normalized_input),
+        engine.events(request_id, {step_id: normalized_input}),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -108,13 +246,19 @@ def run_step(payload: RunStepInput) -> StreamingResponse:
 
 @app.post("/api/reset-session", response_model=ResetSessionOutput)
 def reset_session(payload: ResetSessionInput) -> ResetSessionOutput:
-    engine = _get_engine(payload.sessionId)
-    engine.reset_session()
+    engine = _get_engine()
+    with _REQUEST_LOCK:
+        request_id = SESSION_REQUESTS.get(payload.sessionId)
+        if request_id is not None:
+            engine.close(request_id)
+        new_request_id = str(uuid4())
+        SESSION_REQUESTS[payload.sessionId] = new_request_id
+    # Preserve HTTP field names, not removed engine attributes.
     return ResetSessionOutput(
         ok=True,
         sessionId=payload.sessionId,
-        threadId=engine.thread_id,
-        runId=engine.session.run_id,
+        threadId=GRAPH_CONFIG_ID,
+        runId=new_request_id,
     )
 
 

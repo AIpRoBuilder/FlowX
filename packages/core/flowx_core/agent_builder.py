@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified: explicitly release cached native workflow pools on reset/shutdown.
+# Modified 2026-10-13: delegate pool cleanup to synchronized service cache owners.
 from typing import Optional, List, Dict, Any, Mapping
 import os
 import subprocess
@@ -97,6 +99,11 @@ class AgentBuilder:
         self._node_artifact_service = NodeArtifactService(self)
         self._main_entrypoint_service = MainEntrypointService(self)
         self._runtime_service = RuntimeService(self)
+
+    def close(self) -> None:
+        """Release cached generation/repair pools before disposing this builder."""
+        self._node_build_service.close()
+        self._node_artifact_service.close()
 
     @property
     def artifact_state(self) -> Any:
@@ -278,8 +285,7 @@ class AgentBuilder:
             self.provider = provider
         self._logger.info("Resetting LLM configuration.")
         self._reset_llm_components()
-        self._node_artifact_service.modifiers.clear()
-        self._node_build_service.workflows.clear()
+        self.close()
 
     def _make_node_coder(self, node_meta: Any) -> PromptNodeFileCoderBase:
         return self._component_factory.create_node_coder(node_meta)

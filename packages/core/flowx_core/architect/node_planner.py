@@ -1,3 +1,4 @@
+# Modified: use request-local settings and preserve configured pooled-node prompts.
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -5,6 +6,7 @@ from typing import Any, Optional
 from ag_ui_workflow import StepRunOutput
 
 from flowx_core._paths import bootstrap_package_root
+from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.workflow_node_reference import (
 	render_workflow_method_signatures,
 	render_workflow_step_meta_catalog,
@@ -36,6 +38,8 @@ class NodePlanElement(Coder):
 	This step uses Coder to generate and amend node markdown.
 	 """
 
+	STEP_ID = "node_plan"
+	DEPENDENCIES = []
 	INPUT_REQUIRED = False
 
 	prompt_path: str = "architect/prompts/node_planner_prompt.md"
@@ -47,18 +51,20 @@ class NodePlanElement(Coder):
 	max_tokens: int = MAX_TOKENS
 
 	def __post_init__(self) -> None:
+		apply_node_settings(self)
 		prompt_file = ROOT_DIR / self.prompt_path
 		if not prompt_file.exists():
 			raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
 
 		base_prompt = prompt_file.read_text(encoding="utf-8")
-		self.system_prompt = (
-			f"{base_prompt}\n\n"
-			"## ag_ui_workflow Base Step Metas (Authoritative)\n"
-			"Use the following base-node `step_meta()` catalog as the source of truth for `meta_node_kind`,\n"
-			"node capability boundaries, and default ext_data pairings.\n\n"
-			f"{render_workflow_step_meta_catalog()}\n"
-		)
+		if self.system_prompt == Coder.system_prompt:
+			self.system_prompt = (
+				f"{base_prompt}\n\n"
+				"## ag_ui_workflow Base Step Metas (Authoritative)\n"
+				"Use the following base-node `step_meta()` catalog as the source of truth for `meta_node_kind`,\n"
+				"node capability boundaries, and default ext_data pairings.\n\n"
+				f"{render_workflow_step_meta_catalog()}\n"
+			)
 		super().__post_init__()
 
 	def _build_node_prompt(self, requirement_text: str, node_context: str, dependencies: str = "") -> str:
@@ -143,11 +149,13 @@ class NodePlanElement(Coder):
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
 		del user_input, dependency_results
-		if self.output_path is None:
-			raise ValueError("Configure output_path before running the node plan step.")
 		plan_request = session_state.get("node_plan_request")
 		if not isinstance(plan_request, dict):
 			raise TypeError("node_plan_request must be a dictionary")
+		output_path = plan_request.get("output_path", self.output_path)
+		if output_path is None:
+			raise ValueError("Configure output_path before running the node plan step.")
+		temperature = plan_request.get("temperature", self.temperature)
 		node = plan_request.get("node")
 		if not isinstance(node, dict):
 			raise ValueError("node_plan_request requires a node dictionary")
@@ -165,18 +173,18 @@ class NodePlanElement(Coder):
 				"node_plan_request requires string requirement_text, boolean generate_markdown, "
 				"string amendment and string dependencies"
 			)
-		path = Path(self.output_path)
+		path = Path(output_path)
 		if not path.is_file() and (generate_markdown or amendment):
 			self.plan_node(
 				node, requirement_text, path,
 				overwrite=self.overwrite,
-				temperature=self.temperature, max_tokens=self.max_tokens,
+				temperature=temperature, max_tokens=self.max_tokens,
 				dependencies=dependencies,
 			)
 		if amendment:
 			self.amend_node_plan(
 				node, requirement_text, path, amendment,
-				temperature=self.temperature,
+				temperature=temperature,
 				max_tokens=self.max_tokens, dependencies=dependencies,
 			)
 		return StepRunOutput(derived={

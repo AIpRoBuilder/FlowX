@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-10-13: request lifecycle, confirmed resets and active-node selection.
 """FastMCP server that wraps ``core`` and ``ag_ui_workflow`` workflows."""
 
 from __future__ import annotations
@@ -28,7 +29,12 @@ from .bootstrap import bootstrap_import_paths, load_env_from_runtime_context
 load_env_from_runtime_context(__file__)
 bootstrap_import_paths(__file__)
 
-from .client import DEFAULT_RUN_TIMEOUT, health_check, run_step_sse
+from .client import (
+    DEFAULT_RUN_TIMEOUT,
+    health_check,
+    reset_session as reset_backend_session,
+    run_step_sse,
+)
 from .registry import core_available, core_import_error, find_free_port, registry
 
 logger = logging.getLogger("flowx.server")
@@ -37,8 +43,8 @@ _MCP_SERVER_AVAILABLE = False
 _MCP_SERVER_IMPORT_ERROR = ""
 MCPServerClass: Any = None
 for module_name, attr_name in (
-    ("flowx_mcp.server.fastmcp", "FastMCP"),
-    ("flowx_mcp.server.mcpserver", "MCPServer"),
+    ("mcp.server.fastmcp", "FastMCP"),
+    ("mcp.server.mcpserver", "MCPServer"),
 ):
     try:
         MCPServerClass = getattr(importlib.import_module(module_name), attr_name)
@@ -435,6 +441,32 @@ def _require_handle(workflow_name: str, workspace: Optional[str] = None) -> Any:
     return _attach_existing_workflow(workflow_name, workspace=workspace_dir)
 
 
+def _clear_runtime_progress(handle: Any) -> None:
+    """A new backend has no native request state, even if the HTTP session id stays."""
+    handle.completed_steps = []
+    handle._mcp_run_state = None
+
+
+def _current_run_response(handle: Any) -> dict[str, Any]:
+    # Keep MCP-only state on the handle, scoped to its current HTTP session.
+    state = getattr(handle, "_mcp_run_state", None)
+    if isinstance(state, dict) and state.get("session_id") == handle.session_id:
+        return state.get("response", {})
+    return {}
+
+
+def _reset_workflow_session(handle: Any) -> None:
+    """Cancel a live request before forgetting the only session id that owns its lease."""
+    if handle.is_running:
+        result = reset_backend_session(handle.base_url(), handle.session_id)
+        if result.get("ok") is not True:
+            raise RuntimeError(
+                f"backend session reset failed; session retained: {result.get('error', 'unknown error')}"
+            )
+    handle.new_session()
+    _clear_runtime_progress(handle)
+
+
 def _restart_builder_handle(
     workflow_name: str,
     *,
@@ -452,7 +484,6 @@ def _restart_builder_handle(
     backend_port: Optional[int] = None
     backend_was_running = False
     previous_session_id: Optional[str] = None
-    previous_completed_steps: list[str] = []
 
     if previous_handle is not None:
         backend_port = previous_handle.backend_port
@@ -462,7 +493,6 @@ def _restart_builder_handle(
                 and health_check(previous_handle.backend_port, timeout=1.0)
             )
         previous_session_id = previous_handle.session_id
-        previous_completed_steps = list(previous_handle.completed_steps)
         api_key = api_key or previous_handle.api_key or None
         model = model or previous_handle.model or None
         provider = provider or previous_handle.provider or None
@@ -484,7 +514,7 @@ def _restart_builder_handle(
         handle.new_session()
     elif previous_session_id is not None:
         handle.session_id = previous_session_id
-        handle.completed_steps = previous_completed_steps
+    _clear_runtime_progress(handle)
     return handle, backend_was_running
 
 
@@ -500,14 +530,39 @@ def _load_steps_meta(handle: Any, *, include_hidden: bool = True) -> list[dict[s
 def _find_step_meta(handle: Any, step_id: str) -> Optional[dict[str, Any]]:
     target = str(step_id).strip()
     for step in _load_steps_meta(handle, include_hidden=True):
+        if not bool(step.get("enabled", True)):
+            continue
         if str(step.get("id", "")).strip() == target:
             return step
     return None
 
 
 def _next_user_input_step(handle: Any) -> Optional[dict[str, Any]]:
+    response = _current_run_response(handle)
+    if response.get("status") == "completed":
+        return None
+    steps = _load_steps_meta(handle, include_hidden=True)
+    awaiting_input = response.get("awaitingInput")
+    if awaiting_input:
+        for step in steps:
+            if str(step.get("id", "")).strip() == awaiting_input:
+                if not bool(step.get("enabled", True)):
+                    raise ValueError(f"backend is awaiting disabled step '{awaiting_input}'; reload the workflow")
+                # The native wait function, not static dependencies/inputRequired,
+                # decides which input is needed to resume this request.
+                return step
+        metadata = response.get("input_required") or {}
+        return {
+            "id": awaiting_input,
+            "title": metadata.get("title", ""),
+            "prompt": metadata.get("prompt", ""),
+            "inputRequired": True,
+            "dependencies": [],
+        }
     completed = set(handle.completed_steps)
-    for step in _load_steps_meta(handle, include_hidden=True):
+    for step in steps:
+        if not bool(step.get("enabled", True)):
+            continue
         step_id = str(step.get("id", "")).strip()
         if not step_id or step_id in completed:
             continue
@@ -530,7 +585,7 @@ def _input_nodes_summary(handle: Any) -> list[dict[str, Any]]:
 
     nodes: list[dict[str, Any]] = []
     for step in _load_steps_meta(handle, include_hidden=True):
-        if not bool(step.get("inputRequired", False)):
+        if not bool(step.get("enabled", True)) or not bool(step.get("inputRequired", False)):
             continue
         step_id = str(step.get("id", "")).strip()
         fmt = formats.get(step_id, {}) if isinstance(formats, dict) else {}
@@ -621,12 +676,12 @@ def create_server() -> Any:
     if not _MCP_SERVER_AVAILABLE:
         raise ImportError(
             "MCP server could not load a compatible SDK entry point. "
-            "Expected either 'flowx_mcp.server.fastmcp.FastMCP' or 'flowx_mcp.server.mcpserver.MCPServer'. "
+            "Expected either 'mcp.server.fastmcp.FastMCP' or 'mcp.server.mcpserver.MCPServer'. "
             f"Install or repair the SDK with: {sys.executable} -m pip install -U 'mcp'. "
             f"Last import error: {_MCP_SERVER_IMPORT_ERROR}"
         )
 
-    mcp = MCPServerClass(
+    flowx_mcp = MCPServerClass(
         "flowx",
         instructions=(
             "FlowX workflow builder and runner. Use these tools to create AG-UI workflows "
@@ -787,6 +842,7 @@ def create_server() -> Any:
             backend_was_running = bool(handle.is_running)
             handle.sync_artifacts()
             handle.new_session()
+            _clear_runtime_progress(handle)
             if backend_was_running:
                 handle.stop_backend()
             return {
@@ -828,7 +884,7 @@ def create_server() -> Any:
             if not handle.backend_port:
                 handle.backend_port = find_free_port()
             if reset_session:
-                handle.new_session()
+                _reset_workflow_session(handle)
 
             if handle.is_running and health_check(handle.backend_port, timeout=1.0):
                 return {
@@ -851,6 +907,7 @@ def create_server() -> Any:
                     )
                 )
             with _capture_builder_output("start_backend.start"):
+                _clear_runtime_progress(handle)
                 info = handle.start_backend(
                     timeout=float(timeout_sec),
                 )
@@ -901,6 +958,7 @@ def create_server() -> Any:
                     )
                 )
             with _capture_builder_output("reload_workflow.restart"):
+                _clear_runtime_progress(handle)
                 info = handle.reload_backend(
                     reset_session=reset_session,
                     timeout=float(timeout_sec),
@@ -1013,6 +1071,7 @@ def create_server() -> Any:
             handle = _require_handle(workflow_name, workspace=workspace)
             input_nodes = _input_nodes_summary(handle)
             next_step = _next_user_input_step(handle)
+            response = _current_run_response(handle)
             return {
                 "ok": True,
                 "workflow_name": handle.workflow_name,
@@ -1020,6 +1079,9 @@ def create_server() -> Any:
                 "completed_steps": list(handle.completed_steps),
                 "next_input_step": next_step,
                 "input_nodes": input_nodes,
+                "status": response.get("status"),
+                "awaitingInput": response.get("awaitingInput"),
+                "input_required": response.get("input_required"),
             }
 
         return _tool_call("get_node_input_formats", _impl)
@@ -1051,12 +1113,13 @@ def create_server() -> Any:
         def _impl() -> dict[str, Any]:
             handle = _require_handle(workflow_name, workspace=workspace)
             if reset_session:
-                handle.new_session()
+                _reset_workflow_session(handle)
 
             if not handle.backend_port:
                 handle.backend_port = find_free_port()
             if not handle.is_running or not health_check(handle.backend_port, timeout=1.0):
                 with _capture_builder_output("run_workflow_step.autostart"):
+                    _clear_runtime_progress(handle)
                     start_info = handle.start_backend(timeout=30.0)
                 if not start_info.get("is_running", False):
                     return {
@@ -1068,7 +1131,17 @@ def create_server() -> Any:
                     }
 
             selected_step = _find_step_meta(handle, step_id) if step_id else _next_user_input_step(handle)
+            if selected_step is None and not step_id and not _current_run_response(handle):
+                # A wholly automatic graph still needs one engine request to
+                # start; inputRequired is metadata, not a scheduling trigger.
+                selected_step = next(
+                    (step for step in _load_steps_meta(handle, include_hidden=True)
+                     if bool(step.get("enabled", True))),
+                    None,
+                )
             if selected_step is None:
+                if step_id:
+                    raise ValueError(f"unknown or disabled step_id: {step_id}")
                 return {
                     "ok": True,
                     "workflow_name": handle.workflow_name,
@@ -1100,6 +1173,10 @@ def create_server() -> Any:
             completed_steps = response.get("completedSteps") or []
             if isinstance(completed_steps, list):
                 handle.completed_steps = [str(item) for item in completed_steps]
+            handle._mcp_run_state = {
+                "session_id": handle.session_id,
+                "response": dict(response),
+            }
 
             next_step = _next_user_input_step(handle)
             return {
@@ -1391,7 +1468,7 @@ def create_server() -> Any:
 
         return _tool_call("replace_workflow_files", _impl)
 
-    return mcp
+    return flowx_mcp
 
 
 def run_stdio_server(verbose: bool = False) -> None:
@@ -1407,7 +1484,7 @@ def run_server(
     if not _MCP_SERVER_AVAILABLE:
         print(
             "Error: MCP server could not load a compatible MCP SDK entry point.\n"
-            "Expected either flowx_mcp.server.fastmcp.FastMCP or flowx_mcp.server.mcpserver.MCPServer.\n"
+            "Expected either mcp.server.fastmcp.FastMCP or mcp.server.mcpserver.MCPServer.\n"
             f"Install or repair with: {sys.executable} -m pip install -U 'mcp'\n"
             f"Last import error: {_MCP_SERVER_IMPORT_ERROR}",
             file=sys.stderr,

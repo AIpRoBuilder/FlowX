@@ -1,4 +1,7 @@
-"""Utilities for generating a PyDaoGraph entrypoint from a file template."""
+"""Utilities for generating a PyDaoGraph entrypoint from a file template.
+
+Modified 2026-10-13: render pooled request-scoped entrypoints and refresh node exports on amendment.
+"""
 
 from __future__ import annotations
 
@@ -217,6 +220,7 @@ class PromptMainFileCoder(Coder):
         replacements = {
             "__NODES_PACKAGE_NAME__": context.nodes_package_name,
             "__NODE_IMPORTS__": self._format_node_imports(context.node_class_names),
+            "__NODE_CLASS_ITEMS__": self._format_node_imports(context.node_class_names),
             "__APP_NAME__": context.nodes_package_name.replace("_", "-"),
             "__PIPELINE_JSON_EXPR__": self._render_relative_path_expr(
                 "_HERE",
@@ -405,6 +409,11 @@ class PromptMainFileCoder(Coder):
             uvicorn_reload=previous_context.uvicorn_reload,
         )
 
+        self.write_nodes_package_init(
+            graph_plan_json_path=str(previous_context.graph_plan_json_path),
+            package_dir_path=str(resolved_target.parent),
+            overwrite=overwrite,
+        )
         source = self._build_main_source(refreshed_context)
         written_path = self.write_code_to_file(source, str(resolved_target), overwrite=overwrite)
         self._render_context_by_target[written_path.resolve()] = refreshed_context

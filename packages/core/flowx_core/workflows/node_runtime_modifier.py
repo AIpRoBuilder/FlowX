@@ -1,24 +1,27 @@
-"""Repair one generated workflow node from its isolated pytest result."""
+"""Repair one generated workflow node from its isolated pytest result.
+
+Modified: exact concrete class maps and construction-scoped instance settings.
+"""
 
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
-from functools import wraps
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from threading import RLock
 from typing import Any, Callable, Mapping
 
-from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
+from ag_ui_workflow import RunResult, StepRunOutput, WorkflowEngine
 
 from flowx_core.runtime import RunNodeTest
+from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.tools.file_tools import parse_json_file
 from flowx_core.tools.workflow_engine import (
-	build_workflow_config,
+	close_workflow_engine,
 	init_workflow_engine,
-	run_workflow_step,
+	run_workflow,
 )
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
@@ -65,23 +68,13 @@ class NodeRuntimeModifierContext:
 		self.amended_node_file_path = ""
 		self.skipped_stages: list[str] = []
 		self.completed_stages: set[str] = set()
-		self.stage_lock = RLock()
 
 
-def _context_from_node(node: WorkflowStepNode) -> NodeRuntimeModifierContext:
-	context = getattr(node, "_runtime_modifier_context", None)
+def _context_from_state(session_state: Mapping[str, Any]) -> NodeRuntimeModifierContext:
+	context = session_state.get("node_runtime_modifier")
 	if not isinstance(context, NodeRuntimeModifierContext):
 		raise TypeError("node runtime modifier context is missing or has an unexpected type")
 	return context
-
-
-def _synchronized_stage(handler: Callable[..., StepRunOutput]) -> Callable[..., StepRunOutput]:
-	@wraps(handler)
-	def run(self: WorkflowStepNode, *args: Any, **kwargs: Any) -> StepRunOutput:
-		with _context_from_node(self).stage_lock:
-			return handler(self, *args, **kwargs)
-
-	return run
 
 
 def _resolve_path(path_value: str, working_directory: Path) -> Path:
@@ -92,17 +85,20 @@ def _resolve_path(path_value: str, working_directory: Path) -> Path:
 class GenerateNodeTestFile(PromptNodeTestFileCoder):
 	"""Generate the single-node pytest module through ``PromptNodeTestFileCoder``."""
 
+	STEP_ID = "generate_node_test"
+	DEPENDENCIES = []
+	INPUT_REQUIRED = False
+
 	__hash__ = object.__hash__
 
-	@_synchronized_stage
 	def process_input(
 		self,
 		user_input: str,
 		dependency_results: dict[str, StepRunOutput],
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
-		del user_input, dependency_results, session_state
-		context = _context_from_node(self)
+		del user_input, dependency_results
+		context = _context_from_state(session_state)
 		working_directory = Path(context.working_directory).expanduser().resolve()
 		node_path = _resolve_path(context.node_file_name, working_directory)
 		node_name = context.node_name or node_path.stem
@@ -110,11 +106,6 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 			context.test_file_name or str(Path("tests") / f"test_{node_name}.py"),
 			working_directory,
 		)
-		if "generate_node_test" in context.completed_stages:
-			return StepRunOutput(
-				card={"kind": "node-test-generation", "status": "completed"},
-				derived={"test_file_path": context.test_file_path},
-			)
 		if context.skip_generate_node_test:
 			context.skipped_stages.append("generate_node_test")
 			if not context.skip_run_node_test and not test_path.is_file():
@@ -141,19 +132,50 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 class ExecuteNodeTest(RunNodeTest):
 	"""Run the generated pytest module and retain its dedicated log."""
 
-	@_synchronized_stage
+	STEP_ID = "run_node_test"
+	DEPENDENCIES = ["generate_node_test"]
+	INPUT_REQUIRED = False
+
+	def __init__(
+		self,
+		*,
+		run_subprocess: Callable[..., Any] = subprocess.run,
+		timeout_expired: type[BaseException] = subprocess.TimeoutExpired,
+	) -> None:
+		"""Retain execution dependencies, not one request's paths or command."""
+		super().__init__(
+			node_name="", test_path=Path(), log_path=Path(), command=[], cwd="", timeout=60,
+			run_subprocess=run_subprocess, timeout_expired=timeout_expired,
+		)
+		apply_node_settings(self)
+
 	def process_input(
 		self,
 		user_input: str,
 		dependency_results: dict[str, StepRunOutput],
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
-		del user_input, dependency_results, session_state
-		context = _context_from_node(self)
-		if "run_node_test" in context.completed_stages:
-			derived = dict(context.test_result or {})
-			derived["log_file_path"] = context.log_file_path
-			return StepRunOutput(card={"kind": "node-test", "status": "completed"}, derived=derived)
+		del user_input, dependency_results
+		context = _context_from_state(session_state)
+		# A slot is exclusively leased to this request. Replace, never mutate,
+		# command/result objects already retained by an earlier RunResult.
+		working_directory = Path(context.working_directory).expanduser().resolve()
+		self.node_name = context.node_name or Path(context.node_file_name).stem
+		self.test_path = _resolve_path(
+			context.test_file_path or context.test_file_name or str(Path("tests") / f"test_{self.node_name}.py"),
+			working_directory,
+		).resolve()
+		self.log_path = _resolve_path(
+			context.log_file_name or str(Path("logs") / f"{self.node_name}_test.log"), working_directory,
+		).resolve()
+		self.command = [context.python_command or sys.executable, "-m", "pytest", str(self.test_path), "-q"]
+		self.cwd = str(working_directory)
+		self.timeout = context.timeout
+		self.result = None
+		context.test_file_path = str(self.test_path)
+		context.test_result = None
+		context.test_log = ""
+		context.log_file_path = ""
 		if context.skip_run_node_test:
 			context.skipped_stages.append("run_node_test")
 			if not context.skip_amend_node:
@@ -182,6 +204,10 @@ class ExecuteNodeTest(RunNodeTest):
 class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 	"""Apply the pytest log to the original node with graph-aware node context."""
 
+	STEP_ID = "amend_node"
+	DEPENDENCIES = ["run_node_test"]
+	INPUT_REQUIRED = False
+
 	__hash__ = object.__hash__
 
 	def get_node_contract_text(self) -> str:
@@ -190,23 +216,17 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 	def get_feedback_contract_text(self) -> str:
 		return "Preserve the existing AG-UI workflow node contract while applying the test feedback.\n"
 
-	@_synchronized_stage
 	def process_input(
 		self,
 		user_input: str,
 		dependency_results: dict[str, StepRunOutput],
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
-		del user_input, dependency_results, session_state
-		context = _context_from_node(self)
+		del user_input, dependency_results
+		context = _context_from_state(session_state)
 		working_directory = Path(context.working_directory).expanduser().resolve()
 		node_path = _resolve_path(context.node_file_name, working_directory)
 		node_name = context.node_name or node_path.stem
-		if "amend_node" in context.completed_stages:
-			return StepRunOutput(
-				card={"kind": "node-amendment", "status": "completed"},
-				derived={"amended_node_file_path": context.amended_node_file_path},
-			)
 		if context.skip_amend_node or (context.test_result is not None and context.test_result["ok"]):
 			context.skipped_stages.append("amend_node")
 			context.amended_node_file_path = str(node_path.resolve())
@@ -240,10 +260,31 @@ class NodeRuntimeModifierPipeline:
 	run_subprocess: Callable[..., Any] = subprocess.run
 	timeout_expired: type[BaseException] = subprocess.TimeoutExpired
 	_engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
+	_last_result: RunResult | None = field(default=None, init=False, repr=False)
+
+	def __post_init__(self) -> None:
+		# Eager pool construction consumes shallow snapshots, preserving client
+		# and recording-sink identities. Request paths/settings remain in state.
+		NODES = (type(self.node_test_writer), ExecuteNodeTest, type(self.node_writer))
+		NODE_CLASSES = {node.STEP_ID: node for node in NODES}
+		settings = {
+			component.STEP_ID: {
+				setting.name: getattr(component, setting.name)
+				for setting in fields(component) if setting.init
+			}
+			for component in (self.node_test_writer, self.node_writer)
+			if is_dataclass(component)
+		}
+		settings[ExecuteNodeTest.STEP_ID] = {
+			"run_subprocess": self.run_subprocess,
+			"timeout_expired": self.timeout_expired,
+		}
+		with node_settings(settings):
+			self._engine = init_workflow_engine(NODE_CLASSES, self.json_config())
 
 	@staticmethod
 	def json_config() -> dict[str, Any]:
-		"""Return the topology definition for the three repair stages."""
+		"""Return the topology and pool_size for the three repair stages."""
 
 		config = parse_json_file(
 			"node_runtime_modifier.json",
@@ -253,50 +294,10 @@ class NodeRuntimeModifierPipeline:
 			raise TypeError("Node runtime modifier configuration must be a JSON object")
 		return config
 
-	def _build_engine(self, context: NodeRuntimeModifierContext) -> WorkflowEngine:
-		"""Build and run the configured workflow steps through ``WorkflowEngine``."""
-
-		config = self.json_config()
-		working_directory = Path(context.working_directory)
-		node_path = _resolve_path(context.node_file_name, working_directory)
-		node_name = context.node_name or node_path.stem
-		test_path = _resolve_path(
-			context.test_file_name or str(Path("tests") / f"test_{node_name}.py"),
-			working_directory,
-		)
-		log_path = _resolve_path(
-			context.log_file_name or str(Path("logs") / f"{node_name}_test.log"),
-			working_directory,
-		)
-		context.test_file_path = str(test_path.resolve())
-		elements: dict[str, WorkflowStepNode] = {
-			"generate_node_test": self.node_test_writer,
-			"run_node_test": ExecuteNodeTest(
-				node_name=node_name,
-				test_path=test_path,
-				log_path=log_path,
-				command=[context.python_command or sys.executable, "-m", "pytest", str(test_path), "-q"],
-				cwd=str(working_directory),
-				timeout=context.timeout,
-				run_subprocess=self.run_subprocess,
-				timeout_expired=self.timeout_expired,
-			),
-			"amend_node": self.node_writer,
-		}
-
-		for element in elements.values():
-			setattr(element, "_runtime_modifier_context", context)
-		dependencies = {
-			str(node_config["name"]): [str(dependency) for dependency in node_config.get("depends", [])]
-			for node_config in config["nodes"]
-		}
-		engine_config = build_workflow_config(elements, dependencies)
-		engine = init_workflow_engine(engine_config)
-		for step_id in elements:
-			run_workflow_step(engine, step_id)
-			if step_id not in context.completed_stages:
-				elements[step_id].process_input("", {}, {})
-		return engine
+	def close(self) -> None:
+		"""Release the native pool when this modifier is no longer needed."""
+		if self._engine is not None:
+			close_workflow_engine(self._engine)
 
 	def run(
 		self,
@@ -329,11 +330,6 @@ class NodeRuntimeModifierPipeline:
 			if not test_path.is_file():
 				raise FileNotFoundError(f"Skipped node test generation requires an existing test file: {test_path}")
 
-		if isinstance(workflow_graph, Mapping):
-			graph_path = workdir / "workflow.json"
-			graph_path.write_text(json.dumps(dict(workflow_graph), ensure_ascii=False, indent=2), encoding="utf-8")
-			workflow_graph = str(graph_path)
-
 		context = NodeRuntimeModifierContext(
 			node_file_name=node_file_name,
 			workflow_graph=str(workflow_graph),
@@ -350,7 +346,19 @@ class NodeRuntimeModifierPipeline:
 			test_temperature=test_temperature,
 			amendment_temperature=amendment_temperature,
 		)
-		self._engine = self._build_engine(context)
+		self._last_result = None
+		if isinstance(workflow_graph, Mapping):
+			# Keep mapping-backed graphs request-local even when repairs share a
+			# workdir. Retain the snapshot for the returned context's provenance.
+			graph_path = workdir / ".flowx" / "runtime_modifier" / uuid.uuid4().hex / "workflow.json"
+			graph_path.parent.mkdir(parents=True, exist_ok=True)
+			graph_path.write_text(json.dumps(dict(workflow_graph), ensure_ascii=False, indent=2), encoding="utf-8")
+			context.workflow_graph = str(graph_path)
+		if self._engine is None:
+			raise RuntimeError("node runtime modifier engine is not initialized")
+		self._last_result = run_workflow(
+			self._engine, session_state={"node_runtime_modifier": context},
+		)
 		if not skip_run_node_test and context.test_result is None:
 			raise RuntimeError(f"node test execution did not produce a result for {context.node_name or node_file_name}")
 		return context

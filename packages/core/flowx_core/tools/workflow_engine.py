@@ -1,161 +1,148 @@
-"""Run configured workflow step instances through ``WorkflowEngine``."""
+"""Build and run reusable AG-UI workflows from JSON-named concrete nodes.
+
+Modified: pass explicit concrete class maps directly; use class-declared identities.
+"""
 
 from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from pathlib import Path
-from tempfile import TemporaryDirectory
+from collections.abc import Generator, Iterable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
-from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
-
-from pydaograph import CStatus, GPipeline, register_class
-
-
-@dataclass(frozen=True)
-class WorkflowEngineConfig:
-    pipeline: dict[str, Any]
-    steps_meta: list[dict[str, Any]]
-    step_classes: tuple[type[WorkflowStepNode], ...]
-
-
-def _step_adapter_class(
-    step_id: str,
-    dependencies: list[str],
-    target: WorkflowStepNode,
-) -> type[WorkflowStepNode]:
-    def process_input(
-        self: WorkflowStepNode,
-        user_input: str,
-        dependency_results: dict[str, StepRunOutput],
-        session_state: dict[str, Any],
-    ) -> StepRunOutput:
-        return target.process_input(user_input, dependency_results, session_state)
-
-    class_name = f"FlowXStep_{uuid.uuid4().hex}"
-    adapter_class = type(
-        class_name,
-        (WorkflowStepNode,),
-        {
-            "STEP_ID": step_id,
-            "TITLE": step_id,
-            "DEPENDENCIES": dependencies,
-            "INPUT_REQUIRED": False,
-            "process_input": process_input,
-        },
-    )
-    register_class(adapter_class)
-    return adapter_class
+from ag_ui_workflow import (
+    RunResult,
+    StepRunInput,
+    StepRunOutput,
+    WorkflowEngine,
+    WorkflowParam,
+    WorkflowPipelinePool,
+)
+from pydaograph import GElement, GPipeline
 
 
-def build_workflow_config(
-    steps: Mapping[str, WorkflowStepNode],
-    dependencies: Mapping[str, Iterable[str]],
-) -> WorkflowEngineConfig:
-    """Build engine JSON and metadata for configured workflow step instances."""
+_RUN_REQUEST: ContextVar[tuple[dict[str, Any], frozenset[str]] | None] = ContextVar(
+    "flowx_workflow_request", default=None,
+)
 
-    step_classes = {
-        step_id: _step_adapter_class(
-            step_id,
-            [dependency for dependency in dependencies.get(step_id, ()) if dependency in steps],
-            step,
-        )
-        for step_id, step in steps.items()
-    }
-    pipeline = {
-        "nodes": [
-            {
-                "name": step_id,
-                "type": step_class.__name__,
-                "meta_type": "WorkflowStepNode",
-                "depends": list(step_class.DEPENDENCIES),
-                "loop": 1,
-            }
-            for step_id, step_class in step_classes.items()
-        ]
-    }
-    return WorkflowEngineConfig(
-        pipeline=pipeline,
-        steps_meta=[step_class.step_meta() for step_class in step_classes.values()],
-        step_classes=tuple(step_classes.values()),
-    )
+
+class _WorkflowPipelinePool(WorkflowPipelinePool):
+    """Seed the leased parameter before native execution, not inside node wrappers."""
+
+    @contextmanager
+    def lease(self) -> Generator[tuple[GPipeline, WorkflowParam], None, None]:
+        with super().lease() as (pipeline, param):
+            request = _RUN_REQUEST.get()
+            if request is not None:
+                state, skipped_steps = request
+                param.state.update(state)
+                for step_id in skipped_steps:
+                    output = StepRunOutput(card={"status": "skipped"})
+                    param.complete(step_id, output, output.card)
+            yield pipeline, param
 
 
 def init_workflow_engine(
-    config: WorkflowEngineConfig,
+    node_classes: Mapping[str, type[GElement]],
+    workflow_config: Mapping[str, Any],
     *,
-    thread_id: str | None = None,
+    graph_config_id: str = "flowx",
 ) -> WorkflowEngine:
-    """Initialize a ``WorkflowEngine`` from a built configuration."""
+    """Pass the supplied concrete class map directly to a reusable pipeline pool.
 
-    temporary_dir = TemporaryDirectory(prefix="flowx-workflow-")
-    config_path = Path(temporary_dir.name) / "workflow.json"
-    config_path.write_text(json.dumps(config.pipeline), encoding="utf-8")
-    engine = WorkflowEngine(
-        pipeline_json_path=str(config_path),
-        steps_meta=config.steps_meta,
-        thread_id=thread_id or f"flowx-{uuid.uuid4().hex}",
+    Class STEP_ID and DEPENDENCIES must match the JSON topology. Metadata comes
+    directly from each class without constructing speculative node instances.
+    """
+    nodes = workflow_config.get("nodes")
+    if not isinstance(nodes, list) or not nodes or any(not isinstance(node, dict) for node in nodes):
+        raise ValueError("workflow configuration requires a non-empty nodes list")
+    names = [node.get("name") for node in nodes]
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("workflow node names must be non-empty strings")
+    if len(names) != len(set(names)) or set(names) != set(node_classes):
+        raise ValueError("workflow configuration must define each node class exactly once")
+    pool_size = workflow_config.get("pool_size", 1)
+    if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
+        raise ValueError("workflow pool_size must be a positive integer")
+
+    native_nodes, steps_meta = [], []
+    for node in nodes:
+        name = node["name"]
+        node_class = node_classes[name]
+        if not isinstance(node_class, type) or not issubclass(node_class, GElement):
+            raise TypeError(f"node '{name}' must map to a concrete GElement class")
+        dependencies = node.get("depends", [])
+        if not isinstance(dependencies, list) or any(not isinstance(dep, str) for dep in dependencies):
+            raise ValueError(f"node '{name}' depends must be a list of node names")
+        if name in dependencies:
+            raise ValueError(f"node '{name}' cannot depend on itself")
+        if node.get("loop", 1) != 1:
+            raise ValueError("internal workflows must be single-pass (loop=1)")
+        if node_class.STEP_ID != name or list(node_class.DEPENDENCIES) != dependencies:
+            raise ValueError(f"node '{name}' class STEP_ID/DEPENDENCIES must match the workflow configuration")
+        native_nodes.append({"name": name, "depends": dependencies})
+        steps_meta.append(node_class.step_meta())
+    pool = _WorkflowPipelinePool(
+        pipeline_json=json.dumps({"nodes": native_nodes}),
+        node_classes=node_classes,
+        size=pool_size,
     )
-    setattr(engine, "_flowx_temporary_directory", temporary_dir)
-    setattr(engine, "_flowx_step_classes", config.step_classes)
-    return engine
-
-
-def init_pipeline_engine(
-    steps: Mapping[str, WorkflowStepNode],
-    dependencies: Mapping[str, Iterable[str]],
-    *,
-    thread_id: str | None = None,
-) -> WorkflowEngine:
-    """Register steps on a ``GPipeline`` (in dependency order) and pass it to ``WorkflowEngine``."""
-
-    pipeline = GPipeline()
-    elements: dict[str, WorkflowStepNode] = {}
-    steps_meta: list[dict[str, Any]] = []
-    for step_id, step in steps.items():
-        step_dependencies = list(dependencies.get(step_id, ()))
-        missing = [dependency for dependency in step_dependencies if dependency not in elements]
-        if missing:
-            raise ValueError(f"step '{step_id}' depends on unregistered step(s): {missing}")
-        step_class = _step_adapter_class(step_id, step_dependencies, step)
-        element = step_class()
-        status = pipeline.registerGElement(
-            element, {elements[dependency] for dependency in step_dependencies}, step_id, 1,
+    try:
+        return WorkflowEngine(
+            graph_config_id=graph_config_id,
+            steps_meta=steps_meta,
+            pool=pool,
         )
-        if status.isErr():
-            raise RuntimeError(f"registerGElement failed for {step_id}: {status.getInfo()}")
-        elements[step_id] = element
-        steps_meta.append(step_class.step_meta())
-    engine = WorkflowEngine(
-        pipeline=pipeline,
-        steps_meta=steps_meta,
-        thread_id=thread_id or f"flowx-{uuid.uuid4().hex}",
-    )
-    # Python must keep the registered elements alive for the native pipeline.
-    setattr(engine, "_flowx_step_elements", tuple(elements.values()))
-    return engine
+    except BaseException:
+        pool.close()
+        raise
 
 
-def run_workflow_step(
+def run_workflow(
     engine: WorkflowEngine,
-    step_id: str,
-    user_input: Any = None,
-) -> CStatus:
-    """Run one engine step and return its successful status."""
+    *,
+    request_id: str | None = None,
+    session_state: Mapping[str, Any] | None = None,
+    inputs: Mapping[str, StepRunInput] | None = None,
+    skipped_steps: Iterable[str] = (),
+) -> RunResult:
+    """Run actual native nodes once with isolated state and original inputs."""
 
-    status = engine.run_step(step_id, user_input)
-    if not status.isOK():
-        raise RuntimeError(f"workflow step '{step_id}' failed: {status.getInfo()}")
-    return status
+    step_ids = [step["id"] for step in engine.steps_meta]
+    skipped = frozenset(skipped_steps)
+    unknown = (set(inputs or {}) | skipped).difference(step_ids)
+    if unknown:
+        raise ValueError(f"unknown workflow step(s): {sorted(unknown)}")
+    if not isinstance(engine.pool, _WorkflowPipelinePool) and (session_state or skipped):
+        raise TypeError("request state/skipping requires a pool created by init_workflow_engine")
+    token = _RUN_REQUEST.set((dict(session_state or {}), skipped))
+    try:
+        result = engine.run(request_id or f"flowx-request-{uuid.uuid4().hex}", dict(inputs or {}))
+    finally:
+        _RUN_REQUEST.reset(token)
+    if result.status != "completed":
+        engine.close(result.request_id)
+        step_id = result.failed_step or (result.awaiting or {}).get("id", "")
+        raise RuntimeError(f"workflow step '{step_id}' failed: {result.error or result.status}")
+    missing = set(step_ids).difference(result.outputs)
+    if missing:
+        raise RuntimeError(f"workflow execution did not produce output for step(s): {sorted(missing)}")
+    return result
+
+
+def close_workflow_engine(engine: WorkflowEngine) -> None:
+    """Cancel outstanding requests before destroying their pool."""
+
+    try:
+        engine.close()
+    finally:
+        engine.pool.close()
 
 
 __all__ = [
-    "WorkflowEngineConfig",
-    "build_workflow_config",
-    "init_pipeline_engine",
+    "close_workflow_engine",
     "init_workflow_engine",
-    "run_workflow_step",
+    "run_workflow",
 ]

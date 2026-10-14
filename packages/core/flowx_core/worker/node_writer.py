@@ -1,3 +1,6 @@
+# Modified: explicit input-gate contracts for pooled generation and repair.
+# Modified: abstract bytes file hooks, explicit persistence, and configured concrete-node prompts.
+# Modified: fixed automatic-stage metadata and scoped settings before prompt composition.
 import json
 import ast
 from dataclasses import dataclass
@@ -11,8 +14,29 @@ from flowx_core._paths import bootstrap_package_root
 
 ROOT_DIR = bootstrap_package_root(__file__)
 
+_WORKFLOW_RUNTIME_POLICY = (
+    "AG-UI pooled runtime policy (authoritative):\n"
+    "- INPUT_REQUIRED is UI metadata only; base nodes and WorkflowEngine install no wait callback.\n"
+    "- Required direct input needs __init__ calling super().__init__() and "
+    "self.setWaitFunc(self.wait_function), with wait_function(self) -> bool in the subclass.\n"
+    "- Inside the non-blocking callback obtain self.get_workflow_param() after pool attachment "
+    "and protect input/state access with param.condition. Return True immediately when "
+    "not param.can_run(self.STEP_ID, self.DEPENDENCIES), so failed dependencies cannot strand gates.\n"
+    "- Decide readiness from param.inputs using membership (0, False and empty values may be valid). "
+    "Apply requirement-defined validation; report "
+    "param.set_state(self.STEP_ID, 'running' if ready else 'awaiting_input') and return ready.\n"
+    "- Automatic nodes set INPUT_REQUIRED = False and install no input gate. "
+    "Do not override run or invent engine/session shims.\n"
+    "- Pooled nodes are reused: store request data in session_state/WorkflowParam rather than "
+    "instance fields and reset custom event gates per run.\n"
+    "- The runtime constructs fresh nodes from JSON-node-name class maps; ordinary undecorated "
+    "subclasses need neither register_class nor clone. Optional legacy decorators/clone "
+    "may remain, but must not be required.\n"
+)
+
 from flowx_core.llm_client.coder import Coder, MAX_TOKENS
 from flowx_core.architect.graph import Graph, NodeMeta
+from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.file_tools import compile_node_file_and_get_derived_keys
 from flowx_core.tools.workflow_node_reference import (
     render_workflow_method_signatures,
@@ -185,20 +209,28 @@ def _reference_primary_method_signature(reference, method_names: tuple[str, ...]
 
 @dataclass
 class PromptNodeFileCoderBase(Coder):
+    STEP_ID = "node_generate"
+    DEPENDENCIES = ["node_plan"]
+    INPUT_REQUIRED = False
+
     prompt_path: str = "worker/prompts/pydaograph_node_prompt.md"
 
     def __post_init__(self) -> None:
+        apply_node_settings(self)
         prompt_file = ROOT_DIR / self.prompt_path
         if not prompt_file.exists():
             raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
 
         workflow_step_meta_catalog_text = render_workflow_step_meta_catalog()
-        self.system_prompt = (
-            f"{prompt_file.read_text(encoding='utf-8')}\n\n"
-            "## ag_ui_workflow Base Step Metas (Authoritative)\n"
-            "Use the injected ag_ui_workflow base-node step_meta()/meta_node_kind() catalog below as the only source of truth for node contracts.\n\n"
-            f"{workflow_step_meta_catalog_text}\n"
-        )
+        # Preserve an explicitly configured or already composed pool snapshot.
+        if self.system_prompt == Coder.system_prompt:
+            self.system_prompt = (
+                f"{prompt_file.read_text(encoding='utf-8')}\n\n"
+                "## ag_ui_workflow Base Step Metas (Authoritative)\n"
+                "Use the injected ag_ui_workflow base-node step_meta()/meta_node_kind() catalog below as the only source of truth for node contracts.\n\n"
+                f"{workflow_step_meta_catalog_text}\n\n"
+                f"{_WORKFLOW_RUNTIME_POLICY}"
+            )
         super().__post_init__()
 
     def process_input(
@@ -532,6 +564,7 @@ class PromptNodeFileCoderBase(Coder):
             "Keep the code as simple as possible while fully satisfying the amendment and node requirements.\n"
             "Avoid adding new abstractions unless they are strictly needed.\n"
             "Every defined variable must be used; remove dead assignments.\n"
+            f"{_WORKFLOW_RUNTIME_POLICY}"
             f"{state_routing_policy_text}"
             f"{contract_text}"
             "Apply the amendment or feedback to produce the improved code.\n"
@@ -669,54 +702,44 @@ class WorkflowFileNodeCoder(PromptNodeFileCoderBase):
         )
 
         ext_data = node_meta.ext_data if isinstance(node_meta.ext_data, Mapping) else {}
-        remote_desc = ""
-        if isinstance(ext_data, Mapping):
-            remote_desc = str(ext_data.get("remote_desc", "")).strip()
-
-        reference = resolve_workflow_node_reference(meta_node_kind="WorkflowFileNode")
-        main_utility_text = _reference_method_signature_text(reference, reference.main_utility_methods)
-        step_output_text = _reference_method_signature_text(reference, reference.step_output_schema_methods)
+        remote_desc = str(ext_data.get("remote_desc", "")).strip()
 
         if not remote_desc:
-            return (
-                base_prompt
-                + "\n\nWorkflowFileNode generation rule (authoritative):\n"
-                + "- Do not implement any custom methods.\n"
-                + "- The selected WorkflowFileNode base reference exposes no decorator-marked subclass implementation hook.\n"
-                + f"- Rely on the inherited main utility {main_utility_text} and StepRunOutput contract {step_output_text}.\n"
-                + "- Only define required class constants (STEP_ID, TITLE, PROMPT, DEPENDENCIES).\n"
-            )
+            return base_prompt
 
         return (
             base_prompt
             + "\n\nWorkflowFileNode remote persistence rule (authoritative):\n"
-            + "- ext_data.remote_desc is provided; add only the smallest custom remote-persistence override truly required by it.\n"
             + f"- remote_desc: {remote_desc}\n"
-            + f"- Inherited main utility: {main_utility_text}\n"
-            + f"- Inherited StepRunOutput contract method: {step_output_text}\n"
-            + "- Do not modify or override other base persistence/output methods unless strictly required by remote_desc.\n"
+            + "- Implement the required remote persistence explicitly in process_input, "
+            "using a small helper only when needed; no inherited storage method exists to override.\n"
+            + "- Return the actual persisted location/identifier in derived only after storage succeeds; "
+            "never fabricate persistence results.\n"
         )
 
     def get_node_contract_text(self) -> str:
         reference = resolve_workflow_node_reference(meta_node_kind="WorkflowFileNode")
-        main_utility_text = _reference_method_signature_text(reference, reference.main_utility_methods)
-        step_output_text = _reference_method_signature_text(reference, reference.step_output_schema_methods)
+        subclass_hook_text = _reference_method_signature_text(reference, reference.subclass_implementation_methods)
         return (
             "Generate a WorkflowFileNode subclass with STEP_ID, TITLE, PROMPT, and DEPENDENCIES.\n"
             "Keep implementation minimal: only imports, constants, and methods required by this node contract.\n"
-            "By default, do not implement any custom methods; the selected WorkflowFileNode base reference exposes no decorator-marked subclass hook for this node kind.\n"
-            f"Rely on inherited main utility {main_utility_text} and StepRunOutput contract {step_output_text}.\n"
-            "Only when ext_data.remote_desc is present and truly requires custom remote persistence, add the smallest override needed for that behavior.\n"
-            "saved_files contains uploaded files already persisted by the inherited WorkflowFileNode storage path, including original fileName(fileName) and saved location(path).\n"
+            f"Implement the abstract subclass hook {subclass_hook_text} with file_bytes: bytes and return StepRunOutput.\n"
+            "Process a single upload's bytes according to the requirements; the base class neither decodes uploads nor persists data.\n"
+            "Implement local or remote persistence explicitly in process_input only when required, and expose actual saved paths/identifiers in derived.\n"
+            "Do not normalize file_path/base64/files/uploads in this subclass; the HTTP backend converts one upload to bytes before engine input.\n"
+            "Define __init__ calling super().__init__() and self.setWaitFunc(self.wait_function). In wait_function, use param.condition and the can_run guard from the runtime policy.\n"
+            "File readiness is self.STEP_ID in param.inputs and isinstance(param.inputs[self.STEP_ID], (bytes, bytearray)); empty bytes are valid unless requirements reject them.\n"
+            "Report running/awaiting_input and return readiness without blocking; do not rely on input truthiness or parse legacy upload formats in the gate.\n"
             "Keep card payload JSON-serializable and derived payload structured for downstream nodes.\n"
-            "Ensure this node expects user file input and supports multiple uploaded files.\n\n"
+            "Keep the inherited run orchestration.\n\n"
         )
 
     def get_feedback_contract_text(self) -> str:
         return (
-            "Preserve the WorkflowFileNode contract "
-            "(STEP_ID/TITLE/PROMPT/DEPENDENCIES). "
-            "Default to no custom methods; only add the smallest remote-persistence override when remote storage behavior is explicitly required (for example ext_data.remote_desc).\n"
+            "Preserve the WorkflowFileNode bytes-processing and explicit input-gate contract below. "
+            "Preserve or implement requirement-defined persistence, including ext_data.remote_desc, explicitly; "
+            "never replace the hook with assumed inherited storage behavior.\n"
+            + self.get_node_contract_text()
         )
 
 

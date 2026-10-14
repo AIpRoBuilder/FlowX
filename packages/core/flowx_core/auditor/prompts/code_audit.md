@@ -1,17 +1,24 @@
 # Code Audit Checklist
 
-Use this checklist to audit PyDaoGraph node files and enforce the two required methods the runtime depends on.
+Modified 2026-10-13: audit explicit class-map construction and bytes-processing contracts.
+
+Use this checklist to audit AG-UI workflow subclasses against the installed base-node reference.
 
 ## Rules
-- Every node class must implement `def clone(self):` with a docstring containing `Create a copy of this node` and must return `self`.
-- Every node class must implement `def run(self) -> CStatus:` and accept only `self`.
+- Define `STEP_ID`, `TITLE`, `PROMPT`, and `DEPENDENCIES`, matching the graph plan.
+- Implement the selected base's required hook and return `StepRunOutput(card=..., derived=...)`: `process_input` for step/file nodes and `process_operation` for skill nodes.
+- File nodes implement `process_input(file_bytes: bytes, dependency_results, session_state)`; decoding HTTP uploads happens before engine input, and persistence is explicit business logic.
+- Keep inherited `run` orchestration. If a custom `run` is required, it accepts only `self` and returns `CStatus`.
+- Fresh instances are constructed from an explicit `node_classes` map; neither `@register_class` nor `clone` is required.
+- Interactive nodes explicitly install a non-blocking wait callback and report `awaiting_input`/`running` through `WorkflowParam`; `INPUT_REQUIRED` alone does not create a gate.
+- Keep request-local mutable state in `session_state`/`WorkflowParam`, not pooled instance fields.
 - If the file has syntax errors or no classes, the audit fails immediately.
 
 ## How to run the automated audit
 ```python
-from auditor.node_auditor import CodeAuditor
+from flowx_core.auditor.node_auditor import NodeAuditor
 
-auditor = CodeAuditor()
+auditor = NodeAuditor()
 passed, violations = auditor.audit_node_file("worker/nodes/sample_node.py")
 
 if passed:
