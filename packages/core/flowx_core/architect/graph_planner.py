@@ -1,3 +1,4 @@
+# Modified 2026-10-14: reuse this planner in graph generation and consume analyzer output.
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from typing import Any
 from ag_ui_workflow import StepRunOutput
 
 from flowx_core._paths import bootstrap_package_root
+from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.workflow_node_reference import (
 	canonical_meta_node_kind,
 	render_workflow_step_meta_catalog,
@@ -42,6 +44,11 @@ class GraphPlanner(Coder):
 	Use `{"type": "skill", "skill_name": "<skill>", ...}` for nodes that should be implemented as WorkflowSkillNode.
 	"""
 
+	STEP_ID = "plan_graph"
+	DEPENDENCIES = ["analyze_requirement"]
+	INPUT_REQUIRED = False
+	__hash__ = object.__hash__
+
 	prompt_path: str = "architect/prompts/graph_planner_prompt.md"
 	default_skills_dirname: str = "skills"
 	skills_root_path: str = ""
@@ -49,6 +56,7 @@ class GraphPlanner(Coder):
 	SKILL_EXT_DESC: str = "skill node"
 
 	def __post_init__(self) -> None:
+		apply_node_settings(self)
 		prompt_file = ROOT_DIR / self.prompt_path
 		if not prompt_file.exists():
 			raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
@@ -472,7 +480,7 @@ class GraphPlanner(Coder):
 	) -> Path:
 		"""Call the LLM and persist the graph plan as JSON."""
 
-		target_path = Path(output_path)
+		target_path = Path(output_path).expanduser()
 		if target_path.suffix.lower() != ".json":
 			target_path = target_path.with_suffix(".json")
 
@@ -503,7 +511,7 @@ class GraphPlanner(Coder):
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
 		"""Plan or amend the graph according to the request in session state."""
-		del user_input, dependency_results
+		del user_input
 		request = session_state.get("graph_planner")
 		if not isinstance(request, Mapping):
 			raise ValueError("session_state['graph_planner'] must be a plan or amend request")
@@ -513,7 +521,10 @@ class GraphPlanner(Coder):
 		if action == "write":
 			requirement_text = request.get("requirement_text")
 			if requirement_text is None:
-				requirement_path = request.get("requirement_md_path")
+				analysis = dependency_results.get("analyze_requirement")
+				requirement_path = (
+					analysis.derived.get("requirement_md_path") if analysis is not None else None
+				) or request.get("requirement_md_path")
 				if not isinstance(requirement_path, str) or not requirement_path.strip():
 					raise ValueError("write requires requirement_text or requirement_md_path")
 				path = Path(requirement_path).expanduser()
@@ -565,7 +576,7 @@ class GraphPlanner(Coder):
 	) -> Path:
 		"""Amend an existing graph JSON plan using feedback."""
 
-		target_path = Path(graph_json_path)
+		target_path = Path(graph_json_path).expanduser()
 		if target_path.suffix.lower() != ".json":
 			target_path = target_path.with_suffix(".json")
 

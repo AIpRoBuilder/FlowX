@@ -1,9 +1,18 @@
-from types import SimpleNamespace
+"""Modified 2026-10-14: inject graph-service analysis dependencies explicitly.
 
+Modified 2026-10-14: use concrete offline nodes for native graph-workflow analysis.
+Modified 2026-10-14: pass analysis state in a run request instead of service configuration.
+"""
+
+from types import SimpleNamespace
 import pytest
 
+from flowx_core.architect.graph_planner import GraphPlanner
+from flowx_core.auditor.graph_json_auditor import GraphJsonAuditor
 from flowx_core.builder_services import GraphBuildService
+from flowx_core.builder_support import BuildSession
 from flowx_core.demand_analyzer.requirement_disector import RequirementDisector
+from flowx_core.workflows.graph_generation import GraphGenerationRequest
 
 
 class _FakeCompletions:
@@ -98,12 +107,23 @@ def test_process_input_amend_requires_existing_file(tmp_path):
 
 def test_graph_build_service_uses_process_input_for_analysis(tmp_path):
     analyzer = RequirementDisector(client=_FakeClient(["# Analysis"]))
-    builder = SimpleNamespace(
-        analyzer=analyzer, root_dir=str(tmp_path), requirement_md_path=None,
-        _logger=SimpleNamespace(info=lambda *args: None, debug=lambda *args: None),
+    session = BuildSession()
+    service = GraphBuildService(
+        analyzer=analyzer,
+        planner=GraphPlanner(client=object()), graph_auditor=GraphJsonAuditor(),
     )
-
-    output_path = GraphBuildService(builder).analyze_requirement("Build a workflow")
-
-    assert output_path == str(tmp_path / "requirement_analysis.md")
-    assert (tmp_path / "requirement_analysis.md").read_text(encoding="utf-8") == "# Analysis"
+    try:
+        result = service.run(GraphGenerationRequest(
+            requirement_text="Build a workflow", requirement_md_path=str(tmp_path / "requirement_analysis.md"),
+            skip_plan_graph=True, skip_audit_graph=True, state={"build_session": session},
+        ))
+        output_path = result.outputs["analyze_requirement"].derived["requirement_md_path"]
+        assert output_path == str(tmp_path / "requirement_analysis.md")
+        assert (tmp_path / "requirement_analysis.md").read_text(encoding="utf-8") == "# Analysis"
+        # Publication belongs to AgentBuilder, not a service-held session.
+        assert session.requirement_md_path is None
+        assert session.graph_plan_path is None
+        assert session.planned_graph is None
+        assert not hasattr(service, "session")
+    finally:
+        service.close()

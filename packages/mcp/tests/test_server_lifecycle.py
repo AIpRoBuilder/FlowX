@@ -5,8 +5,15 @@ import json
 from types import ModuleType, SimpleNamespace
 import sys
 import urllib.error
+from unittest.mock import Mock
 
 import pytest
+
+
+_BATCH_GENERATION_ERROR = (
+    "Batch node generation is not implemented; submit a "
+    "NodeGenerationRequest to NodeBuildService.run() instead."
+)
 
 
 class FakeHandle:
@@ -56,6 +63,10 @@ class FakeHandle:
         self.actions.append("stop")
         self.is_running = False
 
+    def close(self):
+        self.stop_backend()
+        self.actions.append("close")
+
     def reload_backend(self, reset_session=True, **kwargs):
         self.stop_backend()
         if reset_session:
@@ -82,6 +93,98 @@ def tools(mcp_modules, monkeypatch):
         return json.loads(registered[name](workflow_name="example", **kwargs))
 
     return call, handle, server
+
+
+@pytest.fixture
+def deferred_batch_tools(tools):
+    call, handle, server = tools
+    handle.builder.generate_nodes = Mock(side_effect=NotImplementedError(_BATCH_GENERATION_ERROR))
+    handle.builder._sync_workflow_graph_json = Mock()
+    handle.builder.generate_main_entrypoint = Mock()
+    handle.sync_artifacts = Mock()
+    return call, handle, server
+
+
+def test_create_workflow_reports_deferred_batch_error_without_sync_or_main(
+    deferred_batch_tools, fake_http, monkeypatch, tmp_path,
+):
+    call, handle, server = deferred_batch_tools
+    requests, _ = fake_http
+    requirement_path = "/stub/example/requirement_analysis.md"
+    handle.builder.analyze_requirement = Mock(return_value=requirement_path)
+    handle.builder.plan_graph = Mock(return_value=handle.graph_plan_path)
+    monkeypatch.setattr(server, "core_available", lambda: True)
+    monkeypatch.setattr(server, "registry", SimpleNamespace(get_or_create=Mock(return_value=handle)))
+
+    result = call(
+        "create_workflow", user_prompt="Collect input", workspace=str(tmp_path), backend_port=8765,
+    )
+
+    assert result["ok"] is False
+    assert result["tool"] == "create_workflow"
+    assert result["error"] == _BATCH_GENERATION_ERROR
+    handle.builder.analyze_requirement.assert_called_once_with(requirement_text="Collect input")
+    handle.builder.plan_graph.assert_called_once_with(
+        requirement_md_path=requirement_path,
+        graph_plan_filename="workflow.json",
+        temperature=0.3,
+    )
+    handle.builder.generate_nodes.assert_called_once_with(
+        graph_plan_path=handle.graph_plan_path,
+        requirement_md_path=requirement_path,
+        language="python",
+        temperature=0.3,
+        generate_markdowns=True,
+        workflow_name=handle.workflow_name,
+    )
+    handle.builder._sync_workflow_graph_json.assert_not_called()
+    handle.builder.generate_main_entrypoint.assert_not_called()
+    handle.sync_artifacts.assert_not_called()
+    assert requests == []
+
+
+def test_update_workflow_node_reports_deferred_batch_error_without_sync_main_or_backend_reset(
+    deferred_batch_tools, fake_http, monkeypatch,
+):
+    call, handle, server = deferred_batch_tools
+    requests, _ = fake_http
+    handle.completed_steps = ["Entry"]
+    run_state = {"session_id": handle.session_id, "response": {"awaitingInput": "ActualGate"}}
+    handle._mcp_run_state = run_state
+    amended_path = "/stub/example/amended_workflow.json"
+    handle.builder.amend_workflow_json = Mock(return_value=amended_path)
+    reset_backend_session = Mock()
+    monkeypatch.setattr(server, "reset_backend_session", reset_backend_session)
+
+    result = call("update_workflow_node", node_name="Entry", user_prompt="Update input")
+
+    assert result["ok"] is False
+    assert result["tool"] == "update_workflow_node"
+    assert result["error"] == _BATCH_GENERATION_ERROR
+    handle.builder.amend_workflow_json.assert_called_once_with(
+        user_prompt="Update input",
+        workflow_json_path=handle.workflow_json_path,
+        temperature=0.2,
+    )
+    handle.builder.generate_nodes.assert_called_once_with(
+        requirement_md_path=None,
+        graph_plan_path=amended_path,
+        node_names=["Entry"],
+        temperature=0.2,
+        generate_markdowns=True,
+        markdown_amendments={"Entry": "Update input"},
+        workflow_name=handle.workflow_name,
+    )
+    handle.builder._sync_workflow_graph_json.assert_not_called()
+    handle.builder.generate_main_entrypoint.assert_not_called()
+    handle.sync_artifacts.assert_not_called()
+    reset_backend_session.assert_not_called()
+    assert handle.is_running is True
+    assert handle.session_id == "old"
+    assert handle.completed_steps == ["Entry"]
+    assert handle._mcp_run_state is run_state
+    assert handle.actions == []
+    assert requests == []
 
 
 def pause(responses, *, waiting="ActualGate", completed=None):
@@ -232,7 +335,7 @@ def test_restart_builder_does_not_restore_progress_from_dead_native_run(tools, m
     monkeypatch.setattr(server, "_attach_existing_workflow", lambda *_args, **_kwargs: replacement)
     handle, was_running = server._restart_builder_handle("example", reset_session=False)
     assert was_running is True
-    assert previous.actions == ["stop"]
+    assert previous.actions == ["stop", "close"]
     assert handle.session_id == "old"
     assert handle.completed_steps == []
 

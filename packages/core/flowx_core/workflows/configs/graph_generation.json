@@ -1,0 +1,8 @@
+{
+  "pool_size": 1,
+  "nodes": [
+    {"name": "analyze_requirement"},
+    {"name": "plan_graph", "depends": ["analyze_requirement"]},
+    {"name": "audit_graph", "depends": ["plan_graph"]}
+  ]
+}

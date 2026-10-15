@@ -1,7 +1,13 @@
+# Modified 2026-10-14: audit graph-generation workflow requests without repair retries.
 from __future__ import annotations
 
 import re
+from dataclasses import asdict
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Dict, List, Set
+
+from ag_ui_workflow import StepRunOutput
 
 from flowx_core.architect.graph import Graph
 from flowx_core.auditor.base_json_auditor import BaseJsonAuditor
@@ -15,7 +21,36 @@ from flowx_core.tools.workflow_node_reference import (
 class GraphJsonAuditor(BaseJsonAuditor):
 	"""Audit graph JSON definitions for name/type consistency."""
 
+	STEP_ID = "audit_graph"
+	DEPENDENCIES = ["plan_graph"]
+	INPUT_REQUIRED = False
+
 	EN_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9]*$")
+
+	def process_input(
+		self,
+		user_input: str,
+		dependency_results: dict[str, StepRunOutput],
+		session_state: dict[str, Any],
+	) -> StepRunOutput:
+		"""Audit the planner output, or an existing graph when planning is skipped."""
+		del user_input
+		request = session_state.get("graph_auditor")
+		if not isinstance(request, Mapping):
+			raise ValueError("session_state['graph_auditor'] must be a graph audit request")
+		planned = dependency_results.get("plan_graph")
+		graph_path = (
+			planned.derived.get("graph_plan_json_path") if planned is not None else None
+		) or request.get("graph_plan_json_path")
+		if not isinstance(graph_path, str) or not graph_path.strip():
+			raise ValueError("graph_auditor requires a non-empty graph_plan_json_path")
+		graph_path = str(Path(graph_path).expanduser().resolve())
+		ok, violations = self.audit_graph_json(Graph(graph_path))
+		return StepRunOutput(derived={
+			"graph_plan_json_path": graph_path,
+			"ok": ok,
+			"violations": [asdict(violation) for violation in violations],
+		})
 
 	def _extract_ext_type(self, node: Dict[str, Any]) -> str:
 		ext_data = node.get("ext_data")

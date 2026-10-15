@@ -1,6 +1,8 @@
 """Utilities for generating a PyDaoGraph entrypoint from a file template.
 
 Modified 2026-10-13: render pooled request-scoped entrypoints and refresh node exports on amendment.
+Modified 2026-10-14: declare the main-generation workflow step and apply settings before template loading.
+Modified 2026-10-15: stop forwarding no-op temperatures for deterministic template writes.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from typing import Any, Mapping, Optional, Sequence
 from ag_ui_workflow import StepRunOutput
 
 from flowx_core._paths import bootstrap_package_root
+from flowx_core.tools._node_settings import apply_node_settings
 
 
 ROOT_DIR = bootstrap_package_root(__file__)
@@ -61,7 +64,10 @@ class _MainEntrypointRenderContext:
 class PromptMainFileCoder(Coder):
     """Render an AG-UI lifecycle FastAPI backend entrypoint from a template."""
 
+    STEP_ID = "main_generate"
+    DEPENDENCIES = []
     INPUT_REQUIRED = False
+    __hash__ = object.__hash__
 
     system_prompt: str = ""
     template_path: str = "worker/templates/pydaograph_main.py.tmpl"
@@ -73,6 +79,7 @@ class PromptMainFileCoder(Coder):
     )
 
     def __post_init__(self) -> None:
+        apply_node_settings(self)
         template_file = ROOT_DIR / self.template_path
         if not template_file.exists():
             raise FileNotFoundError(f"Main entrypoint template not found: {template_file}")
@@ -126,7 +133,6 @@ class PromptMainFileCoder(Coder):
                 fastapi_port=request.get("fastapi_port", 8000),
                 uvicorn_reload=request.get("uvicorn_reload", False),
                 overwrite=request.get("overwrite", True),
-                temperature=request.get("temperature", 0.2),
             )
         else:
             amendment = request.get("amendment")

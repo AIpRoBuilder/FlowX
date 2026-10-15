@@ -1,3 +1,8 @@
+"""Builder-owned artifact and runtime bookkeeping.
+
+Modified 2026-10-14: retain published paths in the builder, never service run contexts.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, MutableMapping
@@ -15,6 +20,15 @@ def _default_artifact_dynamic_graph_cache() -> dict[str, Any]:
 
 
 @dataclass
+class WorkflowArtifactState:
+    """Published locations for a named workflow, not a retained generation request."""
+
+    graph_plan_path: str
+    node_location_map: dict[str, str] = field(default_factory=dict)
+    node_doc_paths: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class ArtifactSessionState:
     requirement_md_path: Optional[str] = None
     graph_plan_path: Optional[str] = None
@@ -25,6 +39,7 @@ class ArtifactSessionState:
     node_doc_paths: list[str] = field(default_factory=list)
     node_location_map: dict[str, str] = field(default_factory=dict)
     node_coder_map: dict[str, Any] = field(default_factory=dict)
+    workflow_artifacts: dict[str, WorkflowArtifactState] = field(default_factory=dict)
 
     dynamic_graph_cache: dict[str, Any] = field(default_factory=_default_artifact_dynamic_graph_cache)
 

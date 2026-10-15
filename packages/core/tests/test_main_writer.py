@@ -1,14 +1,20 @@
 # Modified 2026-10-13: generated entrypoint assertions use native JSON/configured pools.
 # Modified 2026-10-14: assert the NODES tuple and reusable STEP_ID class map.
+# Modified 2026-10-14: verify eager service replacement retains builder-owned session/artifact state.
+# Modified 2026-10-14: replace graph-retry expectations with single-pass facade delegation.
+# Modified 2026-10-14: isolate unused eager dependencies and pass builder state in graph requests.
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 import flowx_core.agent_builder as agent_builder_module
+from flowx_core import builder_services
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.architect.graph import NodeMeta
 from flowx_core.architect.node_planner import NodePlanElement
+from flowx_core.builder_support import WorkflowArtifactState
 from flowx_core.llm_client.coder import compose_session_marking_prompt
 from flowx_core.tools.workflow_node_reference import (
     render_workflow_method_signatures,
@@ -20,6 +26,7 @@ from flowx_core.worker.node_writer import (
     WorkflowSkillNodeCoder,
     WorkflowStepNodeCoder,
 )
+from flowx_core.workflows.graph_generation import GraphGenerationRequest
 
 
 class _FakeComponent:
@@ -39,29 +46,23 @@ class _FakeClient:
         self.chat = SimpleNamespace(completions=_FakeCompletions())
 
 
-class _FakePlanner:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.plan_calls = []
-        self.amend_calls = []
+@pytest.fixture
+def _fake_builder_components(monkeypatch):
+    """Keep placeholder providers out of real LLM component constructors."""
+    for name in (
+        "RequirementDisector", "GraphPlanner", "NodePlanElement", "PromptMainFileCoder",
+        "RequestNodeFileCoder", "GenerateNodeTestFile", "AmendNodeFromTestLog",
+    ):
+        monkeypatch.setattr(agent_builder_module, name, _FakeComponent)
 
-    def plan_from_file(self, requirement_md_path, graph_plan_path):
-        self.plan_calls.append((requirement_md_path, graph_plan_path))
 
-    def amend_file_with_feedback(self, graph_plan_path, amendment, temperature=0.35):
-        self.amend_calls.append((graph_plan_path, amendment, temperature))
-
-    def process_input(self, user_input, dependency_results, session_state):
-        del user_input, dependency_results
-        request = session_state["graph_planner"]
-        if session_state["GraphPlanner::action"] == "write":
-            self.plan_from_file(request["requirement_md_path"], request["output_path"])
-        else:
-            self.amend_file_with_feedback(
-                request["graph_json_path"],
-                request["amendment"],
-                temperature=request.get("temperature", 0.35),
-            )
+@pytest.fixture
+def _fake_builder_services(monkeypatch, _fake_builder_components):
+    """Factory/configuration tests do not need eagerly initialized native pools."""
+    for name in (
+        "GraphBuildService", "NodeBuildService", "NodeArtifactService", "MainEntrypointService",
+    ):
+        monkeypatch.setattr(agent_builder_module, name, Mock(name=name))
 
 
 def test_main_writer_always_renders_step_execution_route(tmp_path):
@@ -126,11 +127,18 @@ def test_build_user_prompt_requires_uvicorn_launcher(tmp_path):
     compile(output, "main.py", "exec")
 
 
+@pytest.mark.usefixtures("_fake_builder_components")
 def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tmp_path):
-    monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
+    workflow_constructors = {}
+    for service_name, workflow_name in (
+        ("_graph_build_service", "GraphGenerationWorkflow"),
+        ("_node_build_service", "NodeGenerationWorkflow"),
+        ("_node_artifact_service", "NodeRuntimeModifierPipeline"),
+        ("_main_entrypoint_service", "MainEntrypointGenerationWorkflow"),
+    ):
+        constructor = Mock(name=workflow_name, side_effect=[Mock(), Mock()])
+        monkeypatch.setattr(builder_services, workflow_name, constructor)
+        workflow_constructors[service_name] = constructor
 
     builder = AgentBuilder(
         api_key="old-key",
@@ -145,47 +153,103 @@ def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tm
         "Keep request_id on all file/text IO."
     )
 
-    initial_main_writer = builder.main_writer
+    def service_dependencies():
+        return {
+            "_graph_build_service": {
+                "analyzer": builder.analyzer, "planner": builder.planner,
+                "graph_auditor": builder.graph_auditor,
+            },
+            "_node_build_service": {
+                "node_planner": builder.node_planner, "node_coder": builder.node_coder,
+                "node_auditor": builder.node_auditor,
+            },
+            "_node_artifact_service": {
+                "node_test_writer": builder.node_test_writer, "node_writer": builder.node_modifier_writer,
+                "run_subprocess": builder._run_subprocess,
+                "timeout_expired": builder._subprocess_timeout_expired(),
+            },
+            "_main_entrypoint_service": {
+                "main_writer": builder.main_writer, "main_entry_auditor": builder.main_entry_auditor,
+            },
+        }
+
+    initial_components = {
+        name: getattr(builder, name) for name in (
+            "analyzer", "planner", "node_planner", "main_writer",
+            "node_coder", "node_test_writer", "node_modifier_writer",
+        )
+    }
+    initial_services = {name: getattr(builder, name) for name in workflow_constructors}
+    initial_runtime_service = builder._runtime_service
+    initial_session = builder._session
+    initial_artifact_state = builder.artifact_state
+    published_artifacts = builder.artifact_state.workflow_artifacts
+    graph_path = str(tmp_path / "workflow.json")
+    node_path = str(tmp_path / "CollectInput.py")
+    node_doc_path = str(tmp_path / "node_docs" / "CollectInput.md")
+    published_artifact = WorkflowArtifactState(
+        graph_plan_path=graph_path,
+        node_location_map={"CollectInput": node_path},
+        node_doc_paths={"CollectInput": node_doc_path},
+    )
+    published_artifacts["default"] = published_artifact
+    builder.graph_plan_path = graph_path
+    builder.node_coder_map["CollectInput"] = builder.node_coder
+
+    for name, dependencies in service_dependencies().items():
+        service = initial_services[name]
+        workflow_constructors[name].assert_called_once_with(**dependencies)
+        assert vars(service) == {**dependencies, "workflow": service.workflow}
+        service.workflow.run.assert_not_called()
+        service.workflow.close.assert_not_called()
 
     builder.reset_llm_config(api_key="new-key", model="new-model", provider="new-provider")
 
     assert builder.api_key == "new-key"
     assert builder.model == "new-model"
     assert builder.provider == "new-provider"
-    assert builder.main_writer is not initial_main_writer
-    assert builder.analyzer.kwargs == {
+    expected_settings = {
         "api_key": "new-key",
         "model": "new-model",
         "provider": "new-provider",
         "session_marking_prompt": expected_session_prompt,
     }
-    assert builder.planner.kwargs == {
-        "api_key": "new-key",
-        "model": "new-model",
-        "provider": "new-provider",
-        "skills_root_path": "skills-dir",
-        "session_marking_prompt": expected_session_prompt,
-    }
-    assert builder.node_planner.kwargs == {
-        "api_key": "new-key",
-        "model": "new-model",
-        "provider": "new-provider",
-        "skills_root_path": "skills-dir",
-        "session_marking_prompt": expected_session_prompt,
-    }
-    assert builder.main_writer.kwargs == {
-        "api_key": "new-key",
-        "model": "new-model",
-        "provider": "new-provider",
-        "session_marking_prompt": expected_session_prompt,
-    }
+    for name, initial_component in initial_components.items():
+        component = getattr(builder, name)
+        assert component is not initial_component
+        component_settings = dict(expected_settings)
+        if name in {"planner", "node_planner", "node_coder"}:
+            component_settings["skills_root_path"] = "skills-dir"
+        assert component.kwargs == component_settings
+
+    for name, dependencies in service_dependencies().items():
+        service = getattr(builder, name)
+        old_service = initial_services[name]
+        assert service is not old_service
+        assert service.workflow is not old_service.workflow
+        old_service.workflow.close.assert_called_once_with()
+        old_service.workflow.run.assert_not_called()
+        assert workflow_constructors[name].call_count == 2
+        workflow_constructors[name].assert_called_with(**dependencies)
+        assert vars(service) == {**dependencies, "workflow": service.workflow}
+        service.workflow.run.assert_not_called()
+        service.workflow.close.assert_not_called()
+
+    assert builder._runtime_service is not initial_runtime_service
+    assert builder._session is initial_session
+    assert builder.artifact_state is initial_artifact_state
+    assert builder.artifact_state.workflow_artifacts is published_artifacts
+    assert published_artifacts == {"default": published_artifact}
+    assert published_artifacts["default"] is published_artifact
+    assert published_artifact.graph_plan_path == graph_path
+    assert published_artifact.node_location_map == {"CollectInput": node_path}
+    assert published_artifact.node_doc_paths == {"CollectInput": node_doc_path}
+    assert builder.graph_plan_path == graph_path
+    assert builder.node_coder_map == {}
 
 
+@pytest.mark.usefixtures("_fake_builder_services")
 def test_agent_builder_make_node_coder_passes_session_marking_prompt(monkeypatch, tmp_path):
-    monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "WorkflowStepNodeCoder", _FakeComponent)
 
     builder = AgentBuilder(
@@ -210,11 +274,8 @@ def test_agent_builder_make_node_coder_passes_session_marking_prompt(monkeypatch
     )
 
 
+@pytest.mark.usefixtures("_fake_builder_services")
 def test_agent_builder_make_node_coder_routes_automatic_step(monkeypatch, tmp_path):
-    monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "WorkflowStepNodeCoder", _FakeComponent)
 
     builder = AgentBuilder(
@@ -274,12 +335,8 @@ def test_node_writer_contract_text_uses_reference_hook_signatures() -> None:
     assert "save_files_remote(files, session_state)" not in file_contract_text
 
 
-def test_agent_builder_defaults_max_audit_rounds_to_seven(monkeypatch, tmp_path):
-    monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
-
+@pytest.mark.usefixtures("_fake_builder_services")
+def test_agent_builder_defaults_max_audit_rounds_to_seven(tmp_path):
     builder = AgentBuilder(
         api_key="key",
         model="model",
@@ -290,28 +347,61 @@ def test_agent_builder_defaults_max_audit_rounds_to_seven(monkeypatch, tmp_path)
     assert builder.max_audit_rounds == 7
 
 
-def test_plan_graph_stops_after_configured_max_audit_rounds(monkeypatch, tmp_path):
-    monkeypatch.setattr(agent_builder_module, "RequirementDisector", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakePlanner)
-    monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
-    monkeypatch.setattr(agent_builder_module, "Graph", lambda path: SimpleNamespace(path=path))
+@pytest.mark.usefixtures("_fake_builder_services")
+@pytest.mark.parametrize("max_audit_rounds", [1, 2, 7])
+def test_plan_graph_delegates_failure_once_without_repair(monkeypatch, tmp_path, max_audit_rounds):
+    analyzer = Mock(STEP_ID="analyze_requirement")
+    planner = Mock(STEP_ID="plan_graph")
+    graph_auditor = Mock(STEP_ID="audit_graph")
+    monkeypatch.setattr(agent_builder_module, "RequirementDisector", Mock(return_value=analyzer))
+    monkeypatch.setattr(agent_builder_module, "GraphPlanner", Mock(return_value=planner))
+    monkeypatch.setattr(agent_builder_module, "GraphJsonAuditor", Mock(return_value=graph_auditor))
+    monkeypatch.setattr(agent_builder_module, "GraphBuildService", builder_services.GraphBuildService)
+    graph_constructor = Mock()
+    monkeypatch.setattr(agent_builder_module, "Graph", graph_constructor)
+    feedback = "graph plan audit did not pass. Feedback:\nLine 3: invalid_graph - graph invalid"
+    workflow_constructor = Mock()
+    workflow = workflow_constructor.return_value
+    workflow.run.side_effect = RuntimeError(feedback)
+    # This is a facade test: arbitrary component mocks must not enter native pools.
+    monkeypatch.setattr(builder_services, "GraphGenerationWorkflow", workflow_constructor)
 
     builder = AgentBuilder(
         api_key="key",
         model="model",
         provider="provider",
         root_dir=str(tmp_path),
-        max_audit_rounds=2,
+        max_audit_rounds=max_audit_rounds,
     )
-    builder.graph_auditor = SimpleNamespace(
-        audit_graph_json=lambda _graph: (
-            False,
-            [SimpleNamespace(lineno=3, rule="invalid_graph", detail="graph invalid")],
+    workflow_constructor.assert_called_once_with(
+        analyzer=analyzer, planner=planner, graph_auditor=graph_auditor,
+    )
+    assert builder._graph_build_service.workflow is workflow
+    workflow.run.assert_not_called()
+    repair_loop = Mock()
+    monkeypatch.setattr(builder, "_make_audit_repair_loop", repair_loop)
+    requirement_path = str(tmp_path / "requirement.md")
+    graph_path = str(tmp_path / "custom.json")
+
+    with pytest.raises(RuntimeError) as error:
+        builder.plan_graph(
+            requirement_md_path=requirement_path, graph_plan_filename="custom.json", temperature=0.6,
         )
-    )
 
-    with pytest.raises(RuntimeError, match="graph plan audit did not pass after 2 attempt\\(s\\)"):
-        builder.plan_graph(requirement_md_path=str(tmp_path / "requirement.md"))
-
-    assert len(builder.planner.amend_calls) == 1
+    assert str(error.value) == feedback
+    workflow_constructor.assert_called_once()
+    workflow.run.assert_called_once_with(GraphGenerationRequest(
+        requirement_md_path=requirement_path, graph_plan_path=graph_path,
+        graph_action="plan", temperature=0.6, skip_analyze_requirement=True,
+        state={"build_session": builder._session},
+    ))
+    assert workflow.run.call_args.args[0].state["build_session"] is builder._session
+    assert builder.requirement_md_path == requirement_path
+    assert builder.graph_plan_path == graph_path
+    assert builder.planned_graph is None
+    planner.process_input.assert_not_called()
+    planner.amend_file_with_feedback.assert_not_called()
+    planner._write_mermaid_from_graph_json.assert_not_called()
+    graph_auditor.audit_graph_json.assert_not_called()
+    repair_loop.assert_not_called()
+    graph_constructor.assert_not_called()

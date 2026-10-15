@@ -1,11 +1,18 @@
-"""Modified: direct native construction, minimal JSON and request lifecycle."""
+"""Modified: direct native construction, minimal JSON and request lifecycle.
+
+Modified: native state identity, request isolation and reusable generation/repair APIs.
+Modified 2026-10-15: direct generation requests and fresh mutable repair requests.
+Modified 2026-10-15: metadata-selected batches and repair outputs without stage bookkeeping.
+Modified 2026-10-15: complete per-node generation requests without batch fields.
+"""
 
 import json
 import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
+from dataclasses import MISSING, FrozenInstanceError, dataclass, field, fields, replace
+from pathlib import Path
 from threading import Barrier
 from typing import Any
 
@@ -14,11 +21,22 @@ from ag_ui_workflow import RunResult, StepRunOutput, WorkflowFileNode, WorkflowP
 from pydaograph import GElement
 
 import flowx_core.tools.workflow_engine as workflow_engine_module
+import flowx_core.workflows.node_runtime_modifier as modifier_module
 from flowx_core.architect.node_planner import NodePlanElement
+from flowx_core.architect.graph import NodeMeta
+from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.llm_client.coder import Coder
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
-from flowx_core.worker.node_writer import PromptNodeFileCoderBase
+from flowx_core.worker.node_writer import PromptNodeFileCoderBase, RequestNodeFileCoder
+from flowx_core.workflows.node_generation import NodeGenerationRequest, NodeGenerationWorkflow
+from flowx_core.workflows.node_runtime_modifier import (
+    AmendNodeFromTestLog,
+    ExecuteNodeTest,
+    GenerateNodeTestFile,
+    NodeRuntimeModifierPipeline,
+    NodeRuntimeModifierRequest,
+)
 from flowx_core.tools.workflow_engine import (
     close_workflow_engine,
     init_workflow_engine,
@@ -66,7 +84,7 @@ def test_build_init_and_run_workflow() -> None:
         graph_config_id="test-workflow-engine",
     )
     try:
-        result = run_workflow(engine, request_id="first-request", session_state={"received": received})
+        result = run_workflow(engine, request_id="first-request", state={"received": received})
         assert engine.steps_meta[1]["dependencies"] == ["first"]
         assert isinstance(engine.pool, WorkflowPipelinePool)
         assert isinstance(result, RunResult)
@@ -100,7 +118,7 @@ def test_run_workflow_preserves_native_input_normalization() -> None:
             (None, ""),
         ]
         for value, expected in cases:
-            result = run_workflow(engine, inputs={"echo": value}, session_state={"marker": 1})
+            result = run_workflow(engine, inputs={"echo": value}, state={"marker": 1})
             assert result.outputs["echo"].derived == {"input": expected, "marker": 1}
     finally:
         close_workflow_engine(engine)
@@ -112,7 +130,7 @@ def test_workflow_does_not_reserve_a_hidden_control_step_name() -> None:
 
     engine = init_workflow_engine({"_flowx_run_request": ControlStep}, {"nodes": [{"name": "_flowx_run_request"}]})
     try:
-        result = run_workflow(engine, session_state={"marker": 1})
+        result = run_workflow(engine, state={"marker": 1})
         assert result.outputs["_flowx_run_request"].derived == {"value": 2}
     finally:
         close_workflow_engine(engine)
@@ -145,20 +163,26 @@ def test_run_workflow_rejects_failure_and_skips_dependents() -> None:
         with pytest.raises(RuntimeError, match="workflow step 'broken' failed:.*invalid output"):
             run_workflow(engine)
         assert events == ["broken"]
-        assert run_workflow(engine, session_state={"recovered": True}).status == "completed"
+        assert run_workflow(engine, state={"recovered": True}).status == "completed"
         assert events == ["broken", "downstream"]
+        assert workflow_engine_module._RUN_REQUEST.get() is None
     finally:
         close_workflow_engine(engine)
 
 
 def test_run_workflow_seeds_fresh_state_and_reuses_native_pool() -> None:
     states = []
+    native_states = []
+    native_nodes = []
     dependencies_seen = []
 
     class StatefulStep(WorkflowStepNode):
         STEP_ID = "stateful"
 
         def process_input(self, user_input, dependency_results, session_state):
+            assert session_state is self.get_workflow_param().state
+            native_states.append(session_state)
+            native_nodes.append(self)
             states.append(dict(session_state))
             assert "previous" not in session_state
             session_state["previous"] = user_input
@@ -169,6 +193,9 @@ def test_run_workflow_seeds_fresh_state_and_reuses_native_pool() -> None:
         DEPENDENCIES = ["stateful"]
 
         def process_input(self, user_input, dependency_results, session_state):
+            assert session_state is self.get_workflow_param().state
+            if session_state.get("marker"):
+                assert session_state is native_states[-1]
             dependencies_seen.append(dependency_results)
             return StepRunOutput(derived={"previous": session_state.get("previous")})
 
@@ -178,9 +205,10 @@ def test_run_workflow_seeds_fresh_state_and_reuses_native_pool() -> None:
         {"nodes": [{"name": "following", "depends": ["stateful"]}, {"name": "stateful"}]},
     )
     pool = engine.pool
+    first_seed, second_seed = {"marker": 1}, {"marker": 2}
     try:
-        first = run_workflow(engine, inputs={"stateful": "one"}, session_state={"marker": 1})
-        second = run_workflow(engine, inputs={"stateful": "two"}, session_state={"marker": 2})
+        first = run_workflow(engine, inputs={"stateful": "one"}, state=first_seed)
+        second = run_workflow(engine, inputs={"stateful": "two"}, state=second_seed)
         skipped = run_workflow(engine, skipped_steps=["stateful"])
         assert states == [{"marker": 1}, {"marker": 2}]
         assert first.outputs["following"].derived == {"previous": "one"}
@@ -189,6 +217,13 @@ def test_run_workflow_seeds_fresh_state_and_reuses_native_pool() -> None:
         assert skipped.outputs["stateful"].card == {"status": "skipped"}
         assert dependencies_seen[-1]["stateful"].derived == {}
         assert first.outputs["stateful"].derived == {"value": "one"}
+        assert first_seed == {"marker": 1}
+        assert second_seed == {"marker": 2}
+        assert native_states[0] is not first_seed
+        assert native_states[0] is not native_states[1]  # native clear() replaces the dictionary
+        assert native_states == [{"marker": 1, "previous": "one"}, {"marker": 2, "previous": "two"}]
+        assert native_nodes[0] is native_nodes[1]
+        assert native_nodes[0].get_workflow_param().state == {}
         assert engine.pool is pool
     finally:
         close_workflow_engine(engine)
@@ -305,8 +340,8 @@ def _native_explicit_classes_reference() -> None:
         assert len(created) == 4
         assert len({id(node) for node in created}) == 4
         assert all(type(node) is NODE_CLASSES[node.STEP_ID] for node in created)
-        first = run_workflow(engine, session_state={"marker": 1})
-        second = run_workflow(engine, session_state={"marker": 2})
+        first = run_workflow(engine, state={"marker": 1})
+        second = run_workflow(engine, state={"marker": 2})
         assert first.outputs["child"].derived == {"value": 5, "marker": 1}
         assert second.outputs["child"].derived == {"value": 5, "marker": 2}
         assert len(created) == 4
@@ -351,6 +386,7 @@ def test_minimal_json_preserves_file_node_support() -> None:
 
         def process_input(self, file_bytes, dependency_results, session_state):
             assert type(self) is FileNode
+            assert session_state is self.get_workflow_param().state
             return StepRunOutput(derived={"size": len(file_bytes)})
 
     engine = init_workflow_engine({"file": FileNode}, {"nodes": [{"name": "file"}]})
@@ -542,3 +578,503 @@ def test_concurrent_construction_settings_do_not_mutate_classes() -> None:
     assert (first.model, second.model) == ("model-0", "model-1")
     assert Coder.model == "gpt-4.1-mini"
     assert Coder.client is None
+
+
+def _native_concurrent_request_state_reference() -> None:
+    barrier = Barrier(2)
+    native_states = []
+    seen_steps = []
+
+    class MutateState(WorkflowStepNode):
+        STEP_ID = "mutate"
+        INPUT_REQUIRED = False
+
+        def process_input(self, user_input, dependency_results, session_state):
+            assert session_state is self.get_workflow_param().state
+            assert session_state["marker"] == user_input
+            assert "previous" not in session_state
+            native_states.append(session_state)
+            session_state["previous"] = user_input
+            barrier.wait(timeout=10)
+            assert session_state["previous"] == user_input
+            session_state["sink"].append(user_input)
+            return StepRunOutput(derived={"marker": user_input})
+
+    class ReadState(WorkflowStepNode):
+        STEP_ID = "read"
+        DEPENDENCIES = ["mutate"]
+        INPUT_REQUIRED = False
+
+        def process_input(self, user_input, dependency_results, session_state):
+            assert session_state is self.get_workflow_param().state
+            seen_steps.append(session_state["marker"])
+            return StepRunOutput(derived={
+                "marker": session_state["marker"],
+                "previous": session_state.get("previous"),
+                "skipped": dependency_results["mutate"].card.get("status") == "skipped",
+            })
+
+    engine = init_workflow_engine(
+        {"mutate": MutateState, "read": ReadState},
+        {"pool_size": 2, "nodes": [{"name": "mutate"}, {"name": "read", "depends": ["mutate"]}]},
+    )
+    seeds = [{"marker": marker, "sink": []} for marker in ("one", "two")]
+
+    def run(index):
+        result = run_workflow(engine, inputs={"mutate": seeds[index]["marker"]}, state=seeds[index])
+        assert workflow_engine_module._RUN_REQUEST.get() is None
+        return result
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first, second = list(executor.map(run, range(2)))
+        assert first.outputs["read"].derived == {"marker": "one", "previous": "one", "skipped": False}
+        assert second.outputs["read"].derived == {"marker": "two", "previous": "two", "skipped": False}
+        assert native_states[0] is not native_states[1]
+        assert sorted(state["previous"] for state in native_states) == ["one", "two"]
+        with engine.pool.lease() as (_, param):
+            assert param.state == {}
+        assert seeds == [{"marker": "one", "sink": ["one"]}, {"marker": "two", "sink": ["two"]}]
+        skipped = run_workflow(engine, state={"marker": "three"}, skipped_steps=["mutate"])
+        assert skipped.outputs["read"].derived == {"marker": "three", "previous": None, "skipped": True}
+        assert sorted(seen_steps) == ["one", "three", "two"]
+    finally:
+        close_workflow_engine(engine)
+
+
+def test_concurrent_requests_isolate_native_state_and_skips() -> None:
+    script = f"import runpy; runpy.run_path({__file__!r})['_native_concurrent_request_state_reference']()"
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=20,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_generation_request_requires_complete_keyword_only_inputs_and_is_frozen(tmp_path) -> None:
+    meta = NodeMeta(name="direct", type="GNode", desc="direct", meta_node_kind="WorkflowStepNode")
+    required = {
+        "graph_plan_path": str(tmp_path / "workflow.json"),
+        "requirement_md_path": str(tmp_path / "requirement.md"),
+        "requirement_text": "Requirement for direct",
+        "node_meta": meta,
+        "raw_node": meta.to_dict(),
+        "target_path": tmp_path / "direct.py",
+        "markdown_path": tmp_path / "node_docs" / "direct.md",
+    }
+    request = NodeGenerationRequest(**required)
+    request_fields = {setting.name: setting for setting in fields(request)}
+    optional = {
+        "language", "temperature", "generate_markdown", "skip_node_planner", "markdown_amendment",
+        "node_amendment", "node_format", "dependency_context", "state",
+    }
+    assert request_fields.keys() == required.keys() | optional
+    assert all(setting.init and setting.kw_only for setting in request_fields.values())
+    assert {
+        name for name, setting in request_fields.items()
+        if setting.default is MISSING and setting.default_factory is MISSING
+    } == required.keys()
+    for missing in required:
+        with pytest.raises(TypeError, match=missing):
+            NodeGenerationRequest(**{name: value for name, value in required.items() if name != missing})
+    assert request.node_meta is meta
+    assert request.raw_node is required["raw_node"]
+    assert request.language == "python"
+    assert request.temperature == 0.35
+    assert request.generate_markdown is True
+    assert request.skip_node_planner is False
+    assert request.markdown_amendment == request.node_amendment == request.dependency_context == ""
+    assert request.node_format == request.state == {}
+    fresh = NodeGenerationRequest(**required)
+    assert fresh.node_format is not request.node_format
+    assert fresh.state is not request.state
+    removed_fields = {
+        "node_name", "workflow_name", "node_locations", "skipped_node_names",
+        "node_names", "selected_node_names", "node_docs_dir", "generate_markdowns",
+        "markdown_amendments", "node_amendments", "workflow_registry", "raw_nodes",
+        "artifacts", "node_formats", "context",
+    }
+    assert removed_fields.isdisjoint(request_fields)
+    assert all(not hasattr(request, name) for name in removed_fields)
+    with pytest.raises(FrozenInstanceError):
+        request.temperature = 0.5
+
+
+@dataclass
+class _RecordingRequestCoder(RequestNodeFileCoder):
+    calls: list = field(default_factory=list)
+    instances: list = field(default_factory=list)
+
+    __hash__ = object.__hash__
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.instances.append(self)
+
+    def process_input(self, user_input, dependency_results, session_state):
+        assert session_state is self.get_workflow_param().state
+        assert session_state["node_writer"]["node_meta"] is session_state["expected_node_meta"]
+        raw_node = session_state["expected_raw_node"]
+        planned_node = session_state["node_plan_request"]["node"]
+        assert planned_node == raw_node
+        assert planned_node is not raw_node
+        assert planned_node["ext_data"] is raw_node["ext_data"]
+        return super().process_input(user_input, dependency_results, session_state)
+
+    def code_to_file(self, user_prompt, file_path, **kwargs):
+        session_state = self.get_workflow_param().state
+        request = session_state["node_writer"]
+        assert request["node_name"] == request["node_meta"].name
+        assert session_state["marker"] == request["node_name"]
+        self.calls.append({
+            "node_name": request["node_name"], "prompt": user_prompt, "path": file_path,
+            "state_id": id(session_state), "temperature": kwargs["temperature"],
+        })
+        path = Path(file_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# offline generated node\n", encoding="utf-8")
+        return path
+
+
+class _PassingNodeAuditor(NodeAuditor):
+    def process_input(self, user_input, dependency_results, session_state):
+        assert session_state is self.get_workflow_param().state
+        assert session_state["auditor"]["node_meta"] is session_state["node_writer"]["node_meta"]
+        assert session_state["auditor"]["node_meta"] is session_state["expected_node_meta"]
+        assert Path(dependency_results["node_generate"].derived["generated_path"]).is_file()
+        session_state["audit_calls"].append({
+            "node_name": session_state["auditor"]["node_meta"].name, "state_id": id(session_state),
+        })
+        return StepRunOutput(derived={"ok": True, "violations": []})
+
+
+def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_path) -> None:
+    calls, instances, audit_calls = [], [], []
+    coder = _RecordingRequestCoder(client=object(), calls=calls, instances=instances)
+    workflow = NodeGenerationWorkflow(
+        node_planner=NodePlanElement(client=object()), node_coder=coder,
+        node_auditor=_PassingNodeAuditor(),
+    )
+    engine = workflow._engine
+    assert engine is not None
+    pool = engine.pool
+    assert workflow._node_classes["node_generate"] is _RecordingRequestCoder
+    assert len(instances) == 2  # injected settings source plus exactly one native slot
+    pooled_coder = instances[-1]
+    assert pooled_coder.client is coder.client
+    assert pooled_coder.calls is calls
+    before = dict(pooled_coder.__dict__)
+    requests = []
+    try:
+        for index, kind in enumerate(("WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode")):
+            node_name = f"node_{index}"
+            root = tmp_path / node_name
+            root.mkdir()
+            requirement = root / "requirement.md"
+            requirement.write_text(f"Requirement for {node_name}", encoding="utf-8")
+            skill_dir = root / "skills" / "example"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "skill.md").write_text(
+                "# Example\n\n## Using\ninvoke_request_skill()\n\n## Examples\nrequest_skill_example()\n",
+                encoding="utf-8",
+            )
+            ext_data = (
+                {"type": "user_file_input", "remote_desc": "persist to request bucket"}
+                if kind == "WorkflowFileNode" else {"type": "skill", "skill_name": "example"}
+                if kind == "WorkflowSkillNode" else {"type": "none"}
+            )
+            meta = NodeMeta(name=node_name, type="GNode", desc=node_name, meta_node_kind=kind, ext_data=ext_data)
+            raw_node = meta.to_dict()
+            node_format = {"inputs": {f"input_{index}": "str"}, "outputs": {f"output_{index}": "str"}}
+            dependency_context = f"Request dependency context for {node_name}"
+            state = {
+                "marker": node_name, "expected_node_meta": meta, "expected_raw_node": raw_node,
+                "audit_calls": audit_calls,
+            }
+            state_snapshot = dict(state)
+            request = NodeGenerationRequest(
+                graph_plan_path=str(root / "workflow.json"), requirement_md_path=str(requirement),
+                requirement_text=requirement.read_text(), node_meta=meta, raw_node=raw_node,
+                target_path=root / f"{node_name}.py", markdown_path=root / "node_docs" / f"{node_name}.md",
+                generate_markdown=False, node_format=node_format, dependency_context=dependency_context,
+                state=state,
+            )
+            assert request.node_meta is meta
+            assert request.raw_node is raw_node
+            assert request.node_format is node_format
+            assert request.state is state
+            assert all(request.state is not previous.state for previous in requests)
+            requests.append(request)
+            assert not hasattr(request, "context")
+            with pytest.raises(FrozenInstanceError):
+                request.node_meta = meta
+            assert workflow.run(request) == str(request.target_path)
+            assert calls[-1]["node_name"] == meta.name
+            assert calls[-1]["path"] == str(request.target_path)
+            assert calls[-1]["temperature"] == request.temperature == 0.35
+            assert calls[-1]["state_id"] != id(state)
+            assert audit_calls[-1] == {"node_name": node_name, "state_id": calls[-1]["state_id"]}
+            assert len(audit_calls) == len(calls)
+            assert state == state_snapshot
+            assert raw_node == meta.to_dict()
+            assert request.requirement_text in calls[-1]["prompt"]
+            assert json.dumps(node_format, ensure_ascii=False, indent=2) in calls[-1]["prompt"]
+            assert dependency_context in calls[-1]["prompt"]
+            assert not request.markdown_path.exists()
+            assert f"Generate a {kind} subclass" in calls[-1]["prompt"]
+            assert workflow._engine is engine
+            assert workflow.init_node_engine() is engine
+            assert engine.pool is pool
+            with pool.lease() as (_, param):
+                assert param.state == {}
+            assert pooled_coder.get_workflow_param().state == {}
+            assert len(instances) == 2
+            assert not hasattr(workflow, "_last_result")
+            if kind == "WorkflowFileNode":
+                assert "remote_desc: persist to request bucket" in calls[-1]["prompt"]
+                original = request
+                request = replace(request, node_amendment="fix request persistence")
+                assert request is not original
+                assert original.node_amendment == ""
+                assert request.node_amendment == "fix request persistence"
+                assert request.node_meta is original.node_meta is meta
+                assert request.raw_node is original.raw_node is raw_node
+                assert request.node_format is original.node_format is node_format
+                assert request.state is original.state is state
+                requests.append(request)
+                assert workflow.run(request) == str(request.target_path)
+                assert request.node_amendment in calls[-1]["prompt"]
+                assert audit_calls[-1] == {"node_name": node_name, "state_id": calls[-1]["state_id"]}
+                assert len(audit_calls) == len(calls)
+                assert state == state_snapshot
+                assert workflow._engine is engine
+                assert engine.pool is pool
+                assert "Preserve the WorkflowFileNode" in calls[-1]["prompt"]
+                assert "remote_desc: persist to request bucket" in calls[-1]["prompt"]
+            elif kind == "WorkflowSkillNode":
+                assert f"SKILL_DIR class constant must be set to: {skill_dir}" in calls[-1]["prompt"]
+                assert "SKILL_MD_PATH = str(Path(SKILL_DIR) / 'skill.md')" in calls[-1]["prompt"]
+                assert "invoke_request_skill()" in calls[-1]["prompt"]
+                assert "request_skill_example()" in calls[-1]["prompt"]
+                assert "persist to request bucket" not in calls[-1]["prompt"]
+        assert {key: value for key, value in pooled_coder.__dict__.items()} == before
+        assert len(calls) == len(audit_calls) == 4
+        assert not any(
+            value is request
+            for owner in (workflow, workflow.node_planner, workflow.node_coder, workflow.node_auditor,
+                          pooled_coder, engine, pool)
+            for value in vars(owner).values()
+            for request in requests
+        )
+        with pool.lease() as (_, param):
+            assert param.state == {}
+        assert workflow_engine_module._RUN_REQUEST.get() is None
+    finally:
+        workflow.close()
+        workflow.close()
+    assert workflow._engine is None
+    assert engine.pool.closed
+    with pytest.raises(RuntimeError, match="closed"):
+        workflow.run(request)
+    with pytest.raises(RuntimeError, match="closed"):
+        workflow.init_node_engine()
+
+
+@pytest.mark.parametrize("kind", ["WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode"])
+def test_request_coder_direct_contract_helpers_accept_node_metadata(kind) -> None:
+    coder = RequestNodeFileCoder(client=object())
+    meta = NodeMeta(name="direct", type="GNode", desc="direct", meta_node_kind=kind)
+    assert f"Generate a {kind} subclass" in coder.get_node_contract_text(meta)
+    assert f"Preserve the {kind}" in coder.get_feedback_contract_text(meta)
+    assert isinstance(hash(coder), int)
+    assert coder.STEP_ID == "node_generate"
+
+
+@dataclass
+class _RecordingTestGenerator(GenerateNodeTestFile):
+    calls: list = field(default_factory=list)
+    instances: list = field(default_factory=list)
+
+    __hash__ = object.__hash__
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.instances.append(self)
+
+    def code_to_file(self, user_prompt, file_path, **kwargs):
+        session_state = self.get_workflow_param().state
+        request = session_state["node_runtime_modifier"]
+        assert request.test_file_path == request.log_file_path == request.test_log == request.amended_node_file_path == ""
+        assert request.test_result is None
+        assert f"working_directory: {request.working_directory}" in user_prompt
+        assert self.root_dir_path not in user_prompt
+        self.calls.append({
+            "prompt": user_prompt, "path": file_path, "temperature": kwargs["temperature"],
+            "request": request, "marker": session_state["marker"],
+        })
+        path = Path(file_path)
+        path.write_text("def test_offline():\n    assert True\n", encoding="utf-8")
+        return path
+
+
+@dataclass
+class _RecordingAmender(AmendNodeFromTestLog):
+    calls: list = field(default_factory=list)
+
+    __hash__ = object.__hash__
+
+    def code_to_file(self, user_prompt, file_path, **kwargs):
+        request = self.get_workflow_param().state["node_runtime_modifier"]
+        self.calls.append({
+            "prompt": user_prompt, "path": file_path, "temperature": kwargs["temperature"], "request": request,
+        })
+        return Path(file_path)
+
+
+def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_data(tmp_path, monkeypatch) -> None:
+    generation_calls, amendment_calls, execution_calls, instances = [], [], [], []
+    executors = []
+    original_apply_settings = modifier_module.apply_node_settings
+    native_results = []
+    original_run_workflow = modifier_module.run_workflow
+
+    def record_native_result(*args, **kwargs):
+        result = original_run_workflow(*args, **kwargs)
+        native_results.append(result)
+        return result
+
+    def record_executor(node):
+        original_apply_settings(node)
+        if isinstance(node, ExecuteNodeTest):
+            executors.append(node)
+
+    monkeypatch.setattr(modifier_module, "apply_node_settings", record_executor)
+    monkeypatch.setattr(modifier_module, "run_workflow", record_native_result)
+
+    def run_subprocess(command, **kwargs):
+        execution_calls.append({"command": list(command), **kwargs})
+        return subprocess.CompletedProcess(command, 1 if "alpha" in command[-2] else 0, "offline output", "")
+
+    pipeline = NodeRuntimeModifierPipeline(
+        node_test_writer=_RecordingTestGenerator(
+            client=object(), root_dir_path="/stale/construction/root", calls=generation_calls, instances=instances,
+        ),
+        node_writer=_RecordingAmender(client=object(), calls=amendment_calls), run_subprocess=run_subprocess,
+    )
+    engine = pipeline._engine
+    assert engine is not None
+    assert len(instances) == 2
+    results = []
+    try:
+        for index, node_name in enumerate(("alpha", "beta")):
+            workdir = tmp_path / node_name
+            workdir.mkdir()
+            (workdir / f"{node_name}.py").write_text(
+                "from ag_ui_workflow import WorkflowStepNode, StepRunOutput\n"
+                f"class {node_name.title()}(WorkflowStepNode):\n"
+                f"    STEP_ID = {node_name!r}\n"
+                "    INPUT_REQUIRED = False\n"
+                "    def process_input(self, user_input, dependency_results, session_state):\n"
+                "        return StepRunOutput(derived={'ok': True})\n",
+                encoding="utf-8",
+            )
+            graph = {"nodes": [NodeMeta(name=node_name, type="GNode", desc=node_name,
+                                       meta_node_kind="WorkflowStepNode").to_dict()]}
+            state = {"marker": node_name}
+            request = NodeRuntimeModifierRequest(
+                node_file_name=f"{node_name}.py", workflow_graph=graph, working_directory=f"{workdir}/.",
+                node_name=node_name, timeout=40 + index,
+                python_command=f"request-python-{index}", test_temperature=0.1 + index / 10,
+                amendment_temperature=0.4, test_file_name=f"custom_tests/test_{node_name}.py",
+                state=state,
+            )
+            removed_fields = {"workflow_name", "skipped_stages", "completed_stages"}
+            assert removed_fields.isdisjoint(setting.name for setting in fields(request))
+            assert all(not hasattr(request, name) for name in removed_fields)
+            stale_outputs = {
+                "test_file_path": "stale-test.py", "log_file_path": "stale.log", "test_log": "stale log",
+                "test_result": {"node_name": "stale", "ok": True}, "amended_node_file_path": "stale.py",
+            }
+            assert {setting.name for setting in fields(request) if not setting.init} == stale_outputs.keys()
+            for name, value in stale_outputs.items():
+                setattr(request, name, value)
+            inputs = {setting.name: getattr(request, setting.name) for setting in fields(request) if setting.init}
+            result = pipeline.run(request)
+            results.append(result)
+            assert type(result) is NodeRuntimeModifierRequest
+            assert result is not request
+            assert not hasattr(result, "context")
+            assert generation_calls[-1]["request"] is result
+            assert generation_calls[-1]["marker"] == node_name
+            assert result.state is request.state is state
+            assert state == {"marker": node_name}
+            assert result.working_directory == str(workdir.resolve())
+            assert request.workflow_graph is graph
+            assert {setting.name: getattr(request, setting.name) for setting in fields(request) if setting.init} == inputs
+            assert {name: getattr(request, name) for name in stale_outputs} == stale_outputs
+            assert result.test_result is not request.test_result
+            assert result.node_name == request.node_name == node_name
+            assert all(not hasattr(result, name) for name in removed_fields)
+            assert pipeline._engine is engine
+            native_result = native_results[-1]
+            assert isinstance(native_result, RunResult)
+            assert native_result.status == "completed"
+            assert set(native_result.outputs) == {"generate_node_test", "run_node_test", "amend_node"}
+            assert all(isinstance(output, StepRunOutput) for output in native_result.outputs.values())
+            assert native_result.outputs["generate_node_test"].derived == {"test_file_path": result.test_file_path}
+            assert native_result.outputs["run_node_test"].derived == {
+                **result.test_result, "log_file_path": result.log_file_path,
+            }
+            assert native_result.outputs["run_node_test"].derived is not result.test_result
+            assert native_result.outputs["amend_node"].derived == {"amended_node_file_path": result.amended_node_file_path}
+            assert json.loads(Path(result.workflow_graph).read_text()) == graph
+            assert execution_calls[-1]["cwd"] == str(workdir)
+            assert execution_calls[-1]["timeout"] == 40 + index
+            assert execution_calls[-1]["command"][0] == f"request-python-{index}"
+            assert result.test_result["node_name"] == node_name
+            assert result.amended_node_file_path == str(workdir / f"{node_name}.py")
+            assert result.test_result["ok"] is (index == 1)
+            assert generation_calls[-1]["temperature"] == request.test_temperature
+            assert f"Path({str(workdir / f'{node_name}.py')!r})" in generation_calls[-1]["prompt"]
+        assert len(amendment_calls) == 1
+        assert amendment_calls[0]["temperature"] == 0.4
+        assert amendment_calls[0]["request"] is results[0]
+        assert results[0].test_result["node_name"] == "alpha"
+        assert results[0].test_result["command"][0] == "request-python-0"
+        assert results[0].test_result is not results[1].test_result
+        assert results[0].workflow_graph != results[1].workflow_graph
+        skipped = pipeline.run(NodeRuntimeModifierRequest(
+            node_file_name="gamma.py", workflow_graph={"nodes": []}, working_directory=results[1].working_directory,
+            skip_generate_node_test=True, skip_run_node_test=True, skip_amend_node=True,
+        ))
+        assert all(not hasattr(skipped, name) for name in removed_fields)
+        assert skipped.test_result is None
+        assert skipped.test_log == skipped.log_file_path == ""
+        assert skipped.test_file_path == str(Path(skipped.working_directory) / "tests" / "test_gamma.py")
+        assert skipped.amended_node_file_path == str(Path(skipped.working_directory) / "gamma.py")
+        assert native_results[-1].outputs["generate_node_test"].derived == {"test_file_path": ""}
+        assert native_results[-1].outputs["run_node_test"].derived == {"log_file_path": ""}
+        assert native_results[-1].outputs["amend_node"].derived == {
+            "amended_node_file_path": skipped.amended_node_file_path,
+        }
+        assert skipped.workflow_graph != results[1].workflow_graph
+        assert len(generation_calls) == len(execution_calls) == 2
+        assert len(instances) == 2
+        assert instances[-1].root_dir_path == "/stale/construction/root"
+        assert not hasattr(pipeline, "_last_result")
+        assert not any(value is request for value in vars(pipeline).values() for request in results)
+        assert len(executors) == 1
+        executor = executors[0]
+        with engine.pool.lease() as (_, param):
+            assert param.state == {}
+            assert executor.run_subprocess is run_subprocess
+            assert executor.node_name == executor.cwd == ""
+            assert executor.command == []
+            assert executor.result is None
+    finally:
+        pipeline.close()
+        pipeline.close()
+    assert pipeline._engine is None
+    assert engine.pool.closed
+    with pytest.raises(RuntimeError, match="closed"):
+        pipeline.run(request)

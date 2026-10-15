@@ -1,4 +1,5 @@
 """Modified 2026-10-13: metadata must reflect generated pooled node contracts."""
+# Modified 2026-10-14: pass graph, mapping, and path callbacks explicitly.
 
 import json
 from pathlib import Path
@@ -22,6 +23,14 @@ def _builder(tmp_path: Path, nodes: list[dict]) -> SimpleNamespace:
     )
 
 
+def _metadata(builder, **kwargs):
+    return build_steps_meta(
+        builder._load_planned_graph(), node_location_map=builder.node_location_map,
+        resolve_root_path=builder._resolve_root_path,
+        expected_backend_node_path=builder._expected_backend_node_path, **kwargs,
+    )
+
+
 def test_metadata_resolves_automatic_input_and_disabled_nodes_without_files(tmp_path):
     builder = _builder(tmp_path, [
         {"name": "Collect", "meta_node_kind": "WorkflowStepNode", "ext_data": {"type": "user_input"}},
@@ -30,12 +39,12 @@ def test_metadata_resolves_automatic_input_and_disabled_nodes_without_files(tmp_
         {"name": "Skill", "meta_node_kind": "WorkflowSkillNode", "ext_data": {"type": "skill"}},
         {"name": "Disabled", "meta_node_kind": "WorkflowStepNode", "enable": False},
     ])
-    metadata = {step["id"]: step for step in build_steps_meta(builder)}
+    metadata = {step["id"]: step for step in _metadata(builder)}
     assert "Disabled" not in metadata
     assert {name: step["inputRequired"] for name, step in metadata.items()} == {
         "Collect": True, "Automatic": False, "Upload": True, "Skill": False,
     }
-    hidden = {step["id"]: step for step in build_steps_meta(builder, include_hidden_nodes=True)}
+    hidden = {step["id"]: step for step in _metadata(builder, include_hidden_nodes=True)}
     assert hidden["Disabled"]["enabled"] is False
 
 
@@ -52,7 +61,7 @@ class Skill(WorkflowSkillNode):
     DEPENDENCIES: list[str] = ["actual-parent"]
     INPUT_REQUIRED = True
 ''', encoding="utf-8")
-    metadata = build_steps_meta(builder)[0]
+    metadata = _metadata(builder)[0]
     assert metadata["id"] == "actual-skill"
     assert metadata["title"] == "Actual title"
     assert metadata["prompt"] == ""
@@ -69,4 +78,4 @@ class Skill(WorkflowSkillNode):
 def test_metadata_keeps_plan_defaults_for_unresolved_constants(tmp_path, source):
     builder = _builder(tmp_path, [{"name": "Skill", "meta_node_kind": "WorkflowSkillNode"}])
     (tmp_path / "Skill.py").write_text(source, encoding="utf-8")
-    assert build_steps_meta(builder)[0]["inputRequired"] is False
+    assert _metadata(builder)[0]["inputRequired"] is False

@@ -3,6 +3,8 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified 2026-10-13: request lifecycle, confirmed resets and active-node selection.
+# Modified 2026-10-14: dispose discarded builders and roll back failed new attachments.
+# Modified 2026-10-15: document deferred batch orchestration and partial-update risks.
 """FastMCP server that wraps ``core`` and ``ag_ui_workflow`` workflows."""
 
 from __future__ import annotations
@@ -396,14 +398,6 @@ def _attach_existing_workflow(
             f"workflow '{workflow_name}' is not registered and no directory exists at {root_dir}"
         )
 
-    handle = registry.get_or_create(
-        workspace=workspace_dir,
-        workflow_name=workflow_name,
-        api_key=api_key,
-        model=model,
-        provider=provider,
-        skills_root=skills_root,
-    )
     graph_path = root_dir / "graph_plan.json"
     workflow_json_path = root_dir / "workflow.json"
     requirement_path = root_dir / "requirement_analysis.md"
@@ -415,19 +409,36 @@ def _attach_existing_workflow(
             f"workflow '{workflow_name}' exists at {root_dir} but graph_plan.json/workflow.json is missing"
         )
 
-    handle.graph_plan_path = str(chosen_graph)
-    handle.builder.graph_plan_path = str(chosen_graph)
-    if requirement_path.is_file():
-        handle.requirement_md_path = str(requirement_path)
-        handle.builder.requirement_md_path = str(requirement_path)
-    if workflow_json_path.is_file():
-        handle.workflow_json_path = str(workflow_json_path)
-        handle.builder.workflow_json_path = str(workflow_json_path)
-    if main_path.is_file():
-        handle.main_entrypoint_path = str(main_path)
+    handle, created = registry.get_or_create_with_status(
+        workspace=workspace_dir,
+        workflow_name=workflow_name,
+        api_key=api_key,
+        model=model,
+        provider=provider,
+        skills_root=skills_root,
+    )
+    try:
+        handle.graph_plan_path = str(chosen_graph)
+        handle.builder.graph_plan_path = str(chosen_graph)
+        if requirement_path.is_file():
+            handle.requirement_md_path = str(requirement_path)
+            handle.builder.requirement_md_path = str(requirement_path)
+        if workflow_json_path.is_file():
+            handle.workflow_json_path = str(workflow_json_path)
+            handle.builder.workflow_json_path = str(workflow_json_path)
+        if main_path.is_file():
+            handle.main_entrypoint_path = str(main_path)
 
-    with _capture_builder_output("attach_existing_workflow.load_graph"):
-        handle.builder._load_planned_graph(handle.graph_plan_path)
+        with _capture_builder_output("attach_existing_workflow.load_graph"):
+            handle.builder._load_planned_graph(handle.graph_plan_path)
+    except BaseException:
+        if created:
+            try:
+                if not registry.discard(handle):
+                    handle.close()
+            except Exception:
+                logger.exception("failed attachment cleanup for workflow '%s'", workflow_name)
+        raise
 
     return handle
 
@@ -486,19 +497,21 @@ def _restart_builder_handle(
     previous_session_id: Optional[str] = None
 
     if previous_handle is not None:
-        backend_port = previous_handle.backend_port
-        if previous_handle.backend_port:
-            backend_was_running = bool(
-                previous_handle.is_running
-                and health_check(previous_handle.backend_port, timeout=1.0)
-            )
-        previous_session_id = previous_handle.session_id
-        api_key = api_key or previous_handle.api_key or None
-        model = model or previous_handle.model or None
-        provider = provider or previous_handle.provider or None
-        if skills_root is None:
-            skills_root = previous_handle.skills_root
-        previous_handle.stop_backend()
+        try:
+            backend_port = previous_handle.backend_port
+            if previous_handle.backend_port:
+                backend_was_running = bool(
+                    previous_handle.is_running
+                    and health_check(previous_handle.backend_port, timeout=1.0)
+                )
+            previous_session_id = previous_handle.session_id
+            api_key = api_key or previous_handle.api_key or None
+            model = model or previous_handle.model or None
+            provider = provider or previous_handle.provider or None
+            if skills_root is None:
+                skills_root = previous_handle.skills_root
+        finally:
+            previous_handle.close()
 
     handle = _attach_existing_workflow(
         workflow,
@@ -702,6 +715,11 @@ def create_server() -> Any:
     ) -> str:
         """Create a workflow using FlowX core with a workspace and workflow name.
 
+        Warning:
+            Currently unavailable: batch node orchestration is deferred, so this
+            tool returns ``ok: false`` with the batch-generation error.
+            Requirement/graph files may already have changed; there is no rollback.
+
         Args:
             workflow_name: Logical name and folder name for the workflow.
             user_prompt: Natural-language requirement used to generate the workflow.
@@ -791,6 +809,11 @@ def create_server() -> Any:
     ) -> str:
         """Update one workflow node and regenerate workflow.json, the node backend, and main.py.
 
+        Warning:
+            Currently unavailable: batch node orchestration is deferred, so this
+            tool returns ``ok: false`` with the batch-generation error.
+            Graph files may already have changed; there is no rollback.
+
         Args:
             workflow_name: Existing workflow name.
             node_name: Node id/name to amend.
@@ -825,8 +848,7 @@ def create_server() -> Any:
                     markdown_amendments={node: amendment},
                     workflow_name=handle.workflow_name,
                 )
-            generation_context = handle.builder._node_build_service.contexts[handle.workflow_name]
-            node_doc_path = generation_context.artifacts[node]["node_markdown_path"]
+            node_doc_path = handle.builder.get_node_doc_path(node, workflow_name=handle.workflow_name)
             with _capture_builder_output("update_workflow_node.sync_workflow_json"):
                 workflow_json_path = handle.builder._sync_workflow_graph_json(
                     context_base_dir=handle.root_dir

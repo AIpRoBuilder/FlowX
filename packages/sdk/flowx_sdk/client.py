@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-10-15: clarify builder-owned artifacts and reusable workflows.
+# Modified 2026-10-15: document deferred batch orchestration and partial-update risks.
 """Python SDK for compiling and evolving FlowX workflows."""
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ class FlowXClient:
     """Create and update workflows without an MCP transport.
 
     The client owns one :class:`AgentBuilder` per workflow, preserving the
-    builder's graph and node-generation caches for subsequent updates.
+    builder's graph/artifact bookkeeping and reusable workflows for updates.
     """
 
     def __init__(
@@ -80,7 +82,13 @@ class FlowXClient:
         skills_root: str | None = None,
         temperature: float = 0.3,
     ) -> WorkflowArtifacts:
-        """Compile a requirement into an executable FlowX workflow."""
+        """Compile a requirement into an executable FlowX workflow.
+
+        Warning:
+            Currently unavailable: batch node orchestration is deferred, so
+            ``AgentBuilder.generate_nodes()`` raises ``NotImplementedError``.
+            Requirement/graph files may already have changed; there is no rollback.
+        """
         name = _normalize_name(workflow_name, "workflow_name")
         prompt = str(requirement).strip()
         if not prompt:
@@ -130,7 +138,13 @@ class FlowXClient:
         *,
         temperature: float = 0.2,
     ) -> Path:
-        """Apply an amendment to one existing workflow node."""
+        """Apply an amendment to one existing workflow node.
+
+        Warning:
+            Currently unavailable: batch node orchestration is deferred, so
+            ``AgentBuilder.generate_nodes()`` raises ``NotImplementedError``.
+            Graph files may already have changed; there is no rollback.
+        """
         name = _normalize_name(workflow_name, "workflow_name")
         builder = self.builder(name)
         node = _normalize_name(node_name, "node_name")

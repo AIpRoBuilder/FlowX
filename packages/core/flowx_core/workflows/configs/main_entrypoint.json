@@ -1,0 +1,7 @@
+{
+  "pool_size": 1,
+  "nodes": [
+    {"name": "main_generate"},
+    {"name": "main_audit", "depends": ["main_generate"]}
+  ]
+}

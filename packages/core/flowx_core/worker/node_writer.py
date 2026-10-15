@@ -1,6 +1,7 @@
 # Modified: explicit input-gate contracts for pooled generation and repair.
 # Modified: abstract bytes file hooks, explicit persistence, and configured concrete-node prompts.
 # Modified: fixed automatic-stage metadata and scoped settings before prompt composition.
+# Modified: concrete request-driven generator selects all node contracts from WorkflowParam.state.
 import json
 import ast
 from dataclasses import dataclass
@@ -94,7 +95,7 @@ def _render_dependency_results_context(dependency_results: dict[str, StepRunOutp
 def _render_session_state_context(session_state: dict[str, Any]) -> str:
     values = {
         key: value for key, value in session_state.items()
-        if key != "node_writer" and not key.endswith("::action")
+        if key not in {"node_writer", "build_session"} and not key.endswith("::action")
     }
     return json.dumps(values, ensure_ascii=False, default=str) if values else ""
 
@@ -903,3 +904,141 @@ class WorkflowSkillNodeCoder(PromptNodeFileCoderBase):
             "Preserve the WorkflowSkillNode contract "
             f"(STEP_ID/TITLE/PROMPT/DEPENDENCIES/SKILL_DIR/SKILL_MD_PATH and {subclass_hook_text} returning StepRunOutput).\n"
         )
+
+
+@dataclass
+class RequestNodeFileCoder(PromptNodeFileCoderBase):
+    """Generate any node kind using request metadata, never per-request instance fields."""
+
+    skills_root_path: str = ""
+    default_skills_dirname: str = "skills"
+
+    __hash__ = object.__hash__
+
+    def _writer_request(self) -> Mapping[str, Any]:
+        try:
+            state = self.get_workflow_param().state
+        except RuntimeError:
+            # Direct prompt-building calls can supply NodeMeta explicitly.
+            return {}
+        request = state.get("node_writer", {})
+        return request if isinstance(request, Mapping) else {}
+
+    def _request_node_meta(self) -> NodeMeta | None:
+        request = self._writer_request()
+        node_meta = request.get("node_meta")
+        if isinstance(node_meta, Mapping):
+            node_meta = NodeMeta.from_dict(node_meta)
+        if isinstance(node_meta, NodeMeta):
+            return node_meta
+        graph_path = request.get("graph_plan_path")
+        node_name = request.get("node_name") or Path(str(request.get("code_path", ""))).stem
+        return Graph(graph_path).get_node_meta(node_name) if graph_path and node_name else None
+
+    def _contract_coder(self, node_meta: NodeMeta | None) -> type[PromptNodeFileCoderBase]:
+        reference = resolve_workflow_node_reference(
+            meta_node_kind=node_meta.meta_node_kind or None if node_meta is not None else None,
+            ext_data=node_meta.ext_data if node_meta is not None else None,
+        )
+        if reference.meta_node_kind == "WorkflowFileNode":
+            return WorkflowFileNodeCoder
+        if reference.meta_node_kind == "WorkflowSkillNode":
+            return WorkflowSkillNodeCoder
+        return WorkflowStepNodeCoder
+
+    def get_node_contract_text(self, node_meta: NodeMeta | None = None) -> str:
+        coder = self._contract_coder(node_meta if node_meta is not None else self._request_node_meta())
+        return coder.get_node_contract_text(self)
+
+    def get_feedback_contract_text(self, node_meta: NodeMeta | None = None) -> str:
+        coder = self._contract_coder(node_meta if node_meta is not None else self._request_node_meta())
+        if coder is WorkflowFileNodeCoder:
+            return (
+                "Preserve the WorkflowFileNode bytes-processing and explicit input-gate contract below. "
+                "Preserve or implement requirement-defined persistence, including ext_data.remote_desc, explicitly; "
+                "never replace the hook with assumed inherited storage behavior.\n"
+                + coder.get_node_contract_text(self)
+            )
+        return coder.get_feedback_contract_text(self)
+
+    def _node_reference_context(self, node_meta: NodeMeta, root_dir_path: str) -> str:
+        ext_data = node_meta.ext_data if isinstance(node_meta.ext_data, Mapping) else {}
+        coder = self._contract_coder(node_meta)
+        if coder is WorkflowFileNodeCoder:
+            remote_desc = str(ext_data.get("remote_desc", "")).strip()
+            if not remote_desc:
+                return ""
+            return (
+                "\n\nWorkflowFileNode remote persistence rule (authoritative):\n"
+                f"- remote_desc: {remote_desc}\n"
+                "- Implement the required remote persistence explicitly in process_input; "
+                "no inherited storage method exists to override.\n"
+                "- Return the actual persisted location/identifier in derived only after storage succeeds; "
+                "never fabricate persistence results.\n"
+            )
+        if coder is not WorkflowSkillNodeCoder:
+            return ""
+
+        skills_root = _resolve_named_root(self.skills_root_path, root_dir_path, self.default_skills_dirname)
+        skill_name = str(ext_data.get("skill_name", "")).strip()
+        sections = _parse_markdown_sections(_read_named_markdown(skills_root, skill_name, "skill.md"))
+        skill_dir = str(skills_root / skill_name) if skill_name else "path/to/skill/dir"
+        lines = [
+            "", "Skill node context (authoritative):",
+            f"- skills_root: {skills_root}",
+            f"- selected_skill_name: {skill_name or 'none'}",
+            f"- SKILL_DIR class constant must be set to: {skill_dir}",
+            "- Set SKILL_MD_PATH = str(Path(SKILL_DIR) / 'skill.md') so the base class parses the skill doc on init.",
+            "- Invoke the skill exactly as described in ## Using; use self.skill_using and self.skill_examples as references.",
+            "- Keep output JSON-serializable and expose useful derived fields for downstream nodes.",
+        ]
+        for heading in ("Using", "Examples"):
+            if sections.get(heading):
+                lines.extend(["", f"skill.md ## {heading} section (authoritative):", sections[heading]])
+        return "\n" + "\n".join(lines)
+
+    def _build_requirement_prompt(
+        self,
+        node_name: str,
+        node_meta: NodeMeta,
+        requirement_text: str,
+        node_markdown_reference: str,
+        output_path: str,
+        graph_plan_path: str,
+        language_clean: str,
+        node_contract_text: str,
+        dependency_context: str | None = None,
+        ancestor_session_state_context: str | None = None,
+        root_dir_path: str = "",
+        additional_generation_context: str = "",
+    ) -> str:
+        # Only the base prompt builder is shared; specialized builders use
+        # super() and cannot be called on this unrelated concrete subclass.
+        del node_contract_text
+        prompt = super()._build_requirement_prompt(
+            node_name=node_name, node_meta=node_meta, requirement_text=requirement_text,
+            node_markdown_reference=node_markdown_reference, output_path=output_path,
+            graph_plan_path=graph_plan_path, language_clean=language_clean,
+            node_contract_text=self.get_node_contract_text(node_meta),
+            dependency_context=dependency_context,
+            ancestor_session_state_context=ancestor_session_state_context,
+            root_dir_path=root_dir_path, additional_generation_context=additional_generation_context,
+        )
+        return prompt + self._node_reference_context(node_meta, root_dir_path)
+
+    def _build_amendment_prompt(
+        self,
+        original_code: str,
+        amendment: str,
+        language_clean: str,
+        contract_text: str,
+        additional_generation_context: str = "",
+    ) -> str:
+        prompt = super()._build_amendment_prompt(
+            original_code, amendment, language_clean, contract_text, additional_generation_context,
+        )
+        node_meta = self._request_node_meta()
+        if node_meta is not None:
+            request = self._writer_request()
+            prompt += self._node_reference_context(node_meta, str(request.get("root_dir_path", "")))
+        return prompt

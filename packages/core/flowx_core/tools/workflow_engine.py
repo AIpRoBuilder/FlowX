@@ -1,6 +1,7 @@
 """Build and run reusable AG-UI workflows from JSON-named concrete nodes.
 
 Modified: pass explicit concrete class maps directly; use class-declared identities.
+Modified: seed the attached WorkflowParam.state through a request-local lease bridge.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from ag_ui_workflow import (
 from pydaograph import GElement, GPipeline
 
 
-_RUN_REQUEST: ContextVar[tuple[dict[str, Any], frozenset[str]] | None] = ContextVar(
+_RUN_REQUEST: ContextVar[tuple[Mapping[str, Any], frozenset[str]] | None] = ContextVar(
     "flowx_workflow_request", default=None,
 )
 
@@ -104,20 +105,25 @@ def run_workflow(
     engine: WorkflowEngine,
     *,
     request_id: str | None = None,
-    session_state: Mapping[str, Any] | None = None,
+    state: Mapping[str, Any] | None = None,
     inputs: Mapping[str, StepRunInput] | None = None,
     skipped_steps: Iterable[str] = (),
 ) -> RunResult:
-    """Run actual native nodes once with isolated state and original inputs."""
+    """Seed native WorkflowParam.state and run once with the original inputs.
+
+    ``state`` is only a seed mapping, not a second session object. The native
+    pool owns the attached dictionary passed by identity to every step and
+    clears it when the lease ends. Nested request values retain their identity.
+    """
 
     step_ids = [step["id"] for step in engine.steps_meta]
     skipped = frozenset(skipped_steps)
     unknown = (set(inputs or {}) | skipped).difference(step_ids)
     if unknown:
         raise ValueError(f"unknown workflow step(s): {sorted(unknown)}")
-    if not isinstance(engine.pool, _WorkflowPipelinePool) and (session_state or skipped):
+    if not isinstance(engine.pool, _WorkflowPipelinePool) and (state or skipped):
         raise TypeError("request state/skipping requires a pool created by init_workflow_engine")
-    token = _RUN_REQUEST.set((dict(session_state or {}), skipped))
+    token = _RUN_REQUEST.set((state if state is not None else {}, skipped))
     try:
         result = engine.run(request_id or f"flowx-request-{uuid.uuid4().hex}", dict(inputs or {}))
     finally:

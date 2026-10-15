@@ -1,3 +1,4 @@
+# Modified 2026-10-14: reuse this analyzer as the requirement step in graph generation.
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -5,6 +6,7 @@ from typing import Any, Mapping
 from ag_ui_workflow import StepRunOutput
 
 from flowx_core._paths import bootstrap_package_root
+from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.workflow_node_reference import render_workflow_step_meta_catalog
 
 
@@ -24,9 +26,15 @@ class RequirementAnalysisResult:
 class RequirementDisector(Coder):
 	"""Generate requirements analysis markdown from a demand description."""
 
+	STEP_ID = "analyze_requirement"
+	DEPENDENCIES = []
+	INPUT_REQUIRED = False
+	__hash__ = object.__hash__
+
 	prompt_path: str = "demand_analyzer/prompts/requirement_disector_prompt.md"
 
 	def __post_init__(self) -> None:
+		apply_node_settings(self)
 		prompt_file = ROOT_DIR / self.prompt_path
 		if not prompt_file.exists():
 			raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
@@ -87,7 +95,7 @@ class RequirementDisector(Coder):
 	) -> RequirementAnalysisResult:
 		"""Call the LLM and persist the requirements analysis."""
 
-		target_path = Path(output_path)
+		target_path = Path(output_path).expanduser()
 		if target_path.suffix.lower() != ".md":
 			target_path = target_path.with_suffix(".md")
 
@@ -110,7 +118,7 @@ class RequirementDisector(Coder):
 		max_tokens: int = MAX_TOKENS,
 	) -> RequirementAnalysisResult:
 		"""Update an existing requirement analysis using feedback."""
-		target_path = Path(output_path)
+		target_path = Path(output_path).expanduser()
 		if target_path.suffix.lower() != ".md":
 			target_path = target_path.with_suffix(".md")
 		if not target_path.is_file():

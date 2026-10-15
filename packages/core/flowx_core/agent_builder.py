@@ -4,14 +4,27 @@
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified: explicitly release cached native workflow pools on reset/shutdown.
 # Modified 2026-10-13: delegate pool cleanup to synchronized service cache owners.
+# Modified 2026-10-14: wire explicit service dependencies and refresh components after LLM resets.
+# Modified 2026-10-14: graph service delegates to a single-pass workflow without repair-loop injection.
+# Modified 2026-10-14: own session bookkeeping and dispatch explicit requests to initialized services.
+# Modified 2026-10-14: refresh request graph snapshots and merge repair publications under a builder-owned lock.
+# Modified 2026-10-15: use unified workflow requests instead of separate context models.
+# Modified 2026-10-15: keep routing local and remove redundant request identities/bookkeeping.
+# Modified 2026-10-15: orchestrate batches locally and dispatch complete per-node requests without callback registries.
+# Modified 2026-10-15: disable batch node generation and remove batch-only helpers; retain per-node services.
 from typing import Optional, List, Dict, Any, Mapping
+from contextlib import ExitStack
+from dataclasses import replace
 import os
 import subprocess
 from pathlib import Path
+from threading import RLock
 
 from flowx_core.architect import GraphPlanner, NodePlanElement, Graph
 from flowx_core.auditor import GraphJsonAuditor, NodeAuditor, MainEntryPointAuditor, OutputAuditor
-from flowx_core.builder_support import AuditRepairLoop, BuildSession, BuilderComponentFactory
+from flowx_core.builder_support import (
+    AuditRepairLoop, BuildSession, BuilderComponentFactory,
+)
 from flowx_core.builder_services import (
     GraphBuildService,
     MainEntrypointService,
@@ -25,6 +38,7 @@ from flowx_core.worker.main_writer import PromptMainFileCoder
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import (
     PromptNodeFileCoderBase,
+    RequestNodeFileCoder,
     WorkflowSkillNodeCoder,
     WorkflowFileNodeCoder,
     WorkflowStepNodeCoder,
@@ -35,13 +49,20 @@ from flowx_core.tools.agent_builder_tools import (
     get_language_extension,
     select_python_command,
 )
+from flowx_core.workflows.graph_generation import GraphGenerationRequest
+from flowx_core.workflows.main_entrypoint_generation import MainEntrypointGenerationRequest
+from flowx_core.workflows.node_runtime_modifier import (
+    AmendNodeFromTestLog,
+    GenerateNodeTestFile,
+    NodeRuntimeModifierRequest,
+)
 
 
 DEFAULT_MAX_AUDIT_ROUNDS = 7
 
 
 class AgentBuilder:
-    """Build AG-UI workflow artifacts with generation, auditing, and progress display."""
+    """Build AG-UI workflow artifacts with generation and auditing."""
 
     def __init__(
         self,
@@ -63,6 +84,7 @@ class AgentBuilder:
         self.max_audit_rounds = self._validate_max_audit_rounds(max_audit_rounds)
         self.session_marking_prompt = compose_session_marking_prompt(session_marking_prompt)
         self._session = BuildSession()
+        self._artifact_publication_lock = RLock()
         os.makedirs(self.root_dir, exist_ok=True)
         self.log_level = log_level or os.getenv("META_AGENT_LOG_LEVEL", "INFO")
         self.runtime_log_path = str(
@@ -83,10 +105,6 @@ class AgentBuilder:
             self.max_audit_rounds,
         )
 
-        self._progress_total = 0
-        self._progress_current = 0
-        self._progress_width = 28
-
         self._reset_llm_components()
         # initialize auditors for later validation steps
         self.graph_auditor = GraphJsonAuditor()
@@ -94,16 +112,52 @@ class AgentBuilder:
         self.main_entry_auditor = MainEntryPointAuditor()
         # output auditor will inspect test logs and help trigger amendments
         self.output_auditor = OutputAuditor()
-        self._graph_build_service = GraphBuildService(self)
-        self._node_build_service = NodeBuildService(self)
-        self._node_artifact_service = NodeArtifactService(self)
-        self._main_entrypoint_service = MainEntrypointService(self)
-        self._runtime_service = RuntimeService(self)
+        self._init_services()
+
+    def _init_services(self) -> None:
+        """Construct each reusable workflow once and clean up partial initialization."""
+        with ExitStack() as cleanup:
+            graph_service = GraphBuildService(
+                analyzer=self.analyzer, planner=self.planner, graph_auditor=self.graph_auditor,
+            )
+            cleanup.callback(graph_service.close)
+            node_service = NodeBuildService(
+                node_planner=self.node_planner, node_coder=self.node_coder, node_auditor=self.node_auditor,
+            )
+            cleanup.callback(node_service.close)
+            artifact_service = NodeArtifactService(
+                node_test_writer=self.node_test_writer, node_writer=self.node_modifier_writer,
+                run_subprocess=self._run_subprocess, timeout_expired=self._subprocess_timeout_expired(),
+            )
+            cleanup.callback(artifact_service.close)
+            main_service = MainEntrypointService(
+                main_writer=self.main_writer, main_entry_auditor=self.main_entry_auditor,
+            )
+            cleanup.callback(main_service.close)
+            self._graph_build_service = graph_service
+            self._node_build_service = node_service
+            self._node_artifact_service = artifact_service
+            self._main_entrypoint_service = main_service
+            cleanup.pop_all()
+        self._runtime_service = RuntimeService(
+            logger=self._logger,
+            select_python_command=self._select_python_command,
+            popen_subprocess=self._popen_subprocess, run_subprocess=self._run_subprocess,
+            timeout_expired=self._subprocess_timeout_expired(),
+        )
 
     def close(self) -> None:
-        """Release cached generation/repair pools before disposing this builder."""
-        self._node_build_service.close()
-        self._node_artifact_service.close()
+        """Release all four initialized workflows, even if one cleanup fails."""
+        with ExitStack() as cleanup:
+            for service in (
+                self._graph_build_service, self._node_build_service,
+                self._node_artifact_service, self._main_entrypoint_service,
+            ):
+                cleanup.callback(service.close)
+
+    def _request_state(self) -> dict[str, Any]:
+        """Seed the leased WorkflowParam.state; services never retain this session."""
+        return {"build_session": self._session}
 
     @property
     def artifact_state(self) -> Any:
@@ -270,6 +324,13 @@ class AgentBuilder:
         self.planner = bundle.planner
         self.node_planner = bundle.node_planner
         self.main_writer = bundle.main_writer
+        settings = dict(
+            api_key=self.api_key, model=self.model, provider=self.provider,
+            session_marking_prompt=self.session_marking_prompt,
+        )
+        self.node_coder = RequestNodeFileCoder(skills_root_path=self.skills_root_path, **settings)
+        self.node_test_writer = GenerateNodeTestFile(**settings)
+        self.node_modifier_writer = AmendNodeFromTestLog(**settings)
 
     def reset_llm_config(
         self,
@@ -286,6 +347,8 @@ class AgentBuilder:
         self._logger.info("Resetting LLM configuration.")
         self._reset_llm_components()
         self.close()
+        self._session.node_coder_map.clear()
+        self._init_services()
 
     def _make_node_coder(self, node_meta: Any) -> PromptNodeFileCoderBase:
         return self._component_factory.create_node_coder(node_meta)
@@ -310,13 +373,15 @@ class AgentBuilder:
             return Path(self.graph_plan_path).expanduser().resolve().parent
         return Path(self.root_dir).expanduser().resolve()
 
-    def _load_planned_graph(self, graph_plan_path: Optional[str] = None) -> Graph:
+    def _load_planned_graph(self, graph_plan_path: Optional[str] = None, *, refresh: bool = False) -> Graph:
+        """Return a graph snapshot; explicit execution requests refresh same-path files."""
+        selected_path = graph_plan_path or self.graph_plan_path
         if graph_plan_path:
             self.graph_plan_path = graph_plan_path
-        if not self.graph_plan_path:
+        if not selected_path:
             raise ValueError("graph_plan_path is not set. Call plan_graph(...) first or pass graph_plan_path.")
 
-        graph_path = Path(self.graph_plan_path).expanduser().resolve()
+        graph_path = Path(selected_path).expanduser().resolve()
         planned_graph = getattr(self, "planned_graph", None)
         planned_graph_path: Optional[Path] = None
         if planned_graph is not None and hasattr(planned_graph, "graph_json_path"):
@@ -324,29 +389,38 @@ class AgentBuilder:
                 planned_graph_path = Path(planned_graph.graph_json_path).resolve()
             except Exception:
                 planned_graph_path = None
-        if planned_graph is None or planned_graph_path != graph_path:
-            self.planned_graph = Graph(str(graph_path))
-        return self.planned_graph
-
-    def _read_requirement_text(self, requirement_md_path: Optional[str] = None) -> str:
-        if requirement_md_path:
-            self.requirement_md_path = requirement_md_path
-        if not self.requirement_md_path:
-            raise ValueError("requirement_md_path is not set. Call analyze_requirement(...) first or pass requirement_md_path.")
-        requirement_path = Path(self.requirement_md_path).expanduser().resolve()
-        return requirement_path.read_text(encoding="utf-8")
+        if refresh or planned_graph is None or planned_graph_path != graph_path:
+            self.planned_graph = None
+            planned_graph = Graph(str(graph_path))
+            self.planned_graph = planned_graph
+        # Concurrent named-workflow requests may publish another cache entry;
+        # each caller must still receive the snapshot it actually selected.
+        return planned_graph
 
     def _sync_workflow_graph_json(self, context_base_dir: Optional[str] = None) -> str:
-        return self._main_entrypoint_service.sync_workflow_graph_json(
-            context_base_dir=context_base_dir,
-        )
+        self._load_planned_graph()
+        target_dir = Path(self._resolve_managed_path(context_base_dir or self.root_dir))
+        source_path = Path(self.graph_plan_path).expanduser().resolve()
+        workflow_path = target_dir / "workflow.json"
+        workflow_path.parent.mkdir(parents=True, exist_ok=True)
+        source_text = source_path.read_text(encoding="utf-8")
+        if not workflow_path.exists() or workflow_path.read_text(encoding="utf-8") != source_text:
+            workflow_path.write_text(source_text, encoding="utf-8")
+        self.workflow_json_path = str(workflow_path)
+        return self.workflow_json_path
+
+    def _resolve_managed_path(self, path_value: str) -> str:
+        root = Path(self.root_dir).expanduser()
+        requested = Path(path_value).expanduser()
+        if not requested.is_absolute():
+            try:
+                requested.relative_to(root)
+            except ValueError:
+                requested = root / requested
+        return str(requested.resolve())
 
     def _expected_backend_node_path(self, node_name: str, language: str = "python") -> Path:
         return (self._resolve_backend_node_base_dir() / f"{node_name}{get_language_extension(language)}").resolve()
-
-    @staticmethod
-    def _supports_backend_node_tests(language: str = "python") -> bool:
-        return get_language_extension(language) == ".py"
 
     def _ensure_node_coder(self, node_name: str) -> Optional[PromptNodeFileCoderBase]:
         if not node_name:
@@ -406,40 +480,66 @@ class AgentBuilder:
         backend_language: str = "python",
         main_entrypoint_path: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return self._main_entrypoint_service.validate_generated_artifacts(
-            graph_plan_path=graph_plan_path,
-            node_docs_dirname=node_docs_dirname,
-            backend_language=backend_language,
-            main_entrypoint_path=main_entrypoint_path,
-        )
+        graph = self._load_planned_graph(graph_plan_path)
+        doc_dir = self._resolve_root_path(self.node_docs_dir or node_docs_dirname)
+        main_path = Path(main_entrypoint_path or self.main_output_path or self._resolve_root_path("main.py")).expanduser()
+        if not main_path.is_absolute():
+            main_path = self._resolve_root_path(main_path)
+        plans, backends, missing = {}, {}, []
+        for name in graph.get_topological_sorted_nodes():
+            doc_path = doc_dir / f"{name}.md"
+            backend_path = self._expected_backend_node_path(name, backend_language)
+            if doc_path.is_file():
+                plans[name] = str(doc_path)
+            else:
+                missing.append(str(doc_path))
+            if backend_path.is_file():
+                backends[name] = str(backend_path)
+            else:
+                missing.append(str(backend_path))
+        if not main_path.is_file():
+            missing.append(str(main_path))
+        if missing:
+            raise FileNotFoundError(
+                "Missing artifacts required for graph refresh/server restart:\n" + "\n".join(sorted(set(missing)))
+            )
+        return {"node_plan": plans, "backend_nodes": backends, "main_entrypoint": str(main_path)}
 
     def _stop_managed_server_process(self, process: Optional[Any]) -> None:
         self._runtime_service.stop_managed_server_process(process)
 
-    def _start_progress(self, total_steps: int) -> None:
-        self._progress_total = max(1, total_steps)
-        self._progress_current = 0
-        self._logger.info(f"Pipeline started. Total steps: {self._progress_total}")
-        self._print_progress_bar("Initializing")
-
-    def _advance_progress(self, message: str) -> None:
-        self._progress_current = min(self._progress_total, self._progress_current + 1)
-        self._print_progress_bar(message)
-
-    def _print_progress_bar(self, message: str) -> None:
-        ratio = self._progress_current / self._progress_total if self._progress_total else 0
-        filled = int(self._progress_width * ratio)
-        bar = "#" * filled + "-" * (self._progress_width - filled)
-        pct = int(ratio * 100)
-        self._logger.info(f"[{bar}] {self._progress_current}/{self._progress_total} ({pct:3d}%) | {message}")
-
     def analyze_requirement(self, requirement_text: Optional[str] = None, requirement_file: Optional[str] = None, out_file: str = "requirement_analysis.md") -> str:
         """Produce a requirement analysis markdown file."""
-        return self._graph_build_service.analyze_requirement(
-            requirement_text=requirement_text,
-            requirement_file=requirement_file,
-            out_file=out_file,
-        )
+        out_path = requirement_file or os.path.join(self.root_dir, out_file)
+        self._logger.info("%s requirement -> %s", "Using existing" if requirement_file else "Analyzing", out_path)
+        self._run_graph_request(GraphGenerationRequest(
+            requirement_text=requirement_text or "", requirement_md_path=out_path,
+            skip_analyze_requirement=bool(requirement_file), skip_plan_graph=True, skip_audit_graph=True,
+        ))
+        return self.requirement_md_path
+
+    def _run_graph_request(self, request: GraphGenerationRequest) -> Any:
+        """Publish successful graph artifacts in builder state, not in a service."""
+        if request.requirement_md_path:
+            self.requirement_md_path = request.requirement_md_path
+        if not request.skip_plan_graph or (
+            request.graph_plan_path and request.graph_plan_path != self.graph_plan_path
+        ):
+            # A failed same-path audit may follow an on-disk overwrite. Never
+            # expose the old topology as if it described the new file.
+            self.planned_graph = None
+        if request.graph_plan_path:
+            self.graph_plan_path = request.graph_plan_path
+        result = self._graph_build_service.run(replace(
+            request, state={**request.state, **self._request_state()},
+        ))
+        if not request.skip_analyze_requirement:
+            self.requirement_md_path = result.outputs["analyze_requirement"].derived["requirement_md_path"]
+        if not request.skip_plan_graph or not request.skip_audit_graph:
+            final_step = "plan_graph" if request.skip_audit_graph else "audit_graph"
+            self.graph_plan_path = result.outputs[final_step].derived["graph_plan_json_path"]
+            self.planned_graph = self._instantiate_graph(self.graph_plan_path)
+        return result
 
     def plan_graph(
         self,
@@ -447,11 +547,18 @@ class AgentBuilder:
         graph_plan_filename: str = "workflow.json",
         temperature: float = 0.35,
     ) -> str:
-        return self._graph_build_service.plan_graph(
-            requirement_md_path=requirement_md_path,
-            graph_plan_filename=graph_plan_filename,
-            temperature=temperature,
-        )
+        if requirement_md_path:
+            self.requirement_md_path = requirement_md_path
+        if not self.requirement_md_path:
+            raise ValueError("requirement_md_path is not set. Call analyze_requirement(...) first or pass requirement_md_path.")
+        graph_path = os.path.join(self.root_dir, graph_plan_filename)
+        self._logger.info("Planning graph -> %s", graph_path)
+        self._run_graph_request(GraphGenerationRequest(
+            requirement_md_path=self.requirement_md_path, graph_plan_path=graph_path,
+            temperature=temperature, skip_analyze_requirement=True,
+        ))
+        self._logger.info("Graph plan audit passed.")
+        return self.graph_plan_path
 
     def amend_graph(
         self,
@@ -459,11 +566,17 @@ class AgentBuilder:
         graph_plan_path: Optional[str] = None,
         temperature: float = 0.35,
     ) -> str:
-        return self._graph_build_service.amend_graph(
-            amendment=amendment,
-            graph_plan_path=graph_plan_path,
-            temperature=temperature,
-        )
+        selected_path = graph_plan_path or self.graph_plan_path
+        if not selected_path:
+            raise ValueError("graph_plan_path is not set. Call plan_graph(...) first or pass graph_plan_path.")
+        if not isinstance(amendment, str) or not amendment.strip():
+            raise ValueError("amendment must be a non-empty string.")
+        self._run_graph_request(GraphGenerationRequest(
+            graph_plan_path=selected_path, graph_action="amend", amendment=amendment,
+            temperature=temperature, skip_analyze_requirement=True,
+        ))
+        self._logger.info("Graph amendment audit passed.")
+        return self.graph_plan_path
 
     def amend_workflow_json(
         self,
@@ -499,6 +612,11 @@ class AgentBuilder:
             temperature=temperature,
         )
 
+    def get_node_doc_path(self, node_name: str, *, workflow_name: str = "default") -> str | None:
+        """Read a published artifact path without exposing a service's run context."""
+        record = self.artifact_state.workflow_artifacts.get(workflow_name)
+        return record.node_doc_paths.get(node_name) if record is not None else None
+
     def generate_nodes(
         self,
         graph_plan_path: Optional[str] = None,
@@ -510,53 +628,90 @@ class AgentBuilder:
         generate_markdowns: bool = False,
         markdown_amendments: Optional[Mapping[str, str]] = None,
         node_amendments: Optional[Mapping[str, str]] = None,
-        workflow_requests: Optional[Mapping[str, Any]] = None,
-        workflow_registry: Optional[Mapping[str, Any]] = None,
         workflow_name: str = "default",
     ) -> List[str]:
-        if requirement_md_path:
-            self.requirement_md_path = requirement_md_path
-        if not self.requirement_md_path:
-            raise ValueError("requirement_md_path is not set. Call analyze_requirement(...) first or pass requirement_md_path.")
-        planned_graph = self._load_planned_graph(graph_plan_path)
-        context = self._node_build_service.run(
-            workflow_name=workflow_name,
-            graph_plan_path=graph_plan_path,
-            requirement_md_path=self.requirement_md_path,
-            node_names=(
-                planned_graph.get_topological_sorted_nodes()
-                if node_names is None
-                else node_names
-            ),
-            run_nodes=run_nodes,
-            language=language,
-            temperature=temperature,
-            reset_mappings=node_names is None,
-            generate_markdowns=generate_markdowns,
-            markdown_amendments=markdown_amendments,
-            node_amendments=node_amendments,
-            workflow_requests=workflow_requests,
-            workflow_registry=workflow_registry,
+        """Batch generation is disabled; the per-node workflow and service remain usable."""
+        raise NotImplementedError(
+            "Batch node generation is not implemented; submit a NodeGenerationRequest "
+            "to NodeBuildService.run() instead."
         )
-        generated_paths = [
-            self.node_location_map[name]
-            for name in context.selected_node_names
-            if name in self.node_location_map
-        ]
-        if self._supports_backend_node_tests(language):
-            for node_name in context.selected_node_names:
-                self._node_artifact_service.run_modifier(
-                    workflow_name=workflow_name,
-                    node_name=node_name,
-                    graph_plan_path=context.graph_plan_path,
-                    generate_test=True,
-                    run_test=False,
-                    amend_node=False,
-                    temperature=temperature,
-                )
-        elif workflow_name == "default":
-            self.dynamic_graph_cache["node_tests"] = {}
-        return generated_paths
+
+    def run_node_modifier(
+        self,
+        *,
+        workflow_name: str = "default",
+        node_name: str,
+        graph_plan_path: str | None = None,
+        generate_test: bool = True,
+        run_test: bool = True,
+        amend_node: bool = True,
+        timeout: int = 60,
+        temperature: float = 0.2,
+        amendment_temperature: float = 0.3,
+    ) -> NodeRuntimeModifierRequest:
+        """Resolve builder artifacts and send a complete repair request to the service."""
+        if not isinstance(workflow_name, str) or not workflow_name.strip():
+            raise ValueError("workflow_name must be a non-empty string")
+        if not isinstance(node_name, str) or not node_name.strip():
+            raise ValueError("node_name must be a non-empty string")
+        workflow_name, node_name = workflow_name.strip(), node_name.strip()
+        record = self.artifact_state.workflow_artifacts.get(workflow_name)
+        selected_path = graph_plan_path or (record.graph_plan_path if record else None)
+        if selected_path is None and workflow_name != "default":
+            raise ValueError(f"graph_plan_path is required for workflow {workflow_name!r} before it has been generated")
+        graph = self._load_planned_graph(selected_path, refresh=True)
+        if node_name not in graph.get_topological_sorted_nodes():
+            raise ValueError(f"node {node_name!r} not found in workflow {workflow_name!r}")
+        workflow_path = Path(graph.graph_json_path).expanduser().resolve()
+        same_record = record is not None and Path(record.graph_plan_path).resolve() == workflow_path
+        node_path_value = record.node_location_map.get(node_name) if same_record else None
+        if not node_path_value:
+            mapped = self.node_location_map.get(node_name)
+            if mapped and self._resolve_root_path(mapped).parent == workflow_path.parent:
+                node_path_value = mapped
+        node_path = self._resolve_root_path(node_path_value) if node_path_value else workflow_path.parent / f"{node_name}.py"
+        if not node_path.is_file():
+            raise FileNotFoundError(f"backend node file not found for workflow {workflow_name!r}, node {node_name!r}: {node_path}")
+        with self._artifact_publication_lock:
+            workflow_tests = self.dynamic_graph_cache.get("workflow_node_tests", {})
+            test_paths = workflow_tests.get(workflow_name, {}) if isinstance(workflow_tests, Mapping) else {}
+            if workflow_name == "default" and not test_paths:
+                test_paths = self.dynamic_graph_cache.get("node_tests", {})
+            cached_test = test_paths.get(node_name) if isinstance(test_paths, Mapping) else None
+        component = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in workflow_name).strip("._") or "workflow"
+        default_test = str(Path("tests") / component / f"test_{node_name}.py") if workflow_name != "default" else ""
+        request = self._node_artifact_service.run(NodeRuntimeModifierRequest(
+            node_file_name=str(node_path), workflow_graph=str(workflow_path),
+            working_directory=str(workflow_path.parent), node_name=node_name,
+            python_command=self._select_python_command() if run_test else "", timeout=timeout,
+            test_temperature=temperature, amendment_temperature=amendment_temperature,
+            test_file_name=str(cached_test) if not generate_test and cached_test else default_test,
+            log_file_name=str(Path("logs") / component / f"{node_name}_test.log") if workflow_name != "default" else "",
+            skip_generate_node_test=not generate_test, skip_run_node_test=not run_test,
+            skip_amend_node=not amend_node, state=self._request_state(),
+        ))
+        # Do not serialize native execution. Merge only completed publications,
+        # reading current metadata rather than the pre-execution snapshot.
+        with self._artifact_publication_lock:
+            if request.test_file_path:
+                workflow_tests = self.dynamic_graph_cache.get("workflow_node_tests", {})
+                workflow_maps = dict(workflow_tests) if isinstance(workflow_tests, Mapping) else {}
+                current_paths = workflow_maps.get(workflow_name, {})
+                test_map = dict(current_paths) if isinstance(current_paths, Mapping) else {}
+                if workflow_name == "default":
+                    legacy_paths = self.dynamic_graph_cache.get("node_tests", {})
+                    if isinstance(legacy_paths, Mapping):
+                        test_map = {**legacy_paths, **test_map}
+                test_map[node_name] = request.test_file_path
+                workflow_maps[workflow_name] = test_map
+                self.dynamic_graph_cache["workflow_node_tests"] = workflow_maps
+                if workflow_name == "default":
+                    self.dynamic_graph_cache["node_tests"] = dict(test_map)
+            if request.amended_node_file_path:
+                self.node_location_map[node_name] = request.amended_node_file_path
+                if same_record:
+                    record.node_location_map[node_name] = request.amended_node_file_path
+        return request
 
     def rerun_server(
         self,
@@ -566,16 +721,28 @@ class AgentBuilder:
         main_entrypoint_path: Optional[str] = None,
         backend_port: int = 8000,
     ) -> Dict[str, Any]:
-        return self._runtime_service.rerun_server(
+        del backend_port
+        artifacts = self._validate_generated_artifacts(
             graph_plan_path=graph_plan_path,
             node_docs_dirname=node_docs_dirname,
             backend_language=backend_language,
             main_entrypoint_path=main_entrypoint_path,
-            backend_port=backend_port,
         )
+        process, backend = self._runtime_service.rerun_server(
+            main_entrypoint_path=artifacts["main_entrypoint"], previous_process=self.backend_server_process,
+        )
+        self.backend_server_process = process
+        runtime = {"backend": backend, "artifacts": artifacts}
+        self.dynamic_graph_cache["server_runtime"] = runtime
+        return runtime
 
     def _build_steps_meta(self, include_hidden_nodes: bool = False) -> List[Dict[str, Any]]:
-        return build_steps_meta(self, include_hidden_nodes=include_hidden_nodes)
+        return build_steps_meta(
+            self._load_planned_graph(), node_location_map=self.node_location_map,
+            resolve_root_path=self._resolve_root_path,
+            expected_backend_node_path=self._expected_backend_node_path,
+            include_hidden_nodes=include_hidden_nodes,
+        )
 
     def _write_main_entrypoint(
         self,
@@ -583,16 +750,20 @@ class AgentBuilder:
         graph_plan_path: Optional[str] = None,
         output_filename: str = "main.py",
         fastapi_host: str = "0.0.0.0",
-        temperature: float = 0.0,
         fastapi_port: int = 8000,
     ) -> str:
-        return self._main_entrypoint_service.write_main_entrypoint(
-            graph_plan_path=graph_plan_path,
-            output_filename=output_filename,
-            fastapi_host=fastapi_host,
-            temperature=temperature,
-            fastapi_port=fastapi_port,
-        )
+        selected_path = graph_plan_path or self.graph_plan_path
+        if not selected_path:
+            raise ValueError("graph_plan_path is not set. Call plan_graph(...) first or pass graph_plan_path.")
+        self.main_output_path = self._resolve_managed_path(output_filename)
+        self._logger.info("Generating main entrypoint -> %s", self.main_output_path)
+        self.main_output_path = self._main_entrypoint_service.run(MainEntrypointGenerationRequest(
+            project_root_path=self.root_dir, graph_plan_json_path=selected_path,
+            output_path=self.main_output_path, fastapi_host=fastapi_host,
+            fastapi_port=fastapi_port, state=self._request_state(),
+        ))
+        self._logger.info("Main entrypoint audit passed.")
+        return self.main_output_path
 
     def generate_main_entrypoint(
         self,
@@ -602,11 +773,13 @@ class AgentBuilder:
         temperature: float = 0.0,
         fastapi_port: int = 8000,
     ) -> str:
+        # Accept the old public keyword without forwarding it into deterministic
+        # template rendering or a native run request.
+        del temperature
         generated_main_output_path = self._write_main_entrypoint(
             graph_plan_path=graph_plan_path,
             output_filename=output_filename,
             fastapi_host=fastapi_host,
-            temperature=temperature,
             fastapi_port=fastapi_port,
         )
         self.main_output_path = generated_main_output_path
@@ -636,14 +809,33 @@ class AgentBuilder:
         Returns:
             Whether the test was successful. The log file will contain detailed output.
         """
-        return self._runtime_service.test_main_entrypoint(
+        if graph_plan_path:
+            self._load_planned_graph(graph_plan_path)
+        self.log_path = os.path.join(self.root_dir, log_filename)
+        self._runtime_service.test_main_entrypoint(
             main_entrypoint_path=main_entrypoint_path,
-            log_filename=log_filename,
-            graph_plan_path=graph_plan_path,
+            log_path=self.log_path,
         )
+        return self.amend_by_log(self.log_path)
 
     def amend_by_log(
         self,
         log_path: str
     ) -> bool:
-        return self._runtime_service.amend_by_log(log_path)
+        ok, violations = self.output_auditor.audit_log_file(log_path)
+        if not ok:
+            for violation in violations:
+                coder, target = self._resolve_amendment_target(violation.rule, language="python")
+                if coder is None:
+                    self._logger.warning("Skipping amendment for unresolved target: %s", violation.rule)
+                    continue
+                try:
+                    self._logger.warning("Applying amendment to %s: %s", violation.rule, violation.detail)
+                    coder.amend_code_with_feedback(
+                        target, violation.detail, graph_plan_path=self.graph_plan_path or "",
+                        requirement_md_path=self.requirement_md_path or "", current_node_name=Path(target).stem,
+                        language="python", temperature=0.3,
+                    )
+                except Exception as exc:
+                    self._logger.error("Failed to amend %s: %s", violation.rule, exc, exc_info=True)
+        return ok

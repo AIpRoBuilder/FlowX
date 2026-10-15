@@ -1,6 +1,10 @@
 """Repair one generated workflow node from its isolated pytest result.
 
 Modified: exact concrete class maps and construction-scoped instance settings.
+Modified: immutable request inputs, request-local execution data and terminal close.
+Modified 2026-10-14: native-free request execution; pooled nodes keep only dependencies.
+Modified 2026-10-15: mutable repair requests own outputs; each run uses a fresh copy.
+Modified 2026-10-15: remove unused workflow name and write-only stage bookkeeping.
 """
 
 from __future__ import annotations
@@ -9,13 +13,14 @@ import json
 import subprocess
 import sys
 import uuid
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ag_ui_workflow import RunResult, StepRunOutput, WorkflowEngine
+from ag_ui_workflow import StepRunOutput, WorkflowEngine
 
 from flowx_core.runtime import RunNodeTest
+from flowx_core.runtime.run_node_test import _execute_node_test
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.tools.file_tools import parse_json_file
 from flowx_core.tools.workflow_engine import (
@@ -27,54 +32,36 @@ from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
 
 
-class NodeRuntimeModifierContext:
-	"""Shared paths and runtime settings for a single-node repair run."""
+@dataclass(kw_only=True)
+class NodeRuntimeModifierRequest:
+	"""Repair inputs and mutable outputs, shallow-copied with fresh outputs per run."""
 
-	def __init__(
-		self,
-		node_file_name: str = "",
-		workflow_graph: str = "",
-		test_file_name: str = "",
-		log_file_name: str = "",
-		working_directory: str = "",
-		python_command: str = "",
-		timeout: int = 60,
-		skip_generate_node_test: bool = False,
-		skip_run_node_test: bool = False,
-		skip_amend_node: bool = False,
-		workflow_name: str = "",
-		node_name: str = "",
-		test_temperature: float = 0.2,
-		amendment_temperature: float = 0.3,
-	) -> None:
-		self.workflow_name = workflow_name
-		self.node_name = node_name
-		self.test_temperature = test_temperature
-		self.amendment_temperature = amendment_temperature
-		self.node_file_name = node_file_name
-		self.workflow_graph = workflow_graph
-		self.test_file_name = test_file_name
-		self.log_file_name = log_file_name
-		self.working_directory = working_directory
-		self.python_command = python_command
-		self.timeout = timeout
-		self.skip_generate_node_test = skip_generate_node_test
-		self.skip_run_node_test = skip_run_node_test
-		self.skip_amend_node = skip_amend_node
-		self.test_file_path = ""
-		self.log_file_path = ""
-		self.test_log = ""
-		self.test_result: dict[str, Any] | None = None
-		self.amended_node_file_path = ""
-		self.skipped_stages: list[str] = []
-		self.completed_stages: set[str] = set()
+	node_file_name: str
+	workflow_graph: str | Mapping[str, Any]
+	working_directory: str
+	test_file_name: str = ""
+	log_file_name: str = ""
+	python_command: str = ""
+	timeout: int = 60
+	skip_generate_node_test: bool = False
+	skip_run_node_test: bool = False
+	skip_amend_node: bool = False
+	node_name: str = ""
+	test_temperature: float = 0.2
+	amendment_temperature: float = 0.3
+	state: Mapping[str, Any] = field(default_factory=dict)
+	test_file_path: str = field(default="", init=False)
+	log_file_path: str = field(default="", init=False)
+	test_log: str = field(default="", init=False)
+	test_result: dict[str, Any] | None = field(default=None, init=False)
+	amended_node_file_path: str = field(default="", init=False)
 
 
-def _context_from_state(session_state: Mapping[str, Any]) -> NodeRuntimeModifierContext:
-	context = session_state.get("node_runtime_modifier")
-	if not isinstance(context, NodeRuntimeModifierContext):
-		raise TypeError("node runtime modifier context is missing or has an unexpected type")
-	return context
+def _request_from_state(session_state: Mapping[str, Any]) -> NodeRuntimeModifierRequest:
+	request = session_state.get("node_runtime_modifier")
+	if not isinstance(request, NodeRuntimeModifierRequest):
+		raise TypeError("node runtime modifier request is missing or has an unexpected type")
+	return request
 
 
 def _resolve_path(path_value: str, working_directory: Path) -> Path:
@@ -91,6 +78,19 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 
 	__hash__ = object.__hash__
 
+	def _build_user_prompt(self, node_file_path: str) -> str:
+		prompt = super()._build_user_prompt(node_file_path)
+		request = _request_from_state(self.get_workflow_param().state)
+		working_directory = Path(request.working_directory).expanduser().resolve()
+		node_path = _resolve_path(node_file_path, working_directory).resolve()
+		return (
+			prompt
+			+ "\nRequest working directory (authoritative):\n"
+			+ f"- working_directory: {working_directory}\n"
+			+ f"- Load this node with Path({str(node_path)!r}), regardless of the test output directory.\n"
+			+ "- Resolve request-relative paths against this working directory, not a construction-time root.\n"
+		)
+
 	def process_input(
 		self,
 		user_input: str,
@@ -98,34 +98,32 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
 		del user_input, dependency_results
-		context = _context_from_state(session_state)
-		working_directory = Path(context.working_directory).expanduser().resolve()
-		node_path = _resolve_path(context.node_file_name, working_directory)
-		node_name = context.node_name or node_path.stem
+		request = _request_from_state(session_state)
+		working_directory = Path(request.working_directory).expanduser().resolve()
+		node_path = _resolve_path(request.node_file_name, working_directory)
+		node_name = request.node_name or node_path.stem
 		test_path = _resolve_path(
-			context.test_file_name or str(Path("tests") / f"test_{node_name}.py"),
+			request.test_file_name or str(Path("tests") / f"test_{node_name}.py"),
 			working_directory,
 		)
-		if context.skip_generate_node_test:
-			context.skipped_stages.append("generate_node_test")
-			if not context.skip_run_node_test and not test_path.is_file():
+		if request.skip_generate_node_test:
+			if not request.skip_run_node_test and not test_path.is_file():
 				raise FileNotFoundError(
 					f"Skipped node test generation requires an existing test file: {test_path}"
 				)
 			if test_path.is_file():
-				context.test_file_path = str(test_path.resolve())
+				request.test_file_path = str(test_path.resolve())
 		else:
 			test_path.parent.mkdir(parents=True, exist_ok=True)
 			written_path = self.write_test_from_node_file(
 				str(node_path),
 				str(test_path),
-				temperature=context.test_temperature,
+				temperature=request.test_temperature,
 			)
-			context.test_file_path = str(Path(written_path).resolve())
-		context.completed_stages.add("generate_node_test")
+			request.test_file_path = str(Path(written_path).resolve())
 		return StepRunOutput(
 			card={"kind": "node-test-generation", "status": "completed"},
-			derived={"test_file_path": context.test_file_path},
+			derived={"test_file_path": request.test_file_path},
 		)
 
 
@@ -156,45 +154,44 @@ class ExecuteNodeTest(RunNodeTest):
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
 		del user_input, dependency_results
-		context = _context_from_state(session_state)
-		# A slot is exclusively leased to this request. Replace, never mutate,
-		# command/result objects already retained by an earlier RunResult.
-		working_directory = Path(context.working_directory).expanduser().resolve()
-		self.node_name = context.node_name or Path(context.node_file_name).stem
-		self.test_path = _resolve_path(
-			context.test_file_path or context.test_file_name or str(Path("tests") / f"test_{self.node_name}.py"),
+		request = _request_from_state(session_state)
+		# The pooled step retains only execution dependencies. The standalone
+		# function's paths, command and result belong exclusively to this request.
+		working_directory = Path(request.working_directory).expanduser().resolve()
+		node_name = request.node_name or Path(request.node_file_name).stem
+		test_path = _resolve_path(
+			request.test_file_path or request.test_file_name or str(Path("tests") / f"test_{node_name}.py"),
 			working_directory,
 		).resolve()
-		self.log_path = _resolve_path(
-			context.log_file_name or str(Path("logs") / f"{self.node_name}_test.log"), working_directory,
+		log_path = _resolve_path(
+			request.log_file_name or str(Path("logs") / f"{node_name}_test.log"), working_directory,
 		).resolve()
-		self.command = [context.python_command or sys.executable, "-m", "pytest", str(self.test_path), "-q"]
-		self.cwd = str(working_directory)
-		self.timeout = context.timeout
-		self.result = None
-		context.test_file_path = str(self.test_path)
-		context.test_result = None
-		context.test_log = ""
-		context.log_file_path = ""
-		if context.skip_run_node_test:
-			context.skipped_stages.append("run_node_test")
-			if not context.skip_amend_node:
-				if not self.log_path.is_file():
+		request.test_file_path = str(test_path)
+		request.test_result = None
+		request.test_log = ""
+		request.log_file_path = ""
+		if request.skip_run_node_test:
+			if not request.skip_amend_node:
+				if not log_path.is_file():
 					raise FileNotFoundError(
-						f"Skipped node test execution requires an existing log file: {self.log_path}"
+						f"Skipped node test execution requires an existing log file: {log_path}"
 					)
-				context.log_file_path = str(self.log_path.resolve())
-				context.test_log = self.log_path.read_text(encoding="utf-8")
+				request.log_file_path = str(log_path)
+				request.test_log = log_path.read_text(encoding="utf-8")
 		else:
-			status = self._execute()
-			if status.isErr() or self.result is None:
-				raise RuntimeError(status.getInfo())
-			context.log_file_path = str(self.log_path.resolve())
-			context.test_log = self.log_path.read_text(encoding="utf-8")
-			context.test_result = self.result
-		context.completed_stages.add("run_node_test")
-		derived = dict(context.test_result or {})
-		derived["log_file_path"] = context.log_file_path
+			result = _execute_node_test(
+				node_name=node_name, test_path=test_path, log_path=log_path,
+				command=[request.python_command or sys.executable, "-m", "pytest", str(test_path), "-q"],
+				cwd=str(working_directory), timeout=request.timeout,
+				run_subprocess=self.run_subprocess, timeout_expired=self.timeout_expired,
+			)
+			if result is None:
+				raise RuntimeError("node test execution did not produce a result")
+			request.log_file_path = str(log_path)
+			request.test_log = log_path.read_text(encoding="utf-8")
+			request.test_result = result
+		derived = dict(request.test_result or {})
+		derived["log_file_path"] = request.log_file_path
 		return StepRunOutput(
 			card={"kind": "node-test", "status": "completed"},
 			derived=derived,
@@ -223,31 +220,29 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
 		del user_input, dependency_results
-		context = _context_from_state(session_state)
-		working_directory = Path(context.working_directory).expanduser().resolve()
-		node_path = _resolve_path(context.node_file_name, working_directory)
-		node_name = context.node_name or node_path.stem
-		if context.skip_amend_node or (context.test_result is not None and context.test_result["ok"]):
-			context.skipped_stages.append("amend_node")
-			context.amended_node_file_path = str(node_path.resolve())
+		request = _request_from_state(session_state)
+		working_directory = Path(request.working_directory).expanduser().resolve()
+		node_path = _resolve_path(request.node_file_name, working_directory)
+		node_name = request.node_name or node_path.stem
+		if request.skip_amend_node or (request.test_result is not None and request.test_result["ok"]):
+			request.amended_node_file_path = str(node_path.resolve())
 		else:
-			if not context.test_log:
+			if not request.test_log:
 				raise RuntimeError("node test output log is missing")
-			graph_path = _resolve_path(context.workflow_graph, working_directory)
+			graph_path = _resolve_path(request.workflow_graph, working_directory)
 			if not graph_path.is_file():
 				raise FileNotFoundError(f"Workflow graph not found: {graph_path}")
 			amended_path = self.amend_code_with_feedback(
 				str(node_path),
-				context.test_log,
+				request.test_log,
 				graph_plan_path=str(graph_path),
 				current_node_name=node_name,
-				temperature=context.amendment_temperature,
+				temperature=request.amendment_temperature,
 			)
-			context.amended_node_file_path = str(Path(amended_path).resolve())
-		context.completed_stages.add("amend_node")
+			request.amended_node_file_path = str(Path(amended_path).resolve())
 		return StepRunOutput(
 			card={"kind": "node-amendment", "status": "completed"},
-			derived={"amended_node_file_path": context.amended_node_file_path},
+			derived={"amended_node_file_path": request.amended_node_file_path},
 		)
 
 
@@ -260,7 +255,6 @@ class NodeRuntimeModifierPipeline:
 	run_subprocess: Callable[..., Any] = subprocess.run
 	timeout_expired: type[BaseException] = subprocess.TimeoutExpired
 	_engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
-	_last_result: RunResult | None = field(default=None, init=False, repr=False)
 
 	def __post_init__(self) -> None:
 		# Eager pool construction consumes shallow snapshots, preserving client
@@ -295,77 +289,51 @@ class NodeRuntimeModifierPipeline:
 		return config
 
 	def close(self) -> None:
-		"""Release the native pool when this modifier is no longer needed."""
-		if self._engine is not None:
-			close_workflow_engine(self._engine)
+		"""Release the native pool once; subsequent runs require a new modifier."""
+		engine, self._engine = self._engine, None
+		if engine is not None:
+			close_workflow_engine(engine)
 
 	def run(
 		self,
-		*,
-		node_file_name: str,
-		workflow_graph: str | Mapping[str, Any],
-		working_directory: str,
-		test_file_name: str = "",
-		log_file_name: str = "",
-		python_command: str = "",
-		timeout: int = 60,
-		skip_generate_node_test: bool = False,
-		skip_run_node_test: bool = False,
-		skip_amend_node: bool = False,
-		workflow_name: str = "",
-		node_name: str = "",
-		test_temperature: float = 0.2,
-		amendment_temperature: float = 0.3,
-	) -> NodeRuntimeModifierContext:
-		"""Generate, test, and amend one node; return paths, logs, and test data."""
+		request: NodeRuntimeModifierRequest,
+	) -> NodeRuntimeModifierRequest:
+		"""Return a fresh repair request with outputs; leave caller inputs unchanged."""
 
-		workdir = Path(working_directory).expanduser().resolve()
+		engine = self._engine
+		if engine is None:
+			raise RuntimeError("node runtime modifier is closed or not initialized")
+		workdir = Path(request.working_directory).expanduser().resolve()
 		if not workdir.is_dir():
 			raise NotADirectoryError(f"Working directory not found: {workdir}")
-		if skip_generate_node_test and not skip_run_node_test:
+		# replace is shallow for inputs/state and reconstructs every init=False
+		# output, so repeated/concurrent runs cannot reuse caller-owned results.
+		request = replace(request, working_directory=str(workdir))
+		if request.skip_generate_node_test and not request.skip_run_node_test:
 			test_path = _resolve_path(
-				test_file_name or str(Path("tests") / f"test_{node_name or Path(node_file_name).stem}.py"),
+				request.test_file_name or str(Path("tests") / f"test_{request.node_name or Path(request.node_file_name).stem}.py"),
 				workdir,
 			)
 			if not test_path.is_file():
 				raise FileNotFoundError(f"Skipped node test generation requires an existing test file: {test_path}")
 
-		context = NodeRuntimeModifierContext(
-			node_file_name=node_file_name,
-			workflow_graph=str(workflow_graph),
-			test_file_name=test_file_name,
-			log_file_name=log_file_name,
-			working_directory=str(workdir),
-			python_command=python_command,
-			timeout=timeout,
-			skip_generate_node_test=skip_generate_node_test,
-			skip_run_node_test=skip_run_node_test,
-			skip_amend_node=skip_amend_node,
-			workflow_name=workflow_name,
-			node_name=node_name,
-			test_temperature=test_temperature,
-			amendment_temperature=amendment_temperature,
-		)
-		self._last_result = None
-		if isinstance(workflow_graph, Mapping):
+		if isinstance(request.workflow_graph, Mapping):
 			# Keep mapping-backed graphs request-local even when repairs share a
-			# workdir. Retain the snapshot for the returned context's provenance.
+			# workdir. Retain the snapshot for the returned request's provenance.
 			graph_path = workdir / ".flowx" / "runtime_modifier" / uuid.uuid4().hex / "workflow.json"
 			graph_path.parent.mkdir(parents=True, exist_ok=True)
-			graph_path.write_text(json.dumps(dict(workflow_graph), ensure_ascii=False, indent=2), encoding="utf-8")
-			context.workflow_graph = str(graph_path)
-		if self._engine is None:
-			raise RuntimeError("node runtime modifier engine is not initialized")
-		self._last_result = run_workflow(
-			self._engine, session_state={"node_runtime_modifier": context},
+			graph_path.write_text(json.dumps(dict(request.workflow_graph), ensure_ascii=False, indent=2), encoding="utf-8")
+			request.workflow_graph = str(graph_path)
+		run_workflow(
+			engine, state={**request.state, "node_runtime_modifier": request},
 		)
-		if not skip_run_node_test and context.test_result is None:
-			raise RuntimeError(f"node test execution did not produce a result for {context.node_name or node_file_name}")
-		return context
+		if not request.skip_run_node_test and request.test_result is None:
+			raise RuntimeError(f"node test execution did not produce a result for {request.node_name or request.node_file_name}")
+		return request
 
 
 __all__ = [
-	"NodeRuntimeModifierContext",
+	"NodeRuntimeModifierRequest",
 	"GenerateNodeTestFile",
 	"ExecuteNodeTest",
 	"AmendNodeFromTestLog",

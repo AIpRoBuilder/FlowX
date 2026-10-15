@@ -1,4 +1,5 @@
 # Modified 2026-10-13: require explicit JSON node-class maps alongside request-scoped lifecycle.
+# Modified 2026-10-14: declare the dependent, single-pass main-entrypoint audit step.
 from __future__ import annotations
 
 import ast
@@ -12,6 +13,10 @@ from flowx_core.tools.file_tools import check_registered_class_imports, find_reg
 
 class MainEntryPointAuditor(BaseAuditor):
 	"""Audit main entrypoint files for AG-UI lifecycle backend requirements."""
+
+	STEP_ID = "main_audit"
+	DEPENDENCIES = ["main_generate"]
+	INPUT_REQUIRED = False
 
 	RouteFunctionNode = Union[ast.FunctionDef, ast.AsyncFunctionDef]
 

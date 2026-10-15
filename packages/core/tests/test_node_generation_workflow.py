@@ -1,22 +1,34 @@
 """Modified: verify exact class maps, scoped settings and isolated native pools."""
+# Modified 2026-10-14: explicitly inject replacements while preserving cached pool snapshots.
+# Modified 2026-10-14: exercise eager request-driven workflows and builder-owned published paths.
+# Modified 2026-10-15: verify flat requests, shared batch artifacts and isolated node selections.
+# Modified 2026-10-15: derive selected names from metadata and remove redundant routing/stage fields.
+# Modified 2026-10-15: migrate to complete per-node requests and builder-local dependency snapshots.
+# Modified 2026-10-15: remove batch expectations and verify request-local native planner skipping.
 
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import MISSING, FrozenInstanceError, dataclass, field, fields, replace
 from pathlib import Path
 from threading import Barrier
+from types import MappingProxyType
+from unittest.mock import Mock
 
 import pytest
-from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
+from ag_ui_workflow import RunResult, StepRunOutput, WorkflowEngine, WorkflowStepNode
 
 import flowx_core.agent_builder as agent_builder_module
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.auditor.data import RuleViolation
 from flowx_core.auditor.node_auditor import NodeAuditor
+from flowx_core.builder_services import NodeBuildService
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
-from flowx_core.worker.node_writer import WorkflowSkillNodeCoder, WorkflowStepNodeCoder
-from flowx_core.workflows import node_generation
+from flowx_core.worker.node_writer import (
+    RequestNodeFileCoder, WorkflowSkillNodeCoder, WorkflowStepNodeCoder,
+)
+from flowx_core.workflows import node_generation, node_runtime_modifier
+from flowx_core.workflows.node_runtime_modifier import NodeRuntimeModifierRequest
 from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.architect.graph import NodeMeta
 
@@ -66,11 +78,396 @@ def _make_builder(monkeypatch, root: Path) -> AgentBuilder:
     monkeypatch.setattr(agent_builder_module, "GraphPlanner", _FakeComponent)
     monkeypatch.setattr(agent_builder_module, "NodePlanElement", _FakePlanner)
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
-    return AgentBuilder(api_key="key", model="model", provider="provider", root_dir=str(root))
+    for name in ("GraphBuildService", "MainEntrypointService", "NodeArtifactService"):
+        monkeypatch.setattr(agent_builder_module, name, Mock(name=name))
+    return AgentBuilder(api_key="key", model="model", provider="openai", root_dir=str(root))
 
 
-def test_node_build_service_runs_single_node_workflow_per_kind(monkeypatch, tmp_path: Path) -> None:
+def _replace_node_service(builder: AgentBuilder) -> NodeBuildService:
+    """Explicitly replace an eager service after choosing new builder components."""
+    old_workflow = builder._node_build_service.workflow
+    old_engine = old_workflow._engine
+    builder._node_build_service.close()
+    assert old_workflow._engine is None
+    assert old_engine is not None and old_engine.pool.closed
+    service = NodeBuildService(
+        node_planner=builder.node_planner,
+        node_coder=builder.node_coder,
+        node_auditor=builder.node_auditor,
+    )
+    builder._node_build_service = service
+    return service
+
+
+def _capture_workflow_results(monkeypatch) -> list[RunResult]:
+    """Observe native results without adding retained run state to production objects."""
+    results: list[RunResult] = []
+    real_run_workflow = node_generation.run_workflow
+
+    def capture_result(*args, **kwargs):
+        result = real_run_workflow(*args, **kwargs)
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(node_generation, "run_workflow", capture_result)
+    return results
+
+
+def _make_generation_request(root: Path, name: str = "First") -> node_generation.NodeGenerationRequest:
+    raw_node = {
+        "name": name, "type": "WorkflowStepNode", "desc": name.lower(),
+        "planner_extra": {"labels": [name]},
+    }
+    return node_generation.NodeGenerationRequest(
+        graph_plan_path=str(root / "workflow.json"), requirement_md_path=str(root / "requirement.md"),
+        requirement_text=f"Generate {name}", node_meta=NodeMeta.from_dict(raw_node),
+        raw_node=raw_node, target_path=root / f"{name}.py",
+        markdown_path=root / "node_docs" / f"{name}.md",
+    )
+
+
+@pytest.fixture
+def recording_node_service():
+    """Record real native stages without replacing the engine or dispatching batches."""
+    events = []
+    native_states = []
+
+    def observe(stage, node, session_state):
+        assert node.get_workflow_param().state is session_state
+        events.append(stage)
+        native_states.append((
+            stage, session_state, session_state["native_identity"],
+            session_state["node_writer"]["node_meta"], session_state["auditor"]["node_meta"],
+        ))
+
+    class Planner(_FakePlanner):
+        def process_input(self, user_input, dependency_results, session_state):
+            observe("node_plan", self, session_state)
+            return super().process_input(user_input, dependency_results, session_state)
+
+        def plan_node(self, node, requirement_text, output_path, **kwargs):
+            events.append("create_plan")
+            Path(output_path).write_text("# generated plan", encoding="utf-8")
+            return Path(output_path)
+
+        def amend_node_plan(self, node, requirement_text, output_path, amendment, **kwargs):
+            assert amendment == "Clarify the plan"
+            assert Path(output_path).is_file()
+            events.append("amend_plan")
+            Path(output_path).write_text("# amended plan", encoding="utf-8")
+            return Path(output_path)
+
+    class Coder(_FakeWriter):
+        def process_input(self, user_input, dependency_results, session_state):
+            observe("node_generate", self, session_state)
+            assert set(dependency_results) == {"node_plan"}
+            assert "previous_request" not in session_state
+            session_state["previous_request"] = True
+            return super().process_input(user_input, dependency_results, session_state)
+
+        def write_node_from_requirement(self, name, meta, requirement_md_path, output_path, **kwargs):
+            Path(output_path).write_text(f"# generated {name}\n", encoding="utf-8")
+            return Path(output_path)
+
+        def amend_code_with_feedback(self, *_args, **_kwargs):
+            raise AssertionError("generation must not add an automatic repair or completeness retry")
+
+    class Auditor(_FakeAuditor):
+        def process_input(self, user_input, dependency_results, session_state):
+            observe("node_audit", self, session_state)
+            assert set(dependency_results) == {"node_generate"}
+            return super().process_input(user_input, dependency_results, session_state)
+
+    service = NodeBuildService(
+        node_planner=Planner(), node_coder=Coder(),
+        node_auditor=Auditor(lambda *_args, **_kwargs: (True, [])),
+    )
+    engine = service.workflow._engine
+    try:
+        yield service, events, native_states
+    finally:
+        service.close()
+    assert service.workflow._engine is None
+    assert engine.pool.closed
+
+
+def test_generation_and_modifier_requests_are_flat_keyword_only_models(tmp_path: Path) -> None:
+    generation = _make_generation_request(tmp_path)
+    repair = NodeRuntimeModifierRequest(
+        node_file_name=str(tmp_path / "First.py"), workflow_graph=generation.graph_plan_path,
+        working_directory=str(tmp_path),
+    )
+    for module, request, legacy_name, removed_fields in (
+        (node_generation, generation, "NodeGenerationContext", {
+            "node_name", "workflow_name", "node_locations", "skipped_node_names",
+            "node_names", "selected_node_names", "node_docs_dir", "generate_markdowns",
+            "markdown_amendments", "node_amendments", "workflow_requests", "workflow_registry",
+            "node_formats", "raw_nodes", "artifacts",
+        }),
+        (node_runtime_modifier, repair, "NodeRuntimeModifierContext",
+         {"workflow_name", "skipped_stages", "completed_stages"}),
+    ):
+        assert not hasattr(module, legacy_name)
+        assert legacy_name not in module.__all__
+        assert type(request).__name__ in module.__all__
+        assert "context" not in {setting.name for setting in fields(request)}
+        assert not hasattr(request, "context")
+        assert removed_fields.isdisjoint(setting.name for setting in fields(request))
+        assert all(not hasattr(request, name) for name in removed_fields)
+        assert all(setting.kw_only for setting in fields(request) if setting.init)
+    assert node_generation.NodeGenerationRequest.__dataclass_params__.frozen is True
+    assert NodeRuntimeModifierRequest.__dataclass_params__.frozen is False
+    assert not hasattr(AgentBuilder, "_generate_node_context")
+    assert not hasattr(AgentBuilder, "_generate_node_request")
+    required = {
+        "graph_plan_path", "requirement_md_path", "requirement_text", "node_meta",
+        "raw_node", "target_path", "markdown_path",
+    }
+    optional = {
+        "language", "temperature", "generate_markdown", "skip_node_planner", "markdown_amendment", "node_amendment",
+        "node_format", "dependency_context", "state",
+    }
+    assert {setting.name for setting in fields(generation)} == required | optional
+    assert {
+        setting.name for setting in fields(generation)
+        if setting.default is MISSING and setting.default_factory is MISSING
+    } == required
+    assert all(setting.init for setting in fields(generation))
+    assert type(generation.node_meta) is NodeMeta
+    assert generation.node_meta.name == generation.raw_node["name"] == "First"
+    assert generation.target_path == tmp_path / "First.py"
+    assert generation.markdown_path == tmp_path / "node_docs" / "First.md"
+    assert (generation.language, generation.temperature, generation.generate_markdown) == ("python", 0.35, True)
+    assert generation.skip_node_planner is False
+    assert next(setting for setting in fields(generation) if setting.name == "skip_node_planner").default is False
+    assert generation.markdown_amendment == generation.node_amendment == generation.dependency_context == ""
+    assert generation.node_format == generation.state == {}
+    assert type(generation.node_format) is type(generation.state) is dict
+    with pytest.raises(FrozenInstanceError):
+        generation.language = "javascript"
+    with pytest.raises(TypeError):
+        node_generation.NodeGenerationRequest(generation.graph_plan_path)
+    assert {setting.name for setting in fields(repair) if not setting.init} == {
+        "test_file_path", "log_file_path", "test_log", "test_result", "amended_node_file_path",
+    }
+
+
+def test_builder_batch_helpers_are_absent_and_public_generation_is_disabled() -> None:
+    for name in (
+        "_generate_nodes", "_normalize_requested_names", "_node_path_for",
+        "_render_dependency_context", "_read_node_artifact", "_supports_backend_node_tests",
+        "_start_progress", "_advance_progress", "_print_progress_bar",
+    ):
+        assert not hasattr(AgentBuilder, name)
+    # No constructor state or valid paths are needed: the boundary must fail immediately.
+    builder = object.__new__(AgentBuilder)
+    with pytest.raises(NotImplementedError) as error:
+        builder.generate_nodes()
+    assert str(error.value) == (
+        "Batch node generation is not implemented; submit a NodeGenerationRequest "
+        "to NodeBuildService.run() instead."
+    )
+    assert vars(builder) == {}
+
+
+@pytest.mark.parametrize("missing", [
+    "graph_plan_path", "requirement_md_path", "requirement_text", "node_meta",
+    "raw_node", "target_path", "markdown_path",
+])
+def test_generation_request_requires_complete_constructor_inputs(tmp_path: Path, missing: str) -> None:
+    request = _make_generation_request(tmp_path)
+    inputs = {setting.name: getattr(request, setting.name) for setting in fields(request)}
+    del inputs[missing]
+    with pytest.raises(TypeError, match=missing):
+        node_generation.NodeGenerationRequest(**inputs)
+
+
+def test_modifier_request_replacement_preserves_inputs_and_resets_outputs(tmp_path: Path) -> None:
+    request = NodeRuntimeModifierRequest(
+        node_file_name="First.py", workflow_graph={"nodes": [{"name": "First"}]},
+        working_directory=str(tmp_path), state={"native_identity": object()},
+    )
+    request.test_file_path = "old_test.py"
+    request.log_file_path = "old_test.log"
+    request.test_log = "old failure"
+    request.test_result = {"ok": False}
+    request.amended_node_file_path = "old_First.py"
+    first, second = replace(request), replace(request)
+
+    assert len({id(item) for item in (request, first, second)}) == 3
+    for result in (first, second):
+        for setting in fields(request):
+            if setting.init:
+                assert getattr(result, setting.name) is getattr(request, setting.name)
+        assert result.test_file_path == result.log_file_path == result.test_log == ""
+        assert result.test_result is None
+        assert result.amended_node_file_path == ""
+    first.test_file_path = "new_test.py"
+    first.test_result = {"ok": True}
+    second.test_result = {"ok": False}
+    assert len({id(item.test_result) for item in (request, first, second)}) == 3
+    first.test_result["returncode"] = 0
+    assert first.test_result == {"ok": True, "returncode": 0}
+    assert second.test_file_path == ""
+    assert second.test_result == {"ok": False}
+    assert request.test_file_path == "old_test.py"
+    assert request.log_file_path == "old_test.log"
+    assert request.test_log == "old failure"
+    assert request.test_result == {"ok": False}
+    assert request.amended_node_file_path == "old_First.py"
+
+
+@pytest.mark.parametrize("output_name", [
+    "test_file_path", "log_file_path", "test_log", "test_result", "amended_node_file_path",
+])
+def test_modifier_request_outputs_reject_constructor_and_replace_keywords(tmp_path: Path, output_name: str) -> None:
+    inputs = {
+        "node_file_name": "First.py", "workflow_graph": {"nodes": [{"name": "First"}]},
+        "working_directory": str(tmp_path),
+    }
+    request = NodeRuntimeModifierRequest(**inputs)
+    output = {"ok": False} if output_name == "test_result" else "stale output"
+    with pytest.raises(TypeError, match=output_name):
+        NodeRuntimeModifierRequest(**inputs, **{output_name: output})
+    with pytest.raises(ValueError, match=output_name):
+        replace(request, **{output_name: output})
+    assert request.test_file_path == request.log_file_path == request.test_log == ""
+    assert request.test_result is None
+    assert request.amended_node_file_path == ""
+
+
+def test_generation_requests_have_independent_defaults_and_shallow_replacements(tmp_path: Path) -> None:
+    first = _make_generation_request(tmp_path)
+    second = _make_generation_request(tmp_path, "Second")
+    independent = _make_generation_request(tmp_path)
+
+    assert len({id(request) for request in (first, second, independent)}) == 3
+    assert type(first.node_meta) is type(second.node_meta) is NodeMeta
+    assert first.node_meta is not second.node_meta
+    assert (first.node_meta.name, first.target_path) == ("First", tmp_path / "First.py")
+    assert (second.node_meta.name, second.target_path) == ("Second", tmp_path / "Second.py")
+    for name in ("raw_node", "node_format", "state"):
+        assert len({id(getattr(request, name)) for request in (first, second, independent)}) == 3
+    first.node_format["user_input_format"] = {"query": "string"}
+    first.raw_node["first_only"] = True
+    first.state["native_identity"] = object()
+    for request in (second, independent):
+        assert request.node_format == request.state == {}
+        assert "first_only" not in request.raw_node
+
+    amended = replace(
+        first, markdown_amendment="Clarify the plan", node_amendment="Keep the contract",
+        dependency_context="Previously generated file:\n# prior node", skip_node_planner=True,
+    )
+    assert amended is not first
+    for setting in fields(first):
+        if setting.name not in {"markdown_amendment", "node_amendment", "dependency_context", "skip_node_planner"}:
+            assert getattr(amended, setting.name) is getattr(first, setting.name)
+    assert amended.state["native_identity"] is first.state["native_identity"]
+    assert amended.markdown_amendment == "Clarify the plan"
+    assert amended.node_amendment == "Keep the contract"
+    assert amended.skip_node_planner is True
+    assert first.skip_node_planner is second.skip_node_planner is independent.skip_node_planner is False
+    assert first.markdown_amendment == first.node_amendment == first.dependency_context == ""
+
+
+def test_generation_context_renders_one_node_and_preformatted_dependencies(tmp_path: Path) -> None:
+    request = replace(
+        _make_generation_request(tmp_path),
+        node_format=MappingProxyType({"user_input_format": {"query": "string"}}),
+        dependency_context="### Prior\nMarkdown:\n# Prior plan\nGenerated file:\n# generated Prior",
+    )
+    context = request.render_generation_context()
+    assert context.startswith("Node generation request context (authoritative):\n- node: First\n")
+    assert request.requirement_text in context
+    assert '"query": "string"' in context
+    assert context.endswith(request.dependency_context)
+    with pytest.raises(TypeError):
+        request.render_generation_context("First")
+
+
+def test_plan_request_shallow_copies_raw_mapping_without_losing_extras(tmp_path: Path) -> None:
+    request = _make_generation_request(tmp_path)
+    raw_node = MappingProxyType(dict(request.raw_node))
+    request = replace(request, raw_node=raw_node)
+    plan = node_generation.NodeGenerationWorkflow.build_plan_request(request)
+    assert type(plan["node"]) is dict
+    assert plan["node"] == raw_node
+    assert plan["node"] is not raw_node
+    assert plan["node"]["planner_extra"] is raw_node["planner_extra"]
+    assert plan["requirement_text"] == request.requirement_text
+    assert plan["output_path"] == str(request.markdown_path)
+    assert plan["generate_markdown"] is True
+    assert plan["amendment"] == ""
+    assert plan["temperature"] == 0.2
+    plan["node"]["planner_only"] = True
+    assert "planner_only" not in raw_node
+
+
+@pytest.mark.parametrize("missing", ["node_meta", "target_path"])
+def test_generation_rejects_incomplete_requests_before_engine_run(monkeypatch, tmp_path: Path, missing: str) -> None:
+    complete = _make_generation_request(tmp_path)
+    request = replace(complete, **{missing: None})
+    run = Mock(name="run_workflow")
+    monkeypatch.setattr(node_generation, "run_workflow", run)
+    # Input validation precedes native execution; it needs no extra pool lifetime.
+    workflow = object.__new__(node_generation.NodeGenerationWorkflow)
+    workflow._engine = Mock(name="unused_engine")
+    with pytest.raises(ValueError, match="requires named node_meta and target_path"):
+        workflow.run(request)
+    run.assert_not_called()
+    assert complete.node_meta.name == "First"
+    assert complete.target_path == tmp_path / "First.py"
+    assert request.state is complete.state
+
+
+def test_generation_rejects_empty_metadata_name_before_engine_run(monkeypatch, tmp_path: Path) -> None:
+    complete = _make_generation_request(tmp_path)
+    request = replace(complete, node_meta=replace(complete.node_meta, name=""))
+    run = Mock(name="run_workflow")
+    monkeypatch.setattr(node_generation, "run_workflow", run)
+    workflow = object.__new__(node_generation.NodeGenerationWorkflow)
+    workflow._engine = Mock(name="unused_engine")
+    with pytest.raises(ValueError, match="requires named node_meta and target_path"):
+        workflow.run(request)
+    run.assert_not_called()
+    assert type(request.node_meta) is NodeMeta
+    assert request.node_meta.name == ""
+    assert complete.node_meta.name == "First"
+    assert request.state is complete.state
+
+
+@pytest.mark.parametrize("raw_node", [{"name": "Second"}, {"name": ""}, {}])
+def test_generation_rejects_raw_node_name_mismatch_before_engine_run(monkeypatch, tmp_path: Path, raw_node) -> None:
+    request = replace(_make_generation_request(tmp_path), raw_node=raw_node)
+    run = Mock(name="run_workflow")
+    monkeypatch.setattr(node_generation, "run_workflow", run)
+    workflow = object.__new__(node_generation.NodeGenerationWorkflow)
+    workflow._engine = Mock(name="unused_engine")
+    with pytest.raises(ValueError, match=r"raw_node\.name must match node_meta\.name"):
+        workflow.run(request)
+    run.assert_not_called()
+    assert type(request.node_meta) is NodeMeta
+    assert request.node_meta.name == "First"
+    assert request.raw_node.get("name") != request.node_meta.name
+    assert request.state == {}
+
+
+def test_generation_rejects_missing_markdown_path_before_engine_run(monkeypatch, tmp_path: Path) -> None:
+    request = replace(_make_generation_request(tmp_path), markdown_path=None, generate_markdown=False)
+    run = Mock(name="run_workflow")
+    monkeypatch.setattr(node_generation, "run_workflow", run)
+    workflow = object.__new__(node_generation.NodeGenerationWorkflow)
+    workflow._engine = Mock(name="unused_engine")
+    with pytest.raises(ValueError, match="requires markdown_path"):
+        workflow.run(request)
+    run.assert_not_called()
+    assert request.state == {}
+
+
+def test_node_build_service_runs_single_eager_workflow_from_request(monkeypatch, tmp_path: Path) -> None:
     builder = _make_builder(monkeypatch, tmp_path)
+    results = _capture_workflow_results(monkeypatch)
     graph_path = tmp_path / "workflow.json"
     graph_path.write_text(json.dumps({"nodes": [
         {"name": "Standalone", "type": "WorkflowStepNode", "desc": "standalone",
@@ -89,133 +486,69 @@ def test_node_build_service_runs_single_node_workflow_per_kind(monkeypatch, tmp_
             return Path(path)
 
     class Coder(_FakeWriter):
+        def process_input(self, user_input, dependency_results, session_state):
+            assert self.get_workflow_param().state is session_state
+            assert session_state is not request.state
+            assert session_state["native_identity"] is request.state["native_identity"]
+            assert session_state["node_writer"]["node_meta"] is request.node_meta
+            assert session_state["auditor"]["node_meta"] is request.node_meta
+            return super().process_input(user_input, dependency_results, session_state)
+
         def code_to_file(self, prompt, path, **kwargs):
             Path(path).write_text("class Standalone: pass\n", encoding="utf-8")
             return Path(path)
 
+    def audit(_path, meta, **_kwargs):
+        assert meta is request.node_meta
+        return True, []
+
     builder.graph_plan_path = str(graph_path)
     builder.requirement_md_path = str(requirement_path)
     builder.node_planner = Planner()
-    builder._make_node_coder = lambda _meta: Coder()
-    builder.node_auditor = _FakeAuditor(lambda *_args, **_kwargs: (True, []))
-    service = builder._node_build_service
-    context = service.run()
+    builder.node_coder = Coder()
+    builder.node_auditor = _FakeAuditor(audit)
+    service = _replace_node_service(builder)
+    workflow = service.workflow
+    engine = workflow._engine
+    try:
+        assert type(engine) is WorkflowEngine
+        assert set(vars(service)) == {"node_planner", "node_coder", "node_auditor", "workflow"}
+        docs = tmp_path / "node_docs"
+        docs.mkdir()
+        node = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"][0]
+        native_identity = object()
+        request = node_generation.NodeGenerationRequest(
+            graph_plan_path=str(graph_path), requirement_md_path=str(requirement_path),
+            requirement_text="Build standalone node", node_meta=NodeMeta.from_dict(node),
+            raw_node=node, target_path=tmp_path / "Standalone.py", markdown_path=docs / "Standalone.md",
+            state={"native_identity": native_identity},
+        )
+        generated_path = service.run(request)
 
-    assert context.selected_node_names == ["Standalone"]
-    assert context.artifacts["Standalone"]["node_markdown"] == "# Standalone plan"
-    assert context.artifacts["Standalone"]["node_file"] == "class Standalone: pass\n"
-    assert service.workflows["WorkflowStepNode"]._last_result.outputs["node_audit"].derived["ok"] is True
-    builder.close()
+        assert type(generated_path) is str
+        assert generated_path == str(request.target_path)
+        assert request.state == {"native_identity": native_identity}
+        assert type(request.node_meta) is NodeMeta
+        assert request.node_meta.name == "Standalone"
+        assert request.markdown_path.read_text(encoding="utf-8") == "# Standalone plan"
+        assert Path(generated_path).read_text(encoding="utf-8") == "class Standalone: pass\n"
+        assert not hasattr(request, "artifacts")  # Publishing belongs to the builder, not the service.
+        assert builder.node_location_map == {}
+        assert builder.artifact_state.workflow_artifacts == {}
+        assert len(results) == 1
+        assert results[0].outputs["node_audit"].derived["ok"] is True
+        assert workflow._engine is engine
+        assert not hasattr(workflow, "_last_result")
+    finally:
+        builder.close()
+    assert workflow._engine is None
+    assert engine.pool.closed
 
 
-def test_node_generation_workflow_carries_prior_artifacts_and_routes_requested_workflows(
+def test_node_generation_has_three_ordered_stages_and_applies_explicit_amendment(
     monkeypatch, tmp_path: Path
 ) -> None:
-    builder = _make_builder(monkeypatch, tmp_path)
-    requirement_path = tmp_path / "requirement.md"
-    requirement_path.write_text("Build a small data pipeline.\n", encoding="utf-8")
-    graph_path = tmp_path / "workflow.json"
-    graph_path.write_text(
-        json.dumps(
-            {
-                "nodes": [
-                    {
-                        "name": "Collect",
-                        "type": "WorkflowStepNode",
-                        "desc": "Collect input",
-                        "enable": True,
-                        "depends": [],
-                        "ext_data": {"type": "user_input", "desc": "collect input"},
-                        "inputs_format": {"query": "String"},
-                    },
-                    {
-                        "name": "Transform",
-                        "type": "WorkflowStepNode",
-                        "desc": "Transform data",
-                        "enable": True,
-                        "depends": ["Collect"],
-                        "ext_data": {"type": "none", "desc": "none"},
-                    },
-                    {
-                        "name": "Publish",
-                        "type": "WorkflowStepNode",
-                        "desc": "Publish results",
-                        "enable": True,
-                        "depends": ["Transform"],
-                        "ext_data": {"type": "none", "desc": "none"},
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    builder.requirement_md_path = str(requirement_path)
-    builder.graph_plan_path = str(graph_path)
-
-    class _FakeNodePlanElement(_FakePlanner):
-        def process_input(self, user_input, dependency_results, session_state):
-            request = session_state["node_plan_request"]
-            path = Path(request["output_path"])
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                f"# {request['node']['name']} plan\n{request['requirement_text']}", encoding="utf-8"
-            )
-            return StepRunOutput(derived={"markdown_path": str(path.resolve())})
-
-    generated_prompt_contexts: dict[str, str] = {}
-    builder.node_planner = _FakeNodePlanElement()
-
-    class _FakeNodeCoder(_FakeWriter):
-        def write_node_from_requirement(
-            self, node_name, node_meta, requirement_md_path, output_path, **kwargs
-        ):
-            self.prompt_contexts[node_name] = kwargs["additional_generation_context"]
-            path = Path(output_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"# generated {node_name}\n", encoding="utf-8")
-            return path
-
-        def amend_code_with_feedback(self, *_args, **_kwargs):
-            raise AssertionError("unexpected audit repair")
-
-    builder._make_node_coder = lambda _meta: _FakeNodeCoder(prompt_contexts=generated_prompt_contexts)
-    builder.node_auditor = _FakeAuditor(lambda *_args, **_kwargs: (True, []))
-    service = builder._node_build_service
-    invoked_workflows: list[str] = []
-
-    def run_review(*, node_name, artifact, context):
-        invoked_workflows.append(node_name)
-        assert artifact["node_file_path"].endswith("Publish.py")
-        return {"reviewed": True}
-
-    context = service.run(
-        graph_plan_path=str(graph_path),
-        requirement_md_path=str(requirement_path),
-        run_nodes={"Collect": True, "Transform": False, "Publish": True},
-        generate_markdowns=True,
-        workflow_requests={"Publish": ["review"]},
-        workflow_registry={"review": run_review},
-    )
-
-    assert context.selected_node_names == ["Collect", "Publish"]
-    assert context.skipped_node_names == ["Transform"]
-    assert set(context.artifacts) == {"Collect", "Publish"}
-    assert Path(context.artifacts["Collect"]["node_markdown_path"]).is_file()
-    assert Path(context.artifacts["Collect"]["node_file_path"]).is_file()
-    assert "# generated Collect" in generated_prompt_contexts["Publish"]
-    assert "# Collect plan" in generated_prompt_contexts["Publish"]
-    assert "Build a small data pipeline." in generated_prompt_contexts["Publish"]
-    assert context.node_formats["Collect"]["user_input_format"] == {"query": "string"}
-    assert '"query": "string"' in generated_prompt_contexts["Collect"]
-    assert invoked_workflows == ["Publish"]
-    assert context.artifacts["Publish"]["workflow_outputs"] == {"review": {"reviewed": True}}
-    builder.close()
-
-
-def test_node_generation_has_three_ordered_stages_and_publishes_explicit_amendment(
-    monkeypatch, tmp_path: Path
-) -> None:
-    builder = _make_builder(monkeypatch, tmp_path)
+    results = _capture_workflow_results(monkeypatch)
     requirement_path = tmp_path / "requirement.md"
     requirement_path.write_text("Generate one step", encoding="utf-8")
     graph_path = tmp_path / "workflow.json"
@@ -225,8 +558,6 @@ def test_node_generation_has_three_ordered_stages_and_publishes_explicit_amendme
         {"name": "Second", "type": "WorkflowStepNode", "desc": "second", "enable": True,
          "depends": ["First"], "ext_data": {"type": "none", "desc": "none"}},
     ]}), encoding="utf-8")
-    builder.requirement_md_path = str(requirement_path)
-    builder.graph_plan_path = str(graph_path)
     events: list[str] = []
     configs = []
     real_init_engine = node_generation.init_workflow_engine
@@ -237,19 +568,35 @@ def test_node_generation_has_three_ordered_stages_and_publishes_explicit_amendme
 
     monkeypatch.setattr(node_generation, "init_workflow_engine", capture_config)
     (tmp_path / "Second.py").write_text("# existing Second", encoding="utf-8")
+    docs = tmp_path / "node_docs"
+    docs.mkdir()
+    (docs / "Second.md").write_text("# existing Second plan", encoding="utf-8")
 
     class FakePlanner(_FakePlanner):
-        def process_input(self, user_input, dependency_results, session_state):
-            name = session_state["node_plan_request"]["node"]["name"]
+        def plan_node(self, node, requirement_text, output_path, **kwargs):
+            name = node["name"]
+            assert name == "First"
+            assert requirement_text == "Generate one step"
             self.events.append(f"{name}:plan")
-            path = Path(session_state["node_plan_request"]["output_path"])
+            path = Path(output_path)
             path.write_text(f"# {name} plan", encoding="utf-8")
-            return StepRunOutput(derived={"markdown_path": str(path.resolve())})
+            return path
 
-    builder.node_planner = FakePlanner(events=events)
+        def amend_node_plan(self, node, requirement_text, output_path, amendment, **kwargs):
+            assert node["name"] == "Second"
+            assert requirement_text == "Generate one step"
+            assert amendment == "Clarify the second plan"
+            path = Path(output_path)
+            assert path.read_text(encoding="utf-8") == "# existing Second plan"
+            self.events.append("Second:plan")
+            path.write_text("# amended Second plan", encoding="utf-8")
+            return path
 
     class FakeCoder(_FakeWriter):
-        def write_node_from_requirement(self, name, _meta, _requirement, output_path, **kwargs):
+        def write_node_from_requirement(self, name, meta, _requirement, output_path, **kwargs):
+            assert name == "First"
+            assert meta is first.node_meta
+            assert "Requested amendment (apply while generating):\nKeep first contract" in kwargs["additional_generation_context"]
             self.events.append(f"{name}:write")
             path = Path(output_path)
             path.write_text(f"# initial {name}", encoding="utf-8")
@@ -258,96 +605,150 @@ def test_node_generation_has_three_ordered_stages_and_publishes_explicit_amendme
         def amend_code_with_feedback(self, file_path, feedback, **kwargs):
             self.events.append("Second:repair")
             assert feedback == "Apply requested fix"
+            assert second.node_amendment == feedback
+            assert "# initial First" in kwargs["additional_generation_context"]
+            assert "# First plan" in kwargs["additional_generation_context"]
             Path(file_path).write_text("# repaired Second", encoding="utf-8")
             return Path(file_path)
 
-    builder._make_node_coder = lambda _meta: FakeCoder(events=events)
-
-    def audit(file_path, _meta, **kwargs):
+    def audit(file_path, meta, **kwargs):
         name = Path(file_path).stem
+        assert meta is (first if name == "First" else second).node_meta
         events.append(f"{name}:audit")
         if name == "Second" and "repaired" not in Path(file_path).read_text(encoding="utf-8"):
             return False, [RuleViolation(class_name=name, rule="bad_code", detail="repair needed", lineno=1)]
         return True, []
 
-    builder.node_auditor = _FakeAuditor(audit)
-    service = builder._node_build_service
-    context = service.run(workflow_name="stages", node_amendments={"Second": "Apply requested fix"}, workflow_requests={"Second": "review"}, workflow_registry={
-        "review": lambda *, artifact, **kwargs: events.append("Second:review") or artifact["node_file"]
-    })
+    service = NodeBuildService(
+        node_planner=FakePlanner(events=events), node_coder=FakeCoder(events=events),
+        node_auditor=_FakeAuditor(audit),
+    )
+    workflow = service.workflow
+    engine = workflow._engine
+    try:
+        nodes = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]
+        first = node_generation.NodeGenerationRequest(
+            graph_plan_path=str(graph_path), requirement_md_path=str(requirement_path),
+            requirement_text="Generate one step", node_meta=NodeMeta.from_dict(nodes[0]),
+            raw_node=nodes[0], target_path=tmp_path / "First.py", markdown_path=docs / "First.md",
+            node_amendment="Keep first contract",
+        )
+        first_path = service.run(first)
+        second = node_generation.NodeGenerationRequest(
+            graph_plan_path=str(graph_path), requirement_md_path=str(requirement_path),
+            requirement_text="Generate one step", node_meta=NodeMeta.from_dict(nodes[1]),
+            raw_node=nodes[1], target_path=tmp_path / "Second.py", markdown_path=docs / "Second.md",
+            markdown_amendment="Clarify the second plan", node_amendment="Apply requested fix",
+            dependency_context="### First\nMarkdown:\n# First plan\nGenerated file:\n# initial First",
+        )
+        second_path = service.run(second)
 
-    assert len(configs) == 1  # All nodes of this kind use the same initialized pool.
-    component_classes = {"node_plan": FakePlanner, "node_generate": FakeCoder, "node_audit": _FakeAuditor}
-    workflow = service.workflows["WorkflowStepNode"]
-    for node_classes, config in configs:
-        assert node_classes == component_classes
-        assert list(node_classes) == list(component_classes)
-        assert all(node_classes[name] is cls for name, cls in component_classes.items())
-        assert workflow._node_classes is node_classes
-        assert workflow._engine.steps_meta == [cls.step_meta() for cls in component_classes.values()]
-        assert config["pool_size"] == 1
-        assert {node["name"]: node.get("depends", []) for node in config["nodes"]} == {
-            "node_plan": [], "node_generate": ["node_plan"], "node_audit": ["node_generate"],
-        }
-    assert events == [
-        "First:plan", "First:write", "First:audit",
-        "Second:plan", "Second:repair", "Second:audit", "Second:review",
-    ]
-    assert context.artifacts["Second"]["node_file"] == "# repaired Second"
-    assert context.artifacts["Second"]["workflow_outputs"] == {"review": "# repaired Second"}
-    assert service.workflows["WorkflowStepNode"].node_coder is not None
-    assert service.workflows["WorkflowStepNode"]._node_classes == component_classes
-    assert builder.node_location_map["Second"] == context.artifacts["Second"]["node_file_path"]
-    builder.close()
+        assert first_path == str(first.target_path)
+        assert second_path == str(second.target_path)
+        assert first.generate_markdown is second.generate_markdown is True
+        assert first.skip_node_planner is second.skip_node_planner is False
+        assert len(configs) == 1  # Every node request uses the same eagerly initialized pool.
+        component_classes = {"node_plan": FakePlanner, "node_generate": FakeCoder, "node_audit": _FakeAuditor}
+        for node_classes, config in configs:
+            assert node_classes == component_classes
+            assert list(node_classes) == list(component_classes)
+            assert all(node_classes[name] is cls for name, cls in component_classes.items())
+            assert workflow._node_classes is node_classes
+            assert engine.steps_meta == [cls.step_meta() for cls in component_classes.values()]
+            assert config["pool_size"] == 1
+            assert {node["name"]: node.get("depends", []) for node in config["nodes"]} == {
+                "node_plan": [], "node_generate": ["node_plan"], "node_audit": ["node_generate"],
+            }
+        assert events == [
+            "First:plan", "First:write", "First:audit",
+            "Second:plan", "Second:repair", "Second:audit",
+        ]
+        assert Path(second_path).read_text(encoding="utf-8") == "# repaired Second"
+        assert second.markdown_path.read_text(encoding="utf-8") == "# amended Second plan"
+        assert len(results) == 2
+        assert all(set(result.outputs) == {"node_plan", "node_generate", "node_audit"} for result in results)
+        assert all(result.outputs["node_audit"].derived["ok"] is True for result in results)
+        assert workflow.node_coder is service.node_coder
+        assert workflow._node_classes == component_classes
+        assert workflow._engine is engine
+        assert not hasattr(workflow, "_last_result")
+    finally:
+        service.close()
+    assert workflow._engine is None
+    assert engine.pool.closed
 
 
-def test_failed_audit_does_not_publish_generated_node(monkeypatch, tmp_path: Path) -> None:
-    builder = _make_builder(monkeypatch, tmp_path)
-    requirement_path = tmp_path / "requirement.md"
-    requirement_path.write_text("Generate a step", encoding="utf-8")
-    graph_path = tmp_path / "workflow.json"
-    graph_path.write_text(json.dumps({"nodes": [
-        {"name": "Broken", "type": "WorkflowStepNode", "desc": "broken", "enable": True,
-         "depends": [], "ext_data": {"type": "none", "desc": "none"}},
-    ]}), encoding="utf-8")
-    builder.requirement_md_path = str(requirement_path)
-    builder.graph_plan_path = str(graph_path)
+@pytest.mark.parametrize("skip_node_planner", [False, True])
+def test_failed_audit_raises_without_repair_or_retry(monkeypatch, tmp_path: Path, skip_node_planner) -> None:
+    results = _capture_workflow_results(monkeypatch)
+    request = replace(
+        _make_generation_request(tmp_path, "Broken"), generate_markdown=False,
+        skip_node_planner=skip_node_planner, state={"native_identity": object()},
+    )
+    events = []
+    native_states = []
+
+    class Planner(_FakePlanner):
+        def process_input(self, *_args, **_kwargs):
+            raise AssertionError("the native planner must be skipped")
 
     class FakeCoder(_FakeWriter):
+        def process_input(self, user_input, dependency_results, session_state):
+            assert self.get_workflow_param().state is session_state
+            assert session_state is not request.state
+            assert session_state["native_identity"] is request.state["native_identity"]
+            assert session_state["node_writer"]["node_meta"] is request.node_meta
+            assert session_state["auditor"]["node_meta"] is request.node_meta
+            native_states.append(session_state)
+            return super().process_input(user_input, dependency_results, session_state)
+
         def write_node_from_requirement(self, name, _meta, _requirement, output_path, **kwargs):
+            events.append("write")
             path = Path(output_path)
             path.write_text("# invalid", encoding="utf-8")
             return path
 
-    builder._make_node_coder = lambda _meta: FakeCoder()
-    audit_calls = []
+        def amend_code_with_feedback(self, *_args, **_kwargs):
+            raise AssertionError("failed audits must not trigger automatic repairs")
 
-    def audit(*_args, **_kwargs):
-        audit_calls.append(1)
+    def audit(_path, meta, **_kwargs):
+        events.append("audit")
+        assert meta is request.node_meta
         return False, [RuleViolation(class_name="Broken", rule="bad_code", detail="invalid", lineno=1)]
 
-    builder.node_auditor = _FakeAuditor(audit)
-    service = builder._node_build_service
+    class Auditor(_FakeAuditor):
+        def process_input(self, user_input, dependency_results, session_state):
+            assert self.get_workflow_param().state is session_state is native_states[0]
+            return super().process_input(user_input, dependency_results, session_state)
 
-    with pytest.raises(RuntimeError, match="bad_code"):
-        service.run(workflow_name="failed", generate_markdowns=False, reset_mappings=True)
+    service = NodeBuildService(node_planner=Planner(), node_coder=FakeCoder(), node_auditor=Auditor(audit))
+    try:
+        with pytest.raises(RuntimeError, match="bad_code"):
+            service.run(request)
 
-    assert service.contexts["failed"] is not None
-    assert "Broken" not in service.contexts["failed"].artifacts
-    assert "Broken" not in builder.node_location_map
-    assert "Broken" not in builder.node_coder_map
-    assert audit_calls == [1]
-    builder.close()
+        assert request.node_meta.name == request.raw_node["name"] == "Broken"
+        assert request.target_path.read_text(encoding="utf-8") == "# invalid"
+        assert not request.markdown_path.exists()
+        assert not hasattr(request, "artifacts")
+        assert events == ["write", "audit"]
+        assert len(native_states) == 1
+        assert set(request.state) == {"native_identity"}
+        assert len(results) == 1
+        assert set(results[0].outputs) == {"node_plan", "node_generate", "node_audit"}
+        assert results[0].outputs["node_audit"].derived["ok"] is False
+        assert results[0].outputs["node_plan"].card == {"status": "skipped"}
+        assert set(vars(service)) == {"node_planner", "node_coder", "node_auditor", "workflow"}
+        assert not hasattr(service.workflow, "_last_result")
+    finally:
+        service.close()
 
 
 def test_generation_reuses_pool_and_constructor_snapshots_when_components_change(monkeypatch, tmp_path) -> None:
-    builder = _make_builder(monkeypatch, tmp_path)
+    results = _capture_workflow_results(monkeypatch)
     graph = tmp_path / "workflow.json"
     graph.write_text(json.dumps({"nodes": [{"name": "Example", "type": "WorkflowStepNode"}]}), encoding="utf-8")
     requirement = tmp_path / "requirement.md"
     requirement.write_text("One node", encoding="utf-8")
-    builder.graph_plan_path = str(graph)
-    builder.requirement_md_path = str(requirement)
     events = []
 
     class Planner(_FakePlanner):
@@ -368,23 +769,30 @@ def test_generation_reuses_pool_and_constructor_snapshots_when_components_change
             Path(output_path).write_text("# generated", encoding="utf-8")
             return Path(output_path)
 
-    builder.node_planner = Planner(events=events)
-    builder._make_node_coder = lambda _meta: Coder(events=events)
     audits = []
-    builder.node_auditor = _FakeAuditor(lambda *_a, **_kw: audits.append("original") or (True, []))
-    service = builder._node_build_service
+    original_auditor = _FakeAuditor(lambda *_a, **_kw: audits.append("original") or (True, []))
+    service = NodeBuildService(
+        node_planner=Planner(events=events), node_coder=Coder(events=events), node_auditor=original_auditor,
+    )
+    workflow = service.workflow
+    engine = workflow._engine
     try:
-        service.run(generate_markdowns=False)
-        workflow = service.workflows["WorkflowStepNode"]
-        engine = workflow._engine
-        assert workflow._last_result.outputs["node_plan"].card == {"status": "skipped"}
-        first_result = workflow._last_result
-        service.run(generate_markdowns=True)
+        docs = tmp_path / "node_docs"
+        docs.mkdir()
+        request = replace(
+            _make_generation_request(tmp_path, "Example"), requirement_text="One node",
+            generate_markdown=False, state={"native_identity": object()},
+        )
+        assert service.run(request) == str(request.target_path)
+        assert results[-1].outputs["node_plan"].card == {"status": "skipped"}
+        first_result = results[-1]
+        planned = replace(request, generate_markdown=True)
+        assert service.run(planned) == str(planned.target_path)
         assert workflow._engine is engine
-        assert workflow._last_result.request_id != first_result.request_id
+        assert results[-1].request_id != first_result.request_id
         assert events == ["write", "plan", "write"]
         replacement_auditor = _FakeAuditor(lambda *_a, **_kw: pytest.fail("replacement was not constructed into the pool"))
-        builder.node_auditor = replacement_auditor
+        service.node_auditor = replacement_auditor
         workflow.node_coder.write_node_from_requirement = lambda *_a, **_kw: pytest.fail("instance monkeypatch")
 
         class ReplacementCoder(_FakeWriter):
@@ -392,19 +800,208 @@ def test_generation_reuses_pool_and_constructor_snapshots_when_components_change
                 raise AssertionError("replacement coder was not constructed into the pool")
 
         workflow.node_coder = ReplacementCoder()
-        service.run(generate_markdowns=True)
-        assert workflow.node_auditor is replacement_auditor
+        # Prototype mutations must not lazily rebuild or reconfigure the native pool.
+        assert service.run(planned) == str(planned.target_path)
+        assert results[-1].outputs["node_plan"].card == {"status": "skipped"}
+        assert service.workflow is workflow
+        assert service.node_auditor is replacement_auditor
+        assert workflow.node_auditor is original_auditor
         assert events == ["write", "plan", "write", "write"]
         assert audits == ["original", "original", "original"]
         assert workflow._engine is engine
+        assert workflow._node_classes == {"node_plan": Planner, "node_generate": Coder, "node_audit": _FakeAuditor}
+        assert len({result.request_id for result in results}) == 3
+        assert request.state is planned.state
+        assert set(request.state) == {"native_identity"}
+        assert not hasattr(workflow, "_last_result")
     finally:
-        builder.close()
+        service.close()
+    assert workflow._engine is None
     assert engine.pool.closed
+
+
+def test_generation_does_not_retry_completeness_after_a_successful_audit(monkeypatch, tmp_path: Path) -> None:
+    results = _capture_workflow_results(monkeypatch)
+    request = replace(
+        _make_generation_request(tmp_path), skip_node_planner=True,
+        markdown_amendment="Clarify the plan",
+    )
+    events = []
+
+    class Planner(_FakePlanner):
+        def process_input(self, *_args, **_kwargs):
+            raise AssertionError("missing markdown must not override the explicit planner skip")
+
+    class Coder(_FakeWriter):
+        def write_node_from_requirement(self, name, meta, requirement_md_path, output_path, **kwargs):
+            events.append("write")
+            assert meta is request.node_meta
+            # The auditor owns acceptance; the workflow must not add a completeness sweep.
+            return Path(output_path)
+
+        def amend_code_with_feedback(self, *_args, **_kwargs):
+            raise AssertionError("a successful audit must not trigger a completeness repair")
+
+    def audit(file_path, meta, **_kwargs):
+        events.append("audit")
+        assert meta is request.node_meta
+        assert not Path(file_path).exists()
+        return True, []
+
+    service = NodeBuildService(node_planner=Planner(), node_coder=Coder(), node_auditor=_FakeAuditor(audit))
+    try:
+        assert service.run(request) == str(request.target_path)
+        assert events == ["write", "audit"]
+        assert request.generate_markdown is True
+        assert not request.target_path.exists()
+        assert not request.markdown_path.exists()
+        assert len(results) == 1
+        assert set(results[0].outputs) == {"node_plan", "node_generate", "node_audit"}
+        assert results[0].outputs["node_plan"].card == {"status": "skipped"}
+        assert results[0].outputs["node_audit"].derived["ok"] is True
+        assert not hasattr(service.workflow, "_last_result")
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("skip_node_planner", [False, True], ids=["automatic", "explicit-skip"])
+@pytest.mark.parametrize("generate_markdown", [False, True], ids=["no-generation", "generate"])
+@pytest.mark.parametrize("markdown_amendment", ["", "Clarify the plan"], ids=["no-amendment", "amend"])
+@pytest.mark.parametrize("existing_markdown", [False, True], ids=["missing-md", "existing-md"])
+def test_generation_native_planner_skip_matrix(
+    monkeypatch, tmp_path: Path, recording_node_service,
+    skip_node_planner, generate_markdown, markdown_amendment, existing_markdown,
+) -> None:
+    service, events, native_states = recording_node_service
+    results = _capture_workflow_results(monkeypatch)
+    run = Mock(wraps=node_generation.run_workflow)
+    monkeypatch.setattr(node_generation, "run_workflow", run)
+    engine = service.workflow._engine
+    request = replace(
+        _make_generation_request(tmp_path), skip_node_planner=skip_node_planner,
+        generate_markdown=generate_markdown, markdown_amendment=markdown_amendment,
+        state={"native_identity": object()},
+    )
+    request.markdown_path.parent.mkdir()
+    original_markdown = "# existing plan\n"
+    if existing_markdown:
+        request.markdown_path.write_text(original_markdown, encoding="utf-8")
+    expected_skip = skip_node_planner or not (
+        (generate_markdown and not existing_markdown) or markdown_amendment
+    )
+
+    generated = service.run(request)
+
+    run.assert_called_once()
+    assert run.call_args.args == (engine,)
+    assert run.call_args.kwargs["skipped_steps"] == (("node_plan",) if expected_skip else ())
+    assert generated == str(request.target_path)
+    assert request.target_path.read_text(encoding="utf-8") == "# generated First\n"
+    expected_events = []
+    if not expected_skip:
+        expected_events.append("node_plan")
+        if not existing_markdown:
+            expected_events.append("create_plan")
+        if markdown_amendment:
+            expected_events.append("amend_plan")
+    assert events == expected_events + ["node_generate", "node_audit"]
+    assert len(results) == 1
+    result = results[0]
+    assert set(result.outputs) == {"node_plan", "node_generate", "node_audit"}
+    assert result.outputs["node_generate"].derived["generated_path"] == generated
+    assert result.outputs["node_audit"].derived["ok"] is True
+    if expected_skip:
+        assert result.outputs["node_plan"].card == {"status": "skipped"}
+        if existing_markdown:
+            assert request.markdown_path.read_text(encoding="utf-8") == original_markdown
+        else:
+            assert not request.markdown_path.exists()
+    else:
+        assert result.outputs["node_plan"].card != {"status": "skipped"}
+        assert result.outputs["node_plan"].derived["markdown_path"] == str(request.markdown_path.resolve())
+        assert request.markdown_path.read_text(encoding="utf-8") == (
+            "# amended plan" if markdown_amendment else "# generated plan"
+        )
+    assert [stage for stage, *_ in native_states] == (
+        (["node_plan"] if not expected_skip else []) + ["node_generate", "node_audit"]
+    )
+    for _, state, native_identity, writer_meta, auditor_meta in native_states:
+        assert state is native_states[0][1]
+        assert state is not request.state
+        assert native_identity is request.state["native_identity"]
+        assert writer_meta is auditor_meta is request.node_meta
+    assert set(request.state) == {"native_identity"}
+    assert request.skip_node_planner is skip_node_planner
+    assert request.generate_markdown is generate_markdown
+    assert request.markdown_amendment == markdown_amendment
+    assert service.workflow._engine is engine
+    assert not hasattr(service.workflow, "_last_result")
+
+
+@pytest.mark.parametrize("generate_markdown", [False, True])
+def test_generation_reused_workflow_honors_each_planner_skip_without_leakage(
+    monkeypatch, tmp_path: Path, recording_node_service, generate_markdown,
+) -> None:
+    service, events, native_states = recording_node_service
+    results = _capture_workflow_results(monkeypatch)
+    run = Mock(wraps=node_generation.run_workflow)
+    monkeypatch.setattr(node_generation, "run_workflow", run)
+    workflow = service.workflow
+    engine = workflow._engine
+    base = replace(
+        _make_generation_request(tmp_path), generate_markdown=generate_markdown,
+        markdown_amendment="Clarify the plan",
+    )
+    base.markdown_path.parent.mkdir()
+    observed_requests = []
+    for index, skip in enumerate((True, False, True)):
+        # A missing brief with an amendment always needs the planner unless explicitly skipped.
+        request = replace(
+            base, skip_node_planner=skip, state={"native_identity": object()},
+        )
+        observed_requests.append(request)
+        assert not request.markdown_path.exists()
+        events.clear()
+        native_states.clear()
+
+        assert service.run(request) == str(request.target_path)
+
+        assert run.call_count == index + 1
+        assert run.call_args.args == (engine,)
+        assert run.call_args.kwargs["skipped_steps"] == (("node_plan",) if skip else ())
+        assert len(results) == index + 1
+        result = results[-1]
+        assert set(result.outputs) == {"node_plan", "node_generate", "node_audit"}
+        assert result.outputs["node_audit"].derived["ok"] is True
+        if skip:
+            assert events == ["node_generate", "node_audit"]
+            assert result.outputs["node_plan"].card == {"status": "skipped"}
+            assert not request.markdown_path.exists()
+        else:
+            assert events == ["node_plan", "create_plan", "amend_plan", "node_generate", "node_audit"]
+            assert result.outputs["node_plan"].card != {"status": "skipped"}
+            assert request.markdown_path.read_text(encoding="utf-8") == "# amended plan"
+            request.markdown_path.unlink()
+        for _, state, identity, writer_meta, auditor_meta in native_states:
+            assert state is native_states[0][1]
+            assert state is not request.state
+            assert identity is request.state["native_identity"]
+            assert writer_meta is auditor_meta is request.node_meta
+        assert set(request.state) == {"native_identity"}
+        assert service.workflow is workflow
+        assert workflow._engine is engine
+    assert len({result.request_id for result in results}) == 3
+    assert [request.skip_node_planner for request in observed_requests] == [True, False, True]
+    assert len({id(request.state) for request in observed_requests}) == 3
+    assert not hasattr(workflow, "_last_result")
 
 
 @pytest.mark.parametrize("pool_size", [1, 2])
 def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(monkeypatch, tmp_path, pool_size):
     planners, coders, auditors, requests, configs = [], [], [], [], []
+    planner_states = []
+    native_states = []
+    results = _capture_workflow_results(monkeypatch)
     barrier = Barrier(2) if pool_size == 2 else None
 
     @dataclass
@@ -420,6 +1017,9 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
             assert self.STEP_ID == "node_plan"
             assert self.DEPENDENCIES == []
             assert self.get_workflow_param().state is session_state
+            planner_states.append((
+                session_state, session_state["request_label"], session_state["node_plan_request"]["node"],
+            ))
             return super().process_input(user_input, dependency_results, session_state)
 
     @dataclass
@@ -438,11 +1038,23 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
             assert self.DEPENDENCIES == ["node_plan"]
             assert set(dependency_results) == {"node_plan"}
             assert self.get_workflow_param().state is session_state
+            assert session_state["node_writer"]["node_name"] == session_state["node_writer"]["node_meta"].name
+            # Capture identities during the lease, not mutable state after pool cleanup.
+            native_states.append((
+                session_state, session_state["request_label"], session_state["native_identity"],
+                session_state["node_writer"]["node_meta"], session_state["auditor"]["node_meta"],
+            ))
             assert "previous_request" not in session_state
+            assert session_state["request_label"] == Path(session_state["node_writer"]["requirement_md_path"]).parent.name
             session_state["previous_request"] = True
             return super().process_input(user_input, dependency_results, session_state)
 
         def write_node_from_requirement(self, name, meta, requirement_md_path, output_path, **kwargs):
+            assert type(meta) is NodeMeta
+            assert name == meta.name
+            assert self.get_workflow_param().state["node_writer"]["node_meta"] is meta
+            label = Path(requirement_md_path).parent.name
+            assert f"# prior {label}" in kwargs["additional_generation_context"]
             if self.barrier is not None and Path(requirement_md_path).parent.name != "third":
                 self.barrier.wait(timeout=10)
             self.requests.append((self, output_path, kwargs["temperature"], kwargs["language"]))
@@ -463,6 +1075,8 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
             assert self.DEPENDENCIES == ["node_generate"]
             assert set(dependency_results) == {"node_generate"}
             assert self.get_workflow_param().state is session_state
+            assert type(session_state["auditor"]["node_meta"]) is NodeMeta
+            assert session_state["auditor"]["node_meta"] is session_state["node_writer"]["node_meta"]
             return super().process_input(user_input, dependency_results, session_state)
 
     planner = Planner(instances=planners)
@@ -483,22 +1097,30 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
 
     monkeypatch.setattr(node_generation, "init_workflow_engine", capture_config)
 
-    def request(label, temperature, language="python", generate_markdowns=True):
+    def request(label, temperature, language="python", generate_markdown=True):
         root = tmp_path / label
         root.mkdir()
         docs = root / "node_docs"
         docs.mkdir()
         requirement = root / "requirement.md"
         requirement.write_text(label, encoding="utf-8")
-        context = node_generation.NodeGenerationContext(
+        raw_node = {"name": "Example", "type": "WorkflowStepNode", "desc": label, "planner_extra": {"label": label}}
+        selected = node_generation.NodeGenerationRequest(
             graph_plan_path=str(root / "workflow.json"), requirement_md_path=str(requirement),
-            requirement_text=label, node_names=["Example"], selected_node_names=["Example"],
-            language=language, temperature=temperature, node_docs_dir=docs,
-            generate_markdowns=generate_markdowns, raw_nodes={"Example": {"name": "Example"}},
+            requirement_text=label, node_meta=NodeMeta.from_dict(raw_node), raw_node=raw_node,
+            target_path=root / "Example.py", markdown_path=docs / "Example.md",
+            language=language, temperature=temperature, generate_markdown=generate_markdown,
+            dependency_context=f"Generated file:\n# prior {label}",
+            state={"request_label": label, "native_identity": object()},
         )
-        return context, NodeMeta(name="Example", type="WorkflowStepNode", desc=label), "Example", root / "Example.py"
+        assert type(selected.node_meta) is NodeMeta
+        assert selected.node_meta.name == "Example"
+        assert selected.raw_node is raw_node
+        assert selected.node_format == {}
+        assert not hasattr(selected, "artifacts")
+        return selected
 
-    workflow = node_generation.NodeGenerationWorkflow("WorkflowStepNode", planner, coder, auditor)
+    workflow = node_generation.NodeGenerationWorkflow(planner, coder, auditor)
     engine = workflow._engine
     try:
         assert type(engine) is WorkflowEngine
@@ -520,23 +1142,64 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
         # A prototype instance cannot be used as a dispatcher by native nodes.
         planner.process_input = coder.process_input = auditor.process_input = lambda *_a, **_kw: pytest.fail("prototype dispatch")
         first, second = request("first", 0.1), request("second", 0.7, "javascript")
+        assert first is not second
+        assert first.node_meta is not second.node_meta
+        assert first.raw_node is not second.raw_node
+        assert first.node_format is not second.node_format
+        assert first.state is not second.state
+        assert first.state["native_identity"] is not second.state["native_identity"]
         with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [executor.submit(workflow.run, *args) for args in (first, second)]
+            futures = [executor.submit(workflow.run, item) for item in (first, second)]
             paths = [future.result(timeout=15) for future in futures]
-        assert paths == [str(first[-1]), str(second[-1])]
+        assert paths == [str(first.target_path), str(second.target_path)]
         assert sorted((Path(path).parent.name, temperature, language) for _, path, temperature, language in requests) == [
             ("first", 0.1, "python"), ("second", 0.7, "javascript"),
         ]
         if pool_size == 2:
             assert requests[0][0] is not requests[1][0]
-        assert workflow.run(*request("third", 0.4, generate_markdowns=False)).endswith("third/Example.py")
-        assert workflow._last_result.outputs["node_plan"].card == {"status": "skipped"}
+        third = request("third", 0.4, generate_markdown=False)
+        assert workflow.run(third).endswith("third/Example.py")
+        assert results[-1].outputs["node_plan"].card == {"status": "skipped"}
+        assert len({result.request_id for result in results}) == 3
+        assert len(native_states) == 3
+        assert len(planner_states) == 2
+        for name in ("raw_node", "node_format", "state"):
+            assert len({id(getattr(item, name)) for item in (first, second, third)}) == 3
+        for item in (first, second, third):
+            state, _, native_identity, writer_meta, auditor_meta = next(
+                observed for observed in native_states if observed[1] == item.requirement_text
+            )
+            assert state is not item.state
+            assert native_identity is item.state["native_identity"]
+            assert writer_meta is item.node_meta
+            assert auditor_meta is item.node_meta
+            if item.generate_markdown:
+                planner_state, _, planned_node = next(
+                    observed for observed in planner_states if observed[1] == item.requirement_text
+                )
+                assert planner_state is state
+                assert type(planned_node) is dict
+                assert planned_node == item.raw_node
+                assert planned_node is not item.raw_node
+                assert planned_node["planner_extra"] is item.raw_node["planner_extra"]
+                assert item.markdown_path.is_file()
+            else:
+                assert not item.markdown_path.exists()
+            assert item.state == {"request_label": item.requirement_text, "native_identity": native_identity}
+            assert item.node_format == {}
+            assert item.dependency_context == f"Generated file:\n# prior {item.requirement_text}"
+            assert not hasattr(item, "artifacts")  # The workflow never publishes builder-owned artifacts.
+        assert not hasattr(workflow, "_last_result")
         assert workflow._engine is engine
         assert (len(planners), len(coders), len(auditors)) == (pool_size,) * 3
         assert [(cls.STEP_ID, list(cls.DEPENDENCIES)) for cls in (Planner, Coder, Auditor)] == original_metadata
     finally:
         workflow.close()
+    assert workflow._engine is None
     assert engine.pool.closed
+    workflow.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        workflow.run(third)
 
 
 @pytest.mark.parametrize("pool_size", [1, 2])
@@ -570,7 +1233,7 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
     config = node_generation.NodeGenerationWorkflow.json_config()
     config["pool_size"] = pool_size
     monkeypatch.setattr(node_generation.NodeGenerationWorkflow, "json_config", staticmethod(lambda: config))
-    workflows = []
+    workflows, engines = [], []
     try:
         for label in ("first", "second"):
             planners, coders, auditors = [], [], []
@@ -591,8 +1254,9 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
             auditors.clear()
             snapshots = ((planner, planners), (coder, coders), (auditor, auditors))
             with node_settings({Planner.STEP_ID: {"system_prompt": "outer prompt"}}):
-                workflow = node_generation.NodeGenerationWorkflow("WorkflowStepNode", planner, coder, auditor)
+                workflow = node_generation.NodeGenerationWorkflow(planner, coder, auditor)
                 workflows.append(workflow)
+                engines.append(workflow._engine)
                 assert _FakePlanner().system_prompt == "outer prompt"
             assert _FakePlanner().system_prompt == NodePlanElement.system_prompt
             assert _FakeAuditor().audit is None
@@ -630,4 +1294,205 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
     finally:
         for workflow in workflows:
             workflow.close()
-    assert all(workflow._engine.pool.closed for workflow in workflows)
+    assert all(workflow._engine is None for workflow in workflows)
+    assert all(engine.pool.closed for engine in engines)
+
+
+def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, tmp_path: Path) -> None:
+    results = _capture_workflow_results(monkeypatch)
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("Collect, upload and summarize data.", encoding="utf-8")
+    graph_path = tmp_path / "workflow.json"
+    graph_path.write_text(json.dumps({"nodes": [
+        {"name": "Collect", "type": "WorkflowStepNode", "meta_node_kind": "WorkflowStepNode",
+         "desc": "Collect data", "depends": [], "ext_data": {"type": "none"}},
+        {"name": "Upload", "type": "WorkflowFileNode", "meta_node_kind": "WorkflowFileNode",
+         "desc": "Upload data", "depends": ["Collect"],
+         "ext_data": {"type": "user_file_input", "remote_desc": "Archive uploaded bytes"}},
+        {"name": "Summarize", "type": "WorkflowSkillNode", "meta_node_kind": "WorkflowSkillNode",
+         "desc": "Summarize data", "depends": ["Upload"],
+         "ext_data": {"type": "skill", "skill_name": "summarize"}},
+    ]}), encoding="utf-8")
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "summarize"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.md").write_text(
+        "## Using\nCall summarize_payload(payload).\n\n## Examples\nsummarize_payload('example')\n",
+        encoding="utf-8",
+    )
+    prompts: dict[str, str] = {}
+    configs = []
+    audited_kinds = []
+    native_states = []
+
+    @dataclass
+    class Coder(RequestNodeFileCoder):
+        prompts: dict[str, str] = field(default_factory=dict)
+
+        def process_input(self, user_input, dependency_results, session_state):
+            assert self.get_workflow_param().state is session_state
+            assert session_state is not active_request.state
+            assert session_state["native_identity"] is active_request.state["native_identity"]
+            assert session_state["node_writer"]["node_meta"] is active_request.node_meta
+            assert session_state["auditor"]["node_meta"] is active_request.node_meta
+            assert "previous_request" not in session_state
+            session_state["previous_request"] = True
+            native_states.append((active_request, session_state))
+            return super().process_input(user_input, dependency_results, session_state)
+
+        def code_to_file(self, prompt, path, **kwargs):
+            target = Path(path)
+            self.prompts[target.stem] = prompt
+            target.write_text(f"# generated {target.stem}\n", encoding="utf-8")
+            return target
+
+    def audit(_path, meta, **_kwargs):
+        assert meta is active_request.node_meta
+        audited_kinds.append(meta.meta_node_kind)
+        return True, []
+
+    real_init_engine = node_generation.init_workflow_engine
+
+    def capture_config(node_classes, workflow_config):
+        configs.append((node_classes, workflow_config))
+        return real_init_engine(node_classes, workflow_config)
+
+    monkeypatch.setattr(node_generation, "init_workflow_engine", capture_config)
+    service = NodeBuildService(
+        node_planner=_FakePlanner(),
+        node_coder=Coder(client=object(), prompts=prompts, skills_root_path=str(skills_root)),
+        node_auditor=_FakeAuditor(audit),
+    )
+    workflow = service.workflow
+    engine = workflow._engine
+    try:
+        assert len(configs) == 1  # Construction happens before any node request.
+        assert type(engine) is WorkflowEngine
+        component_classes = {"node_plan": _FakePlanner, "node_generate": Coder, "node_audit": _FakeAuditor}
+        assert configs[0][0] == component_classes
+        assert all(configs[0][0][name] is cls for name, cls in component_classes.items())
+        assert workflow._node_classes is configs[0][0]
+
+        docs = tmp_path / "node_docs"
+        docs.mkdir()
+        nodes = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]
+        collect = node_generation.NodeGenerationRequest(
+            graph_plan_path=str(graph_path), requirement_md_path=str(requirement),
+            requirement_text="Collect, upload and summarize data.", node_meta=NodeMeta.from_dict(nodes[0]),
+            raw_node=nodes[0], target_path=tmp_path / "Collect.py", markdown_path=docs / "Collect.md",
+            state={"native_identity": object()},
+        )
+        active_request = collect
+        collect_path = service.run(collect)
+        upload = node_generation.NodeGenerationRequest(
+            graph_plan_path=str(graph_path), requirement_md_path=str(requirement),
+            requirement_text="Collect, upload and summarize data.", node_meta=NodeMeta.from_dict(nodes[1]),
+            raw_node=nodes[1], target_path=tmp_path / "Upload.py", markdown_path=docs / "Upload.md",
+            dependency_context="### Collect\nGenerated file:\n# generated Collect\n",
+            state={"native_identity": object()},
+        )
+        active_request = upload
+        upload_path = service.run(upload)
+        summarize = node_generation.NodeGenerationRequest(
+            graph_plan_path=str(graph_path), requirement_md_path=str(requirement),
+            requirement_text="Collect, upload and summarize data.", node_meta=NodeMeta.from_dict(nodes[2]),
+            raw_node=nodes[2], target_path=tmp_path / "Summarize.py", markdown_path=docs / "Summarize.md",
+            dependency_context="### Upload\nGenerated file:\n# generated Upload\n",
+            state={"native_identity": object()},
+        )
+        active_request = summarize
+        summarize_path = service.run(summarize)
+        selected_requests = [collect, upload, summarize]
+        generated = [collect_path, upload_path, summarize_path]
+        assert generated == [str(tmp_path / f"{name}.py") for name in ("Collect", "Upload", "Summarize")]
+        assert [request.node_meta.name for request in selected_requests] == ["Collect", "Upload", "Summarize"]
+        assert all(type(request.node_meta) is NodeMeta for request in selected_requests)
+        assert len({id(request) for request in selected_requests}) == 3
+        assert len({id(request.raw_node) for request in selected_requests}) == 3
+        assert len({id(request.node_format) for request in selected_requests}) == 3
+        assert len({id(request.state) for request in selected_requests}) == 3
+        assert all(request.node_amendment == "" for request in selected_requests)
+        assert all(request.skip_node_planner is False for request in selected_requests)
+        assert selected_requests[0].dependency_context == ""
+        assert len(results) == 3
+        assert audited_kinds == ["WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode"]
+        assert "Generate a WorkflowStepNode subclass" in prompts["Collect"]
+        assert "Generate a WorkflowFileNode subclass" in prompts["Upload"]
+        assert "file_bytes: bytes" in prompts["Upload"]
+        assert "Archive uploaded bytes" in prompts["Upload"]
+        assert "Generate a WorkflowSkillNode subclass" in prompts["Summarize"]
+        assert "selected_skill_name: summarize" in prompts["Summarize"]
+        assert str(skill_dir) in prompts["Summarize"]
+        assert "summarize_payload(payload)" in prompts["Summarize"]
+        assert "# generated Collect" in prompts["Upload"]
+        assert "# generated Upload" in prompts["Summarize"]
+        assert "# generated Collect" in selected_requests[1].dependency_context
+        assert "# generated Upload" in selected_requests[2].dependency_context
+        assert selected_requests[1].dependency_context in prompts["Upload"]
+        assert selected_requests[2].dependency_context in prompts["Summarize"]
+        snapshots = [request.dependency_context for request in selected_requests]
+
+        amended_upload = replace(
+            upload, node_meta=NodeMeta.from_dict(upload.raw_node), raw_node=dict(upload.raw_node),
+            node_format={}, state={"native_identity": object()}, generate_markdown=False,
+            node_amendment="Retain remote persistence",
+        )
+        active_request = amended_upload
+        amended_upload_path = service.run(amended_upload)
+        amended_summarize = replace(
+            summarize, node_meta=NodeMeta.from_dict(summarize.raw_node), raw_node=dict(summarize.raw_node),
+            node_format={}, state={"native_identity": object()}, generate_markdown=False,
+            node_amendment="Retain skill invocation",
+        )
+        active_request = amended_summarize
+        amended_summarize_path = service.run(amended_summarize)
+        amended = [amended_upload_path, amended_summarize_path]
+        selected_requests.extend((amended_upload, amended_summarize))
+        assert amended == generated[1:]
+        assert len(selected_requests) == 5
+        assert [request.node_meta.name for request in selected_requests[3:]] == ["Upload", "Summarize"]
+        assert [request.node_amendment for request in selected_requests[3:]] == [
+            "Retain remote persistence", "Retain skill invocation",
+        ]
+        for original, request in zip(selected_requests[1:3], selected_requests[3:]):
+            assert request is not original
+            assert request.node_meta is not original.node_meta
+            assert request.raw_node is not original.raw_node
+            assert request.node_format is not original.node_format
+            assert request.state is not original.state
+            assert request.state["native_identity"] is not original.state["native_identity"]
+            assert request.target_path == original.target_path
+            assert request.markdown_path == original.markdown_path
+            assert request.generate_markdown is False
+        assert "# generated Collect" in selected_requests[3].dependency_context
+        assert "### Summarize" not in selected_requests[3].dependency_context
+        assert "# generated Upload" in selected_requests[4].dependency_context
+        assert [request.dependency_context for request in selected_requests[:3]] == snapshots
+        assert "Preserve the WorkflowFileNode bytes-processing" in prompts["Upload"]
+        assert "Archive uploaded bytes" in prompts["Upload"]
+        assert "Preserve the WorkflowSkillNode contract" in prompts["Summarize"]
+        assert "selected_skill_name: summarize" in prompts["Summarize"]
+        assert len(configs) == 1
+        assert len(results) == 5
+        assert len(native_states) == 5
+        assert [request for request, _ in native_states] == selected_requests
+        assert audited_kinds == [
+            "WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode", "WorkflowFileNode", "WorkflowSkillNode",
+        ]
+        assert len({result.request_id for result in results}) == 5
+        assert all(set(result.outputs) == {"node_plan", "node_generate", "node_audit"} for result in results)
+        assert all(result.outputs["node_audit"].derived["ok"] is True for result in results)
+        assert all(result.outputs["node_plan"].card == {"status": "skipped"} for result in results[-2:])
+        assert all(set(request.state) == {"native_identity"} for request in selected_requests)
+        assert service.workflow is workflow and workflow._engine is engine
+        assert set(vars(service)) == {"node_planner", "node_coder", "node_auditor", "workflow"}
+        assert not hasattr(workflow, "_last_result")
+    finally:
+        service.close()
+    assert workflow._engine is None
+    assert engine.pool.closed
+
+
+
+
+

@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: 2026 FlowX contributors
+# SPDX-License-Identifier: Apache-2.0
+# FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
+# Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-10-14: explicit terminal handle disposal and attachment ownership.
 """Per-workflow state registry and backend process management.
 
 A :class:`WorkflowHandle` bundles one ``flowx_core.AgentBuilder`` instance together with
@@ -113,6 +118,10 @@ class WorkflowHandle:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     completed_steps: List[str] = field(default_factory=list)
 
+    # Terminal disposal is separate from restartable backend management.
+    _closed: bool = field(default=False, init=False, repr=False, compare=False)
+    _close_lock: Any = field(default_factory=threading.RLock, init=False, repr=False, compare=False)
+
     # ------------------------------------------------------------------ utils
     def base_url(self) -> str:
         if not self.backend_port:
@@ -148,6 +157,26 @@ class WorkflowHandle:
         self.backend_process = None
         self.is_running = False
 
+    def close(self) -> None:
+        """Terminally release the backend and builder, attempting each exactly once.
+
+        Cleanup failures propagate, but never prevent builder cleanup or make this
+        handle restartable again. Ordinary stop/reload must not call this method.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self.stop_backend()
+            finally:
+                try:
+                    if self.builder is not None:
+                        self.builder.close()
+                finally:
+                    self.backend_process = None
+                    self.is_running = False
+
     def _ensure_main_entrypoint(self) -> str:
         """Make sure main.py exists (regenerate with the assigned port if missing)."""
         if self.main_entrypoint_path and Path(self.main_entrypoint_path).is_file():
@@ -168,6 +197,8 @@ class WorkflowHandle:
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
         """Start the generated FastAPI backend."""
+        if self._closed:
+            raise RuntimeError("workflow handle is closed")
         from .client import health_check
 
         self.stop_backend()
@@ -214,6 +245,8 @@ class WorkflowHandle:
         timeout: float = 30.0,
     ) -> Dict[str, Any]:
         """Restart the backend so updated node files / workflow.json take effect."""
+        if self._closed:
+            raise RuntimeError("workflow handle is closed")
         self.stop_backend()
         if reset_session:
             self.new_session()
@@ -310,11 +343,26 @@ class WorkflowRegistry:
         workflow_name: str,
         workspace: Optional[str] = None,
     ) -> Optional[WorkflowHandle]:
+        """Transfer ownership to the caller without stopping or closing the handle."""
         with self._lock:
             handle = self._find_unlocked(workflow_name, workspace)
             if handle is None:
                 return None
             return self._handles.pop(_registry_key(handle.workspace, handle.workflow_name), None)
+
+    def discard(self, handle: WorkflowHandle) -> bool:
+        """Remove and close this exact registered handle, never a replacement.
+
+        If ownership was already transferred by pop(), its caller must close it.
+        Removal precedes cleanup so a cleanup failure cannot retain a dead handle.
+        """
+        with self._lock:
+            key = _registry_key(handle.workspace, handle.workflow_name)
+            if self._handles.get(key) is not handle:
+                return False
+            self._handles.pop(key)
+        handle.close()
+        return True
 
     def find_by_backend_port(self, backend_port: int) -> Optional[WorkflowHandle]:
         with self._lock:
@@ -372,7 +420,7 @@ class WorkflowRegistry:
                 _registry_key(handle.workspace, handle.workflow_name)
             )
 
-        stopped_handle.stop_backend()
+        stopped_handle.close()
         return stopped_handle
 
     def get_or_create(
@@ -385,6 +433,30 @@ class WorkflowRegistry:
         provider: Optional[str] = None,
         skills_root: Optional[str] = None,
     ) -> WorkflowHandle:
+        handle, _ = self.get_or_create_with_status(
+            workspace=workspace,
+            workflow_name=workflow_name,
+            api_key=api_key,
+            model=model,
+            provider=provider,
+            skills_root=skills_root,
+        )
+        return handle
+
+    def get_or_create_with_status(
+        self,
+        *,
+        workspace: str,
+        workflow_name: str,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        skills_root: Optional[str] = None,
+    ) -> Tuple[WorkflowHandle, bool]:
+        """Atomically return the handle and whether this call allocated it.
+
+        Failure rollback may dispose newly created handles, not shared ones.
+        """
         if not _CORE_AVAILABLE:
             raise ImportError(
                 "core is not importable. Install the unified FlowX package "
@@ -410,7 +482,7 @@ class WorkflowRegistry:
                         existing.provider = provider
                 if skills_root is not None:
                     existing.skills_root = skills_root
-                return existing
+                return existing, False
 
             defaults = _default_llm_config()
             eff_api_key = api_key or defaults["api_key"]
@@ -437,7 +509,7 @@ class WorkflowRegistry:
                 skills_root=skills_root,
             )
             self._handles[key] = handle
-            return handle
+            return handle, True
 
 
 # process-wide singleton

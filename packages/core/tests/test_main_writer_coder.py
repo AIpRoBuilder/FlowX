@@ -2,6 +2,10 @@
 
 Modified 2026-10-13: explicit JSON class maps, binary file transport, and native wait gates.
 Modified 2026-10-14: distinguish node tuples from STEP_ID maps and verify pool map identity.
+Modified 2026-10-14: verify single-pass main writer -> auditor workflow requests.
+Modified 2026-10-14: verify service delegation to the extracted main-entrypoint workflow.
+Modified 2026-10-14: use explicit requests, eager pool reuse, and terminal cleanup.
+Modified 2026-10-15: template-only requests omit temperature; public writer compatibility remains.
 """
 
 import importlib.util
@@ -9,18 +13,34 @@ import base64
 import json
 import subprocess
 import sys
+from contextlib import closing
+from dataclasses import fields
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from uuid import uuid4
 
 import pytest
 from ag_ui_workflow import StepRunOutput
 from fastapi.testclient import TestClient
 
+from flowx_core import builder_services
+from flowx_core.auditor.data import RuleViolation
 from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
 from flowx_core.llm_client.coder import Coder
 from flowx_core.builder_services import MainEntrypointService
-from flowx_core.builder_support import AuditRepairLoop
 from flowx_core.worker.main_writer import PromptMainFileCoder
+from flowx_core.workflows import main_entrypoint_generation
+from flowx_core.workflows.main_entrypoint_generation import (
+    MainEntrypointGenerationRequest,
+    MainEntrypointGenerationWorkflow,
+)
+
+
+def _main_service(writer, auditor):
+    return MainEntrypointService(
+        main_writer=writer, main_entry_auditor=auditor,
+    )
 
 
 def test_main_writer_initializes_without_credentials(monkeypatch) -> None:
@@ -51,6 +71,13 @@ def test_main_writer_renders_and_refreshes_template_without_llm(tmp_path) -> Non
     assert result == main_path
     assert "Collect.step_meta()" in main_path.read_text(encoding="utf-8")
     assert "from .Collect import Collect" in (package_dir / "__init__.py").read_text(encoding="utf-8")
+    original_source = main_path.read_text(encoding="utf-8")
+    assert writer.write_main_entrypoint(
+        project_root_path=str(tmp_path), graph_plan_json_path=str(graph_path),
+        output_path=str(main_path), temperature=0.9, max_tokens=1,
+    ) == main_path
+    assert main_path.read_text(encoding="utf-8") == original_source
+    assert writer.client is None
 
     with pytest.raises(FileExistsError):
         writer.write_main_entrypoint(
@@ -93,8 +120,12 @@ def test_main_writer_renders_step_route_without_scheduling_code(tmp_path) -> Non
     assert "uvicorn.run(app, host='127.0.0.1', port=9000, reload=True)" in output
 
 
-def test_process_input_writes_then_amends_from_session_request(tmp_path) -> None:
+def test_process_input_writes_then_amends_from_session_request(tmp_path, monkeypatch) -> None:
     writer = PromptMainFileCoder()
+    write_main = Mock(wraps=writer.write_main_entrypoint)
+    amend_main = Mock(wraps=writer.amend_code_with_feedback)
+    monkeypatch.setattr(writer, "write_main_entrypoint", write_main)
+    monkeypatch.setattr(writer, "amend_code_with_feedback", amend_main)
     package_dir = tmp_path / "nodes"
     package_dir.mkdir()
     graph_path = tmp_path / "workflow.json"
@@ -107,8 +138,16 @@ def test_process_input_writes_then_amends_from_session_request(tmp_path) -> None
         {"graph": StepRunOutput(derived={"graph_plan_json_path": str(graph_path)})},
         {"PromptMainFileCoder::action": "write", "main_entrypoint": {
             "project_root_path": str(tmp_path), "output_path": str(main_path),
+            "temperature": 0.9,
         }},
     )
+    write_main.assert_called_once_with(
+        project_root_path=str(tmp_path), graph_plan_json_path=str(graph_path),
+        output_path=str(main_path), fastapi_host="0.0.0.0", fastapi_port=8000,
+        uvicorn_reload=False, overwrite=True,
+    )
+    assert "temperature" not in write_main.call_args.kwargs
+    amend_main.assert_not_called()
     assert output.derived["main_entrypoint_path"] == str(main_path)
     assert "Collect.step_meta()" in main_path.read_text(encoding="utf-8")
 
@@ -116,7 +155,12 @@ def test_process_input_writes_then_amends_from_session_request(tmp_path) -> None
     graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}, {"name": "Publish"}]}), encoding="utf-8")
     result = writer.process_input("", {}, {"PromptMainFileCoder::action": "amend", "main_entrypoint": {
         "output_path": str(main_path), "amendment": "Refresh imports",
+        "temperature": 0.4,
     }})
+    amend_main.assert_called_once_with(
+        str(main_path), "Refresh imports", language="python", overwrite=True, temperature=0.4,
+    )
+    write_main.assert_called_once()
     assert result.derived["main_entrypoint_path"] == str(main_path)
     assert "Publish.step_meta()" in main_path.read_text(encoding="utf-8")
 
@@ -133,48 +177,337 @@ def test_process_input_rejects_incomplete_requests(session_state, message) -> No
         PromptMainFileCoder().process_input("", {}, session_state)
 
 
-def test_builder_service_routes_generation_and_audit_repair_through_process_input(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("audit_ok", [True, False])
+def test_builder_service_runs_main_writer_then_auditor_once(tmp_path, monkeypatch, audit_ok) -> None:
     package_dir = tmp_path / "nodes"
     package_dir.mkdir()
     (package_dir / "Collect.py").write_text("class Collect: pass\n", encoding="utf-8")
     graph_path = tmp_path / "workflow.json"
     graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
 
-    writer = PromptMainFileCoder()
+    writer = PromptMainFileCoder(model="configured-main-writer")
     requests = []
-    original_process_input = writer.process_input
+    original_process_input = PromptMainFileCoder.process_input
 
-    def capture_request(user_input, dependency_results, session_state):
+    def capture_request(self, user_input, dependency_results, session_state):
+        assert self.model == writer.model
+        assert dependency_results == {}
+        assert "temperature" not in session_state["main_entrypoint"]
         requests.append((session_state["PromptMainFileCoder::action"], dict(session_state["main_entrypoint"])))
-        return original_process_input(user_input, dependency_results, session_state)
+        return original_process_input(self, user_input, dependency_results, session_state)
 
-    monkeypatch.setattr(writer, "process_input", capture_request)
+    monkeypatch.setattr(PromptMainFileCoder, "process_input", capture_request)
+    amendment = Mock(side_effect=AssertionError("main generation must not amend or retry"))
+    monkeypatch.setattr(PromptMainFileCoder, "amend_code_with_feedback", amendment)
     audit_calls = []
+    original_audit_input = MainEntryPointAuditor.process_input
 
-    def audit_main_entrypoint_file(*_args):
-        audit_calls.append(None)
-        if len(audit_calls) == 1:
-            return False, [SimpleNamespace(lineno=1, rule="missing", detail="refresh")]
-        return True, []
+    def capture_audit(self, user_input, dependency_results, session_state):
+        assert list(dependency_results) == [writer.STEP_ID]
+        assert dependency_results[writer.STEP_ID].derived["main_entrypoint_path"] == str(package_dir / "main.py")
+        return original_audit_input(self, user_input, dependency_results, session_state)
 
-    logger = SimpleNamespace(info=lambda *_args: None, warning=lambda *_args: None)
-    builder = SimpleNamespace(
-        root_dir=str(tmp_path),
-        graph_plan_path=str(graph_path),
-        main_output_path=None,
-        main_writer=writer,
-        main_entry_auditor=SimpleNamespace(audit_main_entrypoint_file=audit_main_entrypoint_file),
-        _logger=logger,
-        _make_audit_repair_loop=lambda: AuditRepairLoop(logger=logger, max_attempts=2),
+    def audit_file(self, file_path, nodes_root=None):
+        assert Path(file_path).is_file(), "the writer must run before the auditor"
+        audit_calls.append((file_path, nodes_root))
+        return audit_ok, [] if audit_ok else [RuleViolation("(file)", "missing", "refresh", 1)]
+
+    monkeypatch.setattr(MainEntryPointAuditor, "process_input", capture_audit)
+    monkeypatch.setattr(MainEntryPointAuditor, "audit_file", audit_file)
+    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
+    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+
+    request = MainEntrypointGenerationRequest(
+        project_root_path=str(package_dir), graph_plan_json_path=str(graph_path),
+        output_path=str(package_dir / "main.py"), fastapi_host="127.0.0.1",
+        fastapi_port=9001,
+    )
+    assert "temperature" not in {setting.name for setting in fields(request)}
+    assert not hasattr(request, "temperature")
+
+    with closing(_main_service(writer, MainEntryPointAuditor())) as service:
+        engine = service.workflow._engine
+        assert engine is not None
+        init_engine.assert_called_once()
+        assert init_engine.call_args.args[0] == {
+            "main_generate": PromptMainFileCoder,
+            "main_audit": MainEntryPointAuditor,
+        }
+        close_engine.assert_not_called()
+
+        if audit_ok:
+            assert service.run(request) == request.output_path
+        else:
+            with pytest.raises(RuntimeError, match="main entrypoint audit did not pass") as error:
+                service.run(request)
+            assert "Line 1: missing - refresh" in str(error.value)
+
+        assert set(vars(service)) == {"main_writer", "main_entry_auditor", "workflow"}
+        assert request.state == {}
+        assert [action for action, _ in requests] == ["write"]
+        assert requests[0][1] == {
+            "project_root_path": request.project_root_path,
+            "graph_plan_json_path": request.graph_plan_json_path,
+            "output_path": request.output_path,
+            "fastapi_host": request.fastapi_host,
+            "fastapi_port": request.fastapi_port,
+        }
+        assert "temperature" not in requests[0][1]
+        assert audit_calls == [(request.output_path, request.project_root_path)]
+        source = Path(request.output_path).read_text(encoding="utf-8")
+        assert "Collect.step_meta()" in source
+        assert "uvicorn.run(app, host='127.0.0.1', port=9001, reload=False)" in source
+        amendment.assert_not_called()
+        init_engine.assert_called_once()
+        assert service.workflow._engine is engine
+        assert not engine.pool.closed
+        with engine.pool.lease() as (_, param):
+            assert param.state == {}
+        close_engine.assert_not_called()
+
+    close_engine.assert_called_once_with(engine)
+    assert service.workflow._engine is None
+    assert engine.pool.closed
+
+
+def test_main_entrypoint_service_delegates_build_request_to_workflow(tmp_path, monkeypatch) -> None:
+    workflow = Mock()
+    workflow.run.return_value = str(tmp_path / "generated-main.py")
+    constructor = Mock(return_value=workflow)
+    monkeypatch.setattr(builder_services, "MainEntrypointGenerationWorkflow", constructor)
+    writer, auditor = object(), object()
+    state = {"marker": {"value": "caller-owned"}}
+    request = MainEntrypointGenerationRequest(
+        project_root_path=str(tmp_path), graph_plan_json_path=str(tmp_path / "requested-workflow.json"),
+        output_path=str(tmp_path / "entrypoint.py"), fastapi_host="127.0.0.1",
+        fastapi_port=9002, state=state,
     )
 
-    output = MainEntrypointService(builder).write_main_entrypoint(output_filename="nodes/main.py")
+    with closing(_main_service(writer, auditor)) as service:
+        constructor.assert_called_once_with(main_writer=writer, main_entry_auditor=auditor)
+        assert service.workflow is workflow
+        workflow.run.assert_not_called()
+        workflow.close.assert_not_called()
 
-    assert output == str(package_dir / "main.py")
-    assert [action for action, _request in requests] == ["write", "amend"]
-    assert requests[0][1]["graph_plan_json_path"] == str(graph_path)
-    assert "missing" in requests[1][1]["amendment"]
-    assert "Collect.step_meta()" in (package_dir / "main.py").read_text(encoding="utf-8")
+        output = service.run(request)
+
+        workflow.run.assert_called_once_with(request)
+        assert workflow.run.call_args.args[0] is request
+        assert workflow.run.call_args.kwargs == {}
+        assert output == workflow.run.return_value
+        assert set(vars(service)) == {"main_writer", "main_entry_auditor", "workflow"}
+        assert request.state is state
+        constructor.assert_called_once()
+        workflow.close.assert_not_called()
+
+    workflow.close.assert_called_once_with()
+
+
+def test_builder_main_workflow_preserves_template_and_explicit_amendment_context(tmp_path) -> None:
+    package_dir = tmp_path / "nodes"
+    package_dir.mkdir()
+    graph_path = package_dir / "workflow.json"
+    graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
+    (package_dir / "Collect.py").write_text("class Collect: pass\n", encoding="utf-8")
+    template_path = tmp_path / "custom.tmpl"
+    default_writer = PromptMainFileCoder()
+    template_path.write_text(default_writer._template_source + "\n# custom template\n", encoding="utf-8")
+    writer = PromptMainFileCoder(template_path=str(template_path))
+    request = MainEntrypointGenerationRequest(
+        project_root_path=str(package_dir), graph_plan_json_path=str(graph_path),
+        output_path=str(package_dir / "main.py"),
+    )
+
+    with closing(_main_service(writer, MainEntryPointAuditor())) as service:
+        output = service.run(request)
+
+        assert MainEntryPointAuditor().audit_file(output, nodes_root=str(package_dir)) == (True, [])
+        assert "# custom template" in Path(output).read_text(encoding="utf-8")
+        assert Path(output) in writer._render_context_by_target
+
+    assert service.workflow._engine is None
+    assert writer.amend_code_with_feedback(output, "Refresh the entrypoint") == Path(output)
+
+
+def test_builder_main_workflow_retains_pool_when_writer_raises(tmp_path, monkeypatch) -> None:
+    graph_path = tmp_path / "workflow.json"
+    graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
+    (tmp_path / "Collect.py").write_text("class Collect: pass\n", encoding="utf-8")
+    writer = PromptMainFileCoder()
+    original_write = PromptMainFileCoder.write_main_entrypoint
+    original_audit_input = MainEntryPointAuditor.process_input
+    monkeypatch.setattr(
+        PromptMainFileCoder, "write_main_entrypoint",
+        Mock(side_effect=ValueError("writer failed")),
+    )
+    audit_input = Mock(side_effect=AssertionError("audit must not run after writer failure"))
+    monkeypatch.setattr(MainEntryPointAuditor, "process_input", audit_input)
+    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
+    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+    request = MainEntrypointGenerationRequest(
+        project_root_path=str(tmp_path), graph_plan_json_path=str(graph_path),
+        output_path=str(tmp_path / "main.py"), state={"failed_request": True},
+    )
+
+    with closing(_main_service(writer, MainEntryPointAuditor())) as service:
+        engine = service.workflow._engine
+        assert engine is not None
+        init_engine.assert_called_once()
+        with pytest.raises(RuntimeError, match="writer failed"):
+            service.run(request)
+
+        audit_input.assert_not_called()
+        close_engine.assert_not_called()
+        assert service.workflow._engine is engine
+        assert not engine.pool.closed
+        assert request.state == {"failed_request": True}
+        with engine.pool.lease() as (_, param):
+            assert param.state == {}
+
+        monkeypatch.setattr(PromptMainFileCoder, "write_main_entrypoint", original_write)
+        monkeypatch.setattr(MainEntryPointAuditor, "process_input", original_audit_input)
+        recovery_request = MainEntrypointGenerationRequest(
+            project_root_path=str(tmp_path), graph_plan_json_path=str(graph_path),
+            output_path=str(tmp_path / "recovered.py"),
+        )
+        assert service.run(recovery_request) == recovery_request.output_path
+        assert MainEntryPointAuditor().audit_file(recovery_request.output_path, nodes_root=str(tmp_path)) == (True, [])
+        init_engine.assert_called_once()
+        close_engine.assert_not_called()
+        assert service.workflow._engine is engine
+        assert not engine.pool.closed
+        with engine.pool.lease() as (_, param):
+            assert param.state == {}
+
+    close_engine.assert_called_once_with(engine)
+    assert service.workflow._engine is None
+    assert engine.pool.closed
+
+
+def test_main_entrypoint_workflow_runs_direct_build_request(tmp_path, monkeypatch) -> None:
+    graph_path = tmp_path / "workflow.json"
+    graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
+    (tmp_path / "Collect.py").write_text("class Collect: pass\n", encoding="utf-8")
+    writer = PromptMainFileCoder()
+    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
+    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+    request = MainEntrypointGenerationRequest(
+        project_root_path=str(tmp_path), graph_plan_json_path=str(graph_path),
+        output_path=str(tmp_path / "main.py"),
+    )
+
+    with closing(MainEntrypointGenerationWorkflow(writer, MainEntryPointAuditor())) as workflow:
+        engine = workflow._engine
+        assert engine is not None
+        init_engine.assert_called_once()
+        close_engine.assert_not_called()
+        output = workflow.run(request)
+
+        assert output == request.output_path
+        assert MainEntryPointAuditor().audit_file(output, nodes_root=str(tmp_path)) == (True, [])
+        assert Path(output) in writer._render_context_by_target
+        assert workflow._engine is engine
+        assert not engine.pool.closed
+        with engine.pool.lease() as (_, param):
+            assert param.state == {}
+        init_engine.assert_called_once()
+        close_engine.assert_not_called()
+
+    assert workflow._engine is None
+    assert engine.pool.closed
+    workflow.close()
+    close_engine.assert_called_once_with(engine)
+    with pytest.raises(RuntimeError, match="main entrypoint workflow is closed"):
+        workflow.run(request)
+    init_engine.assert_called_once()
+    close_engine.assert_called_once_with(engine)
+
+
+@pytest.mark.parametrize("runner_kind", ["service", "workflow"])
+def test_main_entrypoint_requests_reuse_pool_with_independent_targets_and_state(tmp_path, monkeypatch, runner_kind) -> None:
+    first_root, second_root = tmp_path / "first_nodes", tmp_path / "second_nodes"
+    for root, node_name in ((first_root, "Collect"), (second_root, "Publish")):
+        root.mkdir()
+        (root / f"{node_name}.py").write_text(f"class {node_name}: pass\n", encoding="utf-8")
+        (root / "workflow.json").write_text(json.dumps({"nodes": [{"name": node_name}]}), encoding="utf-8")
+    marker = {"value": "caller-owned"}
+    state = {"marker": marker}
+    first_request = MainEntrypointGenerationRequest(
+        project_root_path=str(first_root), graph_plan_json_path=str(first_root / "workflow.json"),
+        output_path=str(first_root / "main.py"), fastapi_host="127.0.0.1", fastapi_port=9003,
+        state=state,
+    )
+    second_request = MainEntrypointGenerationRequest(
+        project_root_path=str(second_root), graph_plan_json_path=str(second_root / "workflow.json"),
+        output_path=str(second_root / "main.py"), fastapi_port=9004,
+    )
+    native_params, observed_states = [], []
+    original_process_input = PromptMainFileCoder.process_input
+
+    def capture_request(self, user_input, dependency_results, session_state):
+        param = self.get_workflow_param()
+        assert session_state is param.state
+        assert "previous_target" not in session_state
+        assert "temperature" not in session_state["main_entrypoint"]
+        # Lease cleanup replaces the state dict, so track the native parameter.
+        native_params.append(param)
+        observed_states.append(dict(session_state))
+        session_state["previous_target"] = session_state["main_entrypoint"]["output_path"]
+        return original_process_input(self, user_input, dependency_results, session_state)
+
+    monkeypatch.setattr(PromptMainFileCoder, "process_input", capture_request)
+    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
+    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+    writer, auditor = PromptMainFileCoder(), MainEntryPointAuditor()
+
+    with closing(
+        _main_service(writer, auditor) if runner_kind == "service"
+        else MainEntrypointGenerationWorkflow(writer, auditor)
+    ) as runner:
+        workflow = runner.workflow if runner_kind == "service" else runner
+        engine = workflow._engine
+        assert engine is not None
+        init_engine.assert_called_once()
+        sources = []
+        for request in (first_request, first_request, second_request):
+            assert runner.run(request) == request.output_path
+            sources.append(Path(request.output_path).read_text(encoding="utf-8"))
+            assert workflow._engine is engine
+            assert not engine.pool.closed
+            assert all(native_param.state == {} for native_param in native_params)
+            with engine.pool.lease() as (_, param):
+                assert param.state == {}
+            init_engine.assert_called_once()
+            close_engine.assert_not_called()
+
+        assert len(observed_states) == 3
+        assert observed_states[0]["marker"] is marker
+        assert observed_states[1]["marker"] is marker
+        assert "marker" not in observed_states[2]
+        assert state == {"marker": {"value": "caller-owned"}}
+        assert second_request.state == {}
+        assert sources[0] == sources[1] == Path(first_request.output_path).read_text(encoding="utf-8")
+        assert "Collect.step_meta()" in sources[0] and "Publish.step_meta()" not in sources[0]
+        assert "Publish.step_meta()" in sources[2] and "Collect.step_meta()" not in sources[2]
+        assert "uvicorn.run(app, host='127.0.0.1', port=9003, reload=False)" in sources[0]
+        assert "uvicorn.run(app, host='0.0.0.0', port=9004, reload=False)" in sources[2]
+        assert set(writer._render_context_by_target) == {
+            Path(first_request.output_path), Path(second_request.output_path),
+        }
+        if runner_kind == "service":
+            assert set(vars(runner)) == {"main_writer", "main_entry_auditor", "workflow"}
+
+    close_engine.assert_called_once_with(engine)
+    assert workflow._engine is None
+    assert engine.pool.closed
 
 
 def _render_backend(tmp_path, sources=None, *, workflow_config=None):
