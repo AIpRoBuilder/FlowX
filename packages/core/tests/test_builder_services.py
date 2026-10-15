@@ -854,7 +854,7 @@ def test_runtime_service_writes_requested_log_without_auditing_or_publishing_sta
 @pytest.mark.parametrize("failed_kind", (None, "graph", "node", "artifact", "main"))
 def test_agent_builder_close_delegates_to_all_four_services_even_if_cleanup_fails(failed_kind) -> None:
     builder = SimpleNamespace(**{
-        name: Mock(name=name, spec_set=["close"]) for _, _, _, _, name in _WORKFLOW_SERVICE_CASES
+        name: Mock(name=name, spec_set=["close", "workflow"]) for _, _, _, _, name in _WORKFLOW_SERVICE_CASES
     })
     closes = Mock()
     failure = RuntimeError("service cleanup failed")

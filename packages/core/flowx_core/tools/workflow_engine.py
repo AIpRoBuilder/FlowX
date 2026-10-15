@@ -2,6 +2,7 @@
 
 Modified: pass explicit concrete class maps directly; use class-declared identities.
 Modified: seed the attached WorkflowParam.state through a request-local lease bridge.
+Modified 2026-10-16: reload an engine's pool and step metadata when the workflow config changes.
 """
 
 from __future__ import annotations
@@ -45,13 +46,11 @@ class _WorkflowPipelinePool(WorkflowPipelinePool):
             yield pipeline, param
 
 
-def init_workflow_engine(
+def _prepare_graph(
     node_classes: Mapping[str, type[GElement]],
     workflow_config: Mapping[str, Any],
-    *,
-    graph_config_id: str = "flowx",
-) -> WorkflowEngine:
-    """Pass the supplied concrete class map directly to a reusable pipeline pool.
+) -> tuple[str, list[dict[str, Any]], int]:
+    """Check a class map against its JSON topology; return native JSON, step metadata and pool size.
 
     Class STEP_ID and DEPENDENCIES must match the JSON topology. Metadata comes
     directly from each class without constructing speculative node instances.
@@ -85,8 +84,19 @@ def init_workflow_engine(
             raise ValueError(f"node '{name}' class STEP_ID/DEPENDENCIES must match the workflow configuration")
         native_nodes.append({"name": name, "depends": dependencies})
         steps_meta.append(node_class.step_meta())
+    return json.dumps({"nodes": native_nodes}), steps_meta, pool_size
+
+
+def init_workflow_engine(
+    node_classes: Mapping[str, type[GElement]],
+    workflow_config: Mapping[str, Any],
+    *,
+    graph_config_id: str = "flowx",
+) -> WorkflowEngine:
+    """Pass the supplied concrete class map directly to a reusable pipeline pool."""
+    pipeline_json, steps_meta, pool_size = _prepare_graph(node_classes, workflow_config)
     pool = _WorkflowPipelinePool(
-        pipeline_json=json.dumps({"nodes": native_nodes}),
+        pipeline_json=pipeline_json,
         node_classes=node_classes,
         size=pool_size,
     )
@@ -99,6 +109,26 @@ def init_workflow_engine(
     except BaseException:
         pool.close()
         raise
+
+
+def reload_workflow_engine(
+    engine: WorkflowEngine,
+    node_classes: Mapping[str, type[GElement]],
+    workflow_config: Mapping[str, Any],
+) -> None:
+    """Serve new runs from a changed graph on the same engine and pool.
+
+    The pool builds the new graph first, so an invalid config leaves the current
+    graph and engine metadata untouched. Leases already out finish on the old graph;
+    ``run_workflow`` snapshots step ids when a run starts.
+    """
+    if not isinstance(engine.pool, _WorkflowPipelinePool):
+        raise TypeError("only an engine created by init_workflow_engine can be reloaded")
+    pipeline_json, steps_meta, pool_size = _prepare_graph(node_classes, workflow_config)
+    engine.pool.reload(pipeline_json=pipeline_json, node_classes=node_classes, size=pool_size)
+    # The engine has no reload API and keeps its own step metadata and lookup map.
+    engine.steps_meta = engine._normalize_steps_meta(steps_meta)
+    engine._step_map = {step["id"]: step for step in engine.steps_meta}
 
 
 def run_workflow(
@@ -150,5 +180,6 @@ def close_workflow_engine(engine: WorkflowEngine) -> None:
 __all__ = [
     "close_workflow_engine",
     "init_workflow_engine",
+    "reload_workflow_engine",
     "run_workflow",
 ]

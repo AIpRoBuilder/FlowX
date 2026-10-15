@@ -12,6 +12,7 @@
 # Modified 2026-10-15: keep routing local and remove redundant request identities/bookkeeping.
 # Modified 2026-10-15: orchestrate batches locally and dispatch complete per-node requests without callback registries.
 # Modified 2026-10-15: disable batch node generation and remove batch-only helpers; retain per-node services.
+# Modified 2026-10-16: publish the node generation workflow and runtime modifier for DynamicWorkflowOrchestrator.
 from typing import Optional, List, Dict, Any, Mapping
 from contextlib import ExitStack
 from dataclasses import replace
@@ -21,6 +22,7 @@ from pathlib import Path
 from threading import RLock
 
 from flowx_core.architect import GraphPlanner, NodePlanElement, Graph
+from flowx_core import dynamic_workflow_orchestrator
 from flowx_core.auditor import GraphJsonAuditor, NodeAuditor, MainEntryPointAuditor, OutputAuditor
 from flowx_core.builder_support import (
     AuditRepairLoop, BuildSession, BuilderComponentFactory,
@@ -139,6 +141,9 @@ class AgentBuilder:
             self._node_artifact_service = artifact_service
             self._main_entrypoint_service = main_service
             cleanup.pop_all()
+        # Native generation steps are class-only, so they read these module globals.
+        dynamic_workflow_orchestrator.NODE_GENERATION_WORKFLOW = self._node_build_service.workflow
+        dynamic_workflow_orchestrator.NODE_RUNTIME_MODIFIER_PIPELINE = self._node_artifact_service.workflow
         self._runtime_service = RuntimeService(
             logger=self._logger,
             select_python_command=self._select_python_command,
@@ -148,6 +153,11 @@ class AgentBuilder:
 
     def close(self) -> None:
         """Release all four initialized workflows, even if one cleanup fails."""
+        # Unpublish first, and only our own, so no dynamic run starts on a closing workflow.
+        if dynamic_workflow_orchestrator.NODE_GENERATION_WORKFLOW is self._node_build_service.workflow:
+            dynamic_workflow_orchestrator.NODE_GENERATION_WORKFLOW = None
+        if dynamic_workflow_orchestrator.NODE_RUNTIME_MODIFIER_PIPELINE is self._node_artifact_service.workflow:
+            dynamic_workflow_orchestrator.NODE_RUNTIME_MODIFIER_PIPELINE = None
         with ExitStack() as cleanup:
             for service in (
                 self._graph_build_service, self._node_build_service,
