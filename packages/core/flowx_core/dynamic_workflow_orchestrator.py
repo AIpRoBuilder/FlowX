@@ -13,16 +13,12 @@ This coordinator does not execute the generated graph or implement a ReAct judge
 
 from __future__ import annotations
 
-import ast
-import hashlib
-import io
 import json
 import keyword
 import os
 import re
 import shutil
 import sys
-import tokenize
 import uuid
 from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
@@ -33,10 +29,12 @@ from typing import Any, Mapping
 from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
 
 from flowx_core.architect.graph import NodeMeta
-from flowx_core.tools.file_tools import (
-	collect_session_state_keys_from_node_file,
-	compile_node_file_and_get_derived_keys,
-	compile_node_file_and_get_step_output_card_schema,
+from flowx_core.tools.artifact_tools import (
+	fingerprint_json,
+	json_text,
+	make_test_relocatable,
+	node_source_artifact,
+	render_json_context,
 )
 from flowx_core.tools.workflow_engine import (
 	close_workflow_engine,
@@ -117,14 +115,6 @@ class WorkflowVersion:
 		return {name: node.node_id for name, node in self.node_versions.items()}
 
 
-def _json_text(value: Any) -> str:
-	return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
-
-
-def _fingerprint(value: Any) -> str:
-	return hashlib.sha256(_json_text(value).encode("utf-8")).hexdigest()
-
-
 # Published by AgentBuilder: class-only native steps cannot take constructor arguments.
 NODE_GENERATION_WORKFLOW: NodeGenerationWorkflow | None = None
 NODE_RUNTIME_MODIFIER_PIPELINE: NodeRuntimeModifierPipeline | None = None
@@ -134,51 +124,6 @@ def _published_workflows() -> tuple[NodeGenerationWorkflow, NodeRuntimeModifierP
 	if NODE_GENERATION_WORKFLOW is None or NODE_RUNTIME_MODIFIER_PIPELINE is None:
 		raise RuntimeError("AgentBuilder has not published its node generation workflow and runtime modifier")
 	return NODE_GENERATION_WORKFLOW, NODE_RUNTIME_MODIFIER_PIPELINE
-
-
-def _node_artifact(name: str, path: Path) -> dict[str, Any]:
-	"""Static facts about a generated node that its descendants use as generation context."""
-	source = path.read_text(encoding="utf-8")
-	return {
-		"parent_node": name,
-		"source_path": str(path),
-		"source": source,
-		"source_digest": hashlib.sha256(source.encode("utf-8")).hexdigest(),
-		"derived_keys": compile_node_file_and_get_derived_keys(str(path)),
-		"output_card_preview": compile_node_file_and_get_step_output_card_schema(str(path)),
-		"session_state_keys": sorted(collect_session_state_keys_from_node_file(str(path), name)),
-	}
-
-
-def _render_dependency_context(artifacts: Mapping[str, Mapping[str, Any]]) -> str:
-	sections = (_json_text(artifacts[name]) for name in sorted(artifacts))
-	return "Upstream generation artifacts (static, not runtime outputs):\n" + "\n".join(sections)
-
-
-def _make_test_relocatable(path: Path, directory: Path) -> None:
-	"""Rebase literal candidate paths without discarding test comments/notices.
-
-	The existing test writer asks for literal absolute node paths. Convert
-	local path literals to paths relative to the saved test's bundle instead
-	of leaving tests dependent on an eventually pruned workflow directory.
-	Logs are intentionally not rewritten: they describe the original run.
-	"""
-	source = path.read_text(encoding="utf-8")
-	tokens = []
-	for token in tokenize.generate_tokens(io.StringIO(source).readline):
-		if token.type == tokenize.STRING:
-			try:
-				value = ast.literal_eval(token.string)
-			except (ValueError, SyntaxError):
-				value = None
-			if isinstance(value, str) and (value == str(directory) or value.startswith(str(directory) + os.sep)):
-				relative = Path(value).relative_to(directory).as_posix()
-				expression = f"str(__import__('pathlib').Path(__file__).resolve().parents[1] / {relative!r})"
-				token = token._replace(string=expression)
-		tokens.append(token)
-	updated = tokenize.untokenize(tokens)
-	compile(updated, str(path), "exec")
-	path.write_text(updated, encoding="utf-8")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -238,13 +183,16 @@ class _NodeGenerationStep(WorkflowStepNode):
 		generation, _ = _published_workflows()
 		raw_node, targets = run.raw_nodes[name], run.artifacts[name]
 		dependency_digests = {parent: artifact["source_digest"] for parent, artifact in upstream.items()}
-		context = _render_dependency_context(upstream)
+		context = render_json_context(
+			upstream,
+			heading="Upstream generation artifacts (static, not runtime outputs):",
+		)
 		# Amendment mode does not consume node_meta itself. Keep graph edits visible
 		# to the coder as well as to its downstream auditor.
-		context += "\nCurrent target-node specification (authoritative):\n" + _json_text(raw_node)
+		context += "\nCurrent target-node specification (authoritative):\n" + json_text(raw_node)
 		if request.markdown_amendments.get(name):
 			context += "\nApply these node-brief changes to the implementation too:\n" + request.markdown_amendments[name]
-		fingerprint = _fingerprint({
+		fingerprint = fingerprint_json({
 			"node": raw_node, "requirement": run.requirement_text,
 			"dependencies": dependency_digests,
 			"node_format": dict(request.node_formats.get(name, {})),
@@ -290,14 +238,14 @@ class _NodeGenerationStep(WorkflowStepNode):
 			if request.run_runtime_modifier:
 				self._repair(run, NodeMeta.from_dict(raw_node))
 			if targets["test"].is_file():
-				_make_test_relocatable(targets["test"], directory)
+				make_test_relocatable(targets["test"], directory)
 		return StepRunOutput(
 			card={"status": "generated" if dirty else "reused", "node_name": name},
 			derived={
 				"node_id": registry["node_id"] if registry else uuid.uuid4().hex,
 				"version": (registry["version"] if registry else 0) + int(bool(dirty)),
 				"input_fingerprint": fingerprint, "changed": bool(dirty),
-				"artifacts": {**upstream, name: _node_artifact(name, targets["source"])},
+				"artifacts": {**upstream, name: node_source_artifact(name, targets["source"])},
 			},
 		)
 
@@ -404,7 +352,7 @@ class DynamicWorkflowOrchestrator:
 		path.parent.mkdir(parents=True, exist_ok=True)
 		temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
 		try:
-			temporary.write_text(_json_text(value) + "\n", encoding="utf-8")
+			temporary.write_text(json_text(value) + "\n", encoding="utf-8")
 			os.replace(temporary, path)
 		finally:
 			temporary.unlink(missing_ok=True)
@@ -663,7 +611,7 @@ class DynamicWorkflowOrchestrator:
 						registry["versions"].append(saved_record)
 						self._write_json(node_dir / "version.json", saved_record)
 						changed.append(name)
-				graph_fingerprint = _fingerprint({"graph": graph, "requirement": requirement_text})
+				graph_fingerprint = fingerprint_json({"graph": graph, "requirement": requirement_text})
 				if not changed and manifest["workflows"] and manifest["workflows"][-1]["input_fingerprint"] == graph_fingerprint:
 					return self._workflow_version(manifest["workflows"][-1])
 				workflow_record = {

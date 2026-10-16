@@ -20,6 +20,15 @@ from .agent_builder_tools import (
 	select_python_command,
 )
 from .text_tools import truncate_context
+from .artifact_tools import (
+	fingerprint_json,
+	json_text,
+	make_test_relocatable,
+	node_source_artifact,
+	relocate_python_path_literals,
+	render_json_context,
+	text_digest,
+)
 
 __all__ = [
 	"PIPELINE_ID_GPARAM_KEY",
@@ -38,4 +47,11 @@ __all__ = [
 	"get_language_extension",
 	"select_python_command",
 	"truncate_context",
+	"fingerprint_json",
+	"json_text",
+	"make_test_relocatable",
+	"node_source_artifact",
+	"relocate_python_path_literals",
+	"render_json_context",
+	"text_digest",
 ]
