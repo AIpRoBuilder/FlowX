@@ -763,16 +763,3 @@ class MainEntryPointAuditor(BaseAuditor):
 				return True
 		return False
 
-	def _find_async_for_attr_call_lineno(self, fn: RouteFunctionNode, attr_name: str) -> int | None:
-		for node in ast.walk(fn):
-			if not isinstance(node, ast.AsyncFor):
-				continue
-			iter_expr = node.iter
-			if not isinstance(iter_expr, ast.Call):
-				continue
-			if not isinstance(iter_expr.func, ast.Attribute):
-				continue
-			if iter_expr.func.attr == attr_name:
-				return node.lineno
-		return None
-

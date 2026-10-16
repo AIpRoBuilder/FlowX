@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import keyword
-import os
 import re
 import shutil
 import sys
@@ -35,6 +34,7 @@ from flowx_core.tools.artifact_tools import (
 	make_test_relocatable,
 	node_source_artifact,
 	render_json_context,
+	write_json_atomic,
 )
 from flowx_core.tools.workflow_engine import (
 	close_workflow_engine,
@@ -42,6 +42,7 @@ from flowx_core.tools.workflow_engine import (
 	reload_workflow_engine,
 	run_workflow,
 )
+from flowx_core.tools.workflow_logs import WorkflowNodeLogs
 from flowx_core.workflows.node_generation import NodeGenerationRequest, NodeGenerationWorkflow
 from flowx_core.workflows.node_runtime_modifier import (
 	NodeRuntimeModifierPipeline,
@@ -115,6 +116,14 @@ class WorkflowVersion:
 		return {name: node.node_id for name, node in self.node_versions.items()}
 
 
+class DynamicWorkflowError(RuntimeError):
+	"""A run failed; ``failures`` maps each node that failed itself (not blocked ones) to its error."""
+
+	def __init__(self, message: str, failures: Mapping[str, str]) -> None:
+		super().__init__(message)
+		self.failures = dict(failures)
+
+
 # Published by AgentBuilder: class-only native steps cannot take constructor arguments.
 NODE_GENERATION_WORKFLOW: NodeGenerationWorkflow | None = None
 NODE_RUNTIME_MODIFIER_PIPELINE: NodeRuntimeModifierPipeline | None = None
@@ -159,6 +168,9 @@ class _NodeGenerationStep(WorkflowStepNode):
 			run = session_state.get("dynamic_workflow_run")
 			if not isinstance(run, _GenerationRun):
 				raise TypeError("dynamic workflow generation run is missing")
+			logs = session_state.get("dynamic_workflow_logs")
+			if not isinstance(logs, WorkflowNodeLogs):
+				raise TypeError("dynamic workflow node logs are missing")
 			if set(dependency_results) != set(self.DEPENDENCIES):
 				raise RuntimeError(f"generation dependencies are incomplete for {self.STEP_ID}")
 			# Each parent's output already carries all of its ancestors' artifacts.
@@ -167,7 +179,7 @@ class _NodeGenerationStep(WorkflowStepNode):
 				for output in dependency_results.values()
 				for name, artifact in output.derived["artifacts"].items()
 			}
-			return self._build_node(run, upstream)
+			return self._build_node(run, logs, upstream)
 		except Exception as exc:
 			# Do not trigger native fail-fast cancellation while siblings still write
 			# candidate files. Drain the DAG, mark dependents blocked, then raise at
@@ -177,11 +189,14 @@ class _NodeGenerationStep(WorkflowStepNode):
 				derived={"error": f"{type(exc).__name__}: {exc}"},
 			)
 
-	def _build_node(self, run: _GenerationRun, upstream: Mapping[str, Mapping[str, Any]]) -> StepRunOutput:
+	def _build_node(
+		self, run: _GenerationRun, logs: WorkflowNodeLogs, upstream: Mapping[str, Mapping[str, Any]],
+	) -> StepRunOutput:
 		"""Generate and/or repair this node; version metadata is published by the caller."""
 		name, request, directory = self.STEP_ID, run.request, run.directory
 		generation, _ = _published_workflows()
 		raw_node, targets = run.raw_nodes[name], run.artifacts[name]
+		audit_result: tuple[bool, list[Any]] | None = None
 		dependency_digests = {parent: artifact["source_digest"] for parent, artifact in upstream.items()}
 		context = render_json_context(
 			upstream,
@@ -236,9 +251,20 @@ class _NodeGenerationStep(WorkflowStepNode):
 			elif not targets["source"].is_file():
 				raise FileNotFoundError(f"node {name} has no saved source to repair")
 			if request.run_runtime_modifier:
-				self._repair(run, NodeMeta.from_dict(raw_node))
+				audit_result = self._repair(run, logs)
 			if targets["test"].is_file():
 				make_test_relocatable(targets["test"], directory)
+		if audit_result is None:
+			audit_result = generation.node_auditor.audit_node_file(
+				str(targets["source"]), node_meta=NodeMeta.from_dict(raw_node),
+				graph_plan_path=str(directory / "workflow.json"),
+			)
+		ok, violations = audit_result
+		logs.record_audit(name, "\n".join(
+			f"Line {item.lineno}: {item.rule} - {item.detail}" for item in violations
+		) or "passed")
+		if not ok:
+			raise RuntimeError(f"node audit failed for {name}: {violations}")
 		return StepRunOutput(
 			card={"status": "generated" if dirty else "reused", "node_name": name},
 			derived={
@@ -249,7 +275,7 @@ class _NodeGenerationStep(WorkflowStepNode):
 			},
 		)
 
-	def _repair(self, run: _GenerationRun, meta: NodeMeta) -> None:
+	def _repair(self, run: _GenerationRun, logs: WorkflowNodeLogs) -> tuple[bool, list[Any]]:
 		"""Test the candidate, amend it from a failing log once, then retest and re-audit it."""
 		name, request, directory = self.STEP_ID, run.request, run.directory
 		generation, modifier = _published_workflows()
@@ -263,6 +289,7 @@ class _NodeGenerationStep(WorkflowStepNode):
 			state=dict(request.state),
 		)
 		result = modifier.run(modifier_request)
+		logs.record_test(name, result.test_log)
 		if Path(result.amended_node_file_path).resolve() != targets["source"]:
 			raise ValueError("modifier must keep the candidate node source path")
 		if result.test_result is None:
@@ -274,13 +301,14 @@ class _NodeGenerationStep(WorkflowStepNode):
 			modifier_request.skip_generate_node_test = True
 			modifier_request.skip_amend_node = True
 			result = modifier.run(modifier_request)
+			logs.record_test(name, result.test_log)
 			if result.test_result is None or not result.test_result["ok"]:
 				raise RuntimeError(f"node tests still fail after repair for {name}: {result.test_log}")
 		ok, violations = generation.node_auditor.audit_node_file(
-			str(targets["source"]), node_meta=meta, graph_plan_path=str(directory / "workflow.json"),
+			str(targets["source"]), node_meta=NodeMeta.from_dict(run.raw_nodes[name]),
+			graph_plan_path=str(directory / "workflow.json"),
 		)
-		if not ok:
-			raise RuntimeError(f"node audit failed after runtime modification for {name}: {violations}")
+		return ok, violations
 
 
 class DynamicWorkflowOrchestrator:
@@ -321,6 +349,7 @@ class DynamicWorkflowOrchestrator:
 		self._closed = False
 		self._generation_engine: WorkflowEngine | None = None
 		self._generation_config: dict[str, Any] | None = None
+		self._last_logs: WorkflowNodeLogs | None = None
 		self.storage_dir.mkdir(parents=True, exist_ok=True)
 		self._manifest_path = self.storage_dir / "manifest.json"
 		if self._manifest_path.is_file():
@@ -346,16 +375,7 @@ class DynamicWorkflowOrchestrator:
 			raise ValueError("unsupported dynamic workflow manifest")
 		return manifest
 
-	@staticmethod
-	def _write_json(path: Path, value: Any) -> None:
-		"""Replace a JSON document atomically; no partially written current pointer."""
-		path.parent.mkdir(parents=True, exist_ok=True)
-		temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-		try:
-			temporary.write_text(json_text(value) + "\n", encoding="utf-8")
-			os.replace(temporary, path)
-		finally:
-			temporary.unlink(missing_ok=True)
+	_write_json = staticmethod(write_json_atomic)
 
 	@property
 	def workflow_id(self) -> str:
@@ -377,6 +397,12 @@ class DynamicWorkflowOrchestrator:
 		"""The one scheduling engine, or None before the first nonempty run."""
 		with self._lock:
 			return self._generation_engine
+
+	@property
+	def last_logs(self) -> WorkflowNodeLogs | None:
+		"""Test and audit log text by node step_id from the latest run, including a failed one."""
+		with self._lock:
+			return self._last_logs
 
 	def _init_generation_engine(self, config: dict[str, Any]) -> WorkflowEngine | None:
 		"""Create the engine once, then reload its pool when the topology or pool size changes."""
@@ -559,6 +585,7 @@ class DynamicWorkflowOrchestrator:
 			# Never overwrite another writer's candidate or an interrupted build.
 			directory.mkdir(parents=True, exist_ok=False)
 			created_node_dirs: list[Path] = []
+			logs = self._last_logs = WorkflowNodeLogs()
 			committed = False
 			try:
 				self._write_json(directory / "workflow.json", graph)
@@ -581,13 +608,21 @@ class DynamicWorkflowOrchestrator:
 						request=request, directory=directory,
 						requirement_text=requirement_text, raw_nodes=raw_nodes,
 						artifacts=artifacts, registry=manifest["nodes"],
-					)})
-					failures = [
-						f"{name}: {result.outputs[name].derived['error']}"
+					), "dynamic_workflow_logs": logs})
+					failed = {
+						name: result.outputs[name].derived["error"]
 						for name in order if result.outputs[name].derived.get("error")
-					]
-					if failures:
-						raise RuntimeError("dynamic workflow generation failed:\n" + "\n".join(failures))
+					}
+					if failed:
+						root_causes = {
+							name: error for name, error in failed.items()
+							if result.outputs[name].card.get("status") == "failed"
+						}
+						raise DynamicWorkflowError(
+							"dynamic workflow generation failed:\n"
+							+ "\n".join(f"{name}: {error}" for name, error in failed.items()),
+							root_causes,
+						)
 					for name in order:
 						output = result.outputs[name].derived
 						node_record = self._record_node(
@@ -674,4 +709,7 @@ class DynamicWorkflowOrchestrator:
 				close_workflow_engine(engine)
 
 
-__all__ = ["DynamicWorkflowOrchestrator", "DynamicWorkflowRequest", "NodeVersion", "WorkflowVersion"]
+__all__ = [
+	"DynamicWorkflowError", "DynamicWorkflowOrchestrator", "DynamicWorkflowRequest",
+	"NodeVersion", "WorkflowVersion",
+]

@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from flowx_core.tools.artifact_tools import (
 	fingerprint_json,
 	json_text,
@@ -11,7 +13,22 @@ from flowx_core.tools.artifact_tools import (
 	relocate_python_path_literals,
 	render_json_context,
 	text_digest,
+	write_json_atomic,
 )
+
+
+def test_write_json_atomic_replaces_documents_and_leaves_no_temporary_files(tmp_path: Path) -> None:
+	target = tmp_path / "nested" / "state.json"
+
+	write_json_atomic(target, {"b": 1, "a": "雪"})
+	write_json_atomic(target, {"version": 2})
+
+	assert json.loads(target.read_text(encoding="utf-8")) == {"version": 2}
+	assert [path.name for path in target.parent.iterdir()] == ["state.json"]
+	with pytest.raises(ValueError):
+		write_json_atomic(target, {"bad": float("nan")})
+	assert json.loads(target.read_text(encoding="utf-8")) == {"version": 2}
+	assert [path.name for path in target.parent.iterdir()] == ["state.json"]
 
 
 def test_json_text_and_fingerprint_keep_canonical_workflow_format() -> None:

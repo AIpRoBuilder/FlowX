@@ -5,36 +5,38 @@
 # Modified 2026-10-15: verify minimal request APIs and builder-local workflow routing.
 # Modified 2026-10-15: capture complete per-node requests and builder-owned batch publications.
 # Modified 2026-10-15: reject batch generation and separate explicit node requests from lazy log repair.
+# Modified 2026-10-16: drive the builder-owned workflows directly now that service wrappers are gone.
 
 import json
 from dataclasses import dataclass, field, fields
 from inspect import Parameter, signature
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 from ag_ui_workflow import StepRunOutput, WorkflowStepNode
 import flowx_core.agent_builder as agent_builder_module
+import flowx_core.agent_workflow_engine as agent_workflow_engine_module
 from flowx_core.agent_builder import AgentBuilder
+from flowx_core.agent_intent import INTENT_SYSTEM_PROMPT
 from flowx_core.architect.graph import NodeMeta
 from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
-from flowx_core.builder_services import (
-    MainEntrypointService,
-    NodeArtifactService,
-    NodeBuildService,
-    RuntimeService,
-)
 from flowx_core.builder_support import WorkflowArtifactState
 from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.node_formats import collect_node_formats
 from flowx_core.worker.node_writer import WorkflowStepNodeCoder
 from flowx_core.worker.main_writer import PromptMainFileCoder
-from flowx_core.workflows.main_entrypoint_generation import MainEntrypointGenerationRequest
-from flowx_core.workflows.node_generation import NodeGenerationRequest
-from flowx_core.workflows.node_runtime_modifier import NodeRuntimeModifierRequest
+from flowx_core.workflows.main_entrypoint_generation import (
+    MainEntrypointGenerationRequest,
+    MainEntrypointGenerationWorkflow,
+)
+from flowx_core.workflows.node_generation import NodeGenerationRequest, NodeGenerationWorkflow
+from flowx_core.workflows.node_runtime_modifier import (
+    NodeRuntimeModifierPipeline,
+    NodeRuntimeModifierRequest,
+)
 import flowx_core.workflows.node_runtime_modifier as node_runtime_modifier_module
 
 
@@ -43,19 +45,10 @@ class _FakeComponent:
         self.kwargs = kwargs
 
 
-class _FakeService:
+class _FakeWorkflow:
     def __init__(self, **_kwargs):
-        self.workflow = Mock(spec=["run", "close"])
-        self.workflow.run.side_effect = AssertionError("unused workflow must not run")
-        self._closed = False
-
-    def run(self, request):
-        return self.workflow.run(request)
-
-    def close(self):
-        if not self._closed:
-            self._closed = True
-            self.workflow.close()
+        self.run = Mock(side_effect=AssertionError("unused workflow must not run"))
+        self.close = Mock()
 
 
 @dataclass
@@ -125,8 +118,11 @@ def _make_builder(monkeypatch, tmp_path: str | Path) -> AgentBuilder:
     monkeypatch.setattr(agent_builder_module, "PromptMainFileCoder", _FakeComponent)
     for name in ("RequestNodeFileCoder", "GenerateNodeTestFile", "AmendNodeFromTestLog"):
         monkeypatch.setattr(agent_builder_module, name, _FakeComponent)
-    for name in ("GraphBuildService", "NodeBuildService", "NodeArtifactService", "MainEntrypointService"):
-        monkeypatch.setattr(agent_builder_module, name, _FakeService)
+    for name in (
+        "GraphGenerationWorkflow", "NodeGenerationWorkflow",
+        "NodeRuntimeModifierPipeline", "MainEntrypointGenerationWorkflow",
+    ):
+        monkeypatch.setattr(agent_builder_module, name, _FakeWorkflow)
     return AgentBuilder(
         api_key="key",
         model="model",
@@ -135,34 +131,34 @@ def _make_builder(monkeypatch, tmp_path: str | Path) -> AgentBuilder:
     )
 
 
-def _replace_node_build_service(builder, node_coder) -> NodeBuildService:
-    builder._node_build_service.close()
+def _replace_node_workflow(builder, node_coder) -> NodeGenerationWorkflow:
+    builder._node_workflow.close()
     builder.node_coder = node_coder
     builder.node_auditor = _FakeAuditor()
-    builder._node_build_service = NodeBuildService(
+    builder._node_workflow = NodeGenerationWorkflow(
         node_planner=builder.node_planner,
         node_coder=builder.node_coder,
         node_auditor=builder.node_auditor,
     )
-    return builder._node_build_service
+    return builder._node_workflow
 
 
-def _replace_node_artifact_service(
+def _replace_modifier_pipeline(
     builder, *, node_test_writer, node_writer, run_subprocess,
-) -> NodeArtifactService:
-    builder._node_artifact_service.close()
+) -> NodeRuntimeModifierPipeline:
+    builder._modifier_pipeline.close()
     builder.node_test_writer = node_test_writer
     builder.node_modifier_writer = node_writer
-    builder._node_artifact_service = NodeArtifactService(
+    builder._modifier_pipeline = NodeRuntimeModifierPipeline(
         node_test_writer=node_test_writer,
         node_writer=node_writer,
         run_subprocess=run_subprocess,
         timeout_expired=builder._subprocess_timeout_expired(),
     )
-    return builder._node_artifact_service
+    return builder._modifier_pipeline
 
 
-def _assert_no_request_cache(service):
+def _assert_no_request_cache(workflow):
     def contains_request(value):
         if isinstance(value, (NodeGenerationRequest, NodeRuntimeModifierRequest)):
             return True
@@ -172,8 +168,7 @@ def _assert_no_request_cache(service):
             return any(contains_request(item) for item in value)
         return False
 
-    for owner in (service, service.workflow):
-        assert not any(contains_request(value) for value in vars(owner).values())
+    assert not any(contains_request(value) for value in vars(workflow).values())
 
 
 def _assert_fresh_modifier_request(request, result):
@@ -198,37 +193,42 @@ def _assert_fresh_modifier_request(request, result):
 def test_builder_close_releases_all_four_initialized_workflows(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
     workflows = [
-        service.workflow for service in (
-            builder._graph_build_service,
-            builder._node_build_service,
-            builder._node_artifact_service,
-            builder._main_entrypoint_service,
-        )
+        builder._graph_workflow,
+        builder._node_workflow,
+        builder._modifier_pipeline,
+        builder._main_workflow,
     ]
     builder.close()
     builder.close()
     assert len({id(workflow) for workflow in workflows}) == 4
     for workflow in workflows:
-        workflow.close.assert_called_once_with()
+        assert workflow.close.call_count == 2
 
 
-def test_builder_session_splits_artifact_and_runtime_state(monkeypatch, tmp_path):
+def test_builder_session_keeps_only_published_artifact_state(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
 
-    process = object()
     builder.graph_plan_path = str(tmp_path / "workflow.json")
-    builder.node_docs_dir = str(tmp_path / "node_docs")
-    builder.log_path = str(tmp_path / "runtime.log")
-    builder.backend_server_process = process
-    builder.dynamic_graph_cache["node_tests"] = {"NodeA": "test_NodeA.py"}
-    builder.dynamic_graph_cache["server_runtime"] = {"pid": 99}
 
     assert builder.artifact_state.graph_plan_path == str(tmp_path / "workflow.json")
-    assert builder.artifact_state.node_docs_dir == str(tmp_path / "node_docs")
-    assert builder.runtime_state.log_path == str(tmp_path / "runtime.log")
-    assert builder.runtime_state.backend_server_process is process
-    assert builder.artifact_state.dynamic_graph_cache["node_tests"] == {"NodeA": "test_NodeA.py"}
-    assert builder.runtime_state.dynamic_graph_cache["server_runtime"] == {"pid": 99}
+    for removed in (
+        "runtime_state", "dynamic_graph_cache", "node_coder_map", "node_docs_dir", "node_doc_paths",
+        "log_path", "backend_server_process", "output_auditor",
+    ):
+        assert not hasattr(builder, removed), removed
+    builder.close()
+
+
+def test_get_node_doc_path_reads_published_workflow_artifacts(monkeypatch, tmp_path):
+    builder = _make_builder(monkeypatch, tmp_path)
+    builder.artifact_state.workflow_artifacts["alpha"] = WorkflowArtifactState(
+        graph_plan_path=str(tmp_path / "workflow.json"),
+        node_doc_paths={"SharedNode": str(tmp_path / "SharedNode.md")},
+    )
+
+    assert builder.get_node_doc_path("SharedNode", workflow_name="alpha") == str(tmp_path / "SharedNode.md")
+    assert builder.get_node_doc_path("Other", workflow_name="alpha") is None
+    assert builder.get_node_doc_path("SharedNode", workflow_name="missing") is None
     builder.close()
 
 
@@ -279,37 +279,29 @@ def test_generate_nodes_retains_public_signature():
 ])
 def test_generate_nodes_immediately_rejects_batch_generation(monkeypatch, tmp_path, args, kwargs):
     builder = _make_builder(monkeypatch, tmp_path)
-    run_modifier = Mock(side_effect=AssertionError("batch generation must not generate tests"))
-    monkeypatch.setattr(builder, "run_node_modifier", run_modifier)
     original_paths = set(tmp_path.rglob("*"))
-    original_cache = {name: dict(value) for name, value in builder.dynamic_graph_cache.items()}
 
     with pytest.raises(NotImplementedError) as exc_info:
         builder.generate_nodes(*args, **kwargs)
 
     assert str(exc_info.value) == (
-        "Batch node generation is not implemented; "
-        "submit a NodeGenerationRequest to NodeBuildService.run() instead."
+        "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes."
     )
     assert builder.requirement_md_path is None
     assert builder.graph_plan_path is None
     assert builder.planned_graph is None
-    assert builder.node_location_map == builder.node_coder_map == {}
-    assert builder.node_docs_dir is None
-    assert builder.node_doc_paths == []
+    assert builder.node_location_map == {}
     assert builder.artifact_state.workflow_artifacts == {}
-    assert dict(builder.dynamic_graph_cache) == original_cache
     assert set(tmp_path.rglob("*")) == original_paths
-    for service in (
-        builder._graph_build_service, builder._node_build_service,
-        builder._node_artifact_service, builder._main_entrypoint_service,
+    for workflow in (
+        builder._graph_workflow, builder._node_workflow,
+        builder._modifier_pipeline, builder._main_workflow,
     ):
-        service.workflow.run.assert_not_called()
-    run_modifier.assert_not_called()
+        workflow.run.assert_not_called()
     builder.close()
 
 
-def test_node_build_service_generates_and_amends_explicit_requests(monkeypatch, tmp_path):
+def test_node_generation_workflow_generates_and_amends_explicit_requests(monkeypatch, tmp_path):
     project_root = tmp_path / "project_root"
     graph_dir = tmp_path / "graph_dir"
     builder = _make_builder(monkeypatch, project_root)
@@ -388,10 +380,7 @@ def test_node_build_service_generates_and_amends_explicit_requests(monkeypatch, 
 
     builder.node_planner = _FakeNodePlanner()
     fake_node_coder = _FakeNodeCoder()
-    service = _replace_node_build_service(builder, fake_node_coder)
-    run_modifier = Mock(side_effect=AssertionError("node generation must not generate tests"))
-    monkeypatch.setattr(builder, "run_node_modifier", run_modifier)
-    original_cache = {name: dict(value) for name, value in builder.dynamic_graph_cache.items()}
+    workflow = _replace_node_workflow(builder, fake_node_coder)
     node_path = (graph_dir / "GeneratedNode.py").resolve()
     markdown_path = (docs_dir / "GeneratedNode.md").resolve()
     raw_node = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"][1]
@@ -422,7 +411,7 @@ def test_node_build_service_generates_and_amends_explicit_requests(monkeypatch, 
     }
     assert request.skip_node_planner is False
 
-    generated_path = service.run(request)
+    generated_path = workflow.run(request)
 
     assert generated_path == str(node_path)
     assert node_path.read_text(encoding="utf-8") == "class GeneratedNode: ...\n"
@@ -446,7 +435,7 @@ def test_node_build_service_generates_and_amends_explicit_requests(monkeypatch, 
         dependency_context=dependency_context,
     )
 
-    amended_path = service.run(amendment_request)
+    amended_path = workflow.run(amendment_request)
 
     assert amended_path == generated_path
     assert request.markdown_amendment == "Clarify node brief"
@@ -481,300 +470,29 @@ def test_node_build_service_generates_and_amends_explicit_requests(monkeypatch, 
     assert node_path.read_text(encoding="utf-8") == "# amended\n# Apply revised guard\n"
     assert existing_path.read_text(encoding="utf-8") == existing_source
     assert (docs_dir / "ExistingNode.md").read_text(encoding="utf-8") == existing_markdown
-    # Direct service requests do not publish caller-owned builder paths or tests.
+    # Direct workflow requests do not publish caller-owned builder paths or tests.
     assert builder.requirement_md_path is None
     assert builder.graph_plan_path is None
     assert builder.planned_graph is None
-    assert builder.node_location_map == builder.node_coder_map == {}
+    assert builder.node_location_map == {}
     assert builder.artifact_state.workflow_artifacts == {}
-    assert builder.node_docs_dir is None
-    assert builder.node_doc_paths == []
-    assert dict(builder.dynamic_graph_cache) == original_cache
     assert not (graph_dir / "tests").exists()
     assert not (project_root / "tests").exists()
-    _assert_no_request_cache(service)
-    builder._node_artifact_service.workflow.run.assert_not_called()
-    run_modifier.assert_not_called()
+    _assert_no_request_cache(workflow)
+    builder._modifier_pipeline.run.assert_not_called()
     builder.close()
 
 
-def test_lazy_node_coder_can_amend_from_log_prompt(monkeypatch, tmp_path):
-    graph_dir = tmp_path / "graph_dir"
-    graph_dir.mkdir()
-    builder = _make_builder(monkeypatch, tmp_path / "project_root")
-    requirement_path = graph_dir / "requirement.md"
-    requirement_path.write_text("# Requirement\n", encoding="utf-8")
-    graph_path = graph_dir / "workflow.json"
-    _write_graph(graph_path, [{
-        "name": "GeneratedNode",
-        "type": "WorkflowStepNode",
-        "desc": "caller-owned node",
-        "enable": True,
-        "depends": [],
-        "ext_data": {"type": "none", "desc": "none"},
-    }])
-    node_path = graph_dir / "GeneratedNode.py"
-    node_path.write_text("class GeneratedNode: ...\n", encoding="utf-8")
-    # The caller owns path publication; no generation pipeline is needed for repair.
-    builder.requirement_md_path = str(requirement_path)
-    builder.graph_plan_path = str(graph_path)
-    builder.node_location_map["GeneratedNode"] = str(node_path)
-    assert builder.node_coder_map == {}
-    assert builder.planned_graph is None
-
-    class _FakeNodeCoder(_FakeWriter):
-        def amend_code_with_feedback(self, file_path, amendment, **kwargs):
-            self.amend_calls.append({
-                "file_path": file_path, "amendment": amendment, "kwargs": kwargs,
-            })
-            target_path = Path(file_path)
-            target_path.write_text(f"# amended\n# {amendment}\n", encoding="utf-8")
-            return str(target_path)
-
-    coder = _FakeNodeCoder()
-    make_node_coder = Mock(return_value=coder)
-    monkeypatch.setattr(builder, "_make_node_coder", make_node_coder)
-    audit_log = Mock(return_value=(False, [SimpleNamespace(
-        rule=str(node_path), detail="Traceback from node test log",
-    )]))
-    monkeypatch.setattr(builder.output_auditor, "audit_log_file", audit_log)
-    log_path = graph_dir / "node_test.log"
-    log_path.write_text("Traceback from node test log\n", encoding="utf-8")
-
-    assert builder.amend_by_log(str(log_path)) is False
-
-    audit_log.assert_called_once_with(str(log_path))
-    make_node_coder.assert_called_once_with(builder.planned_graph.get_node_meta("GeneratedNode"))
-    assert builder.node_coder_map == {"GeneratedNode": coder}
-    assert builder._ensure_node_coder("GeneratedNode") is coder
-    make_node_coder.assert_called_once()
-    assert builder.node_location_map == {"GeneratedNode": str(node_path)}
-    assert coder.write_calls == []
-    assert coder.amend_calls == [
-        {
-            "file_path": str(node_path),
-            "amendment": "Traceback from node test log",
-            "kwargs": {
-                "graph_plan_path": str(graph_path),
-                "requirement_md_path": str(requirement_path),
-                "current_node_name": "GeneratedNode",
-                "language": "python",
-                "temperature": 0.3,
-            },
-        }
-    ]
-    assert node_path.read_text(encoding="utf-8") == "# amended\n# Traceback from node test log\n"
-    builder._node_build_service.workflow.run.assert_not_called()
-    builder._node_artifact_service.workflow.run.assert_not_called()
-    builder.close()
-
-
-def test_node_artifact_service_routes_test_update_by_workflow_and_node_names(monkeypatch, tmp_path):
-    builder = _make_builder(monkeypatch, tmp_path)
-    graph_path = tmp_path / "workflow.json"
-    _write_graph(
-        graph_path,
-        [
-            {
-                "name": "ExampleNode",
-                "type": "WorkflowStepNode",
-                "desc": "example",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "none", "desc": "none"},
-            }
-        ],
-    )
-    node_path = tmp_path / "ExampleNode.py"
-    node_path.write_text("# source\n", encoding="utf-8")
-    builder.graph_plan_path = str(graph_path)
-    builder.node_location_map["ExampleNode"] = str(node_path)
-
-    monkeypatch.setattr(agent_builder_module, "select_python_command", lambda: "/custom/python")
-    node_writer = _FakeModifierWriter()
-    service = _replace_node_artifact_service(
-        builder,
-        node_test_writer=_FakeTestWriter(),
-        node_writer=node_writer,
-        run_subprocess=Mock(return_value=SimpleNamespace(returncode=1, stdout="F\n", stderr="failed\n")),
-    )
-    workflow = service.workflow
-    run_modifier = Mock(wraps=service.run)
-    monkeypatch.setattr(service, "run", run_modifier)
-
-    context = builder.run_node_modifier(
-        workflow_name="billing",
-        node_name="ExampleNode",
-        graph_plan_path=str(graph_path),
-        timeout=17,
-    )
-
-    assert context.test_file_path == str(tmp_path / "tests" / "billing" / "test_ExampleNode.py")
-    assert context.log_file_path == str(tmp_path / "logs" / "billing" / "ExampleNode_test.log")
-    assert context.test_result["node_name"] == "ExampleNode"
-    assert context.test_result["ok"] is False
-    assert context.amended_node_file_path == str(node_path)
-    assert context.workflow_graph == str(graph_path)
-    assert context.working_directory == str(tmp_path)
-    run_modifier.assert_called_once()
-    request, = run_modifier.call_args.args
-    assert not run_modifier.call_args.kwargs
-    assert isinstance(request, NodeRuntimeModifierRequest)
-    _assert_fresh_modifier_request(request, context)
-    assert request.node_name == "ExampleNode"
-    assert request.node_file_name == str(node_path)
-    assert request.workflow_graph == str(graph_path)
-    assert request.working_directory == str(tmp_path)
-    assert request.test_file_name == "tests/billing/test_ExampleNode.py"
-    assert request.log_file_name == "logs/billing/ExampleNode_test.log"
-    assert request.python_command == "/custom/python"
-    assert request.timeout == 17
-    assert request.skip_generate_node_test is False
-    assert request.skip_run_node_test is False
-    assert request.skip_amend_node is False
-    assert request.state["build_session"] is builder._session
-    assert service.workflow is workflow
-    _assert_no_request_cache(service)
-    assert node_writer.amend_calls[0][0] == str(node_path)
-    assert builder.dynamic_graph_cache["workflow_node_tests"] == {
-        "billing": {
-            "ExampleNode": str(tmp_path / "tests" / "billing" / "test_ExampleNode.py")
-        }
-    }
-    builder.close()
-
-
-def test_named_node_test_update_uses_its_workflow_graph_and_node_file(monkeypatch, tmp_path):
-    builder = _make_builder(monkeypatch, tmp_path)
-    graph_node = {
-        "name": "SharedNode",
-        "type": "WorkflowStepNode",
-        "desc": "shared",
-        "enable": True,
-        "depends": [],
-        "ext_data": {"type": "none", "desc": "none"},
-    }
-    alpha_dir = tmp_path / "alpha"
-    beta_dir = tmp_path / "beta"
-    alpha_dir.mkdir()
-    beta_dir.mkdir()
-    alpha_graph = alpha_dir / "workflow.json"
-    beta_graph = beta_dir / "workflow.json"
-    _write_graph(alpha_graph, [graph_node])
-    _write_graph(beta_graph, [graph_node])
-    alpha_node = alpha_dir / "SharedNode.py"
-    beta_node = beta_dir / "SharedNode.py"
-    alpha_node.write_text("# alpha\n", encoding="utf-8")
-    beta_node.write_text("# beta\n", encoding="utf-8")
-
-    alpha_doc = alpha_dir / "node_docs" / "SharedNode.md"
-    beta_doc = beta_dir / "node_docs" / "SharedNode.md"
-    builder.artifact_state.workflow_artifacts["alpha"] = WorkflowArtifactState(
-        graph_plan_path=str(alpha_graph),
-        node_location_map={"SharedNode": str(alpha_node)},
-        node_doc_paths={"SharedNode": str(alpha_doc)},
-    )
-    builder.artifact_state.workflow_artifacts["beta"] = WorkflowArtifactState(
-        graph_plan_path=str(beta_graph),
-        node_location_map={"SharedNode": str(beta_node)},
-        node_doc_paths={"SharedNode": str(beta_doc)},
-    )
-    builder.graph_plan_path = str(beta_graph)
-    builder.node_location_map["SharedNode"] = str(beta_node)
-
-    monkeypatch.setattr(agent_builder_module, "select_python_command", lambda: "/custom/python")
-    service = _replace_node_artifact_service(
-        builder,
-        node_test_writer=_FakeTestWriter(),
-        node_writer=_FakeModifierWriter(),
-        run_subprocess=Mock(return_value=SimpleNamespace(returncode=0, stdout="passed\n", stderr="")),
-    )
-    workflow = service.workflow
-    run_modifier = Mock(wraps=service.run)
-    monkeypatch.setattr(service, "run", run_modifier)
-
-    alpha_context = builder.run_node_modifier(workflow_name="alpha", node_name="SharedNode")
-
-    first_request = run_modifier.call_args.args[0]
-    _assert_fresh_modifier_request(first_request, alpha_context)
-    assert first_request.node_file_name == str(alpha_node)
-    assert first_request.workflow_graph == str(alpha_graph)
-    assert first_request.working_directory == str(alpha_dir)
-    assert first_request.test_file_name == "tests/alpha/test_SharedNode.py"
-    assert first_request.log_file_name == "logs/alpha/SharedNode_test.log"
-    assert alpha_context.test_file_path == str(alpha_dir / "tests" / "alpha" / "test_SharedNode.py")
-    assert alpha_context.log_file_path == str(alpha_dir / "logs" / "alpha" / "SharedNode_test.log")
-    assert builder.dynamic_graph_cache["workflow_node_tests"]["alpha"] == {
-        "SharedNode": alpha_context.test_file_path,
-    }
-
-    reused_context = builder.run_node_modifier(
-        workflow_name="alpha",
-        node_name="SharedNode",
-        generate_test=False,
-    )
-
-    second_request = run_modifier.call_args.args[0]
-    _assert_fresh_modifier_request(second_request, reused_context)
-    assert second_request.skip_generate_node_test is True
-    assert second_request.skip_run_node_test is False
-    assert second_request.workflow_graph == str(alpha_graph)
-    assert second_request.node_file_name == str(alpha_node)
-    assert second_request.working_directory == str(alpha_dir)
-    assert second_request.test_file_name == alpha_context.test_file_path
-    assert second_request.log_file_name == "logs/alpha/SharedNode_test.log"
-    assert reused_context.test_file_path == alpha_context.test_file_path
-    assert reused_context.log_file_path == alpha_context.log_file_path
-
-    beta_context = builder.run_node_modifier(workflow_name="beta", node_name="SharedNode")
-
-    third_request = run_modifier.call_args.args[0]
-    _assert_fresh_modifier_request(third_request, beta_context)
-    assert third_request.node_file_name == str(beta_node)
-    assert third_request.workflow_graph == str(beta_graph)
-    assert third_request.working_directory == str(beta_dir)
-    assert third_request.test_file_name == "tests/beta/test_SharedNode.py"
-    assert third_request.log_file_name == "logs/beta/SharedNode_test.log"
-    assert beta_context.test_file_path == str(beta_dir / "tests" / "beta" / "test_SharedNode.py")
-    assert beta_context.log_file_path == str(beta_dir / "logs" / "beta" / "SharedNode_test.log")
-    assert len({id(request) for request in (
-        first_request, second_request, third_request, alpha_context, reused_context, beta_context,
-    )}) == 6
-    assert alpha_context.workflow_graph == reused_context.workflow_graph == str(alpha_graph)
-    assert beta_context.workflow_graph == str(beta_graph)
-    assert alpha_context.working_directory == reused_context.working_directory == str(alpha_dir)
-    assert beta_context.working_directory == str(beta_dir)
-    assert alpha_context.node_name == reused_context.node_name == beta_context.node_name == "SharedNode"
-    assert all(context.test_result["ok"] is True for context in (
-        alpha_context, reused_context, beta_context,
-    ))
-    assert alpha_context.amended_node_file_path == reused_context.amended_node_file_path == str(alpha_node)
-    assert beta_context.amended_node_file_path == str(beta_node)
-    assert builder.dynamic_graph_cache["workflow_node_tests"] == {
-        "alpha": {"SharedNode": reused_context.test_file_path},
-        "beta": {"SharedNode": beta_context.test_file_path},
-    }
-    assert service.workflow is workflow
-    _assert_no_request_cache(service)
-    assert builder.get_node_doc_path("SharedNode", workflow_name="alpha") == str(alpha_doc)
-    assert builder.get_node_doc_path("SharedNode", workflow_name="beta") == str(beta_doc)
-    assert builder.get_node_doc_path("SharedNode", workflow_name="missing") is None
-    assert builder.artifact_state.workflow_artifacts["alpha"].node_location_map == {"SharedNode": str(alpha_node)}
-    assert builder.artifact_state.workflow_artifacts["beta"].node_location_map == {"SharedNode": str(beta_node)}
-    builder.close()
-
-
-def test_node_artifact_service_reuses_one_eager_workflow_for_named_node_requests(monkeypatch, tmp_path):
+def test_modifier_pipeline_reuses_one_eager_workflow_for_named_node_requests(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
     test_writer = _FakeTestWriter()
     run_subprocess = Mock(side_effect=AssertionError("node tests must be skipped"))
-    service = _replace_node_artifact_service(
+    workflow = _replace_modifier_pipeline(
         builder,
         node_test_writer=test_writer,
         node_writer=_FakeModifierWriter(),
         run_subprocess=run_subprocess,
     )
-    workflow = service.workflow
     engine = workflow._engine
     assert engine is not None
     contexts = []
@@ -800,10 +518,9 @@ def test_node_artifact_service_reuses_one_eager_workflow_for_named_node_requests
             skip_amend_node=True,
         )
         requests.append(request)
-        context = service.run(request)
+        context = workflow.run(request)
         contexts.append(context)
         _assert_fresh_modifier_request(request, context)
-        assert service.workflow is workflow
         assert workflow._engine is engine
         assert context.node_name == node_name
         assert context.node_file_name == str(node_path)
@@ -825,7 +542,7 @@ def test_node_artifact_service_reuses_one_eager_workflow_for_named_node_requests
         _assert_fresh_modifier_request(request, context)
         assert request.skip_run_node_test is context.skip_run_node_test is True
         assert request.skip_amend_node is context.skip_amend_node is True
-    _assert_no_request_cache(service)
+    _assert_no_request_cache(workflow)
     assert len(test_writer.write_calls) == 4
     assert test_writer.root_dir_path == ""
     run_subprocess.assert_not_called()
@@ -905,14 +622,14 @@ def test_write_main_entrypoint_does_not_duplicate_relative_root_dir(monkeypatch,
 
     builder.main_writer = _FakeMainWriter()
     builder.main_entry_auditor = _FakeMainAuditor()
-    builder._main_entrypoint_service.close()
-    builder._main_entrypoint_service = MainEntrypointService(
+    builder._main_workflow.close()
+    builder._main_workflow = MainEntrypointGenerationWorkflow(
         main_writer=builder.main_writer,
         main_entry_auditor=builder.main_entry_auditor,
     )
-    service = builder._main_entrypoint_service
-    run_main = Mock(wraps=service.run)
-    monkeypatch.setattr(service, "run", run_main)
+    workflow = builder._main_workflow
+    run_main = Mock(wraps=workflow.run)
+    monkeypatch.setattr(workflow, "run", run_main)
 
     main_path = builder._write_main_entrypoint(
         graph_plan_path=str(graph_path),
@@ -930,8 +647,8 @@ def test_write_main_entrypoint_does_not_duplicate_relative_root_dir(monkeypatch,
     assert request.graph_plan_json_path == str(graph_path)
     assert request.output_path == main_path
     assert request.state["build_session"] is builder._session
-    assert service.workflow.main_writer is builder.main_writer
-    assert service.workflow.main_entry_auditor is builder.main_entry_auditor
+    assert workflow.main_writer is builder.main_writer
+    assert workflow.main_entry_auditor is builder.main_entry_auditor
     builder.close()
 
 
@@ -1002,255 +719,64 @@ def test_collect_node_formats_collects_inputs_and_backend_card_schema(monkeypatc
     builder.close()
 
 
-def test_rerun_server_validates_artifacts_and_restarts_processes(monkeypatch, tmp_path):
+def test_builder_publishes_workflows_for_the_agent_engine_and_closes_it(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
+    graph_workflow = builder._graph_workflow
+    main_workflow = builder._main_workflow
+    assert agent_workflow_engine_module.GRAPH_GENERATION_WORKFLOW is graph_workflow
+    assert agent_workflow_engine_module.MAIN_ENTRYPOINT_GENERATION_WORKFLOW is main_workflow
 
-    graph_path = tmp_path / "graph_plan.json"
-    _write_graph(
-        graph_path,
-        [
-            {
-                "name": "ExistingNode",
-                "type": "WorkflowStepNode",
-                "desc": "existing",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "none", "desc": "none"},
-            }
-        ],
-    )
+    engine = builder.engine
 
-    (tmp_path / "node_docs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "node_docs" / "ExistingNode.md").write_text("# ExistingNode\n", encoding="utf-8")
-    (tmp_path / "ExistingNode.py").write_text("class ExistingNode: ...\n", encoding="utf-8")
-    main_path = tmp_path / "main.py"
-    main_path.write_text("print('main')\n", encoding="utf-8")
-
-    class _RunningProcess:
-        def __init__(self, pid=1):
-            self.pid = pid
-            self.terminated = False
-            self.killed = False
-            self._running = True
-
-        def poll(self):
-            return None if self._running else 0
-
-        def terminate(self):
-            self.terminated = True
-            self._running = False
-
-        def wait(self, timeout=None):
-            return 0
-
-        def kill(self):
-            self.killed = True
-            self._running = False
-
-    spawned = []
-
-    class _SpawnedProcess(_RunningProcess):
-        next_pid = 100
-
-        def __init__(self, command, cwd=None, env=None):
-            super().__init__(pid=_SpawnedProcess.next_pid)
-            _SpawnedProcess.next_pid += 1
-            self.command = command
-            self.cwd = cwd
-            self.env = env
-            spawned.append(self)
-
-    def fake_popen(command, cwd=None, env=None):
-        return _SpawnedProcess(command, cwd=cwd, env=env)
-
-    monkeypatch.setattr(agent_builder_module, "select_python_command", lambda: "/usr/bin/python3.10")
-
-    old_backend = _RunningProcess(pid=11)
-    builder.backend_server_process = old_backend
-    builder.graph_plan_path = str(graph_path)
-    builder.main_output_path = str(main_path)
-
-    monkeypatch.setattr(agent_builder_module.subprocess, "Popen", fake_popen)
-    runtime = builder.rerun_server(backend_port=9001)
-
-    assert old_backend.terminated is True
-    assert len(spawned) == 1
-    assert runtime["backend"]["pid"] == spawned[0].pid
-    assert spawned[0].command == ["/usr/bin/python3.10", str(main_path)]
-    assert spawned[0].cwd == str(tmp_path)
-    assert runtime["artifacts"]["backend_nodes"] == {"ExistingNode": str(tmp_path / "ExistingNode.py")}
-    assert isinstance(builder._runtime_service, RuntimeService)
-    assert builder.backend_server_process is spawned[0]
-    assert builder.dynamic_graph_cache["server_runtime"] == runtime
+    assert builder.engine is engine
+    assert engine.storage_dir == (tmp_path / "workflows").resolve()
+    assert engine.runtime() is builder._runtime_service
+    builder.close()
+    assert agent_workflow_engine_module.GRAPH_GENERATION_WORKFLOW is None
+    assert agent_workflow_engine_module.MAIN_ENTRYPOINT_GENERATION_WORKFLOW is None
+    with pytest.raises(RuntimeError, match="closed"):
+        engine.build_workflow("anything")
     builder.close()
 
 
-def test_test_main_entrypoint_uses_selected_python_command(monkeypatch, tmp_path):
+def test_builder_judge_uses_the_current_llm_settings_and_the_intent_prompt(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
+    created = []
 
-    main_path = tmp_path / "main.py"
-    main_path.write_text("print('main')\n", encoding="utf-8")
+    class _Coder:
+        def __init__(self, **settings):
+            created.append(settings)
 
-    observed: dict[str, object] = {}
+        def generate_code(self, prompt, **options):
+            return f"{prompt}|{options['temperature']}"
 
-    monkeypatch.setattr(agent_builder_module, "select_python_command", lambda: "/custom/python")
+    monkeypatch.setattr(agent_builder_module, "Coder", _Coder)
+    builder.reset_llm_config(model="other-model")
 
-    def fake_run(command, cwd=None, capture_output=None, text=None, timeout=None):
-        observed["command"] = command
-        observed["cwd"] = cwd
-        observed["capture_output"] = capture_output
-        observed["text"] = text
-        observed["timeout"] = timeout
-        return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
-
-    monkeypatch.setattr(agent_builder_module.subprocess, "run", fake_run)
-
-    assert builder.test_main_entrypoint(str(main_path), log_filename="runtime_test_log.txt") is True
-    assert observed["command"] == ["/custom/python", str(main_path)]
-    assert observed["cwd"] == str(tmp_path)
-    assert observed["capture_output"] is True
-    assert observed["text"] is True
-    assert observed["timeout"] == 60
-    assert isinstance(builder._runtime_service, RuntimeService)
-    assert builder.log_path == str(tmp_path / "runtime_test_log.txt")
-    log_text = Path(builder.log_path).read_text(encoding="utf-8")
-    assert "Executing: /custom/python" in log_text
-    assert "ok\n" in log_text
-    assert "Test completed successfully" in log_text
+    assert builder.engine.judge("classify") == "classify|0.0"
+    assert created == [{
+        "api_key": "key", "model": "other-model", "provider": "provider",
+        "system_prompt": INTENT_SYSTEM_PROMPT,
+    }]
     builder.close()
 
 
-def test_node_modifier_reuses_tests_and_repairs_only_failed_nodes(monkeypatch, tmp_path):
+def test_builder_build_functions_delegate_to_the_engine(monkeypatch, tmp_path):
     builder = _make_builder(monkeypatch, tmp_path)
-    graph_path = tmp_path / "workflow.json"
-    _write_graph(
-        graph_path,
-        [
-            {
-                "name": "ExistingNode",
-                "type": "WorkflowStepNode",
-                "desc": "existing",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "none", "desc": "none"},
-            },
-            {
-                "name": "AddedNode",
-                "type": "WorkflowStepNode",
-                "desc": "added",
-                "enable": True,
-                "depends": ["ExistingNode"],
-                "ext_data": {"type": "none", "desc": "none"},
-            },
-        ],
-    )
-    builder.graph_plan_path = str(graph_path)
-    for node_name in ("ExistingNode", "AddedNode"):
-        (tmp_path / f"{node_name}.py").write_text("# original\n", encoding="utf-8")
-        test_path = tmp_path / "tests" / f"test_{node_name}.py"
-        test_path.parent.mkdir(parents=True, exist_ok=True)
-        test_path.write_text("def test_node(): pass\n", encoding="utf-8")
-    cached_test = tmp_path / "tests" / "existing_custom.py"
-    (tmp_path / "tests" / "test_ExistingNode.py").rename(cached_test)
-    builder.dynamic_graph_cache["node_tests"] = {"ExistingNode": str(cached_test)}
+    builder._agent = Mock()
 
-    monkeypatch.setattr(agent_builder_module, "select_python_command", lambda: "/custom/python")
-    observed_calls = []
-    amended = []
-    subprocess_results = iter(
-        [
-            SimpleNamespace(returncode=1, stdout="F\n", stderr="AssertionError: boom\n"),
-            SimpleNamespace(returncode=0, stdout=".\n1 passed in 0.01s\n", stderr=""),
-        ]
-    )
-
-    def fake_run(command, cwd=None, capture_output=None, text=None, timeout=None):
-        observed_calls.append(
-            {
-                "command": command,
-                "cwd": cwd,
-                "capture_output": capture_output,
-                "text": text,
-                "timeout": timeout,
-            }
-        )
-        return next(subprocess_results)
-
-    monkeypatch.setattr(agent_builder_module.subprocess, "run", fake_run)
-
-    class TestWriter(_FakeTestWriter):
-        def write_test_from_node_file(self, *_args, **_kwargs):
-            raise AssertionError("existing tests must be reused")
-
-    class NodeWriter(_FakeModifierWriter):
-        def amend_code_with_feedback(self, code_path, amendment, **_kwargs):
-            amended.append(Path(code_path).name)
-            assert "AssertionError: boom" in amendment
-            Path(code_path).write_text("# repaired\n", encoding="utf-8")
-            return Path(code_path)
-
-    service = _replace_node_artifact_service(
-        builder,
-        node_test_writer=TestWriter(),
-        node_writer=NodeWriter(),
-        run_subprocess=fake_run,
-    )
-    workflow = service.workflow
-    run_modifier = Mock(wraps=service.run)
-    monkeypatch.setattr(service, "run", run_modifier)
-    result = {
-        name: builder.run_node_modifier(workflow_name="default", node_name=name, generate_test=False)
-        for name in ("ExistingNode", "AddedNode")
-    }
-
-    assert observed_calls == [
-        {
-            "command": ["/custom/python", "-m", "pytest", str(cached_test), "-q"],
-            "cwd": str(tmp_path),
-            "capture_output": True,
-            "text": True,
-            "timeout": 60,
-        },
-        {
-            "command": ["/custom/python", "-m", "pytest", str(tmp_path / "tests" / "test_AddedNode.py"), "-q"],
-            "cwd": str(tmp_path),
-            "capture_output": True,
-            "text": True,
-            "timeout": 60,
-        },
-    ]
-    assert list(result) == ["ExistingNode", "AddedNode"]
-    requests = [call.args[0] for call in run_modifier.call_args_list]
-    assert len(requests) == 2
-    assert all(len(call.args) == 1 and not call.kwargs for call in run_modifier.call_args_list)
-    assert len({id(request) for request in (*requests, *result.values())}) == 4
-    for request, (name, context) in zip(requests, result.items()):
-        _assert_fresh_modifier_request(request, context)
-        assert request.node_name == context.node_name == name
-        assert request.node_file_name == context.node_file_name == str(tmp_path / f"{name}.py")
-        assert request.workflow_graph == context.workflow_graph == str(graph_path)
-        assert request.working_directory == context.working_directory == str(tmp_path)
-        assert request.skip_generate_node_test is True
-        assert request.skip_run_node_test is False
-        assert request.skip_amend_node is False
-        assert context.log_file_path == str(tmp_path / "logs" / f"{name}_test.log")
-    assert result["ExistingNode"].test_result["ok"] is False
-    assert result["AddedNode"].test_result["ok"] is True
-    assert result["ExistingNode"].test_file_path == str(cached_test)
-    assert result["AddedNode"].test_file_path == str(tmp_path / "tests" / "test_AddedNode.py")
-    assert result["ExistingNode"].amended_node_file_path == str(tmp_path / "ExistingNode.py")
-    assert result["AddedNode"].amended_node_file_path == str(tmp_path / "AddedNode.py")
-    assert amended == ["ExistingNode.py"]
-    assert (tmp_path / "ExistingNode.py").read_text(encoding="utf-8") == "# repaired\n"
-    assert (tmp_path / "AddedNode.py").read_text(encoding="utf-8") == "# original\n"
-    assert "AssertionError: boom" in Path(result["ExistingNode"].log_file_path).read_text(encoding="utf-8")
-    assert "1 passed in 0.01s" in Path(result["AddedNode"].log_file_path).read_text(encoding="utf-8")
-    assert service.workflow is workflow
-    _assert_no_request_cache(service)
-    assert builder.dynamic_graph_cache["node_tests"] == {
-        name: context.test_file_path for name, context in result.items()
-    }
-    assert builder.node_location_map == {
-        name: str(tmp_path / f"{name}.py") for name in result
-    }
+    for name, args, kwargs in (
+        ("build_workflow_json", ("requirement",), {"workflow_id": "w"}),
+        ("build_nodes", ("w", {"Node": "change"}), {}),
+        ("build_main_entrypoint", ("w",), {"amendment": "change"}),
+        ("build_workflow", ("request",), {"max_retries": 2}),
+        ("run_service", ("w",), {}),
+    ):
+        assert getattr(builder, name)(*args, **kwargs) is getattr(builder._agent, name).return_value
+        getattr(builder._agent, name).assert_called_once_with(*args, **kwargs)
+    builder.stop_service("w")
+    builder._agent.stop_service.assert_called_once_with("w")
+    builder._agent.close.assert_not_called()
+    agent = builder._agent
     builder.close()
+    agent.close.assert_called_once_with()

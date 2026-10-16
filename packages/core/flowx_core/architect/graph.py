@@ -3,7 +3,7 @@
 import json
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Iterable, Mapping, MutableMapping, Set, Tuple
+from typing import Dict, List, Optional, Any, Iterable, Mapping, Set, Tuple
 
 from flowx_core.tools.file_tools import collect_session_state_keys_from_node_file
 from flowx_core.tools.workflow_node_reference import canonical_meta_node_kind
@@ -115,14 +115,6 @@ class Graph:
         """
         return self.node_metas.get(node_name)
     
-    def get_all_node_metas(self) -> Dict[str, NodeMeta]:
-        """Get metadata for all nodes.
-        
-        Returns:
-            Dictionary mapping node names to NodeMeta objects.
-        """
-        return self.node_metas.copy()
-    
     def get_node_metas_as_dict(self) -> Dict[str, Dict[str, Any]]:
         """Get all node metadata as dictionary format.
         
@@ -130,25 +122,6 @@ class Graph:
             Dictionary where keys are node names and values are node attribute dicts.
         """
         return {name: meta.to_dict() for name, meta in self.node_metas.items()}
-    
-    def get_nodes_by_type(self, node_type: str) -> List[NodeMeta]:
-        """Get all nodes of a specific type.
-        
-        Args:
-            node_type: Type to filter by.
-            
-        Returns:
-            List of NodeMeta objects with matching type.
-        """
-        return [meta for meta in self.node_metas.values() if meta.type == node_type]
-    
-    def get_enabled_nodes(self) -> List[NodeMeta]:
-        """Get all enabled nodes.
-        
-        Returns:
-            List of enabled NodeMeta objects.
-        """
-        return [meta for meta in self.node_metas.values() if meta.enable]
     
     def get_node_dependencies(self, node_name: str) -> List[str]:
         """Get dependencies for a specific node.
@@ -169,23 +142,6 @@ class Graph:
             Number of nodes.
         """
         return len(self.node_metas)
-
-    def _get_root_nodes(self) -> List[str]:
-        """Get root nodes (nodes with no in-graph dependencies).
-
-        Returns:
-            List of root node names in original graph order.
-        """
-        roots: List[str] = []
-        for node in self.nodes:
-            node_name = str(node.get("name", ""))
-            if not node_name:
-                continue
-            depends = node.get("depends", []) or []
-            in_graph_depends = [dep for dep in depends if dep in self.node_metas]
-            if len(in_graph_depends) == 0:
-                roots.append(node_name)
-        return roots
 
     def _collect_ancestors(self, node_name: str) -> Set[str]:
         """Collect all ancestor nodes (including itself) by following dependencies.
@@ -247,56 +203,6 @@ class Graph:
 
         return sorted(all_keys)
 
-    def get_all_subgraph(self) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
-        """Get root-to-node subgraphs for every node in JSON format.
-
-        For each node in the graph, this returns a subgraph JSON payload that
-        contains all ancestor nodes from graph root node(s) to the target node,
-        including the target itself. Dependencies in each subgraph are filtered
-        to only reference nodes included in that subgraph.
-
-        Returns:
-            A dictionary keyed by target node name where each value is a JSON-like
-            dictionary of the shape ``{"nodes": [...]}``.
-        """
-        root_nodes = set(self._get_root_nodes())
-        subgraphs: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-
-        for node in self.nodes:
-            target_name = str(node.get("name", ""))
-            if not target_name or target_name not in self.node_metas:
-                continue
-
-            ancestor_names = self._collect_ancestors(target_name)
-            if not ancestor_names:
-                subgraphs[target_name] = {"nodes": []}
-                continue
-
-            # Keep only nodes that are on root-to-target routes. For targets that
-            # are roots themselves, keep the root node.
-            if target_name in root_nodes:
-                included_names = {target_name}
-            else:
-                included_names = {
-                    name for name in ancestor_names
-                    if name == target_name or name in root_nodes or len(self.get_node_dependencies(name)) > 0
-                }
-
-            subgraph_nodes: List[Dict[str, Any]] = []
-            for original_node in self.nodes:
-                original_name = str(original_node.get("name", ""))
-                if original_name not in included_names:
-                    continue
-
-                copied_node = dict(original_node)
-                depends = copied_node.get("depends", []) or []
-                copied_node["depends"] = [dep for dep in depends if dep in included_names]
-                subgraph_nodes.append(copied_node)
-
-            subgraphs[target_name] = {"nodes": subgraph_nodes}
-
-        return subgraphs
-    
     def is_weakly_connected(self) -> bool:
         """Check if the graph is weakly connected.
         

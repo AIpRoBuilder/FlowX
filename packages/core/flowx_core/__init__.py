@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-10-16: drop the removed context_builder subpackage from __all__.
 from importlib import import_module
 
 from .provenance import ORIGIN_ID as __origin_id__
@@ -12,7 +13,6 @@ __version__ = "0.2.0"
 __all__ = [
     "architect",
     "auditor",
-    "context_builder",
     "demand_analyzer",
     "llm_client",
     "tools",

@@ -2,6 +2,7 @@
 
 Modified 2026-10-14: extract graph building into a request-controlled workflow.
 Modified 2026-10-14: initialize once and seed native state from each caller's request.
+Modified 2026-10-16: let a request amend the requirement analysis instead of rewriting it.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ class GraphGenerationRequest:
     graph_plan_path: str | None = None
     graph_action: Literal["plan", "amend"] = "plan"
     amendment: str = ""
+    requirement_action: Literal["write", "amend"] = "write"
+    requirement_amendment: str = ""
     temperature: float = 0.35
     requirement_temperature: float = 0.2
     skip_analyze_requirement: bool = False
@@ -83,6 +86,8 @@ class GraphGenerationWorkflow:
             raise RuntimeError("graph generation workflow is closed")
         if request.graph_action not in ("plan", "amend"):
             raise ValueError("graph_action must be 'plan' or 'amend'")
+        if request.requirement_action not in ("write", "amend"):
+            raise ValueError("requirement_action must be 'write' or 'amend'")
         skipped_steps = tuple(
             step_id for step_id, skip in (
                 (self.analyzer.STEP_ID, request.skip_analyze_requirement),
@@ -92,9 +97,10 @@ class GraphGenerationWorkflow:
         )
         result = run_workflow(engine, state={
             **request.state,
-            f"{type(self.analyzer).__name__}::action": "write",
+            f"{type(self.analyzer).__name__}::action": request.requirement_action,
             "requirement_disector": {
                 "requirement_text": request.requirement_text,
+                "amendment": request.requirement_amendment,
                 "output_path": request.requirement_md_path,
                 "temperature": request.requirement_temperature,
             },

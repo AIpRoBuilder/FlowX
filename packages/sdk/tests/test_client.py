@@ -7,8 +7,7 @@ import flowx_sdk.client as client_module
 
 
 _BATCH_GENERATION_ERROR = (
-    "Batch node generation is not implemented; submit a "
-    "NodeGenerationRequest to NodeBuildService.run() instead."
+    "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes."
 )
 
 

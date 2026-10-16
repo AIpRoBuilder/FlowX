@@ -31,7 +31,7 @@ class OutputAuditor(BaseAuditor):
 
         Args:
             file_path: Path to the log file produced by
-                :py:meth:`ProjectCoder.test_main_entrypoint`.
+                :py:meth:`RuntimeService.test_main_entrypoint`.
 
         If the log contains no ``--- STDERR ---`` section the audit passes
         automatically.  Otherwise traceback entries and argparse-style

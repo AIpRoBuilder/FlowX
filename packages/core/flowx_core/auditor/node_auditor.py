@@ -9,7 +9,6 @@ import ast
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple
-from pydaograph import GParam
 
 from flowx_core.auditor.data import RuleViolation
 from flowx_core.auditor.base_auditor import BaseAuditor
@@ -259,12 +258,6 @@ class NodeAuditor(BaseAuditor):
             if isinstance(base, ast.Attribute) and base.attr in WORKFLOW_NODE_BASE_NAMES:
                 return True
         return False
-
-    def _is_workflow_skill_node_subclass(self, cls: ast.ClassDef) -> bool:
-        return self._is_direct_or_attr_base_subclass(cls, {"WorkflowSkillNode"})
-
-    def _is_workflow_input_node_subclass(self, cls: ast.ClassDef) -> bool:
-        return self._is_direct_or_attr_base_subclass(cls, {"WorkflowStepNode"})
 
     def _is_workflow_file_node_subclass(self, cls: ast.ClassDef) -> bool:
         return self._is_direct_or_attr_base_subclass(cls, {"WorkflowFileNode"})

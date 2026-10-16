@@ -38,7 +38,7 @@ Guidelines:
 - Use the parsed subclass implementation hook itself only when the node truly needs custom model invocation or response parsing beyond prompt-guidance changes.
 - Use `dependency_results[<step_id>].derived[...]` to read prerequisite outputs.
 - Extract upstream variables only from dependency nodes listed in `DEPENDENCIES`.
-- When dependency context is provided (for example, GraphContextBuilder context), treat it as authoritative for upstream `STEP_ID` and `derived` keys.
+- When dependency context is provided (upstream node markdown and generated files), treat it as authoritative for upstream `STEP_ID` and `derived` keys.
 - Do not invent upstream variable names/keys; match keys from dependent nodes' returned `StepRunOutput.derived` structure.
 - Do not assign hardcoded empty placeholders (for example `""`, `[]`, `{}`) to required upstream values; read from dependency outputs and fail fast with a clear validation error when required values are missing.
 - If a required upstream key cannot be confirmed from provided dependency context, use safe fallback handling with minimal branching and add one concise TODO only when necessary.

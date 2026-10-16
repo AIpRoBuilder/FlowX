@@ -445,30 +445,6 @@ class GraphPlanner(Coder):
 		mmd_path.write_text(mmd_text, encoding="utf-8")
 		return mmd_path
 
-	def plan_from_file(
-		self,
-		requirement_md_path: str,
-		output_path: str,
-		*,
-		overwrite: bool = True,
-		temperature: float = 0.2,
-		max_tokens: int = MAX_TOKENS,
-	) -> Path:
-		"""Read requirement_analysis.md and write a JSON graph plan."""
-
-		requirement_path = Path(requirement_md_path)
-		if not requirement_path.exists():
-			raise FileNotFoundError(f"Requirement file not found: {requirement_path}")
-
-		requirement_text = requirement_path.read_text(encoding="utf-8")
-		return self.plan(
-			requirement_text,
-			output_path,
-			overwrite=overwrite,
-			temperature=temperature,
-			max_tokens=max_tokens,
-		)
-
 	def plan(
 		self,
 		requirement_text: str,

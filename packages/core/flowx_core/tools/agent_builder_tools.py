@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
 
 
 def get_language_extension(language: str) -> str:

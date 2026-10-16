@@ -4,7 +4,6 @@ import pytest
 
 from flowx_core.auditor import (
     BaseAuditor,
-    ContextAuditor,
     MainEntryPointAuditor,
     NodeAuditor,
     OutputAuditor,
@@ -16,7 +15,6 @@ from flowx_core.auditor import (
     ("auditor_type", "legacy_method", "source"),
     [
         (BaseAuditor, "audit_base_file", "class Example:\n    def run(self):\n        self.missing()\n"),
-        (ContextAuditor, "audit_context_file", "class Example:\n    pass\n"),
         (NodeAuditor, "audit_node_file", "class Example:\n    pass\n"),
         (MainEntryPointAuditor, "audit_main_entrypoint_file", "class Example:\n    pass\n"),
         (OutputAuditor, "audit_log_file", '--- STDERR ---\n  File "example.py", line 3\nValueError: bad\n'),

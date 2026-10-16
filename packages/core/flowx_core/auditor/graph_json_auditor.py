@@ -63,35 +63,6 @@ class GraphJsonAuditor(BaseJsonAuditor):
 	def _extract_meta_node_kind(self, node: Dict[str, Any]) -> str:
 		return str(node.get("meta_node_kind") or node.get("metaNodeKind") or "").strip()
 
-	def _collect_transitive_dependencies(
-		self,
-		node_name: str,
-		node_by_name: Dict[str, Dict[str, Any]],
-	) -> Set[str]:
-		"""Collect all upstream dependency node names (multi-hop) for a node."""
-
-		visited: Set[str] = set()
-		stack: List[str] = [node_name]
-
-		while stack:
-			current = stack.pop()
-			current_node = node_by_name.get(current)
-			if not isinstance(current_node, dict):
-				continue
-
-			depends = current_node.get("depends") or []
-			if not isinstance(depends, list):
-				continue
-
-			for dep in depends:
-				dep_name = str(dep).strip()
-				if not dep_name or dep_name in visited:
-					continue
-				visited.add(dep_name)
-				stack.append(dep_name)
-
-		return visited
-
 	def audit_graph_json(self, source: Graph) -> tuple[bool, List[JsonRuleViolation]]:
 		"""Validate that every node's ``name`` matches its ``type``, check for cycles, and connectivity.
 

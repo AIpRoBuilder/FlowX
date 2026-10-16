@@ -11,6 +11,7 @@ import io
 import json
 import os
 import tokenize
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -39,6 +40,18 @@ def json_text(
 		allow_nan=allow_nan,
 		**options,
 	)
+
+
+def write_json_atomic(path: str | Path, value: Any) -> None:
+	"""Replace a JSON document atomically so readers never see a partial file."""
+	target = Path(path)
+	target.parent.mkdir(parents=True, exist_ok=True)
+	temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+	try:
+		temporary.write_text(json_text(value) + "\n", encoding="utf-8")
+		os.replace(temporary, target)
+	finally:
+		temporary.unlink(missing_ok=True)
 
 
 def text_digest(text: str, *, algorithm: str = "sha256", encoding: str = "utf-8") -> str:
@@ -144,4 +157,5 @@ __all__ = [
 	"relocate_python_path_literals",
 	"render_json_context",
 	"text_digest",
+	"write_json_atomic",
 ]

@@ -10,117 +10,18 @@
 # Modified 2026-10-14: delegate graph building to a skippable single-pass workflow.
 # Modified 2026-10-14: own one initialized workflow per service; accept all run state in requests.
 # Modified 2026-10-15: repair results use the unified request model.
+# Modified 2026-10-16: remove the workflow service wrappers; AgentBuilder owns those workflows directly.
 from __future__ import annotations
 
 import ast
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from ag_ui_workflow import RunResult
-
 from flowx_core.architect.graph import Graph
 from flowx_core.tools.workflow_node_reference import resolve_workflow_node_reference
-from flowx_core.workflows.graph_generation import GraphGenerationRequest, GraphGenerationWorkflow
-from flowx_core.workflows.main_entrypoint_generation import (
-    MainEntrypointGenerationRequest,
-    MainEntrypointGenerationWorkflow,
-)
-from flowx_core.workflows.node_generation import (
-    NodeGenerationRequest,
-    NodeGenerationWorkflow,
-)
-from flowx_core.workflows.node_runtime_modifier import (
-    NodeRuntimeModifierPipeline,
-    NodeRuntimeModifierRequest,
-)
-
-
-@dataclass(kw_only=True)
-class GraphBuildService:
-    """Own one graph workflow, never a builder session or a run context."""
-
-    analyzer: Any
-    planner: Any
-    graph_auditor: Any
-    workflow: GraphGenerationWorkflow = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.workflow = GraphGenerationWorkflow(
-            analyzer=self.analyzer, planner=self.planner, graph_auditor=self.graph_auditor,
-        )
-
-    def run(self, request: GraphGenerationRequest) -> RunResult:
-        return self.workflow.run(request)
-
-    def close(self) -> None:
-        self.workflow.close()
-
-
-@dataclass(kw_only=True)
-class NodeBuildService:
-    """Use the same node-generation workflow for every requested node kind."""
-
-    node_planner: Any
-    node_coder: Any
-    node_auditor: Any
-    workflow: NodeGenerationWorkflow = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.workflow = NodeGenerationWorkflow(
-            node_planner=self.node_planner, node_coder=self.node_coder, node_auditor=self.node_auditor,
-        )
-
-    def run(self, request: NodeGenerationRequest) -> str:
-        return self.workflow.run(request)
-
-    def close(self) -> None:
-        self.workflow.close()
-
-
-@dataclass(kw_only=True)
-class NodeArtifactService:
-    """Reuse one repair workflow; names, paths and skip flags come from requests."""
-
-    node_test_writer: Any
-    node_writer: Any
-    run_subprocess: Callable[..., Any]
-    timeout_expired: type[BaseException]
-    workflow: NodeRuntimeModifierPipeline = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.workflow = NodeRuntimeModifierPipeline(
-            node_test_writer=self.node_test_writer, node_writer=self.node_writer,
-            run_subprocess=self.run_subprocess, timeout_expired=self.timeout_expired,
-        )
-
-    def run(self, request: NodeRuntimeModifierRequest) -> NodeRuntimeModifierRequest:
-        return self.workflow.run(request)
-
-    def close(self) -> None:
-        self.workflow.close()
-
-
-@dataclass(kw_only=True)
-class MainEntrypointService:
-    """Own one main-entrypoint workflow without retaining any build session."""
-
-    main_writer: Any
-    main_entry_auditor: Any
-    workflow: MainEntrypointGenerationWorkflow = field(init=False)
-
-    def __post_init__(self) -> None:
-        self.workflow = MainEntrypointGenerationWorkflow(
-            main_writer=self.main_writer, main_entry_auditor=self.main_entry_auditor,
-        )
-
-    def run(self, request: MainEntrypointGenerationRequest) -> str:
-        return self.workflow.run(request)
-
-    def close(self) -> None:
-        self.workflow.close()
 
 
 @dataclass(kw_only=True)

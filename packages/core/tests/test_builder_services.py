@@ -6,18 +6,18 @@ Modified 2026-10-15: test unified generation requests and caller-isolated mutabl
 Modified 2026-10-15: verify cleaned request APIs, builder-local routing and deterministic main payloads.
 Modified 2026-10-15: migrate generation coverage to complete per-node requests without batch/callback state.
 Modified 2026-10-15: replace removed batch coverage with immediate rejection and direct graph refresh tests.
+Modified 2026-10-16: drop the removed workflow service wrappers; AgentBuilder owns its four workflows.
 """
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import MISSING, FrozenInstanceError, fields, replace
+from dataclasses import MISSING, FrozenInstanceError, fields
 from inspect import Parameter, signature
 from itertools import product
 import json
 from pathlib import Path
-from threading import Barrier, Event, RLock
+from threading import RLock
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import Mock, call
 
@@ -41,30 +41,29 @@ from flowx_core.workflows.node_generation import (
 from flowx_core.workflows.node_runtime_modifier import NodeRuntimeModifierRequest
 
 
-_THREAD_TIMEOUT = 5
-_WORKFLOW_SERVICE_CASES = (
+_WORKFLOW_CASES = (
     (
-        "graph", builder_services.GraphBuildService, "GraphGenerationWorkflow",
-        ("analyzer", "planner", "graph_auditor"), "_graph_build_service",
+        "graph", "GraphGenerationWorkflow",
+        ("analyzer", "planner", "graph_auditor"), "_graph_workflow",
     ),
     (
-        "node", builder_services.NodeBuildService, "NodeGenerationWorkflow",
-        ("node_planner", "node_coder", "node_auditor"), "_node_build_service",
+        "node", "NodeGenerationWorkflow",
+        ("node_planner", "node_coder", "node_auditor"), "_node_workflow",
     ),
     (
-        "artifact", builder_services.NodeArtifactService, "NodeRuntimeModifierPipeline",
+        "artifact", "NodeRuntimeModifierPipeline",
         ("node_test_writer", "node_writer", "run_subprocess", "timeout_expired"),
-        "_node_artifact_service",
+        "_modifier_pipeline",
     ),
     (
-        "main", builder_services.MainEntrypointService, "MainEntrypointGenerationWorkflow",
-        ("main_writer", "main_entry_auditor"), "_main_entrypoint_service",
+        "main", "MainEntrypointGenerationWorkflow",
+        ("main_writer", "main_entry_auditor"), "_main_workflow",
     ),
 )
 _RUNTIME_DEPENDENCIES = (
     "logger", "select_python_command", "popen_subprocess", "run_subprocess", "timeout_expired",
 )
-_SERVICE_ATTRIBUTES = tuple(case[4] for case in _WORKFLOW_SERVICE_CASES) + ("_runtime_service",)
+_SERVICE_ATTRIBUTES = tuple(case[3] for case in _WORKFLOW_CASES) + ("_runtime_service",)
 _LEGACY_SERVICE_ATTRIBUTES = (
     "builder", "session", "build_session", "_session", "request", "requests", "_last_request",
     "generation_contexts", "workflows", "contexts", "modifiers", "_cache_lock",
@@ -105,99 +104,12 @@ def _service_dependencies(names):
     return dependencies
 
 
-def _assert_dependency_only_storage(service, dependencies, workflow=None) -> None:
-    expected = dict(dependencies)
-    if workflow is not None:
-        expected["workflow"] = workflow
-    assert vars(service).keys() == expected.keys()
-    for name, value in expected.items():
+def _assert_dependency_only_storage(service, dependencies) -> None:
+    assert vars(service).keys() == dependencies.keys()
+    for name, value in dependencies.items():
         assert vars(service)[name] is value
     for name in _LEGACY_SERVICE_ATTRIBUTES:
         assert not hasattr(service, name), name
-
-
-def _service_requests(kind, root):
-    """Use real requests; per-node inputs, repair outputs and state are caller-owned."""
-    requests, results = [], []
-    for index, (workflow_name, node_name, node_kind) in enumerate((
-        ("default", "Extract", "WorkflowStepNode"),
-        ("default", "Upload", "WorkflowFileNode"),
-        ("another-workflow", "Summarize", "WorkflowSkillNode"),
-    )):
-        project_root = root / workflow_name
-        graph_path = str(project_root / "workflow.json")
-        requirement_path = str(project_root / f"{node_name}.md")
-        target_path = project_root / f"{node_name}.py"
-        state = MappingProxyType({
-            "build_session": BuildSession(), "request_id": f"{kind}-{index}",
-            "workflow_name": workflow_name, "node_name": node_name, "meta_node_kind": node_kind,
-            "callback": Mock(name=f"{kind}_{node_name}_callback"),
-        })
-        if kind == "graph":
-            item = GraphGenerationRequest(
-                requirement_text=f"Build {node_name}", requirement_md_path=requirement_path,
-                graph_plan_path=graph_path, graph_action="amend" if index == 2 else "plan",
-                amendment="Add validation" if index == 2 else "", temperature=0.3 + index / 10,
-                skip_analyze_requirement=index == 2, state=state,
-            )
-            result = SimpleNamespace(outputs={"opaque": object()})
-        elif kind == "node":
-            node_meta = NodeMeta(
-                name=node_name, type=node_kind, desc=f"Build {node_name}", meta_node_kind=node_kind,
-            )
-            item = NodeGenerationRequest(
-                graph_plan_path=graph_path, requirement_md_path=requirement_path,
-                requirement_text=f"Build {node_name}", node_meta=node_meta,
-                raw_node=node_meta.to_dict(), target_path=target_path,
-                markdown_path=project_root / "node_docs" / f"{node_name}.md",
-                language="python", temperature=0.35, generate_markdown=index != 1,
-                markdown_amendment=f"Document {node_name}", node_amendment=f"Validate {node_name}",
-                skip_node_planner=index == 1,
-                node_format={"user_input_format": {"value": "string"}},
-                dependency_context=f"Earlier artifact for {node_name}", state=state,
-            )
-            result = str(target_path)
-        elif kind == "artifact":
-            item = NodeRuntimeModifierRequest(
-                node_file_name=str(target_path), workflow_graph=graph_path,
-                working_directory=str(project_root), node_name=node_name,
-                skip_generate_node_test=index == 1, skip_run_node_test=index == 2,
-                skip_amend_node=True, state=state,
-            )
-            result = replace(item)
-            result.test_file_path = str(project_root / "tests" / f"test_{node_name}.py")
-            if not item.skip_run_node_test:
-                result.log_file_path = str(project_root / "logs" / f"{node_name}_test.log")
-                result.test_log = f"Test output for {node_name}"
-                result.test_result = {"ok": True, "returncode": 0}
-            result.amended_node_file_path = str(target_path)
-        else:
-            assert kind == "main"
-            item = MainEntrypointGenerationRequest(
-                project_root_path=str(project_root), graph_plan_json_path=graph_path,
-                output_path=str(project_root / f"{node_name}_main.py"),
-                fastapi_port=8000 + index, state=state,
-            )
-            result = str(project_root / f"audited_{node_name}_main.py")
-        requests.append(item)
-        results.append(result)
-    return tuple(requests), tuple(results)
-
-
-@pytest.fixture(params=_WORKFLOW_SERVICE_CASES, ids=lambda case: case[0])
-def workflow_service(request, monkeypatch, tmp_path):
-    kind, service_class, constructor_name, dependency_names, _ = request.param
-    dependencies = _service_dependencies(dependency_names)
-    workflow = Mock(name=f"{kind}_workflow", spec_set=["run", "close"])
-    constructor = Mock(name=constructor_name, return_value=workflow)
-    # Patch the imported constructor before __post_init__ can create a native pool.
-    monkeypatch.setattr(builder_services, constructor_name, constructor)
-    service = service_class(**dependencies)
-    requests, results = _service_requests(kind, tmp_path)
-    return SimpleNamespace(
-        service=service, dependencies=dependencies, workflow=workflow, constructor=constructor,
-        requests=requests, results=results,
-    )
 
 
 @pytest.fixture
@@ -226,21 +138,20 @@ def builder(tmp_path):
     instance._run_subprocess = Mock()
     instance._subprocess_timeout_expired = Mock(return_value=TimeoutError)
     instance._instantiate_graph = Mock()
-    for _, _, _, _, name in _WORKFLOW_SERVICE_CASES:
+    for *_, name in _WORKFLOW_CASES:
         setattr(instance, name, Mock(name=name, spec_set=["run", "close"]))
     instance._runtime_service = Mock(spec_set=[
         "rerun_server", "test_main_entrypoint", "stop_managed_server_process",
     ])
-    instance.output_auditor = Mock(spec_set=["audit_log_file"])
     return instance
 
 
 def _mock_workflow_constructors(monkeypatch):
     constructors, workflows = {}, {}
-    for kind, _, constructor_name, _, _ in _WORKFLOW_SERVICE_CASES:
+    for kind, constructor_name, _, _ in _WORKFLOW_CASES:
         workflows[kind] = Mock(name=f"{kind}_workflow", spec_set=["run", "close"])
         constructors[kind] = Mock(name=constructor_name, return_value=workflows[kind])
-        monkeypatch.setattr(builder_services, constructor_name, constructors[kind])
+        monkeypatch.setattr(agent_builder_module, constructor_name, constructors[kind])
     return constructors, workflows
 
 
@@ -390,7 +301,7 @@ def test_node_generation_api_removes_batch_helpers_but_preserves_public_signatur
     for name in ("callback", "workflow_requests", "workflow_registry"):
         with pytest.raises(TypeError, match="unexpected keyword"):
             builder.generate_nodes(**{name: object()})
-    builder._node_build_service.run.assert_not_called()
+    builder._node_workflow.run.assert_not_called()
 
 
 def test_agent_builder_initialization_has_no_batch_progress_fields(monkeypatch, tmp_path) -> None:
@@ -399,7 +310,7 @@ def test_agent_builder_initialization_has_no_batch_progress_fields(monkeypatch, 
     monkeypatch.setattr(AgentBuilder, "_init_services", init_services)
     monkeypatch.setattr(agent_builder_module, "configure_runtime_logging", Mock(return_value=tmp_path / "debug.log"))
     monkeypatch.setattr(agent_builder_module, "get_logger", Mock(return_value=Mock()))
-    for name in ("GraphJsonAuditor", "NodeAuditor", "MainEntryPointAuditor", "OutputAuditor"):
+    for name in ("GraphJsonAuditor", "NodeAuditor", "MainEntryPointAuditor"):
         monkeypatch.setattr(agent_builder_module, name, Mock())
 
     instance = AgentBuilder(api_key="unused", root_dir=str(tmp_path))
@@ -443,15 +354,7 @@ def test_public_node_generation_immediately_rejects_without_side_effects(
         builder.workflow_json_path = "published-workflow.json"
         builder.main_output_path = "published-main.py"
         builder.node_location_map = dict(record.node_location_map)
-        builder.node_doc_paths = [str(doc_path)]
-        builder.node_docs_dir = str(tmp_path)
-        builder.node_coder_map = {"Shared": SimpleNamespace(kind="existing coder")}
         builder.artifact_state.workflow_artifacts["named"] = record
-        builder.dynamic_graph_cache["node_tests"] = {"Shared": str(test_path)}
-        builder.dynamic_graph_cache["workflow_node_tests"] = {"named": {"Shared": str(test_path)}}
-        builder.dynamic_graph_cache["server_runtime"] = {"backend": {"pid": 123}}
-        builder.backend_server_process = SimpleNamespace(pid=123)
-        builder.log_path = "published.log"
 
     options = {
         "graph_plan_path": str(graph_path), "requirement_md_path": str(requirement_path),
@@ -477,13 +380,13 @@ def test_public_node_generation_immediately_rejects_without_side_effects(
         )
     elif arguments == "invalid-workflow":
         options["workflow_name"] = "   "
-    for name in ("_load_planned_graph", "_request_state", "_resolve_root_path", "run_node_modifier"):
+    for name in ("_load_planned_graph", "_request_state", "_resolve_root_path"):
         monkeypatch.setattr(builder, name, Mock(name=name))
     storage_snapshots = [
         (owner, dict(vars(owner)))
-        for owner in (builder, builder._session, builder.artifact_state, builder.runtime_state, record)
+        for owner in (builder, builder._session, builder.artifact_state, record)
     ]
-    artifact_snapshot, runtime_snapshot = deepcopy(builder.artifact_state), deepcopy(builder.runtime_state)
+    artifact_snapshot = deepcopy(builder.artifact_state)
     options_snapshot = deepcopy(options)
     files_before = {
         path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
@@ -494,14 +397,13 @@ def test_public_node_generation_immediately_rejects_without_side_effects(
         builder.generate_nodes(**options)
 
     assert raised.value.args == (
-        "Batch node generation is not implemented; submit a NodeGenerationRequest to NodeBuildService.run() instead.",
+        "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes.",
     )
     for owner, snapshot in storage_snapshots:
         assert vars(owner).keys() == snapshot.keys()
         for name, value in snapshot.items():
             assert vars(owner)[name] is value, name
     assert builder.artifact_state == artifact_snapshot
-    assert builder.runtime_state == runtime_snapshot
     assert options == options_snapshot
     assert {
         path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
@@ -514,239 +416,21 @@ def test_public_node_generation_immediately_rejects_without_side_effects(
     assert captured.out == captured.err == ""
 
 
-@pytest.mark.parametrize("service_class, dependency_names, owns_workflow", [
-    pytest.param(service_class, names, True, id=kind)
-    for kind, service_class, _, names, _ in _WORKFLOW_SERVICE_CASES
-] + [pytest.param(builder_services.RuntimeService, _RUNTIME_DEPENDENCIES, False, id="runtime")])
-def test_services_expose_only_explicit_keyword_dependencies(
-    service_class, dependency_names, owns_workflow,
-) -> None:
-    service_fields = fields(service_class)
+def test_runtime_service_exposes_only_explicit_keyword_dependencies() -> None:
+    service_fields = fields(builder_services.RuntimeService)
     dependencies = [dependency for dependency in service_fields if dependency.init]
-    assert tuple(dependency.name for dependency in dependencies) == dependency_names
+    assert tuple(dependency.name for dependency in dependencies) == _RUNTIME_DEPENDENCIES
     assert all(dependency.kw_only for dependency in dependencies)
-    assert {dependency.name for dependency in service_fields if not dependency.init} == (
-        {"workflow"} if owns_workflow else set()
-    )
-    injected = _service_dependencies(dependency_names)
+    assert not [dependency for dependency in service_fields if not dependency.init]
+    injected = _service_dependencies(_RUNTIME_DEPENDENCIES)
     with pytest.raises(TypeError, match="positional"):
-        service_class(*injected.values())
+        builder_services.RuntimeService(*injected.values())
     for name in (
         "builder", "session", "build_session", "generation_contexts", "workflows", "contexts",
         "modifiers", "_cache_lock", "workflow",
     ):
         with pytest.raises(TypeError, match="unexpected keyword"):
-            service_class(**injected, **{name: object()})
-
-
-def test_services_construct_one_workflow_before_any_request(workflow_service) -> None:
-    case = workflow_service
-    case.constructor.assert_called_once_with(**case.dependencies)
-    assert case.service.workflow is case.workflow
-    case.workflow.run.assert_not_called()
-    case.workflow.close.assert_not_called()
-    _assert_dependency_only_storage(case.service, case.dependencies, case.workflow)
-
-
-def test_services_repeatedly_delegate_different_requests_without_retaining_state(workflow_service) -> None:
-    case = workflow_service
-    results = {id(request): result for request, result in zip(case.requests, case.results)}
-    states = tuple(request.state for request in case.requests)
-    snapshots = tuple(
-        {field.name: getattr(request, field.name) for field in fields(request)}
-        for request in case.requests
-    )
-    case.workflow.run.side_effect = lambda request: results[id(request)]
-    requests = (*case.requests, case.requests[0], case.requests[2])
-    for request in requests:
-        assert case.service.run(request) is results[id(request)]
-    assert case.workflow.run.call_args_list == [call(request) for request in requests]
-    for actual, expected in zip(case.workflow.run.call_args_list, requests):
-        assert actual.args[0] is expected
-    for request, state, snapshot in zip(case.requests, states, snapshots):
-        assert request.state is state
-        assert isinstance(state, MappingProxyType)
-        for name, value in snapshot.items():
-            assert getattr(request, name) is value
-        if isinstance(request, NodeRuntimeModifierRequest):
-            result = results[id(request)]
-            assert isinstance(result, NodeRuntimeModifierRequest)
-            assert result is not request
-            assert not hasattr(request, "context")
-            assert not hasattr(result, "context")
-            for name in ("workflow_name", "completed_stages", "skipped_stages"):
-                assert not hasattr(request, name)
-                assert not hasattr(result, name)
-            for field in fields(request):
-                if field.init:
-                    assert getattr(result, field.name) is getattr(request, field.name)
-            assert request.test_file_path == request.log_file_path == request.test_log == ""
-            assert request.amended_node_file_path == ""
-            assert request.test_result is None
-            project_root = Path(request.working_directory)
-            assert result.test_file_path == str(project_root / "tests" / f"test_{request.node_name}.py")
-            assert result.amended_node_file_path == request.node_file_name
-            if request.skip_run_node_test:
-                assert result.log_file_path == result.test_log == ""
-                assert result.test_result is None
-            else:
-                assert result.log_file_path == str(project_root / "logs" / f"{request.node_name}_test.log")
-                assert result.test_log == f"Test output for {request.node_name}"
-                assert result.test_result == {"ok": True, "returncode": 0}
-        else:
-            assert isinstance(request, (
-                NodeGenerationRequest, GraphGenerationRequest, MainEntrypointGenerationRequest,
-            ))
-            if isinstance(request, NodeGenerationRequest):
-                _assert_complete_node_request(request)
-                assert request.node_meta.name == state["node_name"]
-            elif isinstance(request, MainEntrypointGenerationRequest):
-                assert not hasattr(request, "temperature")
-            with pytest.raises(FrozenInstanceError):
-                setattr(request, "state", {})
-        state["callback"].assert_not_called()
-        assert state["build_session"].graph_plan_path is None
-    case.constructor.assert_called_once_with(**case.dependencies)
-    _assert_dependency_only_storage(case.service, case.dependencies, case.workflow)
-
-
-@pytest.mark.parametrize("workflow_service", [_WORKFLOW_SERVICE_CASES[2]], indirect=True, ids=("artifact",))
-def test_node_artifact_service_preserves_mutable_caller_data_and_independent_run_outputs(
-    workflow_service, tmp_path,
-) -> None:
-    case = workflow_service
-    request = case.requests[0]
-    request.working_directory = str(tmp_path / "unused" / "..")
-    request.test_file_path = str(tmp_path / "previous_test.py")
-    request.log_file_path = str(tmp_path / "previous_test.log")
-    request.test_log = "previous output"
-    request.test_result = {"ok": False}
-    request.amended_node_file_path = str(tmp_path / "previous_node.py")
-    Path(request.test_file_path).write_text("# previous test\n", encoding="utf-8")
-    Path(request.log_file_path).write_text(request.test_log, encoding="utf-8")
-    Path(request.amended_node_file_path).write_text("# previous node\n", encoding="utf-8")
-    snapshot = {field.name: getattr(request, field.name) for field in fields(request)}
-    test_path, log_path, node_path = (
-        tmp_path / "current_test.py", tmp_path / "current_test.log", tmp_path / "current_node.py",
-    )
-    expected_test_result = {"ok": True, "returncode": 0}
-
-    def repair(actual):
-        assert actual is request
-        result = replace(actual, working_directory=str(Path(actual.working_directory).resolve()))
-        assert result.test_file_path == result.log_file_path == result.test_log == ""
-        assert result.amended_node_file_path == ""
-        assert result.test_result is None
-        test_path.write_text("# current test\n", encoding="utf-8")
-        log_path.write_text("current output", encoding="utf-8")
-        node_path.write_text("# current node\n", encoding="utf-8")
-        result.test_file_path = str(test_path)
-        result.log_file_path = str(log_path)
-        result.test_log = log_path.read_text(encoding="utf-8")
-        result.test_result = dict(expected_test_result)
-        result.amended_node_file_path = str(node_path)
-        return result
-
-    case.workflow.run.side_effect = repair
-    first = case.service.run(request)
-    second = case.service.run(request)
-
-    assert isinstance(first, NodeRuntimeModifierRequest)
-    assert isinstance(second, NodeRuntimeModifierRequest)
-    assert len({id(request), id(first), id(second)}) == 3
-    for result in (first, second):
-        assert not hasattr(result, "context")
-        for name in ("workflow_name", "completed_stages", "skipped_stages"):
-            assert not hasattr(request, name)
-            assert not hasattr(result, name)
-        assert result.working_directory == str(tmp_path.resolve())
-        for field in fields(request):
-            if field.init and field.name != "working_directory":
-                assert getattr(result, field.name) is getattr(request, field.name)
-        assert result.test_file_path == str(test_path)
-        assert result.log_file_path == str(log_path)
-        assert result.test_log == "current output"
-        assert result.amended_node_file_path == str(node_path)
-        assert result.test_result == expected_test_result
-        assert result.test_result is not request.test_result
-        assert result.test_result is not expected_test_result
-    assert first.test_result is not second.test_result
-    first.test_result["first_only"] = True
-    first.test_file_path = str(tmp_path / "first_only_test.py")
-    first.log_file_path = str(tmp_path / "first_only_test.log")
-    first.test_log = "first only output"
-    first.amended_node_file_path = str(tmp_path / "first_only_node.py")
-    assert second.test_result == expected_test_result
-    assert second.test_file_path == str(test_path)
-    assert second.log_file_path == str(log_path)
-    assert second.test_log == "current output"
-    assert second.amended_node_file_path == str(node_path)
-    for name, value in snapshot.items():
-        assert getattr(request, name) is value
-    assert request.test_result == {"ok": False}
-    assert Path(request.test_file_path).read_text(encoding="utf-8") == "# previous test\n"
-    assert Path(request.log_file_path).read_text(encoding="utf-8") == request.test_log == "previous output"
-    assert Path(request.amended_node_file_path).read_text(encoding="utf-8") == "# previous node\n"
-    case.workflow.run.assert_has_calls([call(request), call(request)])
-    assert case.workflow.run.call_count == 2
-    case.constructor.assert_called_once_with(**case.dependencies)
-    _assert_dependency_only_storage(case.service, case.dependencies, case.workflow)
-
-
-def test_services_delegate_concurrent_requests_to_the_same_workflow(workflow_service) -> None:
-    case = workflow_service
-    results = {id(request): result for request, result in zip(case.requests, case.results)}
-    entered = Barrier(len(case.requests))
-
-    def run(request):
-        # A service-level execution lock would prevent all requests reaching this barrier.
-        entered.wait(timeout=_THREAD_TIMEOUT)
-        return results[id(request)]
-
-    case.workflow.run.side_effect = run
-    with ThreadPoolExecutor(max_workers=len(case.requests)) as executor:
-        futures = [executor.submit(case.service.run, request) for request in case.requests]
-        for future, expected in zip(futures, case.results):
-            assert future.result(timeout=_THREAD_TIMEOUT) is expected
-    assert case.workflow.run.call_count == len(case.requests)
-    assert {id(actual.args[0]) for actual in case.workflow.run.call_args_list} == set(results)
-    assert all(len(actual.args) == 1 and not actual.kwargs for actual in case.workflow.run.call_args_list)
-    case.constructor.assert_called_once_with(**case.dependencies)
-    _assert_dependency_only_storage(case.service, case.dependencies, case.workflow)
-
-
-def test_services_delegate_repeated_close_without_replacing_terminal_workflows(workflow_service) -> None:
-    case = workflow_service
-    closed = RuntimeError("workflow is closed")
-
-    def close():
-        case.workflow.run.side_effect = closed
-
-    # Workflow lifecycle and native pool behavior are covered by the workflow tests.
-    case.workflow.close.side_effect = close
-    assert case.service.close() is None
-    assert case.service.close() is None
-    assert case.workflow.close.call_args_list == [call(), call()]
-    with pytest.raises(RuntimeError) as raised:
-        case.service.run(case.requests[0])
-    assert raised.value is closed
-    case.workflow.run.assert_called_once_with(case.requests[0])
-    case.constructor.assert_called_once_with(**case.dependencies)
-    _assert_dependency_only_storage(case.service, case.dependencies, case.workflow)
-
-
-@pytest.mark.parametrize("operation", ("run", "close"))
-def test_services_propagate_workflow_failures_unchanged(workflow_service, operation) -> None:
-    case = workflow_service
-    failure = RuntimeError(f"{operation} failed")
-    getattr(case.workflow, operation).side_effect = failure
-    arguments = (case.requests[0],) if operation == "run" else ()
-    with pytest.raises(RuntimeError) as raised:
-        getattr(case.service, operation)(*arguments)
-    assert raised.value is failure
-    getattr(case.workflow, operation).assert_called_once_with(*arguments)
-    case.constructor.assert_called_once_with(**case.dependencies)
-    _assert_dependency_only_storage(case.service, case.dependencies, case.workflow)
+            builder_services.RuntimeService(**injected, **{name: object()})
 
 
 @pytest.mark.parametrize("method_name, argument_names", [
@@ -852,25 +536,25 @@ def test_runtime_service_writes_requested_log_without_auditing_or_publishing_sta
 
 
 @pytest.mark.parametrize("failed_kind", (None, "graph", "node", "artifact", "main"))
-def test_agent_builder_close_delegates_to_all_four_services_even_if_cleanup_fails(failed_kind) -> None:
+def test_agent_builder_close_closes_all_four_workflows_even_if_cleanup_fails(failed_kind) -> None:
     builder = SimpleNamespace(**{
-        name: Mock(name=name, spec_set=["close", "workflow"]) for _, _, _, _, name in _WORKFLOW_SERVICE_CASES
+        name: Mock(name=name, spec_set=["close"]) for *_, name in _WORKFLOW_CASES
     })
     closes = Mock()
-    failure = RuntimeError("service cleanup failed")
-    for kind, _, _, _, name in _WORKFLOW_SERVICE_CASES:
-        service = getattr(builder, name)
-        closes.attach_mock(service.close, kind)
+    failure = RuntimeError("workflow cleanup failed")
+    for kind, *_, name in _WORKFLOW_CASES:
+        workflow = getattr(builder, name)
+        closes.attach_mock(workflow.close, kind)
         if kind == failed_kind:
-            service.close.side_effect = failure
+            workflow.close.side_effect = failure
     if failed_kind is None:
         assert AgentBuilder.close(builder) is None
     else:
         with pytest.raises(RuntimeError) as raised:
             AgentBuilder.close(builder)
         assert raised.value is failure
-    assert closes.mock_calls == [getattr(call, case[0])() for case in reversed(_WORKFLOW_SERVICE_CASES)]
-    for _, _, _, _, name in _WORKFLOW_SERVICE_CASES:
+    assert closes.mock_calls == [getattr(call, case[0])() for case in reversed(_WORKFLOW_CASES)]
+    for *_, name in _WORKFLOW_CASES:
         getattr(builder, name).close.assert_called_once_with()
 
 
@@ -894,8 +578,8 @@ def test_agent_builder_initializes_workflows_before_publishing_a_complete_servic
 
     def construct_runtime(**kwargs):
         assert set(_published_services(builder)) == set(_SERVICE_ATTRIBUTES[:-1])
-        for kind, _, _, _, name in _WORKFLOW_SERVICE_CASES:
-            assert getattr(builder, name).workflow is workflows[kind]
+        for kind, _, _, name in _WORKFLOW_CASES:
+            assert getattr(builder, name) is workflows[kind]
         return runtime
 
     runtime_constructor = Mock(side_effect=construct_runtime)
@@ -903,10 +587,9 @@ def test_agent_builder_initializes_workflows_before_publishing_a_complete_servic
 
     builder._init_services()
 
-    for kind, service_class, _, _, name in _WORKFLOW_SERVICE_CASES:
+    for kind, _, _, name in _WORKFLOW_CASES:
         constructors[kind].assert_called_once_with(**expected[kind])
-        assert isinstance(getattr(builder, name), service_class)
-        _assert_dependency_only_storage(getattr(builder, name), expected[kind], workflows[kind])
+        assert getattr(builder, name) is workflows[kind]
         workflows[kind].run.assert_not_called()
         workflows[kind].close.assert_not_called()
     runtime_constructor.assert_called_once_with(
@@ -917,7 +600,7 @@ def test_agent_builder_initializes_workflows_before_publishing_a_complete_servic
     assert builder._runtime_service is runtime
 
 
-@pytest.mark.parametrize("failed_index", range(len(_WORKFLOW_SERVICE_CASES)), ids=("graph", "node", "artifact", "main"))
+@pytest.mark.parametrize("failed_index", range(len(_WORKFLOW_CASES)), ids=("graph", "node", "artifact", "main"))
 @pytest.mark.parametrize("preserve_existing", (False, True), ids=("unpublished", "existing-services"))
 def test_agent_builder_initialization_failure_closes_earlier_workflows_without_partial_publication(
     builder, monkeypatch, failed_index, preserve_existing,
@@ -928,7 +611,7 @@ def test_agent_builder_initialization_failure_closes_earlier_workflows_without_p
     previous = _published_services(builder)
     constructors, workflows = _mock_workflow_constructors(monkeypatch)
     expected = _builder_workflow_dependencies(builder)
-    failed_kind = _WORKFLOW_SERVICE_CASES[failed_index][0]
+    failed_kind = _WORKFLOW_CASES[failed_index][0]
     failure = RuntimeError(f"{failed_kind} construction failed")
     constructors[failed_kind].side_effect = failure
     runtime_constructor = Mock()
@@ -942,7 +625,7 @@ def test_agent_builder_initialization_failure_closes_earlier_workflows_without_p
 
     assert raised.value is failure
     assert _published_services(builder) == previous
-    for index, (kind, _, _, _, name) in enumerate(_WORKFLOW_SERVICE_CASES):
+    for index, (kind, _, _, name) in enumerate(_WORKFLOW_CASES):
         if index <= failed_index:
             constructors[kind].assert_called_once_with(**expected[kind])
         else:
@@ -955,7 +638,7 @@ def test_agent_builder_initialization_failure_closes_earlier_workflows_without_p
         if preserve_existing:
             previous[name].close.assert_not_called()
     assert closes.mock_calls == [
-        getattr(call, case[0])() for case in reversed(_WORKFLOW_SERVICE_CASES[:failed_index])
+        getattr(call, case[0])() for case in reversed(_WORKFLOW_CASES[:failed_index])
     ]
     runtime_constructor.assert_not_called()
 
@@ -1046,9 +729,8 @@ def test_load_planned_graph_refreshes_same_path_without_mutating_existing_snapsh
     assert original_graph.get_node_meta("Added") is None
     assert builder.artifact_state.workflow_artifacts == {}
     assert builder.node_location_map == {}
-    assert builder.node_doc_paths == []
-    builder._node_build_service.run.assert_not_called()
-    builder._node_artifact_service.run.assert_not_called()
+    builder._node_workflow.run.assert_not_called()
+    builder._modifier_pipeline.run.assert_not_called()
 
 
 @pytest.mark.parametrize("explicit_path", (False, True), ids=("session-path", "explicit-path"))
@@ -1065,159 +747,8 @@ def test_failed_planned_graph_refresh_does_not_retain_old_topology(builder, tmp_
     assert old_graph.nodes == old_nodes
     assert old_graph.get_node_meta("Shared").desc == "Original step"
     assert builder.artifact_state.workflow_artifacts == {}
-    builder._node_build_service.run.assert_not_called()
-    builder._node_artifact_service.run.assert_not_called()
-
-
-@pytest.mark.parametrize("workflow_names", [
-    ("default", "default"), ("named", "named"), ("alpha", "beta"),
-], ids=("default-nodes", "named-nodes", "different-workflows"))
-def test_overlapping_node_repairs_merge_completed_test_paths_and_reuse_them(
-    builder, tmp_path, workflow_names,
-) -> None:
-    graph_path = tmp_path / "workflow.json"
-    graph_path.write_text(json.dumps({"nodes": [
-        {"name": name, "type": "WorkflowStepNode", "desc": name, "depends": []}
-        for name in ("First", "Second")
-    ]}), encoding="utf-8")
-    for name in ("First", "Second"):
-        (tmp_path / f"{name}.py").write_text(f"# {name}\n", encoding="utf-8")
-    builder.graph_plan_path = str(graph_path)
-    builder._load_planned_graph()
-    initial = {"unrelated": {"Keep": "preserved.py"}}
-    for name in workflow_names:
-        initial[name] = {"Existing": f"{name}_existing.py"}
-    builder.dynamic_graph_cache["workflow_node_tests"] = initial
-    if "default" in workflow_names:
-        builder.dynamic_graph_cache["node_tests"] = dict(initial["default"])
-    entered = {name: Event() for name in ("First", "Second")}
-    finish = {name: Event() for name in entered}
-    paths = {
-        name: str(tmp_path / "custom_tests" / f"{workflow}_{name}.py")
-        for workflow, name in zip(workflow_names, entered)
-    }
-
-    def repair(request):
-        assert request.state["build_session"] is builder._session
-        workflow = workflow_names[("First", "Second").index(request.node_name)]
-        assert not hasattr(request, "workflow_name")
-        assert request.node_file_name == str(tmp_path / f"{request.node_name}.py")
-        assert request.workflow_graph == str(graph_path)
-        assert request.working_directory == str(tmp_path)
-        assert request.log_file_name == (
-            "" if workflow == "default" else str(Path("logs") / workflow / f"{request.node_name}_test.log")
-        )
-        if not request.skip_generate_node_test:
-            assert request.test_file_name == (
-                "" if workflow == "default" else str(Path("tests") / workflow / f"test_{request.node_name}.py")
-            )
-            entered[request.node_name].set()
-            assert finish[request.node_name].wait(_THREAD_TIMEOUT), "test must release each repair"
-        else:
-            assert request.test_file_name == paths[request.node_name]
-        test_path = Path(paths[request.node_name])
-        test_path.parent.mkdir(parents=True, exist_ok=True)
-        test_path.write_text("# completed test\n", encoding="utf-8")
-        result = replace(request)
-        result.test_file_path = str(test_path)
-        return result
-
-    builder._node_artifact_service.run.side_effect = repair
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(
-            builder.run_node_modifier, workflow_name=workflow_names[0], node_name="First",
-            graph_plan_path=str(graph_path), run_test=False, amend_node=False,
-        )
-        second = executor.submit(
-            builder.run_node_modifier, workflow_name=workflow_names[1], node_name="Second",
-            graph_plan_path=str(graph_path), run_test=False, amend_node=False,
-        )
-        try:
-            assert entered["First"].wait(_THREAD_TIMEOUT)
-            assert entered["Second"].wait(_THREAD_TIMEOUT), "execution must not hold a builder publication lock"
-            finish["First"].set()
-            first_result = first.result(timeout=_THREAD_TIMEOUT)
-            assert isinstance(first_result, NodeRuntimeModifierRequest)
-            assert first_result.test_file_path == paths["First"]
-            assert builder.dynamic_graph_cache["workflow_node_tests"][workflow_names[0]]["First"] == paths["First"]
-            finish["Second"].set()
-            second_result = second.result(timeout=_THREAD_TIMEOUT)
-            assert isinstance(second_result, NodeRuntimeModifierRequest)
-            assert second_result.test_file_path == paths["Second"]
-        finally:
-            finish["First"].set()
-            finish["Second"].set()
-
-    requests = {
-        actual.args[0].node_name: actual.args[0]
-        for actual in builder._node_artifact_service.run.call_args_list
-    }
-    for result in (first_result, second_result):
-        request = requests[result.node_name]
-        assert result is not request
-        assert not hasattr(result, "context")
-        assert result.state is request.state
-        for field in fields(request):
-            if field.init:
-                assert getattr(result, field.name) is getattr(request, field.name)
-        for name in ("workflow_name", "completed_stages", "skipped_stages"):
-            assert not hasattr(request, name)
-            assert not hasattr(result, name)
-        assert request.test_file_path == request.log_file_path == request.test_log == ""
-        assert request.amended_node_file_path == ""
-        assert request.test_result is None
-        assert Path(result.test_file_path).read_text(encoding="utf-8") == "# completed test\n"
-        assert result.log_file_path == result.test_log == ""
-        assert result.amended_node_file_path == ""
-        assert result.test_result is None
-    published = builder.dynamic_graph_cache["workflow_node_tests"]
-    assert published["unrelated"] == {"Keep": "preserved.py"}
-    for workflow, name in zip(workflow_names, ("First", "Second")):
-        assert published[workflow][name] == paths[name]
-        assert published[workflow]["Existing"] == f"{workflow}_existing.py"
-        reused = builder.run_node_modifier(
-            workflow_name=workflow, node_name=name, graph_plan_path=str(graph_path),
-            generate_test=False, run_test=False, amend_node=False,
-        )
-        assert isinstance(reused, NodeRuntimeModifierRequest)
-        assert reused.test_file_path == paths[name]
-        request = builder._node_artifact_service.run.call_args.args[0]
-        assert reused is not request
-        assert reused.state is request.state
-        assert request.test_file_path == ""
-    if "default" in workflow_names:
-        assert builder.dynamic_graph_cache["node_tests"] == published["default"]
-    assert initial == {
-        "unrelated": {"Keep": "preserved.py"},
-        **{name: {"Existing": f"{name}_existing.py"} for name in workflow_names},
-    }
-
-
-def test_default_repair_publication_preserves_legacy_test_path_fallback(builder, tmp_path) -> None:
-    graph_path = _generation_files(builder, tmp_path)
-    (tmp_path / "Shared.py").write_text("# node\n", encoding="utf-8")
-    builder.dynamic_graph_cache["node_tests"] = {"Legacy": "legacy_custom_test.py"}
-
-    def repair(request):
-        result = replace(request)
-        result.test_file_path = str(tmp_path / "custom_test.py")
-        return result
-
-    builder._node_artifact_service.run.side_effect = repair
-    result = builder.run_node_modifier(
-        node_name="Shared", graph_plan_path=str(graph_path), run_test=False, amend_node=False,
-    )
-
-    request = builder._node_artifact_service.run.call_args.args[0]
-    assert isinstance(result, NodeRuntimeModifierRequest)
-    assert result is not request
-    assert not hasattr(result, "context")
-    assert result.state is request.state
-    assert request.test_file_path == ""
-
-    expected = {"Legacy": "legacy_custom_test.py", "Shared": str(tmp_path / "custom_test.py")}
-    assert builder.dynamic_graph_cache["node_tests"] == expected
-    assert builder.dynamic_graph_cache["workflow_node_tests"]["default"] == expected
+    builder._node_workflow.run.assert_not_called()
+    builder._modifier_pipeline.run.assert_not_called()
 
 
 def test_agent_builder_graph_facade_delegates_and_publishes_shared_artifacts(builder, tmp_path) -> None:
@@ -1225,7 +756,7 @@ def test_agent_builder_graph_facade_delegates_and_publishes_shared_artifacts(bui
     existing_requirement = str(tmp_path / "existing.md")
     planned_graph, amended_graph = object(), object()
     builder._instantiate_graph.side_effect = [planned_graph, amended_graph]
-    builder._graph_build_service.run.side_effect = [
+    builder._graph_workflow.run.side_effect = [
         SimpleNamespace(outputs={
             "analyze_requirement": StepRunOutput(derived={"requirement_md_path": "analyzed.md"}),
         }),
@@ -1250,7 +781,7 @@ def test_agent_builder_graph_facade_delegates_and_publishes_shared_artifacts(bui
     assert builder.plan_graph(temperature=0.45) == planned_path
     assert builder._session.graph_plan_path == planned_path
     assert builder._session.planned_graph is planned_graph
-    assert builder.amend_graph("Add validation", temperature=0.55) == amended_path
+    assert builder.amend_workflow_json("Add validation", temperature=0.55) == amended_path
     assert builder._session.graph_plan_path == amended_path
     assert builder._session.planned_graph is amended_graph
     assert builder.analyze_requirement(requirement_file=existing_requirement) == existing_requirement
@@ -1259,7 +790,7 @@ def test_agent_builder_graph_facade_delegates_and_publishes_shared_artifacts(bui
     assert builder._session.planned_graph is amended_graph
     assert builder._instantiate_graph.call_args_list == [call(planned_path), call(amended_path)]
     state = {"build_session": builder._session}
-    assert builder._graph_build_service.run.call_args_list == [
+    assert builder._graph_workflow.run.call_args_list == [
         call(GraphGenerationRequest(
             requirement_text="Build a workflow",
             requirement_md_path=str(tmp_path / "requirement_analysis.md"),
@@ -1278,7 +809,7 @@ def test_agent_builder_graph_facade_delegates_and_publishes_shared_artifacts(bui
             skip_analyze_requirement=True, skip_plan_graph=True, skip_audit_graph=True, state=state,
         )),
     ]
-    for actual in builder._graph_build_service.run.call_args_list:
+    for actual in builder._graph_workflow.run.call_args_list:
         assert actual.args[0].state["build_session"] is builder._session
     builder.analyzer.assert_not_called()
     builder.planner.assert_not_called()
@@ -1324,7 +855,7 @@ def test_agent_builder_graph_request_merges_state_and_publishes_selected_normali
         assert forwarded.state["marker"] is marker
         return result
 
-    builder._graph_build_service.run.side_effect = run
+    builder._graph_workflow.run.side_effect = run
     expected_graph = requested_graph if skip_plan and skip_audit else (planned if skip_audit else audited)
 
     def instantiate(path):
@@ -1336,7 +867,7 @@ def test_agent_builder_graph_request_merges_state_and_publishes_selected_normali
 
     assert builder._run_graph_request(request) is result
 
-    builder._graph_build_service.run.assert_called_once()
+    builder._graph_workflow.run.assert_called_once()
     assert builder.requirement_md_path == (requested_requirement if skip_analysis else analyzed)
     assert builder.graph_plan_path == expected_graph
     if skip_plan and skip_audit:
@@ -1378,19 +909,19 @@ def test_agent_builder_graph_failure_does_not_expose_stale_written_or_replaced_t
         assert forwarded.state["build_session"] is builder._session
         raise failure
 
-    builder._graph_build_service.run.side_effect = fail
+    builder._graph_workflow.run.side_effect = fail
     with pytest.raises(RuntimeError) as raised:
         builder._run_graph_request(request)
     assert raised.value is failure
     assert builder.planned_graph is (None if invalidates else old_graph)
-    builder._graph_build_service.run.assert_called_once()
+    builder._graph_workflow.run.assert_called_once()
     builder._instantiate_graph.assert_not_called()
 
 
 def test_agent_builder_graph_instantiation_failure_cannot_restore_the_old_topology(builder) -> None:
     builder.graph_plan_path = "existing.json"
     builder.planned_graph = object()
-    builder._graph_build_service.run.return_value = SimpleNamespace(outputs={
+    builder._graph_workflow.run.return_value = SimpleNamespace(outputs={
         "audit_graph": StepRunOutput(derived={"graph_plan_json_path": "normalized.json"}),
     })
     failure = RuntimeError("graph cannot be loaded")
@@ -1405,106 +936,22 @@ def test_agent_builder_graph_instantiation_failure_cannot_restore_the_old_topolo
     builder._instantiate_graph.assert_called_once_with("normalized.json")
 
 
-def test_agent_builder_rerun_publishes_process_and_runtime_data(builder, tmp_path) -> None:
-    main_path = str(tmp_path / "main.py")
-    artifacts = {"main_entrypoint": main_path, "backend_nodes": {"Extract": "Extract.py"}}
-    previous_process, process = Mock(), object()
-    backend = {"pid": 123, "command": ["/custom/python", main_path], "cwd": str(tmp_path)}
-    builder.backend_server_process = previous_process
-    builder._validate_generated_artifacts = Mock(return_value=artifacts)
-    builder._runtime_service.rerun_server.return_value = (process, backend)
-
-    result = builder.rerun_server(
-        graph_plan_path="workflow.json", node_docs_dirname="docs", backend_language="python",
-        main_entrypoint_path=main_path, backend_port=9000,
-    )
-
-    builder._validate_generated_artifacts.assert_called_once_with(
-        graph_plan_path="workflow.json", node_docs_dirname="docs", backend_language="python",
-        main_entrypoint_path=main_path,
-    )
-    builder._runtime_service.rerun_server.assert_called_once_with(
-        main_entrypoint_path=main_path, previous_process=previous_process,
-    )
-    assert result == {"backend": backend, "artifacts": artifacts}
-    assert result["backend"] is backend
-    assert result["artifacts"] is artifacts
-    assert builder._session.backend_server_process is process
-    assert builder._session.runtime.dynamic_graph_cache["server_runtime"] is result
-
-
-def test_agent_builder_runtime_failure_preserves_previously_published_runtime(builder) -> None:
-    previous_process, previous_runtime = object(), {"backend": {"pid": 123}}
-    builder.backend_server_process = previous_process
-    builder.dynamic_graph_cache["server_runtime"] = previous_runtime
-    builder._validate_generated_artifacts = Mock(return_value={"main_entrypoint": "main.py"})
-    failure = RuntimeError("server failed to start")
-    builder._runtime_service.rerun_server.side_effect = failure
-    with pytest.raises(RuntimeError) as raised:
-        builder.rerun_server()
-    assert raised.value is failure
-    builder._runtime_service.rerun_server.assert_called_once_with(
-        main_entrypoint_path="main.py", previous_process=previous_process,
-    )
-    assert builder.backend_server_process is previous_process
-    assert builder.dynamic_graph_cache["server_runtime"] is previous_runtime
-
-
-@pytest.mark.parametrize("audit_ok", (True, False), ids=("audit-passed", "audit-failed"))
-@pytest.mark.parametrize("load_graph", (False, True), ids=("existing-graph", "explicit-graph"))
-def test_agent_builder_main_test_publishes_log_path_then_audits_and_amends_in_the_builder(
-    builder, tmp_path, audit_ok, load_graph,
-) -> None:
-    main_path, graph_path = str(tmp_path / "main.py"), str(tmp_path / "workflow.json")
-    log_path = str(tmp_path / "logs" / "main_test.txt")
-    builder.graph_plan_path = "existing.json"
-    builder.requirement_md_path = "requirement.md"
-    builder._load_planned_graph = Mock(side_effect=lambda path: setattr(builder, "graph_plan_path", path))
-    builder._runtime_service.test_main_entrypoint.return_value = None
-    violation = SimpleNamespace(rule="main.py", detail="Fix the import")
-    builder.output_auditor.audit_log_file.return_value = (audit_ok, [] if audit_ok else [violation])
-    coder = Mock(spec_set=["amend_code_with_feedback"])
-    builder._resolve_amendment_target = Mock(return_value=(coder, main_path))
-    operations = Mock()
-    operations.attach_mock(builder._load_planned_graph, "load_graph")
-    operations.attach_mock(builder._runtime_service.test_main_entrypoint, "execute")
-    operations.attach_mock(builder.output_auditor.audit_log_file, "audit")
-
-    assert builder.test_main_entrypoint(
-        main_path, log_filename="logs/main_test.txt", graph_plan_path=graph_path if load_graph else None,
-    ) is audit_ok
-
-    assert builder._session.log_path == log_path
-    assert operations.mock_calls == ([call.load_graph(graph_path)] if load_graph else []) + [
-        call.execute(main_entrypoint_path=main_path, log_path=log_path), call.audit(log_path),
-    ]
-    if audit_ok:
-        builder._resolve_amendment_target.assert_not_called()
-        coder.amend_code_with_feedback.assert_not_called()
-    else:
-        builder._resolve_amendment_target.assert_called_once_with("main.py", language="python")
-        coder.amend_code_with_feedback.assert_called_once_with(
-            main_path, violation.detail, graph_plan_path=graph_path if load_graph else "existing.json",
-            requirement_md_path="requirement.md", current_node_name="main", language="python", temperature=0.3,
-        )
-
-
 def test_agent_builder_main_facade_seeds_session_and_publishes_normalized_output(builder, tmp_path) -> None:
     graph_path = str(tmp_path / "workflow.json")
     normalized_path = str(tmp_path / "normalized_main.py")
-    builder._main_entrypoint_service.run.return_value = normalized_path
+    builder._main_workflow.run.return_value = normalized_path
 
     assert builder.generate_main_entrypoint(
         graph_path, output_filename="entrypoints/main.py", fastapi_host="127.0.0.1",
         temperature=0.4, fastapi_port=9000,
     ) == normalized_path
 
-    builder._main_entrypoint_service.run.assert_called_once_with(MainEntrypointGenerationRequest(
+    builder._main_workflow.run.assert_called_once_with(MainEntrypointGenerationRequest(
         project_root_path=str(tmp_path), graph_plan_json_path=graph_path,
         output_path=str(tmp_path / "entrypoints" / "main.py"), fastapi_host="127.0.0.1",
         fastapi_port=9000, state={"build_session": builder._session},
     ))
-    forwarded = builder._main_entrypoint_service.run.call_args.args[0]
+    forwarded = builder._main_workflow.run.call_args.args[0]
     assert "temperature" in signature(AgentBuilder.generate_main_entrypoint).parameters
     assert "temperature" not in signature(MainEntrypointGenerationRequest).parameters
     assert "temperature" not in {field.name for field in fields(MainEntrypointGenerationRequest)}
