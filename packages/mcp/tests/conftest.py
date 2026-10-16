@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Isolated MCP modules: no core imports, native pools, SDK servers or network."""
+"""Load the MCP server in isolation: stubbed MCP SDK, bootstrap and FlowX SDK; no core, pools or network."""
 
 from __future__ import annotations
 
 import importlib.util
-import io
-import json
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -25,10 +23,53 @@ class FakeMCP:
         return register
 
 
+class FakeClient:
+    """Records engine calls; results are plain dicts, which the fake ``result_to_dict`` passes through."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, tuple, dict]] = []
+        self.results: dict[str, Any] = {}
+        self.closed = False
+
+    def _record(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append((name, args, kwargs))
+        outcome = self.results.get(name, {"ok": True, "workflow_id": "wf1"})
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def build_workflow_json(self, *args, **kwargs):
+        return self._record("build_workflow_json", *args, **kwargs)
+
+    def build_nodes(self, *args, **kwargs):
+        return self._record("build_nodes", *args, **kwargs)
+
+    def build_main_entrypoint(self, *args, **kwargs):
+        return self._record("build_main_entrypoint", *args, **kwargs)
+
+    def build_workflow(self, *args, **kwargs):
+        return self._record("build_workflow", *args, **kwargs)
+
+    def run_service(self, *args, **kwargs):
+        return self._record("run_service", *args, **kwargs)
+
+    def stop_service(self, *args, **kwargs):
+        return self._record("stop_service", *args, **kwargs)
+
+    def workflows(self):
+        return self._record("workflows")
+
+    def artifacts(self, *args):
+        return self._record("artifacts", *args)
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture
-def mcp_modules(monkeypatch):
+def mcp_server(monkeypatch):
     source = Path(__file__).resolve().parents[1] / "flowx_mcp"
-    package_name = "_flowx_mcp_lifecycle_tests"
+    package_name = "_flowx_mcp_tests"
     package = ModuleType(package_name)
     package.__path__ = [str(source)]
     monkeypatch.setitem(sys.modules, package_name, package)
@@ -38,51 +79,20 @@ def mcp_modules(monkeypatch):
     bootstrap.load_env_from_runtime_context = lambda *_args: None
     monkeypatch.setitem(sys.modules, bootstrap.__name__, bootstrap)
 
-    registry = ModuleType(f"{package_name}.registry")
-    registry.core_available = lambda: False
-    registry.core_import_error = lambda: "core intentionally stubbed"
-    registry.find_free_port = lambda: 8765
-    registry.registry = object()
-    monkeypatch.setitem(sys.modules, registry.__name__, registry)
-
     sdk = ModuleType("mcp.server.fastmcp")
     sdk.FastMCP = FakeMCP
     monkeypatch.setitem(sys.modules, sdk.__name__, sdk)
 
-    loaded = []
-    for name in ("client", "server"):
-        spec = importlib.util.spec_from_file_location(
-            f"{package_name}.{name}", source / f"{name}.py"
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, spec.name, module)
-        spec.loader.exec_module(module)
-        loaded.append(module)
-    return tuple(loaded)
+    client = FakeClient()
+    flowx_sdk = ModuleType("flowx_sdk")
+    flowx_sdk.FlowXClient = lambda: client
+    flowx_sdk.result_to_dict = lambda result: result
+    monkeypatch.setitem(sys.modules, "flowx_sdk", flowx_sdk)
 
-
-@pytest.fixture
-def fake_http(mcp_modules, monkeypatch):
-    client, _ = mcp_modules
-    requests = []
-    responses: list[Any] = []
-
-    def urlopen(request, timeout):
-        requests.append((request, timeout))
-        assert responses, "Unexpected HTTP request (network is disabled)"
-        response = responses.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        if isinstance(response, list):
-            body = ": heartbeat\r\n\r\n" + "".join(
-                f"data: {json.dumps(event, ensure_ascii=False)}\r\n\r\n"
-                for event in response
-            )
-            return io.BytesIO(body.encode("utf-8"))
-        if isinstance(response, bytes):
-            return io.BytesIO(response)
-        return io.BytesIO(json.dumps(response).encode("utf-8"))
-
-    monkeypatch.setattr(client.urllib.request, "urlopen", urlopen)
-    return requests, responses
+    spec = importlib.util.spec_from_file_location(f"{package_name}.server", source / "server.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    assert module._MCP_SERVER_AVAILABLE, "the MCP SDK entry point must resolve to its stub"
+    return SimpleNamespace(module=module, client=client, tools=module.create_server().tools)

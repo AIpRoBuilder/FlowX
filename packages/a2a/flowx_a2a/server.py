@@ -2,18 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
-"""A2A JSON-RPC adapter for FlowX workflow compilation."""
+# Modified 2026-10-16: build or modify workflows through FlowXClient.build_workflow.
+"""A2A JSON-RPC adapter for FlowX workflow building."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import threading
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Optional
 
-from flowx_sdk import FlowXClient
+from flowx_sdk import FlowXClient, result_to_dict
 
 _JSONRPC_VERSION = "2.0"
 _A2A_PROTOCOL_VERSION = "0.3"
@@ -57,7 +59,7 @@ def agent_card(base_url: str) -> dict[str, Any]:
     return {
         "protocolVersion": _A2A_PROTOCOL_VERSION,
         "name": "FlowX",
-        "description": "Compiles natural-language requirements into executable AG-UI workflows.",
+        "description": "Builds and modifies executable AG-UI workflows from natural-language requests.",
         "url": base_url.rstrip("/"),
         "version": "0.2.0",
         "capabilities": {"streaming": False, "pushNotifications": False},
@@ -67,7 +69,7 @@ def agent_card(base_url: str) -> dict[str, Any]:
             {
                 "id": "compile-workflow",
                 "name": "Compile workflow",
-                "description": "Build a FlowX workflow from a natural-language requirement.",
+                "description": "Build a FlowX workflow from a natural-language requirement, or modify one by workflowId.",
                 "tags": ["workflow", "agent", "code-generation"],
                 "examples": ["Build a workflow that summarizes a support ticket."],
             }
@@ -161,20 +163,25 @@ def _dispatch(payload: Mapping[str, Any], client: FlowXClient, tasks: _TaskStore
     metadata = message.get("metadata") or {}
     if not isinstance(metadata, Mapping):
         raise _RpcError(-32602, "message metadata must be an object")
-    workflow_name = str(metadata.get("workflowName") or "a2a_workflow")
+    workflow_id = metadata.get("workflowId")
     context_id = str(params.get("contextId") or message.get("contextId") or uuid.uuid4().hex)
     task = tasks.create(context_id)
     try:
-        artifacts = client.create_workflow(workflow_name, requirement)
-        task.status = "completed"
+        result = client.build_workflow(requirement, workflow_id=str(workflow_id) if workflow_id else None)
         task.artifacts = [
             {
                 "artifactId": "workflow-artifacts",
-                "name": artifacts.workflow_name,
-                "parts": [{"kind": "data", "data": _artifact_data(artifacts)}],
+                "name": result.workflow_id or "workflow",
+                "parts": [{"kind": "data", "data": _artifact_data(result)}],
             }
         ]
-        task.message = {"role": "agent", "parts": [{"kind": "text", "text": "Workflow compiled."}]}
+        if result.ok:
+            task.status = "completed"
+            task.message = {"role": "agent", "parts": [{"kind": "text", "text": "Workflow built."}]}
+        else:
+            task.status = "failed"
+            report = "\n".join(f"{name}: {text}" for name, text in result.errors.items())
+            task.message = {"role": "agent", "parts": [{"kind": "text", "text": report or "Workflow build failed."}]}
     except Exception as exc:
         task.status = "failed"
         task.message = {"role": "agent", "parts": [{"kind": "text", "text": str(exc)}]}
@@ -195,15 +202,9 @@ def _message_text(message: Mapping[str, Any]) -> str:
     return text
 
 
-def _artifact_data(artifacts: Any) -> dict[str, Any]:
-    return {
-        "workflowName": artifacts.workflow_name,
-        "rootDir": str(artifacts.root_dir),
-        "requirementMdPath": str(artifacts.requirement_md_path),
-        "workflowJsonPath": str(artifacts.workflow_json_path),
-        "mainEntrypointPath": str(artifacts.main_entrypoint_path),
-        "backendPort": artifacts.backend_port,
-    }
+def _artifact_data(result: Any) -> dict[str, Any]:
+    # Engine artifacts can hold Path objects; the JSON-RPC response must not.
+    return json.loads(json.dumps(result_to_dict(result), default=str))
 
 
 def main() -> None:

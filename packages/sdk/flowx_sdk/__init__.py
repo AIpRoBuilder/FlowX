@@ -1,5 +1,7 @@
-"""Programmatic interface for FlowX workflow compilation."""
+"""Programmatic interface for building and running FlowX workflows."""
 
-from .client import FlowXClient, WorkflowArtifacts
+from flowx_core.agent_workflow_engine import AgentResult
 
-__all__ = ["FlowXClient", "WorkflowArtifacts"]
+from .client import FlowXClient, result_to_dict
+
+__all__ = ["AgentResult", "FlowXClient", "result_to_dict"]

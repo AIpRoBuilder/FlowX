@@ -53,12 +53,12 @@ FlowX is model- and UI-agnostic. Connect an MCP-capable agent client, call the P
 | --- | --- |
 | Intent → executable workflow | Generate a workflow graph, node documentation, Python node code, and a backend entry point. |
 | Inspectable artifacts | Read the graph, node inputs, source files, and execution results instead of relying on an opaque plan. |
-| Conversational refinement | Apply a follow-up change prompt to existing nodes, then reload the backend to run the updated workflow. |
-| A local execution loop | Start, inspect, run, reload, and stop workflow backends through MCP. |
-| Reusable workflow files | Keep generated artifacts on disk and discover or reopen workflows for later runs and updates. |
+| Conversational refinement | Apply a follow-up change prompt to the workflow, to specific nodes, or to the main entrypoint; unchanged nodes are reused. |
+| A local execution loop | Run, rerun, and stop a built workflow as a service through MCP or the SDK. |
+| Reusable workflow files | Keep generated artifacts on disk under `workspace/workflows/<workflow_id>` and reopen workflows for later updates. |
 
 > [!NOTE]
-> The primary interactive path is local stdio MCP. The SDK exposes workflow generation and node updates; the A2A adapter currently exposes non-streaming workflow generation. FlowX is a workflow layer, not a hosted UI product.
+> The primary interactive path is local stdio MCP. MCP and the Python SDK expose the same engine: build or modify `workflow.json` and requirements, nodes, the main entrypoint, or the whole workflow, then run it as a service. The A2A adapter currently exposes non-streaming workflow building. FlowX is a workflow layer, not a hosted UI product.
 
 ## Installation
 
@@ -235,18 +235,23 @@ If your environment is isolated behind Poetry or uv, set the command to `poetry`
 
 ### Python SDK
 
-Embed workflow generation directly in a Python agent or the backend behind your own intelligent UI, without an MCP transport:
+Embed workflow building directly in a Python agent or the backend behind your own intelligent UI, without an MCP transport. A complete walkthrough is in [examples/sdk_quickstart.py](examples/sdk_quickstart.py).
 
 ```python
 from flowx_sdk import FlowXClient
 
-client = FlowXClient(workspace="./workflows")
-artifacts = client.create_workflow(
-  "ticket_triage",
-  "Build a workflow that categorizes and prioritizes support tickets.",
-)
-print(artifacts.workflow_json_path)
+with FlowXClient(workspace="./workflows") as flowx:
+    created = flowx.build_workflow_json(
+        "Build a workflow that categorizes and prioritizes support tickets.",
+    ).raise_for_failure()                                  # workflow.json + requirements
+    workflow_id = created.workflow_id
+    flowx.build_nodes(workflow_id).raise_for_failure()     # all nodes, or {step_id: amendment}
+    flowx.build_main_entrypoint(workflow_id).raise_for_failure()
+    flowx.build_workflow("Also return a summary.", workflow_id=workflow_id)  # whole engine
+    print(flowx.run_service(workflow_id))                  # run / rerun as a service
 ```
+
+Each build call returns an `AgentResult` with per-stage outcomes, unresolved errors, logs and artifact paths; stage failures are reported there rather than raised.
 
 ### A2A server
 
@@ -256,14 +261,14 @@ Let another agent delegate workflow generation to FlowX through the non-streamin
 flowx-a2a --host 127.0.0.1 --port 8001
 ```
 
-It serves an A2A agent card at `/.well-known/agent-card.json` and JSON-RPC at `/a2a` (also `/`). Supported methods are `message/send`, `tasks/get`, and `tasks/cancel`. Send an A2A text message with `metadata.workflowName` to compile a workflow; the completed task contains the generated artifact paths.
+It serves an A2A agent card at `/.well-known/agent-card.json` and JSON-RPC at `/a2a` (also `/`). Supported methods are `message/send`, `tasks/get`, and `tasks/cancel`. Send an A2A text message to build a workflow; add `metadata.workflowId` to modify an existing one. The task is `completed` when every stage succeeded and otherwise `failed`; either way it carries the result, including the generated artifact paths.
 
 ### 4. Create a workflow from chat
 
 Start with the same support-ticket intent shown in the walkthrough:
 
 ```text
-Use flowx to create a workflow named ticket_triage.
+Use flowx to build a workflow.
 
 Build a workflow that accepts a support ticket, classifies its category,
 assigns a priority, and drafts a reply. Name the reply node draft_reply.
@@ -275,14 +280,13 @@ Return the category, priority, and draft reply as structured output.
 Follow up in the same conversation:
 
 ```text
-Inspect ticket_triage's graph and input formats, then start its backend.
-Run this ticket through the workflow: "Billing is broken. Our whole team is blocked."
+Run the workflow as a service.
 
 Update the draft_reply node: for urgent tickets, include an escalation note.
-Reload the workflow backend and rerun the ticket with a fresh session.
+Then rerun the service.
 ```
 
-The client uses `get_workflow_json` and `get_node_input_formats` to discover the generated graph and inputs, `start_backend` and `run_workflow_step` to execute its steps, and `update_workflow_node` followed by `reload_workflow` to apply a refinement. Exact step IDs and payloads come from the generated workflow—not from a fixed demo schema.
+The client uses `build_workflow` (or `build_workflow_json`, `build_nodes` and `build_main_entrypoint` one stage at a time) to create and refine the workflow, and `run_service` to start or restart it. `list_workflows` and `get_workflow` show the workflow ids and artifact locations. Exact step IDs come from the generated workflow—not from a fixed demo schema.
 
 This is the distinction: the agent does not only answer the ticket. It builds and evolves the process for handling the next one.
 
@@ -292,16 +296,15 @@ The Generative Workflow layer has one shared core and three agent-facing interfa
 
 ```mermaid
 flowchart TB
-  UI["Intelligent UI / agent host"] --> MCP["Local MCP: generate, inspect, run, refine"]
-  UI --> SDK["Python SDK: generate and update"]
+  UI["Intelligent UI / agent host"] --> MCP["Local MCP: build, modify, run"]
+  UI --> SDK["Python SDK: build, modify, run"]
   PEER["Peer agent"] --> A2A["A2A: delegate generation"]
   MCP --> CORE["FlowX · Generative Workflow layer"]
   SDK --> CORE
   A2A --> CORE
   CORE --> FILES["Workflow graph + node code + backend"]
   FILES --> RUNTIME["FastAPI + ag_ui_workflow runtime"]
-  MCP -->|"manage backend / run steps"| RUNTIME
-  RUNTIME -->|"results via MCP"| MCP
+  MCP -->|"run / rerun as a service"| RUNTIME
   RUNTIME -.->|"AG-UI SSE to a custom frontend"| UI
   MCP -->|"follow-up changes"| CORE
 ```
@@ -316,7 +319,7 @@ flowchart TB
 - `flowx_core.AgentBuilder` creates and updates workflow artifacts from prompts.
 - `flowx_sdk.FlowXClient` and `flowx_a2a` call the same agent core without routing through MCP.
 - The generated `main.py` runs as a managed FastAPI subprocess per workflow.
-- `run_workflow_step` communicates with the backend over HTTP and parses AG-UI SSE events back into MCP responses.
+- `run_service` starts or restarts the generated `main.py`; clients reach it over HTTP and AG-UI SSE.
 
 ### From intent to workflow artifacts
 
@@ -347,23 +350,14 @@ These MCP tools let the host agent operate the workflow layer from the same conv
 
 | Category | Tool | Purpose |
 | --- | --- | --- |
-| Build | `create_workflow` | Build a workflow from a requirement into `workspace/workflow_name`. |
-| Build | `update_workflow_node` | Update `workflow.json`, node code, and `main.py` from a change prompt. |
-| Build | `restart_builder` | Recreate the in-memory builder state from the workflow on disk. |
-| Runtime | `start_backend` | Launch the generated FastAPI backend for a workflow. |
-| Runtime | `reload_workflow` | Restart the backend so updated files take effect. |
-| Runtime | `kill_workflow` | Stop the running backend for a workflow. |
-| Runtime | `run_workflow_step` | Format a chat message into step input, run it, and return results. |
-| Inspection | `get_node_input_formats` | List each user-input node and the payload it expects. |
-| Inspection | `list_workflows` | List workflows registered in the current FlowX server process. |
-| Inspection | `list_workflow_folders` | Discover workflow folders on disk under the workspace root. |
-| Inspection | `list_workflow_python_files` | List all Python files inside a workflow folder. |
-| Inspection | `get_workflow_json` | Read the root `workflow.json` file for a workflow. |
-| Inspection | `get_workflow_files` | Read specific workflow files by file name or relative path. |
-| Inspection | `get_workflow_binary_files` | Read binary workflow files and return base64 content with MIME type. |
-| Workspace | `upload_workspace_input_file` | Save a base64-encoded file into `workspace/inputs` and return its path. |
-| Workspace | `delete_workspace_files` | Delete files from the workspace by file name. |
-| Workspace | `replace_workflow_files` | Replace specific workflow files by file name or relative path. |
+| Build | `build_workflow_json` | Create (no `workflow_id`) or modify `workflow.json` together with its requirement analysis. |
+| Build | `build_nodes` | Build a workflow's nodes, or amend specific nodes by step id; unchanged nodes are reused. |
+| Build | `build_main_entrypoint` | Create or regenerate the main entrypoint from the latest nodes. |
+| Build | `build_workflow` | Create or modify the whole workflow from a request and/or run logs; later stages follow earlier changes. |
+| Runtime | `run_service` | Run a built workflow as a service; calling it again reruns the service with the latest files. |
+| Runtime | `stop_service` | Stop a workflow's running service. |
+| Inspection | `list_workflows` | List workflow ids with their node ids, versions and unresolved errors. |
+| Inspection | `get_workflow` | Locate a workflow's requirement, `workflow.json`, node versions and main entrypoint. |
 
 ## Example workflows
 

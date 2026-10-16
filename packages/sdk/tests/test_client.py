@@ -1,120 +1,118 @@
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 import flowx_sdk.client as client_module
-
-
-_BATCH_GENERATION_ERROR = (
-    "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes."
-)
+from flowx_core.agent_intent import AgentIntent, StagePlan
+from flowx_core.agent_workflow_engine import AgentResult, StageOutcome
 
 
 @pytest.fixture
-def deferred_batch_client(monkeypatch, tmp_path):
-    root_dir = tmp_path / "demo"
-    builder = Mock(
-        root_dir=str(root_dir),
-        requirement_md_path=str(root_dir / "requirement.md"),
-        graph_plan_path=str(root_dir / "workflow.json"),
-        workflow_json_path=str(root_dir / "workflow.json"),
+def sdk(monkeypatch, tmp_path):
+    for name in ("FLOWX_DEFAULT_WORKSPACE", "FLOWX_LLM_API_KEY", "OPENAI_API_KEY", "FLOWX_LLM_MODEL", "FLOWX_LLM_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
+    builder = Mock(name="builder")
+    constructor = Mock(return_value=builder)
+    monkeypatch.setattr(client_module, "AgentBuilder", constructor)
+    client = client_module.FlowXClient(workspace=tmp_path, api_key="key", model="m", provider="p", skills_root="skills")
+    return SimpleNamespace(client=client, builder=builder, constructor=constructor, workspace=tmp_path.resolve())
+
+
+def test_builder_is_created_lazily_once_with_the_workspace_as_root(sdk):
+    sdk.constructor.assert_not_called()
+
+    assert sdk.client.builder is sdk.client.builder is sdk.builder
+
+    sdk.constructor.assert_called_once_with(
+        api_key="key", model="m", provider="p", root_dir=str(sdk.workspace), skills_root_path="skills",
     )
-    builder.analyze_requirement.return_value = builder.requirement_md_path
-    builder.plan_graph.return_value = builder.graph_plan_path
-    builder.amend_workflow_json.return_value = builder.workflow_json_path
-    generation_error = NotImplementedError(_BATCH_GENERATION_ERROR)
-    builder.generate_nodes.side_effect = generation_error
-    monkeypatch.setattr(client_module, "AgentBuilder", Mock(return_value=builder))
-    client = client_module.FlowXClient(workspace=tmp_path, api_key="stub")
-    return client, builder, generation_error
 
 
-def test_sdk_create_propagates_deferred_batch_error_without_sync_or_main(deferred_batch_client):
-    client, builder, generation_error = deferred_batch_client
+def test_llm_settings_fall_back_to_the_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOWX_LLM_API_KEY", "env-key")
+    monkeypatch.setenv("FLOWX_LLM_MODEL", "env-model")
+    monkeypatch.setenv("FLOWX_LLM_PROVIDER", "env-provider")
+    monkeypatch.setenv("FLOWX_DEFAULT_WORKSPACE", str(tmp_path / "ws"))
 
-    with pytest.raises(NotImplementedError) as caught:
-        client.create_workflow("demo", "Collect input", backend_port=8123)
+    client = client_module.FlowXClient()
 
-    assert caught.value is generation_error
-    assert str(caught.value) == _BATCH_GENERATION_ERROR
-    assert [call[0] for call in builder.method_calls] == [
-        "analyze_requirement", "plan_graph", "generate_nodes",
-    ]
-    builder.analyze_requirement.assert_called_once_with(requirement_text="Collect input")
-    builder.plan_graph.assert_called_once_with(
-        requirement_md_path=builder.requirement_md_path,
-        graph_plan_filename="workflow.json",
-        temperature=0.3,
+    assert (client.api_key, client.model, client.provider) == ("env-key", "env-model", "env-provider")
+    assert client.workspace == (tmp_path / "ws").resolve()
+    assert client.workspace.is_dir()
+
+
+def test_build_methods_delegate_to_the_engine_api(sdk):
+    builder, client = sdk.builder, sdk.client
+
+    client.build_workflow_json("  Triage tickets  ", temperature=0.1)
+    client.build_workflow_json("Add priority", workflow_id="wf1")
+    client.build_nodes("wf1")
+    client.build_nodes("wf1", {"Reply": "Escalate urgent tickets"}, cascade=True)
+    client.build_main_entrypoint("wf1", "Use port 9000", fastapi_port=9000)
+    client.build_workflow("Add a node", workflow_id="wf1", logs=("trace",))
+
+    assert builder.build_workflow_json.call_args_list[0].args == ("Triage tickets",)
+    assert builder.build_workflow_json.call_args_list[0].kwargs == {"workflow_id": None, "temperature": 0.1}
+    assert builder.build_workflow_json.call_args_list[1].kwargs == {"workflow_id": "wf1"}
+    assert [c.args for c in builder.build_nodes.call_args_list] == [("wf1", None), ("wf1", {"Reply": "Escalate urgent tickets"})]
+    assert builder.build_nodes.call_args_list[1].kwargs == {"cascade": True}
+    builder.build_main_entrypoint.assert_called_once_with("wf1", "Use port 9000", fastapi_port=9000)
+    builder.build_workflow.assert_called_once_with("Add a node", workflow_id="wf1", logs=("trace",))
+
+
+def test_build_workflow_json_rejects_an_empty_prompt(sdk):
+    with pytest.raises(ValueError, match="prompt"):
+        sdk.client.build_workflow_json("   ")
+
+    sdk.builder.build_workflow_json.assert_not_called()
+
+
+def test_service_and_inspection_methods(sdk):
+    builder = sdk.builder
+    builder.run_service.return_value = {"pid": 7}
+    builder.engine.catalog.return_value = {"wf1": {}}
+    builder.engine.artifacts.return_value = {"workflow_id": "wf1"}
+
+    assert sdk.client.run_service("wf1") == {"pid": 7}
+    sdk.client.stop_service("wf1")
+    assert sdk.client.workflows() == {"wf1": {}}
+    assert sdk.client.artifacts("wf1") == {"workflow_id": "wf1"}
+
+    builder.run_service.assert_called_once_with("wf1")
+    builder.stop_service.assert_called_once_with("wf1")
+    builder.engine.artifacts.assert_called_once_with("wf1")
+
+
+def test_close_releases_the_builder_once_and_a_new_one_is_created_afterwards(sdk):
+    with sdk.client as client:
+        assert client.builder is sdk.builder
+
+    sdk.builder.close.assert_called_once_with()
+    sdk.client.close()
+    sdk.builder.close.assert_called_once_with()
+    sdk.client.builder
+    assert sdk.constructor.call_count == 2
+
+
+def test_close_without_use_does_not_create_a_builder(sdk):
+    sdk.client.close()
+
+    sdk.constructor.assert_not_called()
+
+
+def test_result_to_dict_flattens_nested_dataclasses():
+    result = AgentResult(
+        workflow_id="wf1", ok=False,
+        intent=AgentIntent(workflow_id="wf1", graph=StagePlan("modify", "Add priority")),
+        stages={"graph": StageOutcome("graph", "completed", 1, changed=True), "nodes": StageOutcome("nodes", "failed", 2, "boom")},
+        errors={"nodes/Reply": "boom"}, logs={"main_run": "ok"}, artifacts={"workflow_id": "wf1"},
     )
-    builder.generate_nodes.assert_called_once()
-    builder._sync_workflow_graph_json.assert_not_called()
-    builder.generate_main_entrypoint.assert_not_called()
 
+    payload = client_module.result_to_dict(result)
 
-def test_sdk_update_propagates_deferred_batch_error_without_sync_or_main(deferred_batch_client):
-    client, builder, generation_error = deferred_batch_client
-
-    with pytest.raises(NotImplementedError) as caught:
-        client.update_workflow_node("demo", "Collect", "Update input")
-
-    assert caught.value is generation_error
-    assert str(caught.value) == _BATCH_GENERATION_ERROR
-    assert [call[0] for call in builder.method_calls] == [
-        "amend_workflow_json", "generate_nodes",
-    ]
-    builder.amend_workflow_json.assert_called_once_with(
-        user_prompt="Update input",
-        workflow_json_path=builder.workflow_json_path,
-        temperature=0.2,
-    )
-    builder.generate_nodes.assert_called_once()
-    builder._sync_workflow_graph_json.assert_not_called()
-    builder.generate_main_entrypoint.assert_not_called()
-
-
-def test_sdk_uses_node_generation_workflows_for_create_and_update(monkeypatch, tmp_path):
-    calls = []
-
-    class FakeBuilder:
-        def __init__(self, **kwargs):
-            self.root_dir = kwargs["root_dir"]
-            self.requirement_md_path = None
-            self.graph_plan_path = None
-            self.workflow_json_path = None
-
-        def analyze_requirement(self, *, requirement_text):
-            calls.append(("requirement", requirement_text))
-            self.requirement_md_path = str(Path(self.root_dir) / "requirement.md")
-            return self.requirement_md_path
-
-        def plan_graph(self, **kwargs):
-            self.graph_plan_path = str(Path(self.root_dir) / "workflow.json")
-            return self.graph_plan_path
-
-        def generate_nodes(self, **kwargs):
-            calls.append(("generate_nodes", kwargs))
-            return [str(Path(self.root_dir) / "Collect.py")]
-
-        def _sync_workflow_graph_json(self, **kwargs):
-            self.workflow_json_path = self.graph_plan_path
-            return self.workflow_json_path
-
-        def generate_main_entrypoint(self, *args, **kwargs):
-            return str(Path(self.root_dir) / "main.py")
-
-        def amend_workflow_json(self, **kwargs):
-            return self.graph_plan_path
-
-    monkeypatch.setattr(client_module, "AgentBuilder", FakeBuilder)
-    client = client_module.FlowXClient(workspace=tmp_path, api_key="key")
-    client.create_workflow("demo", "Collect input", backend_port=8123)
-    client.update_workflow_node("demo", "Collect", "Update input")
-
-    creation = calls[1][1]
-    update = calls[2][1]
-    assert creation["workflow_name"] == "demo"
-    assert creation["generate_markdowns"] is True
-    assert update["node_names"] == ["Collect"]
-    assert update["workflow_name"] == "demo"
-    assert update["markdown_amendments"] == {"Collect": "Update input"}
+    assert payload["ok"] is False and payload["workflow_id"] == "wf1"
+    assert payload["intent"]["graph"]["mode"] == "modify"
+    assert payload["stages"]["nodes"]["status"] == "failed" and payload["stages"]["nodes"]["error"] == "boom"
+    assert payload["errors"] == {"nodes/Reply": "boom"}
+    assert payload["service"] is None

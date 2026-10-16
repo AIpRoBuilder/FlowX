@@ -4,42 +4,31 @@
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified 2026-10-15: clarify builder-owned artifacts and reusable workflows.
 # Modified 2026-10-15: document deferred batch orchestration and partial-update risks.
-"""Python SDK for compiling and evolving FlowX workflows."""
+# Modified 2026-10-16: expose the AgentBuilder engine API (build_*, run_service) through one builder.
+"""Python SDK for building, modifying and running FlowX workflows."""
 
 from __future__ import annotations
 
 import os
-import socket
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from threading import RLock
+from typing import Any, Mapping, Optional
 
 from flowx_core.agent_builder import AgentBuilder
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-@dataclass(frozen=True)
-class WorkflowArtifacts:
-    """Paths generated while compiling one workflow."""
-
-    workflow_name: str
-    root_dir: Path
-    requirement_md_path: Path
-    workflow_json_path: Path
-    main_entrypoint_path: Path
-    backend_port: int
+from flowx_core.agent_workflow_engine import AgentResult
 
 
 class FlowXClient:
-    """Create and update workflows without an MCP transport.
+    """Build and run workflows through one :class:`AgentBuilder`.
 
-    The client owns one :class:`AgentBuilder` per workflow, preserving the
-    builder's graph/artifact bookkeeping and reusable workflows for updates.
+    Every build method returns an :class:`AgentResult`; stage failures are reported in it
+    (``ok`` is false, ``errors`` says why), not raised. Call ``result.raise_for_failure()``
+    to turn them into an exception. Workflows are identified by the ``workflow_id`` of the
+    result that created them and live under ``<workspace>/workflows/<workflow_id>``.
+
+    The builder publishes its generation workflows through module-level state, so use one
+    client per process. Extra keyword ``options`` are passed on to the engine's request
+    (``temperature``, ``max_retries``, ``cascade``, ``fastapi_port``, ``node_options`` ...).
     """
 
     def __init__(
@@ -49,6 +38,7 @@ class FlowXClient:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
+        skills_root: Optional[str] = None,
     ) -> None:
         configured_workspace = workspace or os.environ.get("FLOWX_DEFAULT_WORKSPACE")
         self.workspace = Path(configured_workspace or ".flowx_workspaces").expanduser().resolve()
@@ -56,120 +46,83 @@ class FlowXClient:
         self.api_key = api_key or os.environ.get("FLOWX_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
         self.model = model or os.environ.get("FLOWX_LLM_MODEL", "deepseek-chat")
         self.provider = provider or os.environ.get("FLOWX_LLM_PROVIDER", "deepseek")
-        self._builders: dict[str, AgentBuilder] = {}
+        self.skills_root = skills_root
+        self._builder: AgentBuilder | None = None
+        self._lock = RLock()
 
-    def builder(self, workflow_name: str, *, skills_root: str | None = None) -> AgentBuilder:
-        """Return the cached builder for a workflow, creating it when needed."""
-        name = _normalize_name(workflow_name, "workflow_name")
-        builder = self._builders.get(name)
-        if builder is None:
-            builder = AgentBuilder(
-                api_key=self.api_key,
-                model=self.model,
-                provider=self.provider,
-                root_dir=str(self.workspace / name),
-                skills_root_path=skills_root,
-            )
-            self._builders[name] = builder
-        return builder
+    def __enter__(self) -> FlowXClient:
+        return self
 
-    def create_workflow(
-        self,
-        workflow_name: str,
-        requirement: str,
-        *,
-        backend_port: int = 0,
-        skills_root: str | None = None,
-        temperature: float = 0.3,
-    ) -> WorkflowArtifacts:
-        """Compile a requirement into an executable FlowX workflow.
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
-        Warning:
-            Currently unavailable: batch node orchestration is deferred, so
-            ``AgentBuilder.generate_nodes()`` raises ``NotImplementedError``.
-            Requirement/graph files may already have changed; there is no rollback.
-        """
-        name = _normalize_name(workflow_name, "workflow_name")
-        prompt = str(requirement).strip()
-        if not prompt:
-            raise ValueError("requirement must be a non-empty string")
+    @property
+    def builder(self) -> AgentBuilder:
+        """The builder, created on first use because it allocates native workflow pools."""
+        with self._lock:
+            if self._builder is None:
+                self._builder = AgentBuilder(
+                    api_key=self.api_key,
+                    model=self.model,
+                    provider=self.provider,
+                    root_dir=str(self.workspace),
+                    skills_root_path=self.skills_root,
+                )
+            return self._builder
 
-        builder = self.builder(name, skills_root=skills_root)
-        port = int(backend_port) if backend_port > 0 else _find_free_port()
-        requirement_path = Path(builder.analyze_requirement(requirement_text=prompt))
-        graph_path = Path(
-            builder.plan_graph(
-                requirement_md_path=str(requirement_path),
-                graph_plan_filename="workflow.json",
-                temperature=temperature,
-            )
-        )
-        builder.generate_nodes(
-            graph_plan_path=str(graph_path),
-            requirement_md_path=str(requirement_path),
-            language="python",
-            temperature=temperature,
-            generate_markdowns=True,
-            workflow_name=name,
-        )
-        workflow_json_path = Path(builder._sync_workflow_graph_json(context_base_dir=builder.root_dir))
-        main_path = Path(
-            builder.generate_main_entrypoint(
-                str(graph_path),
-                output_filename="main.py",
-                temperature=temperature,
-                fastapi_port=port,
-            )
-        )
-        return WorkflowArtifacts(
-            workflow_name=name,
-            root_dir=Path(builder.root_dir).resolve(),
-            requirement_md_path=requirement_path.resolve(),
-            workflow_json_path=workflow_json_path.resolve(),
-            main_entrypoint_path=main_path.resolve(),
-            backend_port=port,
-        )
+    def build_workflow_json(self, prompt: str, *, workflow_id: str | None = None, **options: Any) -> AgentResult:
+        """Create (no ``workflow_id``) or modify workflow.json together with its requirement analysis."""
+        text = str(prompt).strip()
+        if not text:
+            raise ValueError("prompt must be a non-empty string")
+        return self.builder.build_workflow_json(text, workflow_id=workflow_id, **options)
 
-    def update_workflow_node(
-        self,
-        workflow_name: str,
-        node_name: str,
-        amendment: str,
-        *,
-        temperature: float = 0.2,
-    ) -> Path:
-        """Apply an amendment to one existing workflow node.
+    def build_nodes(
+        self, workflow_id: str, amendments: Mapping[str, str] | None = None, **options: Any,
+    ) -> AgentResult:
+        """Build the nodes of a workflow, or amend specific nodes by step id (``{step_id: amendment}``)."""
+        return self.builder.build_nodes(workflow_id, amendments, **options)
 
-        Warning:
-            Currently unavailable: batch node orchestration is deferred, so
-            ``AgentBuilder.generate_nodes()`` raises ``NotImplementedError``.
-            Graph files may already have changed; there is no rollback.
-        """
-        name = _normalize_name(workflow_name, "workflow_name")
-        builder = self.builder(name)
-        node = _normalize_name(node_name, "node_name")
-        prompt = str(amendment).strip()
-        if not prompt:
-            raise ValueError("amendment must be a non-empty string")
-        updated_path = builder.amend_workflow_json(
-            user_prompt=prompt,
-            workflow_json_path=builder.workflow_json_path or builder.graph_plan_path or None,
-            temperature=temperature,
-        )
-        builder.generate_nodes(
-            requirement_md_path=builder.requirement_md_path or None,
-            graph_plan_path=updated_path or builder.graph_plan_path or None,
-            node_names=[node],
-            temperature=temperature,
-            generate_markdowns=True,
-            markdown_amendments={node: prompt},
-            workflow_name=name,
-        )
-        return Path(builder._sync_workflow_graph_json(context_base_dir=builder.root_dir)).resolve()
+    def build_main_entrypoint(self, workflow_id: str, amendment: str = "", **options: Any) -> AgentResult:
+        """Create or regenerate the main entrypoint from the workflow's latest nodes."""
+        return self.builder.build_main_entrypoint(workflow_id, amendment, **options)
+
+    def build_workflow(self, prompt: str = "", *, workflow_id: str | None = None, **options: Any) -> AgentResult:
+        """Run the whole engine on a free-text request and/or ``logs=[...]``; later stages follow earlier changes."""
+        return self.builder.build_workflow(prompt, workflow_id=workflow_id, **options)
+
+    def run_service(self, workflow_id: str) -> dict[str, Any]:
+        """Start (or restart) the workflow's main entrypoint as a service; returns process info."""
+        return self.builder.run_service(workflow_id)
+
+    def stop_service(self, workflow_id: str) -> None:
+        self.builder.stop_service(workflow_id)
+
+    def workflows(self) -> dict[str, dict[str, Any]]:
+        """Ids, versions and unresolved errors of every workflow in the workspace."""
+        return self.builder.engine.catalog()
+
+    def artifacts(self, workflow_id: str) -> dict[str, Any]:
+        """Locations of a workflow's requirement, workflow.json, nodes and main entrypoint."""
+        return self.builder.engine.artifacts(workflow_id)
+
+    def close(self) -> None:
+        """Stop the services started here and release the builder; safe to call repeatedly."""
+        with self._lock:
+            builder, self._builder = self._builder, None
+        if builder is not None:
+            builder.close()
 
 
-def _normalize_name(value: str, label: str) -> str:
-    name = str(value).strip()
-    if not name or name in {".", ".."} or "/" in name or "\\" in name:
-        raise ValueError(f"{label} must be a non-empty plain directory name")
-    return name
+def result_to_dict(result: AgentResult) -> dict[str, Any]:
+    """A plain-dict view of an :class:`AgentResult`; values may still hold ``Path`` objects."""
+    return {
+        "ok": result.ok,
+        "workflow_id": result.workflow_id,
+        "intent": result.intent.to_dict() if result.intent else None,
+        "stages": {name: stage.to_dict() for name, stage in result.stages.items()},
+        "errors": dict(result.errors),
+        "logs": dict(result.logs),
+        "artifacts": dict(result.artifacts),
+        "service": dict(result.service) if result.service else None,
+    }
