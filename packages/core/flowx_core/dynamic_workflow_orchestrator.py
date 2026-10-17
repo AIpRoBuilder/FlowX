@@ -8,6 +8,7 @@ Modified 2026-10-15: add persisted identities, immutable artifact snapshots and 
 Modified 2026-10-15: schedule generation nodes with JSON-built WorkflowEngine graphs.
 Modified 2026-10-16: native steps run generation and repair through AgentBuilder-published workflows;
 one engine reloads its pool when the workflow config changes.
+Modified 2026-10-17: repair a node again, up to max_repair_retries times, until its tests and audit pass.
 This coordinator does not execute the generated graph or implement a ReAct judge.
 """
 
@@ -61,6 +62,9 @@ class DynamicWorkflowRequest:
 	Each changed node runs node generation (``run_node_generation``) and then the
 	runtime modifier (``run_runtime_modifier``). Disabling generation repairs the
 	node's latest saved source and rejects amendments, which only generation applies.
+
+	A repair that fails (tests still failing after an amendment, or an audit violation) is
+	requested again up to ``max_repair_retries`` more times; 0 restores a single pass.
 	"""
 
 	workflow_json_path: str | Path
@@ -78,7 +82,13 @@ class DynamicWorkflowRequest:
 	amendment_temperature: float = 0.3
 	python_command: str = ""
 	timeout: int = 60
+	max_repair_retries: int = 2
 	state: Mapping[str, Any] = field(default_factory=dict)
+
+	def __post_init__(self) -> None:
+		retries = self.max_repair_retries
+		if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+			raise ValueError("max_repair_retries must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -133,6 +143,10 @@ def _published_workflows() -> tuple[NodeGenerationWorkflow, NodeRuntimeModifierP
 	if NODE_GENERATION_WORKFLOW is None or NODE_RUNTIME_MODIFIER_PIPELINE is None:
 		raise RuntimeError("AgentBuilder has not published its node generation workflow and runtime modifier")
 	return NODE_GENERATION_WORKFLOW, NODE_RUNTIME_MODIFIER_PIPELINE
+
+
+def _audit_report(violations: list[Any]) -> str:
+	return "\n".join(f"Line {item.lineno}: {item.rule} - {item.detail}" for item in violations)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -251,7 +265,20 @@ class _NodeGenerationStep(WorkflowStepNode):
 			elif not targets["source"].is_file():
 				raise FileNotFoundError(f"node {name} has no saved source to repair")
 			if request.run_runtime_modifier:
-				audit_result = self._repair(run, logs)
+				feedback = ""
+				for attempt in range(request.max_repair_retries + 1):
+					try:
+						audit_result = self._repair(run, logs, feedback)
+					except Exception:
+						if attempt == request.max_repair_retries:
+							raise
+						# A failing test is amended from the fresh log of the next attempt's own run.
+						feedback = ""
+						continue
+					ok, violations = audit_result
+					if ok:
+						break
+					feedback = _audit_report(violations) or "node audit failed"
 			if targets["test"].is_file():
 				make_test_relocatable(targets["test"], directory)
 		if audit_result is None:
@@ -260,9 +287,7 @@ class _NodeGenerationStep(WorkflowStepNode):
 				graph_plan_path=str(directory / "workflow.json"),
 			)
 		ok, violations = audit_result
-		logs.record_audit(name, "\n".join(
-			f"Line {item.lineno}: {item.rule} - {item.detail}" for item in violations
-		) or "passed")
+		logs.record_audit(name, _audit_report(violations) or "passed")
 		if not ok:
 			raise RuntimeError(f"node audit failed for {name}: {violations}")
 		return StepRunOutput(
@@ -275,8 +300,11 @@ class _NodeGenerationStep(WorkflowStepNode):
 			},
 		)
 
-	def _repair(self, run: _GenerationRun, logs: WorkflowNodeLogs) -> tuple[bool, list[Any]]:
-		"""Test the candidate, amend it from a failing log once, then retest and re-audit it."""
+	def _repair(self, run: _GenerationRun, logs: WorkflowNodeLogs, feedback: str = "") -> tuple[bool, list[Any]]:
+		"""Test the candidate, amend it from a failing log once, then retest and re-audit it.
+
+		``feedback`` (audit violations from the previous attempt) is applied as an amendment first.
+		"""
 		name, request, directory = self.STEP_ID, run.request, run.directory
 		generation, modifier = _published_workflows()
 		targets = run.artifacts[name]
@@ -286,8 +314,19 @@ class _NodeGenerationStep(WorkflowStepNode):
 			test_file_name=str(targets["test"]), log_file_name=str(targets["log"]),
 			python_command=request.python_command, timeout=request.timeout,
 			test_temperature=request.test_temperature, amendment_temperature=request.amendment_temperature,
+			# Only the first attempt writes the test; retries reuse it.
+			skip_generate_node_test=targets["test"].is_file(),
 			state=dict(request.state),
 		)
+		if feedback:
+			# The violations are in no test log: amend from them as if they were one, then retest.
+			targets["log"].parent.mkdir(parents=True, exist_ok=True)
+			targets["log"].write_text(feedback, encoding="utf-8")
+			modifier_request.skip_run_node_test = True
+			amended = modifier.run(modifier_request)
+			if Path(amended.amended_node_file_path).resolve() != targets["source"]:
+				raise ValueError("modifier must keep the candidate node source path")
+			modifier_request.skip_run_node_test = False
 		result = modifier.run(modifier_request)
 		logs.record_test(name, result.test_log)
 		if Path(result.amended_node_file_path).resolve() != targets["source"]:

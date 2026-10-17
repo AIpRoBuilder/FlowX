@@ -100,6 +100,7 @@ Request options include:
 - `node_formats` for extra generation contract context.
 - `generate_markdown` and `skip_node_planner` for planner control.
 - `run_runtime_modifier` (default `True`) for isolated pytest generation/repair.
+- `max_repair_retries` (default `2`) for how many more times a failing repair is requested.
 - `state` for request-local context; it is not serialized in the manifest.
 - Generation/test temperatures, Python command and per-test timeout.
 
@@ -109,9 +110,13 @@ changes should trigger regeneration. Requirements are currently global: changing
 them conservatively invalidates all enabled nodes. Python is the supported node
 language for this initial coordinator.
 
-The modifier performs one repair pass. When its test fails and it amends source,
-the coordinator reruns the existing test without another amendment and re-audits
-the source. A still-failing node is not published. A failed build does not advance
+A repair pass tests the node, and when its test fails it amends the source from the
+log, reruns the existing test without another amendment, and re-audits the source.
+If a pass still fails its test or audit, another pass is requested, up to
+`max_repair_retries` more times (`0` restores a single pass). The generated test is
+reused; a failing test is amended from its fresh log, and an audit violation is
+amended from the violation report before the node is retested and re-audited. A
+still-failing node is not published. A failed build does not advance
 the workflow/node counters or replace historical files. Disabling the modifier
 does not imply runtime validation; old test logs are not carried into changed,
 untested node versions.

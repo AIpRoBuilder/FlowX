@@ -75,8 +75,18 @@ class FakeNodeGeneration:
 class FakeModifier:
 	def __init__(self) -> None:
 		self.failing: dict[str, int] = {}
+		# (node, skip_generate, skip_run, skip_amend, log content when the call started)
+		self.calls: list[tuple[str, bool, bool, bool, str]] = []
 
 	def run(self, request):
+		log = Path(request.log_file_name)
+		prior_log = log.read_text(encoding="utf-8") if log.is_file() else ""
+		self.calls.append((
+			request.node_name, request.skip_generate_node_test, request.skip_run_node_test,
+			request.skip_amend_node, prior_log,
+		))
+		if request.skip_run_node_test:  # amend from the existing log only
+			return SimpleNamespace(amended_node_file_path=request.node_file_name, test_log=prior_log, test_result=None)
 		remaining = self.failing.get(request.node_name, 0)
 		ok = remaining <= 0
 		if not ok:
@@ -282,7 +292,9 @@ def test_a_failing_node_is_amended_from_its_own_test_log_on_retry(world):
 	agent = world.agent()
 	world.modifier.failing["Collect"] = 2  # first generation: test, then retest after repair, both fail
 
-	result = agent.build_workflow("collect and publish", max_retries={"nodes": 1})
+	result = agent.build_workflow(
+		"collect and publish", max_retries={"nodes": 1}, node_options={"max_repair_retries": 0},
+	)
 
 	assert result.ok, result.errors
 	assert result.stages["nodes"].attempts == 2
@@ -302,6 +314,61 @@ def test_unrecovered_node_failures_are_retained_per_node(world):
 	assert set(result.errors) == {"nodes/Collect"}
 	assert "pytest FAILED for Collect" in result.logs["nodes_test"]["Collect"]
 	assert agent.catalog()[result.workflow_id]["errors"].keys() == {"nodes/Collect"}
+
+
+def test_a_failing_node_is_repaired_again_until_its_test_passes(world):
+	agent = world.agent()
+	world.modifier.failing["Collect"] = 3  # pass 1: test and retest fail; pass 2: test fails, retest passes
+
+	result = agent.build_workflow("collect and publish", max_retries={"nodes": 0})
+
+	assert result.ok, result.errors
+	assert result.stages["nodes"].attempts == 1
+	collect = [call[1:4] for call in world.modifier.calls if call[0] == "Collect"]
+	# (skip_generate, skip_run, skip_amend): the first pass writes the test, the second reuses it.
+	assert collect == [(False, False, False), (True, False, True), (True, False, False), (True, False, True)]
+
+
+def test_repair_retries_are_bounded_by_max_repair_retries(world):
+	agent = world.agent()
+	world.modifier.failing["Collect"] = 99
+
+	result = agent.build_workflow(
+		"collect and publish", max_retries={"nodes": 0}, node_options={"max_repair_retries": 1},
+	)
+
+	assert set(result.errors) == {"nodes/Collect"}
+	assert len([call for call in world.modifier.calls if call[0] == "Collect"]) == 4  # two passes, test + retest each
+
+
+def test_an_audit_violation_is_amended_from_and_the_node_rechecked(world):
+	agent = world.agent()
+	audits = []
+
+	def audit(path, node_meta=None, graph_plan_path=None):
+		audits.append(node_meta.name)
+		if node_meta.name == "Collect" and audits.count("Collect") == 1:
+			return False, [SimpleNamespace(lineno=3, rule="bad_rule", detail="fix me")]
+		return True, []
+
+	world.generation.node_auditor = SimpleNamespace(audit_node_file=audit)
+
+	result = agent.build_workflow("collect and publish", max_retries={"nodes": 0})
+
+	assert result.ok, result.errors
+	collect = [call for call in world.modifier.calls if call[0] == "Collect"]
+	# Test and audit; amend from the violation report (no test run); retest and audit again.
+	assert [call[1:4] for call in collect] == [(False, False, False), (True, True, False), (True, False, False)]
+	assert collect[1][4] == "Line 3: bad_rule - fix me"
+	assert dict(result.logs["nodes_audit"])["Collect"] == "passed"
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_request_validates_the_repair_retry_budget(value):
+	with pytest.raises(ValueError, match="max_repair_retries"):
+		orchestrator_module.DynamicWorkflowRequest(
+			workflow_json_path="workflow.json", requirement_md_path="requirement.md", max_repair_retries=value,
+		)
 
 
 def test_a_main_run_log_error_is_routed_to_the_node_it_names(world):
