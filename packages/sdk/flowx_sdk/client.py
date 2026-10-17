@@ -43,7 +43,7 @@ class FlowXClient:
         self.workspace = Path(configured_workspace or ".flowx_workspaces").expanduser().resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.api_key = api_key or os.environ.get("FLOWX_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
-        self.model = model or os.environ.get("FLOWX_LLM_MODEL", "deepseek-chat")
+        self.model = model or os.environ.get("FLOWX_LLM_MODEL", "deepseek-flash")
         self.provider = provider or os.environ.get("FLOWX_LLM_PROVIDER", "deepseek")
         self._builder: AgentBuilder | None = None
         self._lock = RLock()

@@ -513,6 +513,17 @@ class PromptNodeFileCoderBase(Coder):
             "- If a required value is missing/invalid after resolution attempts, return an explicit validation error.\n\n"
         )
 
+        amendment_policy_text = (
+            "Amendment handling policy (authoritative):\n"
+            "- The amendment may contain test failures, tracebacks, audit findings, user-stated amendments, or reviewer feedback; handle every item.\n"
+            "- Test or audit errors: use the reported test name, traceback, rule id, and message to find the root cause in the existing code, then fix the node code itself so the error no longer occurs.\n"
+            "- Do not hide errors: never skip, weaken, or special-case tests/audit rules, and never swallow exceptions or hard-code expected outputs to pass.\n"
+            "- User-stated amendments or feedback: implement each requested change exactly as stated; do not ignore, defer, or partially apply any item.\n"
+            "- If items conflict, honor the explicit user request while keeping the node contract and runtime policy valid.\n"
+            "- Preserve existing behavior and code unrelated to the amendment; change only what is needed.\n"
+            "- Before answering, verify that every error is resolved and every requested change is present in the output.\n\n"
+        )
+
         user_prompt = (
             "You are updating an existing AG-UI workflow node implementation.\n"
             f"Target language: {language_clean}\n"
@@ -522,11 +533,12 @@ class PromptNodeFileCoderBase(Coder):
             f"{_WORKFLOW_RUNTIME_POLICY}"
             f"{state_routing_policy_text}"
             f"{contract_text}"
-            "Apply the amendment or feedback to produce the improved code.\n"
-            "Return only runnable code without commentary or markdown fences.\n\n"
+            f"{amendment_policy_text}"
+            "Fix the reported errors and apply the requested amendment or feedback to produce the improved code.\n"
+            "Return the complete updated file as runnable code without commentary or markdown fences.\n\n"
             "Existing code:\n"
             f"{original_code}\n\n"
-            "Amendment / feedback to apply:\n"
+            "Amendment / feedback to apply (test errors, audit errors, user amendments, or feedback):\n"
             f"{amendment}\n"
         )
 
