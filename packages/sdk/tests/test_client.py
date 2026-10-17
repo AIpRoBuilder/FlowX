@@ -15,7 +15,7 @@ def sdk(monkeypatch, tmp_path):
     builder = Mock(name="builder")
     constructor = Mock(return_value=builder)
     monkeypatch.setattr(client_module, "AgentBuilder", constructor)
-    client = client_module.FlowXClient(workspace=tmp_path, api_key="key", model="m", provider="p", skills_root="skills")
+    client = client_module.FlowXClient(workspace=tmp_path, api_key="key", model="m", provider="p")
     return SimpleNamespace(client=client, builder=builder, constructor=constructor, workspace=tmp_path.resolve())
 
 
@@ -25,7 +25,7 @@ def test_builder_is_created_lazily_once_with_the_workspace_as_root(sdk):
     assert sdk.client.builder is sdk.client.builder is sdk.builder
 
     sdk.constructor.assert_called_once_with(
-        api_key="key", model="m", provider="p", root_dir=str(sdk.workspace), skills_root_path="skills",
+        api_key="key", model="m", provider="p", root_dir=str(sdk.workspace),
     )
 
 

@@ -129,7 +129,7 @@ class RuntimeService:
 
 
 def _declared_step_metadata(node_path: Path, node_name: str) -> dict[str, Any]:
-    """Read literal node constants without triggering skill installs or module side effects."""
+    """Read literal node constants without triggering module side effects."""
     try:
         tree = ast.parse(node_path.read_text(encoding="utf-8"))
     except (OSError, SyntaxError, UnicodeError):

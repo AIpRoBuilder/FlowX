@@ -63,7 +63,6 @@ class AgentBuilder:
         model: str = "deepseek-chat",
         provider: str = "deepseek",
         root_dir: str = "./example",
-        skills_root_path: Optional[str] = None,
         log_level: str | int | None = None,
         log_filename: str = "flowx_core_debug.log",
         session_marking_prompt: Optional[str] = None,
@@ -72,7 +71,6 @@ class AgentBuilder:
         self.model = model
         self.provider = provider
         self.root_dir = root_dir
-        self.skills_root_path = skills_root_path.strip() if isinstance(skills_root_path, str) else ""
         self.session_marking_prompt = compose_session_marking_prompt(session_marking_prompt)
         self._session = BuildSession()
         self._artifact_publication_lock = RLock()
@@ -89,11 +87,10 @@ class AgentBuilder:
         self._logger = get_logger(__name__)
         self._logger.info(f"Runtime log file: {self.runtime_log_path}")
         self._logger.debug(
-            "Initialized AgentBuilder with model=%s provider=%s root_dir=%s skills_root_path=%s",
+            "Initialized AgentBuilder with model=%s provider=%s root_dir=%s",
             self.model,
             self.provider,
             Path(self.root_dir).expanduser().resolve(),
-            self.skills_root_path,
         )
 
         self._reset_llm_components()
@@ -282,7 +279,6 @@ class AgentBuilder:
             model=self.model,
             provider=self.provider,
             root_dir=self.root_dir,
-            skills_root_path=self.skills_root_path,
             session_marking_prompt=self.session_marking_prompt,
             analyzer_cls=RequirementDisector,
             planner_cls=GraphPlanner,
@@ -306,7 +302,7 @@ class AgentBuilder:
             api_key=self.api_key, model=self.model, provider=self.provider,
             session_marking_prompt=self.session_marking_prompt,
         )
-        self.node_coder = RequestNodeFileCoder(skills_root_path=self.skills_root_path, **settings)
+        self.node_coder = RequestNodeFileCoder(**settings)
         self.node_test_writer = GenerateNodeTestFile(**settings)
         self.node_modifier_writer = AmendNodeFromTestLog(**settings)
 

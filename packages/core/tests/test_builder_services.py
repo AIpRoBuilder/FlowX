@@ -698,9 +698,9 @@ def test_load_planned_graph_refreshes_same_path_without_mutating_existing_snapsh
         "desc": "Replacement upload", "depends": [],
         "ext_data": {"type": "user_file_input", "remote_desc": "Store uploads"},
     }, {
-        "name": "Added", "type": "WorkflowSkillNode", "meta_node_kind": "WorkflowSkillNode",
-        "desc": "New skill", "depends": ["Shared"], "inputs_format": {"summary": "string"},
-        "ext_data": {"type": "skill", "skill_name": "summarize"},
+        "name": "Added", "type": "WorkflowStepNode", "meta_node_kind": "WorkflowStepNode",
+        "desc": "New step", "depends": ["Shared"], "inputs_format": {"summary": "string"},
+        "ext_data": {"type": "user_input"},
     }]}
     graph_path.write_text(json.dumps(replacement), encoding="utf-8")
     selected_path = str(graph_path) if explicit_path else None

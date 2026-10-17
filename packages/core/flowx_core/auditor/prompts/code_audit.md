@@ -6,7 +6,7 @@ Use this checklist to audit AG-UI workflow subclasses against the installed base
 
 ## Rules
 - Define `STEP_ID`, `TITLE`, `PROMPT`, and `DEPENDENCIES`, matching the graph plan.
-- Implement the selected base's required hook and return `StepRunOutput(card=..., derived=...)`: `process_input` for step/file nodes and `process_operation` for skill nodes.
+- Implement the selected base's required hook and return `StepRunOutput(card=..., derived=...)`: `process_input` for step/file nodes.
 - File nodes implement `process_input(file_bytes: bytes, dependency_results, session_state)`; decoding HTTP uploads happens before engine input, and persistence is explicit business logic.
 - Keep inherited `run` orchestration. If a custom `run` is required, it accepts only `self` and returns `CStatus`.
 - Fresh instances are constructed from an explicit `node_classes` map; neither `@register_class` nor `clone` is required.

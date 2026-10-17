@@ -29,7 +29,6 @@ class WorkflowNodeReference:
 _WORKFLOW_NODE_CLASS_NAMES = (
 	"WorkflowStepNode",
 	"WorkflowFileNode",
-	"WorkflowSkillNode",
 )
 
 
@@ -43,11 +42,6 @@ _META_NODE_KIND_TRAITS: dict[str, dict[str, Any]] = {
 		"capability_category": "file",
 		"recommended_ext_data_type": "user_file_input",
 		"supports_inputs_format": False,
-	},
-	"WorkflowSkillNode": {
-		"capability_category": "skill",
-		"recommended_ext_data_type": "skill",
-		"supports_inputs_format": True,
 	},
 }
 
@@ -655,9 +649,6 @@ def workflow_meta_node_kind_name_set() -> frozenset[str]:
 
 def _ext_type_from_value(ext_data: Any) -> str:
 	if isinstance(ext_data, Mapping):
-		skill_name = str(ext_data.get("skill_name", "")).strip()
-		if skill_name:
-			return "skill"
 		return str(ext_data.get("type", "")).strip().lower()
 	if isinstance(ext_data, str):
 		return ext_data.strip().lower()

@@ -43,8 +43,6 @@ class NodePlanElement(Coder):
 	INPUT_REQUIRED = False
 
 	prompt_path: str = "architect/prompts/node_planner_prompt.md"
-	default_skills_dirname: str = "skills"
-	skills_root_path: str = ""
 	output_path: Optional[str] = None
 	overwrite: bool = True
 	temperature: float = 0.2
@@ -192,83 +190,12 @@ class NodePlanElement(Coder):
 			"output_path": str(path) if path.is_file() else None,
 		})
 
-	def _default_skills_root(self) -> Path:
-		if self.skills_root_path:
-			configured = Path(self.skills_root_path).expanduser().resolve()
-			if configured.is_dir():
-				return configured
-		root_dir = ROOT_DIR.parent
-		direct = root_dir / self.default_skills_dirname
-		if direct.is_dir():
-			return direct
-		parent = root_dir.parent / self.default_skills_dirname
-		if parent.is_dir():
-			return parent
-		return direct
-
-	def _list_available_skills(self) -> list[str]:
-		skills_root = self._default_skills_root()
-		if not skills_root.is_dir():
-			return []
-		return sorted(
-			child.name
-			for child in skills_root.iterdir()
-			if child.is_dir() and (child / "skill.md").is_file()
-		)
-
-	def _read_skill_markdown(self, skills_root: Path, skill_name: str) -> str:
-		if not skill_name:
-			return ""
-		skill_doc = skills_root / skill_name / "skill.md"
-		if not skill_doc.is_file():
-			return ""
-		return skill_doc.read_text(encoding="utf-8").strip()
-
-	def _extract_skill_description(self, skill_markdown: str) -> str:
-		if not skill_markdown.strip():
-			return ""
-		from flowx_core.tools.file_tools import parse_skill_md
-
-		sections = parse_skill_md(skill_markdown)
-		description = sections.get("Description", "").strip()
-		if description:
-			return " ".join(description.splitlines()).strip()
-		for line in skill_markdown.splitlines():
-			stripped = line.strip()
-			if stripped and not stripped.startswith("#") and not stripped.startswith("`"):
-				return stripped
-		return ""
-
-	def _skill_descriptions(self) -> dict[str, str]:
-		skills_root = self._default_skills_root()
-		descriptions: dict[str, str] = {}
-		for skill_name in self._list_available_skills():
-			skill_markdown = self._read_skill_markdown(skills_root, skill_name)
-			description = self._extract_skill_description(skill_markdown)
-			if description:
-				descriptions[skill_name] = description
-		return descriptions
-
 	def _node_type_choice_lines(self) -> list[str]:
 		lines = ["- selectable node types:"]
 		for reference in workflow_node_references():
 			lines.append(
 				f"  - {reference.recommended_ext_data_type} -> {reference.meta_node_kind}: {reference.summary}"
 			)
-		return lines
-
-	def _skill_choice_lines(self) -> list[str]:
-		available_skills = self._list_available_skills()
-		if not available_skills:
-			return ["- available skills: none"]
-		descriptions = self._skill_descriptions()
-		lines = [
-			f"- available skills root: {self._default_skills_root()}",
-			"- available skills:",
-		]
-		for skill_name in available_skills:
-			description = descriptions.get(skill_name, "") or "no description found"
-			lines.append(f"  - {skill_name}: {description}")
 		return lines
 
 	def _derive_node_profile(self, node: dict[str, Any]) -> dict[str, Any]:
@@ -291,16 +218,7 @@ class NodePlanElement(Coder):
 			ext_type = str(ext_data.get("type", "")).strip().lower() or ext_type
 		elif isinstance(ext_data, str):
 			ext_type = ext_data.strip().lower() or ext_type
-		skill_name = ""
-		if isinstance(ext_data, dict):
-			skill_name = str(ext_data.get("skill_name", "")).strip()
 
-		note = reference.summary
-		if reference.meta_node_kind == "WorkflowSkillNode" and skill_name:
-			primary_hook = subclass_implementation_signatures[0] if subclass_implementation_signatures else "the selected base-node subclass hook"
-			note = (
-				f"Skill node wrapping skill '{skill_name}': set SKILL_DIR / SKILL_MD_PATH and implement {primary_hook} around the parsed skill.md guidance."
-			)
 		return {
 			"extType": ext_type,
 			"metaNodeKind": reference.meta_node_kind,
@@ -312,7 +230,7 @@ class NodePlanElement(Coder):
 			"stepOutputSchemaSignatures": step_output_schema_signatures,
 			"subclassImplementationMethods": list(reference.subclass_implementation_methods),
 			"subclassImplementationSignatures": subclass_implementation_signatures,
-			"note": note,
+			"note": reference.summary,
 		}
 
 	def render_node_context(self, node: dict[str, Any]) -> str:
@@ -328,10 +246,8 @@ class NodePlanElement(Coder):
 		profile = self._derive_node_profile(node)
 
 		ext_desc = ""
-		skill_name_val = ""
 		if isinstance(ext_data, dict):
 			ext_desc = str(ext_data.get("desc", "")).strip()
-			skill_name_val = str(ext_data.get("skill_name", "")).strip()
 
 		ctx_lines = [
 			f"### Node: {name}",
@@ -341,12 +257,10 @@ class NodePlanElement(Coder):
 			f"- ext_data.type: {profile['extType']}",
 			f"- ext_data.desc: {ext_desc or 'n/a'}",
 		]
-		if profile["metaNodeKind"] in {"WorkflowStepNode", "WorkflowSkillNode"}:
+		if profile["metaNodeKind"] == "WorkflowStepNode":
 			ctx_lines.append(
 				f"- inputs_format: {json.dumps(inputs_format, ensure_ascii=False) if inputs_format else 'n/a'}"
 			)
-		if skill_name_val:
-			ctx_lines.append(f"- ext_data.skill_name: {skill_name_val}")
 		ctx_lines.extend(
 			[
 				f"- capability category: {profile['capabilityCategory']}",
@@ -358,8 +272,6 @@ class NodePlanElement(Coder):
 			]
 		)
 		ctx_lines.extend(self._node_type_choice_lines())
-		if profile["metaNodeKind"] == "WorkflowSkillNode":
-			ctx_lines.extend(self._skill_choice_lines())
 		return "\n".join(ctx_lines)
 
 

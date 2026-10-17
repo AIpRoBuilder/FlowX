@@ -24,7 +24,7 @@ def collect_node_formats(builder: Any, planned_graph: Any, backend_language: str
         user_input_format = (
             {str(key).strip(): str(value).strip().lower()
              for key, value in inputs.items() if str(key).strip() and str(value).strip()}
-            if ext_type in {"user_input", "skill"}
+            if ext_type == "user_input"
             else {}
         )
         backend_path_value = builder.node_location_map.get(node_name)

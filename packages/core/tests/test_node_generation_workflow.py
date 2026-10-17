@@ -25,7 +25,7 @@ from flowx_core.auditor.data import RuleViolation
 from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.worker.node_writer import (
-    RequestNodeFileCoder, WorkflowSkillNodeCoder, WorkflowStepNodeCoder,
+    RequestNodeFileCoder, WorkflowStepNodeCoder,
 )
 from flowx_core.workflows import node_generation, node_runtime_modifier
 from flowx_core.workflows.node_generation import NodeGenerationWorkflow
@@ -1206,7 +1206,7 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
             self.instances.append(self)
 
     @dataclass
-    class Coder(WorkflowSkillNodeCoder):
+    class Coder(WorkflowStepNodeCoder):
         client: object = field(default_factory=object)
         instances: list = field(default_factory=list)
 
@@ -1231,12 +1231,12 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
             planners, coders, auditors = [], [], []
             planner = Planner(
                 client=object(), instances=planners, system_prompt=f"{label} planner prompt",
-                session_marking_prompt=f"{label} planner marking", skills_root_path=f"/{label}/skills",
+                session_marking_prompt=f"{label} planner marking",
                 output_path=f"/{label}/plan.md", overwrite=False, temperature=0.17, max_tokens=123,
             )
             coder = Coder(
                 client=object(), instances=coders, system_prompt=f"{label} coder prompt",
-                session_marking_prompt=f"{label} coder marking", skills_root_path=f"/{label}/skills",
+                session_marking_prompt=f"{label} coder marking",
                 timeout=4.5, use_streaming=False,
             )
             auditor = Auditor(audit=lambda *_a, **_kw: (True, []), instances=auditors)
@@ -1261,7 +1261,6 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
                 assert all(node.client is prototype.client for node in instances)
                 assert all(node.system_prompt == prototype.system_prompt for node in instances)
                 assert all(node.system_prompt.count(prototype.session_marking_prompt) == 1 for node in instances)
-                assert all(node.skills_root_path == prototype.skills_root_path for node in instances)
                 prompt_snapshot = prototype.system_prompt
                 prototype.system_prompt = "late replacement"
                 prototype.client = object()
@@ -1293,7 +1292,7 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
 def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, tmp_path: Path) -> None:
     results = _capture_workflow_results(monkeypatch)
     requirement = tmp_path / "requirement.md"
-    requirement.write_text("Collect, upload and summarize data.", encoding="utf-8")
+    requirement.write_text("Collect and upload data.", encoding="utf-8")
     graph_path = tmp_path / "workflow.json"
     graph_path.write_text(json.dumps({"nodes": [
         {"name": "Collect", "type": "WorkflowStepNode", "meta_node_kind": "WorkflowStepNode",
@@ -1301,17 +1300,7 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
         {"name": "Upload", "type": "WorkflowFileNode", "meta_node_kind": "WorkflowFileNode",
          "desc": "Upload data", "depends": ["Collect"],
          "ext_data": {"type": "user_file_input", "remote_desc": "Archive uploaded bytes"}},
-        {"name": "Summarize", "type": "WorkflowSkillNode", "meta_node_kind": "WorkflowSkillNode",
-         "desc": "Summarize data", "depends": ["Upload"],
-         "ext_data": {"type": "skill", "skill_name": "summarize"}},
     ]}), encoding="utf-8")
-    skills_root = tmp_path / "skills"
-    skill_dir = skills_root / "summarize"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "skill.md").write_text(
-        "## Using\nCall summarize_payload(payload).\n\n## Examples\nsummarize_payload('example')\n",
-        encoding="utf-8",
-    )
     prompts: dict[str, str] = {}
     configs = []
     audited_kinds = []
@@ -1352,7 +1341,7 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
     monkeypatch.setattr(node_generation, "init_workflow_engine", capture_config)
     workflow = NodeGenerationWorkflow(
         node_planner=_FakePlanner(),
-        node_coder=Coder(client=object(), prompts=prompts, skills_root_path=str(skills_root)),
+        node_coder=Coder(client=object(), prompts=prompts),
         node_auditor=_FakeAuditor(audit),
     )
     engine = workflow._engine
@@ -1369,7 +1358,7 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
         nodes = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]
         collect = node_generation.NodeGenerationRequest(
             graph_plan_path=str(graph_path), requirement_md_path=str(requirement),
-            requirement_text="Collect, upload and summarize data.", node_meta=NodeMeta.from_dict(nodes[0]),
+            requirement_text="Collect and upload data.", node_meta=NodeMeta.from_dict(nodes[0]),
             raw_node=nodes[0], target_path=tmp_path / "Collect.py", markdown_path=docs / "Collect.md",
             state={"native_identity": object()},
         )
@@ -1377,50 +1366,34 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
         collect_path = workflow.run(collect)
         upload = node_generation.NodeGenerationRequest(
             graph_plan_path=str(graph_path), requirement_md_path=str(requirement),
-            requirement_text="Collect, upload and summarize data.", node_meta=NodeMeta.from_dict(nodes[1]),
+            requirement_text="Collect and upload data.", node_meta=NodeMeta.from_dict(nodes[1]),
             raw_node=nodes[1], target_path=tmp_path / "Upload.py", markdown_path=docs / "Upload.md",
             dependency_context="### Collect\nGenerated file:\n# generated Collect\n",
             state={"native_identity": object()},
         )
         active_request = upload
         upload_path = workflow.run(upload)
-        summarize = node_generation.NodeGenerationRequest(
-            graph_plan_path=str(graph_path), requirement_md_path=str(requirement),
-            requirement_text="Collect, upload and summarize data.", node_meta=NodeMeta.from_dict(nodes[2]),
-            raw_node=nodes[2], target_path=tmp_path / "Summarize.py", markdown_path=docs / "Summarize.md",
-            dependency_context="### Upload\nGenerated file:\n# generated Upload\n",
-            state={"native_identity": object()},
-        )
-        active_request = summarize
-        summarize_path = workflow.run(summarize)
-        selected_requests = [collect, upload, summarize]
-        generated = [collect_path, upload_path, summarize_path]
-        assert generated == [str(tmp_path / f"{name}.py") for name in ("Collect", "Upload", "Summarize")]
-        assert [request.node_meta.name for request in selected_requests] == ["Collect", "Upload", "Summarize"]
+        selected_requests = [collect, upload]
+        generated = [collect_path, upload_path]
+        assert generated == [str(tmp_path / f"{name}.py") for name in ("Collect", "Upload")]
+        assert [request.node_meta.name for request in selected_requests] == ["Collect", "Upload"]
         assert all(type(request.node_meta) is NodeMeta for request in selected_requests)
-        assert len({id(request) for request in selected_requests}) == 3
-        assert len({id(request.raw_node) for request in selected_requests}) == 3
-        assert len({id(request.node_format) for request in selected_requests}) == 3
-        assert len({id(request.state) for request in selected_requests}) == 3
+        assert len({id(request) for request in selected_requests}) == 2
+        assert len({id(request.raw_node) for request in selected_requests}) == 2
+        assert len({id(request.node_format) for request in selected_requests}) == 2
+        assert len({id(request.state) for request in selected_requests}) == 2
         assert all(request.node_amendment == "" for request in selected_requests)
         assert all(request.skip_node_planner is False for request in selected_requests)
         assert selected_requests[0].dependency_context == ""
-        assert len(results) == 3
-        assert audited_kinds == ["WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode"]
+        assert len(results) == 2
+        assert audited_kinds == ["WorkflowStepNode", "WorkflowFileNode"]
         assert "Generate a WorkflowStepNode subclass" in prompts["Collect"]
         assert "Generate a WorkflowFileNode subclass" in prompts["Upload"]
         assert "file_bytes: bytes" in prompts["Upload"]
         assert "Archive uploaded bytes" in prompts["Upload"]
-        assert "Generate a WorkflowSkillNode subclass" in prompts["Summarize"]
-        assert "selected_skill_name: summarize" in prompts["Summarize"]
-        assert str(skill_dir) in prompts["Summarize"]
-        assert "summarize_payload(payload)" in prompts["Summarize"]
         assert "# generated Collect" in prompts["Upload"]
-        assert "# generated Upload" in prompts["Summarize"]
         assert "# generated Collect" in selected_requests[1].dependency_context
-        assert "# generated Upload" in selected_requests[2].dependency_context
         assert selected_requests[1].dependency_context in prompts["Upload"]
-        assert selected_requests[2].dependency_context in prompts["Summarize"]
         snapshots = [request.dependency_context for request in selected_requests]
 
         amended_upload = replace(
@@ -1430,22 +1403,13 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
         )
         active_request = amended_upload
         amended_upload_path = workflow.run(amended_upload)
-        amended_summarize = replace(
-            summarize, node_meta=NodeMeta.from_dict(summarize.raw_node), raw_node=dict(summarize.raw_node),
-            node_format={}, state={"native_identity": object()}, generate_markdown=False,
-            node_amendment="Retain skill invocation",
-        )
-        active_request = amended_summarize
-        amended_summarize_path = workflow.run(amended_summarize)
-        amended = [amended_upload_path, amended_summarize_path]
-        selected_requests.extend((amended_upload, amended_summarize))
+        amended = [amended_upload_path]
+        selected_requests.append(amended_upload)
         assert amended == generated[1:]
-        assert len(selected_requests) == 5
-        assert [request.node_meta.name for request in selected_requests[3:]] == ["Upload", "Summarize"]
-        assert [request.node_amendment for request in selected_requests[3:]] == [
-            "Retain remote persistence", "Retain skill invocation",
-        ]
-        for original, request in zip(selected_requests[1:3], selected_requests[3:]):
+        assert len(selected_requests) == 3
+        assert [request.node_meta.name for request in selected_requests[2:]] == ["Upload"]
+        assert [request.node_amendment for request in selected_requests[2:]] == ["Retain remote persistence"]
+        for original, request in zip(selected_requests[1:2], selected_requests[2:]):
             assert request is not original
             assert request.node_meta is not original.node_meta
             assert request.raw_node is not original.raw_node
@@ -1455,25 +1419,19 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
             assert request.target_path == original.target_path
             assert request.markdown_path == original.markdown_path
             assert request.generate_markdown is False
-        assert "# generated Collect" in selected_requests[3].dependency_context
-        assert "### Summarize" not in selected_requests[3].dependency_context
-        assert "# generated Upload" in selected_requests[4].dependency_context
-        assert [request.dependency_context for request in selected_requests[:3]] == snapshots
+        assert "# generated Collect" in selected_requests[2].dependency_context
+        assert [request.dependency_context for request in selected_requests[:2]] == snapshots
         assert "Preserve the WorkflowFileNode bytes-processing" in prompts["Upload"]
         assert "Archive uploaded bytes" in prompts["Upload"]
-        assert "Preserve the WorkflowSkillNode contract" in prompts["Summarize"]
-        assert "selected_skill_name: summarize" in prompts["Summarize"]
         assert len(configs) == 1
-        assert len(results) == 5
-        assert len(native_states) == 5
+        assert len(results) == 3
+        assert len(native_states) == 3
         assert [request for request, _ in native_states] == selected_requests
-        assert audited_kinds == [
-            "WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode", "WorkflowFileNode", "WorkflowSkillNode",
-        ]
-        assert len({result.request_id for result in results}) == 5
+        assert audited_kinds == ["WorkflowStepNode", "WorkflowFileNode", "WorkflowFileNode"]
+        assert len({result.request_id for result in results}) == 3
         assert all(set(result.outputs) == {"node_plan", "node_generate", "node_audit"} for result in results)
         assert all(result.outputs["node_audit"].derived["ok"] is True for result in results)
-        assert all(result.outputs["node_plan"].card == {"status": "skipped"} for result in results[-2:])
+        assert all(result.outputs["node_plan"].card == {"status": "skipped"} for result in results[-1:])
         assert all(set(request.state) == {"native_identity"} for request in selected_requests)
         assert workflow._engine is engine
         assert set(vars(workflow)) == {"node_planner", "node_coder", "node_auditor", "_engine"}

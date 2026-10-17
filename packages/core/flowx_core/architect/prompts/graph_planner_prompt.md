@@ -20,9 +20,8 @@ Modified 2026-10-13: request-scoped nodes complete once; do not promise native r
   - ext_data: 必填，JSON 对象，格式为 {"type": "...", "desc": "..."}。
     - 当 `meta_node_kind="WorkflowStepNode"` 时，交互节点 type 使用 "user_input"；无需用户输入的自动节点可使用 "none" 或领域外部源类型，如 "url"、"file"、"db"。
     - 当 `meta_node_kind="WorkflowFileNode"` 时，type 必须为 "user_file_input"。
-    - 当 `meta_node_kind="WorkflowSkillNode"` 时，type 必须为 "skill"，并填写 skill_name（值为默认技能目录中的子目录名）。
     - 若 type 为 "none"，desc 必须为 "no need for ext data"。
-    - 示例：{"type":"user_input","desc":"user input income"}、{"type":"user_file_input","desc":"upload files for storage and downstream processing"}、{"type":"skill","skill_name":"baidu_search","desc":"search baidu for query results"}、{"type":"url","desc":"image generator api"}。
+    - 示例：{"type":"user_input","desc":"user input income"}、{"type":"user_file_input","desc":"upload files for storage and downstream processing"}、{"type":"url","desc":"image generator api"}。
   - enable: 布尔值。
   - loop: 整数，只允许 1；可省略。当前运行时每个节点在一次请求中只完成一次。
     - 需要多次处理时，在节点处理方法内部实现有限循环，或启动新请求；不要设置 loop > 1 来更新已完成节点。
@@ -40,7 +39,7 @@ Modified 2026-10-13: request-scoped nodes complete once; do not promise native r
         "enable": true
       }
   - depends: 数组，依赖节点名称；无依赖时可省略。
-  - inputs_format: 当 ext_data.type 为 "user_input" 或 "skill" 时可填写，值为对象，描述输入字段及其原始类型（string/number/boolean/object/array）。
+  - inputs_format: 当 ext_data.type 为 "user_input" 时可填写，值为对象，描述输入字段及其原始类型（string/number/boolean/object/array）。
 - 节点数量以满足功能模块为主，避免过度拆分。
 
 ## 示例

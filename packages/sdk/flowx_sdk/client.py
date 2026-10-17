@@ -38,7 +38,6 @@ class FlowXClient:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         provider: Optional[str] = None,
-        skills_root: Optional[str] = None,
     ) -> None:
         configured_workspace = workspace or os.environ.get("FLOWX_DEFAULT_WORKSPACE")
         self.workspace = Path(configured_workspace or ".flowx_workspaces").expanduser().resolve()
@@ -46,7 +45,6 @@ class FlowXClient:
         self.api_key = api_key or os.environ.get("FLOWX_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
         self.model = model or os.environ.get("FLOWX_LLM_MODEL", "deepseek-chat")
         self.provider = provider or os.environ.get("FLOWX_LLM_PROVIDER", "deepseek")
-        self.skills_root = skills_root
         self._builder: AgentBuilder | None = None
         self._lock = RLock()
 
@@ -66,7 +64,6 @@ class FlowXClient:
                     model=self.model,
                     provider=self.provider,
                     root_dir=str(self.workspace),
-                    skills_root_path=self.skills_root,
                 )
             return self._builder
 

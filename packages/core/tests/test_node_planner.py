@@ -23,26 +23,17 @@ class _FakeClient:
 		self.chat = SimpleNamespace(completions=_FakeCompletions(responses))
 
 
-def _write_skill(skills_root, skill_name: str, body: str = "# Skill\n\nsearch helper"):
-	skill_dir = skills_root / skill_name
-	skill_dir.mkdir(parents=True, exist_ok=True)
-	(skill_dir / "skill.md").write_text(body, encoding="utf-8")
-
-
-def test_node_context_lists_selectable_types_and_skill_descriptions(tmp_path) -> None:
-	skills_root = tmp_path / "skills"
-	_write_skill(skills_root, "baidu_search", "# Skill\n\nBaidu search helper")
-	planner = NodePlanElement(client=_FakeClient([]), skills_root_path=str(skills_root))
+def test_node_context_lists_selectable_types() -> None:
+	planner = NodePlanElement(client=_FakeClient([]))
 
 	context = planner.render_node_context(
 		{
-			"name": "SearchSkill",
-			"desc": "search for external data",
+			"name": "CollectQuery",
+			"desc": "collect a search query",
 			"depends": [],
 			"ext_data": {
-				"type": "skill",
-				"desc": "use a search skill",
-				"skill_name": "baidu_search",
+				"type": "user_input",
+				"desc": "user enters a query",
 			},
 			"inputs_format": {"query": "string"},
 		},
@@ -51,13 +42,12 @@ def test_node_context_lists_selectable_types_and_skill_descriptions(tmp_path) ->
 	assert "- selectable node types:" in context
 	assert "user_input -> WorkflowStepNode" in context
 	assert "service ->" not in context
-	assert "skill -> WorkflowSkillNode" in context
-	assert "- available skills:" in context
-	assert "baidu_search:" in context
+	assert "WorkflowSkillNode" not in context
+	assert "skill" not in context.lower()
 
 
-def test_node_context_omits_legacy_service_metadata(tmp_path) -> None:
-	planner = NodePlanElement(client=_FakeClient([]), skills_root_path=str(tmp_path / "skills"))
+def test_node_context_omits_legacy_service_metadata() -> None:
+	planner = NodePlanElement(client=_FakeClient([]))
 
 	context = planner.render_node_context(
 		{

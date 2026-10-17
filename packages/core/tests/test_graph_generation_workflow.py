@@ -74,13 +74,10 @@ def engine_spies(monkeypatch):
 
 
 @pytest.fixture
-def workflow_factory(tmp_path, engine_spies):
+def workflow_factory(engine_spies):
     resources = []
 
     def create(events=None, **settings):
-        settings["planner_settings"] = {
-            "skills_root_path": str(tmp_path), **(settings.get("planner_settings") or {}),
-        }
         resource = _workflow(events if events is not None else [], **settings)
         resources.append(resource)
         return resource

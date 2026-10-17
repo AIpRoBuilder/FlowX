@@ -36,13 +36,12 @@ def test_metadata_resolves_automatic_input_and_disabled_nodes_without_files(tmp_
         {"name": "Collect", "meta_node_kind": "WorkflowStepNode", "ext_data": {"type": "user_input"}},
         {"name": "Automatic", "meta_node_kind": "WorkflowStepNode", "ext_data": {"type": "none"}},
         {"name": "Upload", "meta_node_kind": "WorkflowFileNode", "ext_data": {"type": "user_file_input"}},
-        {"name": "Skill", "meta_node_kind": "WorkflowSkillNode", "ext_data": {"type": "skill"}},
         {"name": "Disabled", "meta_node_kind": "WorkflowStepNode", "enable": False},
     ])
     metadata = {step["id"]: step for step in _metadata(builder)}
     assert "Disabled" not in metadata
     assert {name: step["inputRequired"] for name, step in metadata.items()} == {
-        "Collect": True, "Automatic": False, "Upload": True, "Skill": False,
+        "Collect": True, "Automatic": False, "Upload": True,
     }
     hidden = {step["id"]: step for step in _metadata(builder, include_hidden_nodes=True)}
     assert hidden["Disabled"]["enabled"] is False
@@ -50,19 +49,19 @@ def test_metadata_resolves_automatic_input_and_disabled_nodes_without_files(tmp_
 
 def test_metadata_reads_generated_constants_without_executing_source(tmp_path):
     builder = _builder(tmp_path, [{
-        "name": "Skill", "meta_node_kind": "WorkflowSkillNode", "desc": "Planned prompt",
+        "name": "Custom", "meta_node_kind": "WorkflowStepNode", "desc": "Planned prompt",
     }])
-    builder.node_location_map["Skill"] = "custom.py"
+    builder.node_location_map["Custom"] = "custom.py"
     (tmp_path / "custom.py").write_text('''raise AssertionError("Do not import generated modules")
-class Skill(WorkflowSkillNode):
-    STEP_ID = "actual-skill"
+class Custom(WorkflowStepNode):
+    STEP_ID = "actual-step"
     TITLE = "Actual title"
     PROMPT = ""
     DEPENDENCIES: list[str] = ["actual-parent"]
     INPUT_REQUIRED = True
 ''', encoding="utf-8")
     metadata = _metadata(builder)[0]
-    assert metadata["id"] == "actual-skill"
+    assert metadata["id"] == "actual-step"
     assert metadata["title"] == "Actual title"
     assert metadata["prompt"] == ""
     assert metadata["dependencies"] == ["actual-parent"]
@@ -72,10 +71,10 @@ class Skill(WorkflowSkillNode):
 @pytest.mark.parametrize("source", [
     "class Other: INPUT_REQUIRED = True\n",
     "invalid python !!!",
-    "class Skill: INPUT_REQUIRED = configure_input()\n",
-    "class Skill: INPUT_REQUIRED = 'False'\n",
+    "class Custom: INPUT_REQUIRED = configure_input()\n",
+    "class Custom: INPUT_REQUIRED = 'False'\n",
 ])
 def test_metadata_keeps_plan_defaults_for_unresolved_constants(tmp_path, source):
-    builder = _builder(tmp_path, [{"name": "Skill", "meta_node_kind": "WorkflowSkillNode"}])
-    (tmp_path / "Skill.py").write_text(source, encoding="utf-8")
+    builder = _builder(tmp_path, [{"name": "Custom", "meta_node_kind": "WorkflowStepNode"}])
+    (tmp_path / "Custom.py").write_text(source, encoding="utf-8")
     assert _metadata(builder)[0]["inputRequired"] is False

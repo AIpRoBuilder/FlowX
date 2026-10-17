@@ -766,22 +766,15 @@ def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_pat
     before = dict(pooled_coder.__dict__)
     requests = []
     try:
-        for index, kind in enumerate(("WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode")):
+        for index, kind in enumerate(("WorkflowStepNode", "WorkflowFileNode")):
             node_name = f"node_{index}"
             root = tmp_path / node_name
             root.mkdir()
             requirement = root / "requirement.md"
             requirement.write_text(f"Requirement for {node_name}", encoding="utf-8")
-            skill_dir = root / "skills" / "example"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "skill.md").write_text(
-                "# Example\n\n## Using\ninvoke_request_skill()\n\n## Examples\nrequest_skill_example()\n",
-                encoding="utf-8",
-            )
             ext_data = (
                 {"type": "user_file_input", "remote_desc": "persist to request bucket"}
-                if kind == "WorkflowFileNode" else {"type": "skill", "skill_name": "example"}
-                if kind == "WorkflowSkillNode" else {"type": "none"}
+                if kind == "WorkflowFileNode" else {"type": "none"}
             )
             meta = NodeMeta(name=node_name, type="GNode", desc=node_name, meta_node_kind=kind, ext_data=ext_data)
             raw_node = meta.to_dict()
@@ -851,14 +844,8 @@ def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_pat
                 assert engine.pool is pool
                 assert "Preserve the WorkflowFileNode" in calls[-1]["prompt"]
                 assert "remote_desc: persist to request bucket" in calls[-1]["prompt"]
-            elif kind == "WorkflowSkillNode":
-                assert f"SKILL_DIR class constant must be set to: {skill_dir}" in calls[-1]["prompt"]
-                assert "SKILL_MD_PATH = str(Path(SKILL_DIR) / 'skill.md')" in calls[-1]["prompt"]
-                assert "invoke_request_skill()" in calls[-1]["prompt"]
-                assert "request_skill_example()" in calls[-1]["prompt"]
-                assert "persist to request bucket" not in calls[-1]["prompt"]
         assert {key: value for key, value in pooled_coder.__dict__.items()} == before
-        assert len(calls) == len(audit_calls) == 4
+        assert len(calls) == len(audit_calls) == 3
         assert not any(
             value is request
             for owner in (workflow, workflow.node_planner, workflow.node_coder, workflow.node_auditor,
@@ -880,7 +867,7 @@ def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_pat
         workflow.init_node_engine()
 
 
-@pytest.mark.parametrize("kind", ["WorkflowStepNode", "WorkflowFileNode", "WorkflowSkillNode"])
+@pytest.mark.parametrize("kind", ["WorkflowStepNode", "WorkflowFileNode"])
 def test_request_coder_direct_contract_helpers_accept_node_metadata(kind) -> None:
     coder = RequestNodeFileCoder(client=object())
     meta = NodeMeta(name="direct", type="GNode", desc="direct", meta_node_kind=kind)

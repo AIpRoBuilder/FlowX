@@ -24,7 +24,6 @@ from flowx_core.tools.workflow_node_reference import (
 WORKFLOW_NODE_BASE_NAMES = {
     "WorkflowStepNode",
     "WorkflowFileNode",
-    "WorkflowSkillNode",
 }
 
 

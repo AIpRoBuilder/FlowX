@@ -22,7 +22,6 @@ from flowx_core.tools.workflow_node_reference import (
 from flowx_core.worker.main_writer import PromptMainFileCoder
 from flowx_core.worker.node_writer import (
     WorkflowFileNodeCoder,
-    WorkflowSkillNodeCoder,
     WorkflowStepNodeCoder,
 )
 from flowx_core.workflows.graph_generation import GraphGenerationRequest
@@ -145,7 +144,6 @@ def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tm
         model="old-model",
         provider="old-provider",
         root_dir=str(tmp_path),
-        skills_root_path="skills-dir",
         session_marking_prompt="Keep request_id on all file/text IO.",
     )
 
@@ -215,10 +213,7 @@ def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tm
     for name, initial_component in initial_components.items():
         component = getattr(builder, name)
         assert component is not initial_component
-        component_settings = dict(expected_settings)
-        if name in {"planner", "node_planner", "node_coder"}:
-            component_settings["skills_root_path"] = "skills-dir"
-        assert component.kwargs == component_settings
+        assert component.kwargs == expected_settings
 
     for name, dependencies in workflow_dependencies().items():
         workflow = getattr(builder, name)
@@ -257,16 +252,11 @@ def test_node_planner_system_prompt_includes_session_marking_prompt():
 
 def test_node_writer_contract_text_uses_reference_hook_signatures() -> None:
     step_reference = resolve_workflow_node_reference(meta_node_kind="WorkflowStepNode")
-    skill_reference = resolve_workflow_node_reference(meta_node_kind="WorkflowSkillNode")
     file_reference = resolve_workflow_node_reference(meta_node_kind="WorkflowFileNode")
 
     step_hook = render_workflow_method_signatures(
         step_reference.base_class,
         step_reference.subclass_implementation_methods,
-    )[0]
-    skill_hook = render_workflow_method_signatures(
-        skill_reference.base_class,
-        skill_reference.subclass_implementation_methods,
     )[0]
     file_main_utility = render_workflow_method_signatures(
         file_reference.base_class,
@@ -274,7 +264,6 @@ def test_node_writer_contract_text_uses_reference_hook_signatures() -> None:
     )[0]
 
     assert step_hook in WorkflowStepNodeCoder(client=_FakeClient()).get_node_contract_text()
-    assert skill_hook in WorkflowSkillNodeCoder(client=_FakeClient()).get_node_contract_text()
     file_contract_text = WorkflowFileNodeCoder(client=_FakeClient()).get_node_contract_text()
     assert file_main_utility in file_contract_text
     assert "save_files_remote(files, session_state)" not in file_contract_text

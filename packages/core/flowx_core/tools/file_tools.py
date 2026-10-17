@@ -7,10 +7,6 @@ from typing import Any, Mapping
 
 from flowx_core.tools.workflow_node_reference import workflow_node_references
 
-# NOTE: ag_ui_workflow.nodes imports are done lazily inside functions below to
-# avoid circular imports (nodes.py imports parse_skill_md / extract_skill_commands
-# from this module).
-
 
 def parse_json_file(file_name: str | Path, directory: str | Path) -> Any:
 	"""Parse a JSON file located within ``directory``.
@@ -25,56 +21,6 @@ def parse_json_file(file_name: str | Path, directory: str | Path) -> Any:
 	except ValueError as exc:
 		raise ValueError(f"JSON file must be located under {directory_path}: {file_name}") from exc
 	return json.loads(file_path.read_text(encoding="utf-8"))
-
-
-def parse_skill_md(text: str) -> dict[str, str]:
-    """Parse a skill.md document into a dict keyed by H2 section name.
-
-    Only level-2 headings (``## Heading``) are used as section boundaries.
-    The title (H1) is stored under the key ``"_title"``.
-    """
-    sections: dict[str, str] = {}
-    current_key: str | None = None
-    current_lines: list[str] = []
-
-    for line in text.splitlines(keepends=True):
-        stripped = line.rstrip("\n").rstrip("\r")
-        if stripped.startswith("## "):
-            if current_key is not None:
-                sections[current_key] = "".join(current_lines).strip()
-            current_key = stripped[3:].strip()
-            current_lines = []
-        elif stripped.startswith("# ") and current_key is None:
-            # H1 title – store separately
-            sections["_title"] = stripped[2:].strip()
-        else:
-            if current_key is not None:
-                current_lines.append(line)
-
-    if current_key is not None:
-        sections[current_key] = "".join(current_lines).strip()
-
-    return sections
-
-
-def extract_skill_commands(section_text: str) -> list[str]:
-    """Extract shell commands from fenced code blocks in *section_text*.
-
-    Fences may be ```sh, ```bash, ```shell or plain ```.
-    Lines starting with ``$`` have the prefix stripped.
-    """
-    commands: list[str] = []
-    in_block = False
-    for line in section_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            in_block = not in_block
-            continue
-        if in_block:
-            cmd = stripped.lstrip("$ ").strip()
-            if cmd:
-                commands.append(cmd)
-    return commands
 
 
 def _extract_imports_and_body(text: str) -> tuple[list[str], str]:
@@ -367,7 +313,6 @@ def _get_workflow_base_class_objects() -> dict[str, type]:
 	class_names = (
 		"WorkflowStepNode",
 		"WorkflowFileNode",
-		"WorkflowSkillNode",
 	)
 	result: dict[str, type] = {}
 	for class_name in class_names:
@@ -765,8 +710,8 @@ def _get_workflow_base_method_card_fallbacks() -> dict[str, dict[str, dict[str, 
 def compile_node_file_and_get_derived_keys(node_file_path: str) -> list[str]:
 	"""Parse a node file and return all derived-dict keys from workflow node classes.
 
-	The parser inspects subclasses of WorkflowStepNode, WorkflowFileNode,
-	and WorkflowSkillNode using Python AST,
+	The parser inspects subclasses of WorkflowStepNode and WorkflowFileNode
+	using Python AST,
 	then extracts string keys from local ``derived`` dict literals (and equivalent
 	``StepRunOutput(..., derived=...)`` literals) inside relevant methods.
 	"""

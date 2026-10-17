@@ -32,7 +32,6 @@ Guidelines:
     - `PROMPT` (input prompt for user)
     - `DEPENDENCIES` (list of upstream step ids)
 - Implement only the processing hook allowed by the selected base-node contract from the injected catalog.
-- If the selected base node is skill-backed, set `SKILL_DIR` and `SKILL_MD_PATH = str(Path(SKILL_DIR) / 'skill.md')`, then invoke the skill exactly as described in `self.skill_using` / `skill.md ## Using`.
 - If the selected base node is the spatial-temporal contract variant, keep the inherited `run` / runtime flow, and use the selected base-node reference plus node contract instructions as the source of truth for the parsed subclass hook and any prompt/guidance helper methods reachable from it.
 - When the node's own description or `PROMPT` should steer contract generation, add the smallest override among those parsed prompt/guidance helper methods so that guidance enters the inherited generation flow.
 - Use the parsed subclass implementation hook itself only when the node truly needs custom model invocation or response parsing beyond prompt-guidance changes.

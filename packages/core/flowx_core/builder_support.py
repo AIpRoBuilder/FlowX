@@ -97,7 +97,6 @@ class BuilderComponentFactory:
     model: str
     provider: str
     root_dir: str
-    skills_root_path: str
     session_marking_prompt: str
     analyzer_cls: Any
     planner_cls: Any
@@ -115,14 +114,12 @@ class BuilderComponentFactory:
             api_key=self.api_key,
             model=self.model,
             provider=self.provider,
-            skills_root_path=self.skills_root_path,
             session_marking_prompt=self.session_marking_prompt,
         )
         node_planner = self.node_planner_cls(
             api_key=self.api_key,
             model=self.model,
             provider=self.provider,
-            skills_root_path=self.skills_root_path,
             session_marking_prompt=self.session_marking_prompt,
         )
         main_writer = self.main_writer_cls(

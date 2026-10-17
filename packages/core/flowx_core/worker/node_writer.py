@@ -152,52 +152,6 @@ def _read_node_markdown_reference(
     return ""
 
 
-def _resolve_named_root(
-    configured_root_path: str,
-    root_dir_path: str,
-    default_dirname: str,
-) -> Path:
-    if configured_root_path:
-        configured = Path(configured_root_path).expanduser().resolve()
-        if configured.is_dir():
-            return configured
-
-    if root_dir_path:
-        root_dir = Path(root_dir_path).expanduser().resolve()
-        direct = root_dir / default_dirname
-        if direct.is_dir():
-            return direct
-        parent = root_dir.parent / default_dirname
-        if parent.is_dir():
-            return parent
-
-    return ROOT_DIR.parent / default_dirname
-
-
-def _read_named_markdown(root_dir: Path, item_name: str, markdown_name: str) -> str:
-    if not item_name:
-        return ""
-
-    doc_path = root_dir / item_name / markdown_name
-    if not doc_path.is_file():
-        return ""
-    return doc_path.read_text(encoding="utf-8").strip()
-
-
-def _parse_markdown_sections(markdown_text: str) -> dict[str, str]:
-    if not markdown_text.strip():
-        return {}
-
-    try:
-        from flowx_core.tools.file_tools import parse_skill_md
-
-        parsed = parse_skill_md(markdown_text)
-    except Exception:
-        return {}
-
-    return {str(key).strip(): str(value).strip() for key, value in parsed.items()}
-
-
 def _reference_method_signature_text(reference, method_names: tuple[str, ...]) -> str:
     signatures = render_workflow_method_signatures(reference.base_class, method_names)
     return ", ".join(signatures) if signatures else "none"
@@ -432,7 +386,7 @@ class PromptNodeFileCoderBase(Coder):
 
         ext_data = node_meta.ext_data if isinstance(node_meta.ext_data, Mapping) else {}
         ext_type = str(ext_data.get("type", "none")).strip().lower()
-        if ext_type in ("user_input", "skill") and inputs_format_text != "none":
+        if ext_type == "user_input" and inputs_format_text != "none":
             user_prompt += (
                 "Input schema constraints (authoritative):\n"
                 f"- This node is ext_data.type='{ext_type}' with explicit inputs_format.\n"
@@ -772,146 +726,8 @@ class WorkflowStepNodeCoder(PromptNodeFileCoderBase):
 
 
 @dataclass
-class WorkflowSkillNodeCoder(PromptNodeFileCoderBase):
-    default_skills_dirname: str = "skills"
-    skills_root_path: str = ""
-
-    def _default_skills_root(self, root_dir_path: str) -> Path:
-        return _resolve_named_root(
-            configured_root_path=self.skills_root_path,
-            root_dir_path=root_dir_path,
-            default_dirname=self.default_skills_dirname,
-        )
-
-    def _extract_skill_name(self, node_meta: NodeMeta) -> str:
-        ext_data = node_meta.ext_data
-        if isinstance(ext_data, Mapping):
-            return str(ext_data.get("skill_name", "")).strip()
-        return ""
-
-    def _read_skill_markdown(self, skills_root: Path, skill_name: str) -> str:
-        return _read_named_markdown(skills_root, skill_name, "skill.md")
-
-    def _extract_skill_sections(self, skill_markdown: str) -> tuple[str, str]:
-        """Return (using_section, examples_section) from a parsed skill.md."""
-        sections = _parse_markdown_sections(skill_markdown)
-        return sections.get("Using", "").strip(), sections.get("Examples", "").strip()
-
-    def _build_requirement_prompt(
-        self,
-        node_name: str,
-        node_meta: NodeMeta,
-        requirement_text: str,
-        node_markdown_reference: str,
-        output_path: str,
-        graph_plan_path: str,
-        language_clean: str,
-        node_contract_text: str,
-        dependency_context: str | None = None,
-        ancestor_session_state_context: str | None = None,
-        root_dir_path: str = "",
-        additional_generation_context: str = "",
-    ) -> str:
-        base_prompt = super()._build_requirement_prompt(
-            node_name=node_name,
-            node_meta=node_meta,
-            requirement_text=requirement_text,
-            node_markdown_reference=node_markdown_reference,
-            output_path=output_path,
-            graph_plan_path=graph_plan_path,
-            language_clean=language_clean,
-            node_contract_text=node_contract_text,
-            dependency_context=dependency_context,
-            ancestor_session_state_context=ancestor_session_state_context,
-            root_dir_path=root_dir_path,
-            additional_generation_context=additional_generation_context,
-        )
-
-        skills_root = self._default_skills_root(root_dir_path)
-        skill_name = self._extract_skill_name(node_meta)
-        skill_markdown = self._read_skill_markdown(skills_root, skill_name)
-        skill_using, skill_examples = self._extract_skill_sections(skill_markdown)
-        reference = resolve_workflow_node_reference(meta_node_kind="WorkflowSkillNode")
-        subclass_hook_text = _reference_method_signature_text(reference, reference.subclass_implementation_methods)
-
-        skill_context_lines = [
-            "",
-            "Skill node context (authoritative):",
-            f"- skills_root: {skills_root}",
-            f"- selected_skill_name: {skill_name or 'none'}",
-            f"- SKILL_DIR class constant must be set to: {str(skills_root / skill_name) if skill_name else 'path/to/skill/dir'}",
-        ]
-
-        if skill_using:
-            skill_context_lines.extend(
-                [
-                    "",
-                    "skill.md ## Using section (authoritative — tells you how to invoke the skill):",
-                    skill_using,
-                ]
-            )
-
-        if skill_examples:
-            skill_context_lines.extend(
-                [
-                    "",
-                    "skill.md ## Examples section (authoritative — concrete usage patterns):",
-                    skill_examples,
-                ]
-            )
-
-        skill_context_lines.extend(
-            [
-                "",
-                "Implementation constraints for this skill node:",
-                "- Subclass WorkflowSkillNode.",
-                "- Set SKILL_DIR to the exact skill directory path shown above.",
-                "- Set SKILL_MD_PATH = str(Path(SKILL_DIR) / 'skill.md') so the base class parses the skill doc on init.",
-                f"- Implement {subclass_hook_text} -> StepRunOutput.",
-                f"- In {subclass_hook_text}, invoke the skill using the pattern described in the ## Using section; use self.skill_using and self.skill_examples for inline reference if needed.",
-                "- Use user_input when present; keep robust fallback behavior if user_input is empty.",
-                "- Read upstream values from dependency_results[step_id].derived as needed.",
-                "- Do not hardcode skill logic that contradicts skill.md ## Using; follow it exactly.",
-                "- Keep output JSON-serializable and include useful derived fields for downstream nodes.",
-            ]
-        )
-
-        return base_prompt + "\n" + "\n".join(skill_context_lines)
-
-    def get_node_contract_text(self) -> str:
-        reference = resolve_workflow_node_reference(meta_node_kind="WorkflowSkillNode")
-        subclass_hook_text = _reference_method_signature_text(reference, reference.subclass_implementation_methods)
-        return (
-            "Generate a WorkflowSkillNode subclass with STEP_ID, TITLE, PROMPT, DEPENDENCIES, SKILL_DIR, and SKILL_MD_PATH.\n"
-            "Set SKILL_DIR to the absolute path of the chosen skill directory.\n"
-            "Set SKILL_MD_PATH = str(Path(SKILL_DIR) / 'skill.md') — the base class reads and parses it on __init__.\n"
-            "After __init__, self.skill_description, self.skill_using, self.skill_examples are available as strings parsed from skill.md.\n"
-            f"Implement skill invocation in {subclass_hook_text} and return StepRunOutput.\n"
-            "Use user_input when meaningful for the skill behavior; tolerate empty user_input when the step does not require it.\n"
-            "Invoke the skill according to the ## Using section of skill.md; do not invent an invocation pattern.\n"
-            "Keep implementation minimal: only imports, constants, and methods required by this node contract.\n"
-            "Read upstream values from dependency_results[step_id].derived and persist cross-step values in session_state when needed.\n"
-            "Extract upstream variables only from nodes listed in DEPENDENCIES and from keys present in those dependencies' derived payloads.\n"
-            "When dependency context is provided, treat it as authoritative for dependency ids and derived keys; do not invent non-existent upstream keys.\n"
-            "Keep card payload JSON-serializable and derived payload structured for downstream nodes.\n"
-            "This node can consume direct user input when the workflow step is configured with inputRequired=true.\n\n"
-        )
-
-    def get_feedback_contract_text(self) -> str:
-        reference = resolve_workflow_node_reference(meta_node_kind="WorkflowSkillNode")
-        subclass_hook_text = _reference_method_signature_text(reference, reference.subclass_implementation_methods)
-        return (
-            "Preserve the WorkflowSkillNode contract "
-            f"(STEP_ID/TITLE/PROMPT/DEPENDENCIES/SKILL_DIR/SKILL_MD_PATH and {subclass_hook_text} returning StepRunOutput).\n"
-        )
-
-
-@dataclass
 class RequestNodeFileCoder(PromptNodeFileCoderBase):
     """Generate any node kind using request metadata, never per-request instance fields."""
-
-    skills_root_path: str = ""
-    default_skills_dirname: str = "skills"
 
     __hash__ = object.__hash__
 
@@ -942,8 +758,6 @@ class RequestNodeFileCoder(PromptNodeFileCoderBase):
         )
         if reference.meta_node_kind == "WorkflowFileNode":
             return WorkflowFileNodeCoder
-        if reference.meta_node_kind == "WorkflowSkillNode":
-            return WorkflowSkillNodeCoder
         return WorkflowStepNodeCoder
 
     def get_node_contract_text(self, node_meta: NodeMeta | None = None) -> str:
@@ -961,7 +775,7 @@ class RequestNodeFileCoder(PromptNodeFileCoderBase):
             )
         return coder.get_feedback_contract_text(self)
 
-    def _node_reference_context(self, node_meta: NodeMeta, root_dir_path: str) -> str:
+    def _node_reference_context(self, node_meta: NodeMeta) -> str:
         ext_data = node_meta.ext_data if isinstance(node_meta.ext_data, Mapping) else {}
         coder = self._contract_coder(node_meta)
         if coder is WorkflowFileNodeCoder:
@@ -976,26 +790,7 @@ class RequestNodeFileCoder(PromptNodeFileCoderBase):
                 "- Return the actual persisted location/identifier in derived only after storage succeeds; "
                 "never fabricate persistence results.\n"
             )
-        if coder is not WorkflowSkillNodeCoder:
-            return ""
-
-        skills_root = _resolve_named_root(self.skills_root_path, root_dir_path, self.default_skills_dirname)
-        skill_name = str(ext_data.get("skill_name", "")).strip()
-        sections = _parse_markdown_sections(_read_named_markdown(skills_root, skill_name, "skill.md"))
-        skill_dir = str(skills_root / skill_name) if skill_name else "path/to/skill/dir"
-        lines = [
-            "", "Skill node context (authoritative):",
-            f"- skills_root: {skills_root}",
-            f"- selected_skill_name: {skill_name or 'none'}",
-            f"- SKILL_DIR class constant must be set to: {skill_dir}",
-            "- Set SKILL_MD_PATH = str(Path(SKILL_DIR) / 'skill.md') so the base class parses the skill doc on init.",
-            "- Invoke the skill exactly as described in ## Using; use self.skill_using and self.skill_examples as references.",
-            "- Keep output JSON-serializable and expose useful derived fields for downstream nodes.",
-        ]
-        for heading in ("Using", "Examples"):
-            if sections.get(heading):
-                lines.extend(["", f"skill.md ## {heading} section (authoritative):", sections[heading]])
-        return "\n" + "\n".join(lines)
+        return ""
 
     def _build_requirement_prompt(
         self,
@@ -1024,7 +819,7 @@ class RequestNodeFileCoder(PromptNodeFileCoderBase):
             ancestor_session_state_context=ancestor_session_state_context,
             root_dir_path=root_dir_path, additional_generation_context=additional_generation_context,
         )
-        return prompt + self._node_reference_context(node_meta, root_dir_path)
+        return prompt + self._node_reference_context(node_meta)
 
     def _build_amendment_prompt(
         self,
@@ -1039,6 +834,5 @@ class RequestNodeFileCoder(PromptNodeFileCoderBase):
         )
         node_meta = self._request_node_meta()
         if node_meta is not None:
-            request = self._writer_request()
-            prompt += self._node_reference_context(node_meta, str(request.get("root_dir_path", "")))
+            prompt += self._node_reference_context(node_meta)
         return prompt

@@ -31,17 +31,15 @@ class GraphPlanner(Coder):
 
 	`ext_data` should be a JSON object for every node with shape:
 	{
-		"type": "user_input" | "user_file_input" | "url" | "file" | "db" | "skill" | "none" | ...,
-		"desc": "short description",
-		"skill_name": "optional skill directory name (required when type=skill)"
+		"type": "user_input" | "user_file_input" | "url" | "file" | "db" | "none" | ...,
+		"desc": "short description"
 	}
 
 	Use `{"type": "user_input", ...}` for nodes that require user input.
-	For user_input and skill nodes, include `inputs_format` as an object describing expected
+	For user_input nodes, include `inputs_format` as an object describing expected
 	user input fields and primitive types, e.g.:
 	{"email_address": "string", "password": "number"}. 
 	Use `{"type": "user_file_input", ...}` for nodes that should be implemented as WorkflowFileNode.
-	Use `{"type": "skill", "skill_name": "<skill>", ...}` for nodes that should be implemented as WorkflowSkillNode.
 	"""
 
 	STEP_ID = "plan_graph"
@@ -50,10 +48,7 @@ class GraphPlanner(Coder):
 	__hash__ = object.__hash__
 
 	prompt_path: str = "architect/prompts/graph_planner_prompt.md"
-	default_skills_dirname: str = "skills"
-	skills_root_path: str = ""
 	NONE_EXT_DESC: str = "no need for ext data"
-	SKILL_EXT_DESC: str = "skill node"
 
 	def __post_init__(self) -> None:
 		apply_node_settings(self)
@@ -72,144 +67,6 @@ class GraphPlanner(Coder):
 		)
 		super().__post_init__()
 
-	# ------------------------------------------------------------------
-	# Skill helpers
-	# ------------------------------------------------------------------
-
-	def _default_skills_root(self) -> Path:
-		if self.skills_root_path:
-			configured = Path(self.skills_root_path).expanduser().resolve()
-			if configured.is_dir():
-				return configured
-		root_dir = ROOT_DIR.parent
-		direct = root_dir / self.default_skills_dirname
-		if direct.is_dir():
-			return direct
-		# also look one level up
-		parent = root_dir.parent / self.default_skills_dirname
-		if parent.is_dir():
-			return parent
-		# fall back to sibling of the core package root
-		pkg_sibling = ROOT_DIR.parent / self.default_skills_dirname
-		if pkg_sibling.is_dir():
-			return pkg_sibling
-		return direct
-
-	def _list_available_skills(self) -> list[str]:
-		skills_root = self._default_skills_root()
-		if not skills_root.is_dir():
-			return []
-		return sorted(
-			child.name
-			for child in skills_root.iterdir()
-			if child.is_dir() and (child / "skill.md").is_file()
-		)
-
-	def _read_skill_markdown(self, skills_root: Path, skill_name: str) -> str:
-		if not skill_name:
-			return ""
-		skill_doc = skills_root / skill_name / "skill.md"
-		if not skill_doc.is_file():
-			return ""
-		return skill_doc.read_text(encoding="utf-8").strip()
-
-	def _extract_skill_description(self, skill_markdown: str) -> str:
-		"""Return the text under the ## Description section of a skill.md."""
-		if not skill_markdown.strip():
-			return ""
-		from flowx_core.tools.file_tools import parse_skill_md
-		sections = parse_skill_md(skill_markdown)
-		desc = sections.get("Description", "").strip()
-		if desc:
-			return " ".join(desc.splitlines()).strip()
-		# fall back to first non-empty, non-heading line
-		for line in skill_markdown.splitlines():
-			stripped = line.strip()
-			if stripped and not stripped.startswith("#") and not stripped.startswith("`"):
-				return stripped
-		return ""
-
-	def _skill_descriptions(self, skills_root: Path, available_skills: list[str]) -> dict[str, str]:
-		descriptions: dict[str, str] = {}
-		for skill_name in available_skills:
-			skill_markdown = self._read_skill_markdown(skills_root, skill_name)
-			description = self._extract_skill_description(skill_markdown)
-			if description:
-				descriptions[skill_name] = description
-		return descriptions
-
-	def _normalize_skill_key(self, value: str) -> str:
-		clean = value.strip().lower()
-		for sep in ("_", "-", " "):
-			clean = clean.replace(sep, "")
-		return clean
-
-	def _resolve_skill_name(self, node: dict[str, Any], available_skills: list[str]) -> str:
-		if not available_skills:
-			return ""
-
-		ext_data = node.get("ext_data", {})
-		skill_name = ""
-		if isinstance(ext_data, dict):
-			skill_name = str(ext_data.get("skill_name", "")).strip()
-
-		by_key = {self._normalize_skill_key(name): name for name in available_skills}
-
-		if skill_name:
-			matched = by_key.get(self._normalize_skill_key(skill_name))
-			if matched:
-				return matched
-
-		search_texts: list[str] = []
-		for key in ("name", "type", "desc"):
-			val = node.get(key, "")
-			if isinstance(val, str) and val.strip():
-				search_texts.append(val)
-		if isinstance(ext_data, dict):
-			ext_desc = ext_data.get("desc", "")
-			if isinstance(ext_desc, str) and ext_desc.strip():
-				search_texts.append(ext_desc)
-
-		for text in search_texts:
-			norm_text = self._normalize_skill_key(text)
-			for key, canonical in by_key.items():
-				if key and key in norm_text:
-					return canonical
-
-		if len(available_skills) == 1:
-			return available_skills[0]
-
-		return ""
-
-	def _skill_bootstrap_desc(self, skill_name: str, skill_descriptions: dict[str, str]) -> str:
-		description = skill_descriptions.get(skill_name, "").strip()
-		if not description:
-			return self.SKILL_EXT_DESC
-		return f"skill node: {description}"
-
-	def _build_skill_context_prompt(self) -> str:
-		skills_root = self._default_skills_root()
-		available_skills = self._list_available_skills()
-		skill_descriptions = self._skill_descriptions(skills_root, available_skills)
-		skills_text = ", ".join(available_skills) if available_skills else "none"
-		skill_lines = [
-			"Skill planning context:\n"
-			f"- default_skills_root: {skills_root}\n"
-			f"- available_skills_name: {skills_text}\n"
-			"- If choosing WorkflowSkillNode semantics, set ext_data.type='skill' and ext_data.skill_name to one exact available_skills_name entry.\n"
-		]
-		if skill_descriptions:
-			skill_lines.append("- skill_descriptions_from_skill_md:\n")
-			for skill_name in available_skills:
-				description = skill_descriptions.get(skill_name, "")
-				if not description:
-					continue
-				skill_lines.append(f"  - {skill_name}: {description}\n")
-			skill_lines.append(
-				"- For skill-type nodes, choose skill_name by matching requirement semantics to skill_descriptions_from_skill_md, and reflect that purpose in node desc/ext_data.desc.\n"
-			)
-		return "".join(skill_lines)
-
 	def _graph_plan_contract_prompt(self) -> str:
 		operation_reference = resolve_workflow_node_reference(ext_data={"type": "none"})
 		lines = [
@@ -219,7 +76,7 @@ class GraphPlanner(Coder):
 			"- type must be identical to name.\n",
 			"- meta_node_kind must exactly match one value returned by the injected ag_ui_workflow base-node meta_node_kind() catalog.\n",
 			"- Use meta_node_kind as the authoritative base-node selection for downstream subclass generation and auditing.\n",
-			"- ext_data must be a JSON object with keys: type, desc, plus skill_name when the selected base node is a skill node.\n",
+			"- ext_data must be a JSON object with keys: type, desc.\n",
 			"- Use node-level loop to represent repeated execution; default loop=1.\n",
 			"- Include inputs_format only when the selected base node's step_meta contract supports explicit input fields.\n",
 			"- Do not invent node categories outside the injected ag_ui_workflow base-node catalog.\n",
@@ -233,8 +90,6 @@ class GraphPlanner(Coder):
 			line = (
 				f"- When meta_node_kind='{reference.meta_node_kind}', ext_data.type must be '{reference.recommended_ext_data_type}'."
 			)
-			if reference.recommended_ext_data_type == "skill":
-				line += " ext_data.skill_name must be an exact available skill directory name."
 			lines.append(f"{line}\n")
 		lines.extend(
 			[
@@ -251,10 +106,6 @@ class GraphPlanner(Coder):
 		nodes = payload.get("nodes", [])
 		if not isinstance(nodes, list):
 			return
-
-		available_skills = self._list_available_skills()
-		skills_root = self._default_skills_root()
-		skill_descriptions = self._skill_descriptions(skills_root, available_skills)
 
 		for node in nodes:
 			if not isinstance(node, dict):
@@ -286,12 +137,10 @@ class GraphPlanner(Coder):
 				ext_data = {"type": default_ext_type, "desc": ""}
 				if default_ext_type == "none":
 					ext_data["desc"] = self.NONE_EXT_DESC
-				if default_ext_type == "skill":
-					ext_data["skill_name"] = ""
 				node["ext_data"] = ext_data
 
 			ext_type = str(ext_data.get("type", "")).strip().lower()
-			if reference.meta_node_kind in {"WorkflowFileNode", "WorkflowSkillNode"}:
+			if reference.meta_node_kind == "WorkflowFileNode":
 				ext_type = reference.recommended_ext_data_type
 			elif not ext_type:
 				ext_type = reference.recommended_ext_data_type
@@ -300,33 +149,6 @@ class GraphPlanner(Coder):
 				meta_node_kind=node.get("meta_node_kind"),
 				ext_data=ext_data,
 			)
-
-			# ---- skill node normalisation ----
-			skill_name = str(ext_data.get("skill_name", "")).strip()
-			if node["meta_node_kind"] == "WorkflowSkillNode" or ext_type == "skill" or skill_name:
-				ext_data["type"] = "skill"
-				resolved_skill = self._resolve_skill_name(node, available_skills)
-				ext_data["skill_name"] = resolved_skill
-				desc = str(ext_data.get("desc", "")).strip()
-				ext_data["desc"] = desc or self._skill_bootstrap_desc(
-					resolved_skill,
-					skill_descriptions,
-				)
-				# normalize inputs_format for skill nodes
-				raw_inputs_format = node.get("inputs_format", {})
-				normalized_inputs_format: dict[str, str] = {}
-				if isinstance(raw_inputs_format, dict):
-					for key, value in raw_inputs_format.items():
-						input_key = str(key).strip()
-						input_type = str(value).strip().lower()
-						if input_key and input_type:
-							normalized_inputs_format[input_key] = input_type
-				if normalized_inputs_format:
-					node["inputs_format"] = normalized_inputs_format
-				else:
-					node.pop("inputs_format", None)
-				node["meta_node_kind"] = "WorkflowSkillNode"
-				continue
 
 			if node["meta_node_kind"] == "WorkflowStepNode":
 				raw_inputs_format = node.get("inputs_format", {})
@@ -350,10 +172,6 @@ class GraphPlanner(Coder):
 				desc = str(ext_data.get("desc", "")).strip()
 				ext_data["desc"] = desc
 			ext_data.pop("service_name", None)
-			if node["meta_node_kind"] != "WorkflowSkillNode":
-				ext_data.pop("skill_name", None)
-			elif "skill_name" in ext_data and ext_data["skill_name"] is None:
-				ext_data["skill_name"] = ""
 
 		graph_json_path.write_text(
 			json.dumps(payload, ensure_ascii=False, indent=2),
@@ -463,7 +281,6 @@ class GraphPlanner(Coder):
 		user_prompt = (
 			"Generate graph_plan.json from the requirement text below.\n"
 			f"{self._graph_plan_contract_prompt()}"
-			f"{self._build_skill_context_prompt()}"
 			"Return only valid JSON.\n\n"
 			"Requirement text:\n"
 			f"{requirement_text}"
@@ -565,7 +382,6 @@ class GraphPlanner(Coder):
 			"Update the existing graph plan JSON using the amendment provided.\n"
 			"Preserve the graph schema while applying the amendment.\n"
 			f"{self._graph_plan_contract_prompt()}"
-			f"{self._build_skill_context_prompt()}"
 			"Return only valid JSON without code fences or commentary.\n\n"
 			"Existing graph plan:\n"
 			f"{current_plan}\n\n"

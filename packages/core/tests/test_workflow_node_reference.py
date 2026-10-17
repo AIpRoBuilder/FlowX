@@ -25,7 +25,6 @@ def test_workflow_node_references_derive_traits_from_meta_node_kind() -> None:
     assert set(references) == {
         "WorkflowStepNode",
         "WorkflowFileNode",
-        "WorkflowSkillNode",
     }
 
     assert references["WorkflowStepNode"].step_meta.get("nodeKind") is None
@@ -45,14 +44,6 @@ def test_workflow_node_references_derive_traits_from_meta_node_kind() -> None:
     assert references["WorkflowFileNode"].step_output_schema_methods == ("process_input",)
     assert references["WorkflowFileNode"].planner_hooks == ("process_input",)
     assert references["WorkflowFileNode"].base_class.__abstractmethods__ == frozenset({"process_input"})
-
-    assert references["WorkflowSkillNode"].capability_category == "skill"
-    assert references["WorkflowSkillNode"].recommended_ext_data_type == "skill"
-    assert references["WorkflowSkillNode"].supports_inputs_format is True
-    assert references["WorkflowSkillNode"].main_utility_methods == ("process_operation",)
-    assert references["WorkflowSkillNode"].subclass_implementation_methods == ("process_operation",)
-    assert references["WorkflowSkillNode"].step_output_schema_methods == ("process_operation",)
-    assert references["WorkflowSkillNode"].planner_hooks == ("process_operation",)
 
     assert render_workflow_method_signatures(
         references["WorkflowStepNode"].base_class,
@@ -247,7 +238,6 @@ def test_undecorated_nodes_keep_identity_and_metadata_validation(tmp_path, repla
 @pytest.mark.parametrize("base_name, hook_name, input_name", [
     ("WorkflowStepNode", "process_input", "user_input"),
     ("WorkflowFileNode", "process_input", "file_bytes"),
-    ("WorkflowSkillNode", "process_operation", "user_input"),
 ])
 def test_auditor_checks_output_dependencies_for_undecorated_nodes(tmp_path, base_name, hook_name, input_name) -> None:
     source = (

@@ -21,7 +21,7 @@
        3) 节点设计（最小可行）
     - 节点设计必须遵循系统注入的 ag_ui_workflow 基类 `step_meta()` / `meta_node_kind()` catalog，不得虚构 catalog 之外的节点能力模型。
     - 每个节点必须显式给出 `meta_node_kind`，值必须直接使用 catalog 中某个基类 `meta_node_kind()` 的返回值。
-   - `WorkflowStepNode` 的 `ext_data.type` 根据行为使用 `user_input`、`none` 或领域外部源类型（如 `url`、`file`、`db`）；`WorkflowFileNode` 使用 `user_file_input`；`WorkflowSkillNode` 使用 `skill`。
+   - `WorkflowStepNode` 的 `ext_data.type` 根据行为使用 `user_input`、`none` 或领域外部源类型（如 `url`、`file`、`db`）；`WorkflowFileNode` 使用 `user_file_input`。
    - 节点设计输出格式固定为表格，字段为【节点ID | meta_node_kind | ext_data.type | 作用 | depends】。
     - 仅输出最少必要节点；避免冗余节点与重复说明。
 

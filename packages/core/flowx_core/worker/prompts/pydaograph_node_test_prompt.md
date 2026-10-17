@@ -21,7 +21,7 @@ Guidelines:
 - Avoid testing ag_ui_workflow base classes themselves; test the generated node subclass behavior.
 - When the node needs file input, use tmp_path and create the smallest real sample file payload required.
 - When the node needs environment variables, set only the exact variables implied by the node code.
-- When the node uses skill installation or remote APIs, monkeypatch those boundaries while still executing the node's own logic.
+- When the node uses remote APIs, monkeypatch those boundaries while still executing the node's own logic.
 - Assert that behavioral tests return StepRunOutput and that the relevant card or derived content matches the node code.
 
 Preferred test shape:

@@ -13,12 +13,11 @@ from ag_ui_workflow import StepRunOutput
 import flowx_core.worker.node_writer as node_writer
 from flowx_core.worker.node_writer import (
     WorkflowFileNodeCoder,
-    WorkflowSkillNodeCoder,
     WorkflowStepNodeCoder,
 )
 
 
-@pytest.mark.parametrize("coder_type", [WorkflowStepNodeCoder, WorkflowFileNodeCoder, WorkflowSkillNodeCoder])
+@pytest.mark.parametrize("coder_type", [WorkflowStepNodeCoder, WorkflowFileNodeCoder])
 def test_process_input_writes_with_all_live_context(tmp_path, monkeypatch, coder_type) -> None:
     coder = coder_type(client=object())
     requirement = tmp_path / "requirement.md"
@@ -89,7 +88,7 @@ def test_process_input_amends_with_fresh_runtime_context(tmp_path, monkeypatch) 
     assert "INPUT_REQUIRED is UI metadata only" in prompts[0]
 
 
-@pytest.mark.parametrize("coder_type", [WorkflowStepNodeCoder, WorkflowFileNodeCoder, WorkflowSkillNodeCoder])
+@pytest.mark.parametrize("coder_type", [WorkflowStepNodeCoder, WorkflowFileNodeCoder])
 def test_coder_includes_pooled_runtime_input_policy(coder_type) -> None:
     coder = coder_type(client=object())
     assert "self.setWaitFunc(self.wait_function)" in coder.system_prompt
@@ -203,7 +202,7 @@ def test_file_coder_repair_preserves_bytes_hook_and_gate(tmp_path, monkeypatch) 
     assert "Do not normalize file_path/base64/files/uploads in this subclass" in prompts[0]
 
 
-@pytest.mark.parametrize("coder_type", [WorkflowStepNodeCoder, WorkflowFileNodeCoder, WorkflowSkillNodeCoder])
+@pytest.mark.parametrize("coder_type", [WorkflowStepNodeCoder, WorkflowFileNodeCoder])
 def test_node_prompts_do_not_require_global_registration_or_cloning(coder_type) -> None:
     coder = coder_type(client=object())
     assert "ordinary undecorated subclasses" in coder.system_prompt

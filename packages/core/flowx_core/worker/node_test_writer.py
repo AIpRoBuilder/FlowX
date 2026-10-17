@@ -33,7 +33,6 @@ _WORKFLOW_BASE_CLASS_NAMES = frozenset(
     {
         "WorkflowStepNode",
         "WorkflowFileNode",
-        "WorkflowSkillNode",
     }
 )
 
@@ -194,7 +193,6 @@ class PromptNodeTestFileCoder(Coder):
             "- Include one identity test that covers importability plus STEP_ID and step_meta basics.\n"
             "- Include at least one behavioral test focused on the node's primary StepRunOutput contract.\n"
             "- For WorkflowFileNode, call process_input with one bytes payload (including empty bytes when allowed), and assert the subclass's real processing/persistence output. Do not assume inherited saved_files or upload decoding; avoid duplicating base-class tests.\n"
-            "- For WorkflowSkillNode, avoid real installation side effects; monkeypatch installation behavior or create the smallest temporary skill.md needed to instantiate the class.\n"
             "- Return only runnable Python test code with no markdown fences or commentary.\n\n"
             "Selected ag_ui_workflow base-node reference (authoritative):\n"
             f"{render_workflow_node_reference(reference)}\n\n"
