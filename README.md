@@ -2,26 +2,27 @@
 
 <div align="center">
   <h1>FlowX</h1>
-  <p><strong>FlowX is building the Generative Workflow layer for AI Agents.</strong></p>
-  <p>From user intent to executable, inspectable, evolving workflows.</p>
+  <p><strong>Generate, run, and refine AI agent workflows from natural language — via MCP, Python SDK, or A2A.</strong></p>
+  <p>An open-source Generative Workflow layer: intent → workflow graph → node code → runnable FastAPI backend.</p>
   <p>
-    <a href="#see-the-idea-in-45-seconds">See the idea</a> ·
-    <a href="#quickstart">Quickstart</a> ·
-    <a href="https://modelcontextprotocol.io">Model Context Protocol</a> ·
+    <a href="#quickstart-in-5-minutes">Quickstart</a> ·
+    <a href="#why-flowx">Why FlowX</a> ·
+    <a href="#example-workflows">Examples</a> ·
+    <a href="#tool-surface">MCP tools</a> ·
     <a href="#python-sdk">Python SDK</a> ·
     <a href="#a2a-server">A2A</a> ·
-    <a href="https://github.com/AIpRoBuilder/ag_ui_worflow">ag_ui_workflow</a>
+    <a href="docs/DYNAMIC_WORKFLOW.md">Docs</a>
   </p>
   <p>
     <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0" />
     <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB.svg" alt="Python 3.10+" />
-    <img src="https://img.shields.io/badge/MCP-Local%20stdio-0A7E3B.svg" alt="Local stdio MCP" />
+    <img src="https://img.shields.io/badge/MCP-Local%20stdio-0A7E3B.svg" alt="Local stdio MCP server" />
+    <img src="https://img.shields.io/badge/A2A-non--streaming-6f42c1.svg" alt="A2A adapter" />
+    <a href="https://github.com/AIpRoBuilder/FlowX/stargazers"><img src="https://img.shields.io/github/stars/AIpRoBuilder/FlowX?style=social" alt="GitHub stars" /></a>
   </p>
 </div>
 
-An intelligent UI should do more than display an answer. It should help an agent turn a user's intent into a process that can actually run—and adapt when the intent changes.
-
-FlowX provides that **Generative Workflow layer**: agents generate a workflow graph, node implementations, and a runnable backend from natural language, then inspect, execute, and refine those artifacts through the same conversation. The workflow becomes a reusable process, not just a one-off response or a static plan.
+FlowX is an **MCP server and Python SDK that lets AI agents build workflows**. Describe a process in plain language; FlowX generates the workflow graph (`workflow.json`), the node implementations, and a runnable FastAPI backend. The agent can then inspect, run, and change that workflow in the same conversation, so it becomes a reusable process instead of a one-off answer.
 
 **Describe → Generate → Inspect → Run → Refine → Reuse.**
 
@@ -34,6 +35,30 @@ FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 </p>
 
 *Illustrative walkthrough, not a live recording. Your existing agent remains the assistant; FlowX provides its workflow capability behind the conversation. Messages and per-node cards illustrate what the host UI can render, independent of transport. FlowX does not bundle this interface or automatically generate these card layouts. Generation and execution times are illustrative. See the [storyboard and rendering instructions](assets/README-demo.md).*
+
+## Why FlowX
+
+| Instead of… | FlowX gives you… |
+| --- | --- |
+| A one-off chat answer | A reusable workflow stored on disk under `workspace/workflows/<workflow_id>` |
+| A hand-drawn, static flow | A graph and node code generated from intent, audited, and editable |
+| Re-prompting from scratch | Follow-up changes that rebuild only the affected nodes |
+| A hosted black box | A local, Apache-2.0 engine usable from any MCP-capable client, the Python SDK, or A2A |
+
+## Quickstart in 5 minutes
+
+```bash
+python3.10 -m venv .venv && source .venv/bin/activate
+python -m pip install -e .
+cp .env.example .env   # set FLOWX_LLM_PROVIDER, FLOWX_LLM_MODEL, FLOWX_LLM_API_KEY, FLOWX_DEFAULT_WORKSPACE
+flowx-mcp
+```
+
+Register `flowx-mcp` in your MCP client ([config example](#3-register-flowx-in-an-mcp-client)), then ask:
+
+> Use flowx to build a workflow that accepts a support ticket, classifies its category, assigns a priority, and drafts a reply.
+
+Other installers (Poetry, uv, conda, a local `ag_ui_workflow` checkout) are covered in [Installation](#installation).
 
 ## The workflow layer behind intelligent UIs
 
@@ -78,25 +103,23 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-#### Poetry
+<details>
+<summary>Poetry, uv, or conda</summary>
 
 ```bash
+# Poetry
 poetry env use python3.10
 poetry install
-```
 
-#### uv
-
-```bash
+# uv
 uv sync
-```
 
-#### conda
-
-```bash
+# conda
 conda env create -f environment.yml
-conda activate flowx-mcp
+conda activate flowx
 ```
+
+</details>
 
 ### Install with a local AG-UI workflow checkout
 
@@ -112,74 +135,38 @@ python -m pip install -e ../ag_ui_worflow --no-deps
 python -m pip install -e . --no-deps
 ```
 
-#### Poetry
+<details>
+<summary>Poetry, uv, or conda</summary>
 
 ```bash
+# Poetry
 poetry env use python3.10
 poetry install
 poetry run pip install -e ../ag_ui_worflow --no-deps
-```
 
-#### uv
-
-```bash
+# uv
 uv venv --python 3.10
 uv pip install --python .venv/bin/python -e ../ag_ui_worflow --no-deps
 uv pip install --python .venv/bin/python -e . --no-deps
-```
 
-#### conda
-
-```bash
+# conda
 conda env create -f environment.yml
 conda activate flowx
 pip install -e ../ag_ui_worflow --no-deps
 pip install -e . --no-deps
 ```
 
+</details>
+
 For source-checkout execution, FlowX automatically discovers each `packages/*` component. Set `FLOWX_EXTRA_PATHS` only when the external `ag_ui_workflow` source is not installed.
 
 ### Workflow runtime compatibility
 
-FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream
-revision `3e1e15b` (2026-10-13). That revision still reports package version `0.1.0`;
-the version string alone does not distinguish the older API.
+FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream revision `3e1e15b` (2026-10-13). Contract details for contributors are in [docs/RUNTIME.md](docs/RUNTIME.md).
 
-- JSON pipeline pools require `node_classes`, keyed by each JSON node's `name`,
-  with true concrete classes taken from a `NODES` tuple:
-  `NODE_CLASSES = {node.STEP_ID: node for node in NODES}`.
-  Only `name` and `depends` are needed for internal workflows; a JSON `type`, if
-  included, is the concrete class name. FlowX uses no factories, partials, generated
-  wrapper subclasses, or global class configuration mutation.
-- Internal generation/repair workflows construct the actual node types once per
-  pool slot. Callers explicitly snapshot dataclass init fields, retaining shallow
-  references to injected clients and recording sinks. The private
-  `node_settings(settings)` construction scope applies these values once to each
-  instance before prompt composition and restores its `ContextVar` in `finally`.
-  Settings are isolated between concurrent construction contexts, not stored on
-  classes. Replacing a prototype or monkeypatching its methods afterward does not
-  change pooled nodes.
-  Use request state for per-run settings and `reset_llm_config()` to recreate
-  pools after changing LLM configuration.
-- `init_workflow_engine(node_classes, workflow_config)` constructs the shared
-  pool and engine directly, passing `node_classes` unchanged to the pool. Nodes
-  declare fixed step IDs/dependencies and provide their own `step_meta()`.
-  Configured workflows scope instance settings around this initialization call;
-  no constructor inference or factory metadata is needed. JSON supplies the topology
-  and optional `pool_size`; there is no separate configuration object or constructor map.
-  Use `engine.run()` and `engine.answer()` for interactive runs; `run_workflow()`
-  requires completion for the noninteractive generation/repair workflows.
-- `WorkflowFileNode` subclasses implement `process_input(file_bytes, dependency_results,
-  session_state)`. Generated backends decode one file path/base64 upload to bytes;
-  subclasses own processing and any persistence. Multiple uploads must be handled
-  explicitly rather than relying on inherited storage.
-- Nodes install their own wait callbacks. Paused requests retain a pipeline slot;
-  session reset cancels the old request before rotating its ID. Pool size comes
-  from the planning config and resources close at backend shutdown.
+## Setup and first workflow
 
-## Quickstart
-
-The fastest way to try the describe → generate → run → refine loop is through a local MCP-capable agent client.
+The describe → generate → run → refine loop works through any local MCP-capable agent client.
 
 ### 1. Configure FlowX
 
@@ -361,9 +348,6 @@ These MCP tools let the host agent operate the workflow layer from the same conv
 ## Example workflows
 
 Different intents, the same workflow layer: analysis, file transformation, and information collection can each become an executable process. Paste the prompts below into an MCP client connected to your local `flowx` server, then inspect, run, and refine the generated workflow. The screenshots are example outputs, not a bundled FlowX UI; external data sources may require their own access and dependencies.
-
-<details>
-<summary><strong>Example workflow prompts</strong></summary>
 
 ### 1. `stock_pressure`
 
@@ -659,7 +643,9 @@ Use flowx to build a crawler workflow that finds the founders of n AI startups t
   <img src="assets/start-up-hiring.png" alt="start-up-hiring workflow example" width="720" />
 </p>
 
-</details>
+## Contributing
+
+Issues and pull requests are welcome. If FlowX is useful to you, star the repo, share a workflow you generated, or open an issue describing an intent you want turned into a workflow. When you redistribute or modify FlowX, keep the [LICENSE](LICENSE) and [NOTICE](NOTICE) attribution (see [docs/PROVENANCE.md](docs/PROVENANCE.md)).
 
 ## Contact
 

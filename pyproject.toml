@@ -9,6 +9,7 @@ description = "Generative Workflow layer for AI Agents with MCP, SDK, and A2A in
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+keywords = ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "agent-workflow", "workflow-generation", "a2a", "llm", "fastapi"]
 dependencies = [
     "ag-ui-workflow @ git+https://github.com/AIpRoBuilder/ag_ui_worflow.git",
     "fastapi>=0.110",
@@ -18,10 +19,12 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
-classifiers = [
+classDevelopment Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
 [project.scripts]
@@ -29,6 +32,8 @@ flowx-mcp = "flowx_mcp.server:main"
 flowx-a2a = "flowx_a2a.server:main"
 
 [project.urls]
+Repository = "https://github.com/AIpRoBuilder/FlowX"
+Issues = "https://github.com/AIpRoBuilder/FlowX/issues
 Repository = "https://github.com/AIpRoBuilder/FlowX"
 "Attribution and provenance" = "https://github.com/AIpRoBuilder/FlowX/blob/main/docs/PROVENANCE.md"
 
