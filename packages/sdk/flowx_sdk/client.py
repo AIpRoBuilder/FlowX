@@ -5,6 +5,7 @@
 # Modified 2026-10-15: clarify builder-owned artifacts and reusable workflows.
 # Modified 2026-10-15: document deferred batch orchestration and partial-update risks.
 # Modified 2026-10-16: expose the AgentBuilder engine API (build_*, run_service) through one builder.
+# Modified 2026-10-19: add evolve (workflow, one node, or judged) and list_nodes.
 """Python SDK for building, modifying and running FlowX workflows."""
 
 from __future__ import annotations
@@ -87,6 +88,24 @@ class FlowXClient:
     def build_workflow(self, prompt: str = "", *, workflow_id: str | None = None, **options: Any) -> AgentResult:
         """Run the whole engine on a free-text request and/or ``logs=[...]``; later stages follow earlier changes."""
         return self.builder.build_workflow(prompt, workflow_id=workflow_id, **options)
+
+    def evolve(
+        self, workflow_id: str, command: str, *, target: str | None = None, **options: Any,
+    ) -> AgentResult:
+        """Evolve an existing workflow by ``command``.
+
+        ``target="workflow"`` changes the workflow itself (its graph; nodes and main entrypoint
+        follow with ``cascade``). A node step id or node id from :meth:`list_nodes` changes only
+        that node. Without ``target`` the engine judges which part the command refers to.
+        """
+        text = str(command).strip()
+        if not text:
+            raise ValueError("command must be a non-empty string")
+        return self.builder.evolve(workflow_id, text, target=target, **options)
+
+    def list_nodes(self, workflow_id: str) -> list[dict[str, Any]]:
+        """The workflow's nodes as ``{"step_id", "node_id", "version"}``; ``node_id`` is None until built."""
+        return self.builder.engine.list_nodes(workflow_id)
 
     def run_service(self, workflow_id: str) -> dict[str, Any]:
         """Start (or restart) the workflow's main entrypoint as a service; returns process info."""

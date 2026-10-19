@@ -87,10 +87,14 @@ class AgentRequest:
 	also runs the later stages that depend on it. ``fix_errors`` adds the errors retained
 	from earlier runs of the workflow; ``node_options`` are extra ``DynamicWorkflowRequest``
 	fields (temperatures, ``force_nodes``, ``node_formats`` ...).
+
+	``target`` names what ``prompt`` evolves: ``"workflow"`` for the workflow itself, or a node
+	step id or node id of ``workflow_id`` for that node only. Without it the judge decides.
 	"""
 
 	prompt: str = ""
 	workflow_id: str | None = None
+	target: str | None = None
 	logs: tuple[str, ...] = ()
 	fix_errors: bool = False
 	intent: AgentIntent | None = None
@@ -104,6 +108,10 @@ class AgentRequest:
 	serve: bool = False
 
 	def __post_init__(self) -> None:
+		if self.target is not None and (not isinstance(self.target, str) or not self.target.strip()):
+			raise ValueError("target must be a non-empty string")
+		if self.target is not None and self.intent is not None:
+			raise ValueError("pass either target or intent, not both")
 		object.__setattr__(self, "logs", (self.logs,) if isinstance(self.logs, str) else tuple(self.logs))
 		limits = [self.max_retries] if isinstance(self.max_retries, int) else list(self.max_retries.values())
 		if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in limits):
@@ -281,7 +289,8 @@ class _ReformatStep(WorkflowStepNode):
 				return resolve_intent(request.intent, catalog)
 			return build_intent(
 				prompt=request.prompt, logs=request.logs, fix_errors=request.fix_errors,
-				workflow_id=request.workflow_id, catalog=catalog, judge=agent.judge, feedback=failure,
+				workflow_id=request.workflow_id, target=request.target, catalog=catalog,
+				judge=agent.judge, feedback=failure,
 			)
 
 		intent, attempts, error = _with_retries(request.retries("reformat"), attempt)
@@ -669,6 +678,23 @@ class AgentWorkflowEngine:
 			},
 		}
 
+	def list_nodes(self, workflow_id: str) -> list[dict[str, Any]]:
+		"""The workflow's enabled nodes as ``{step_id, node_id, version}``; ``node_id`` is None until built."""
+		record = self.record(workflow_id)
+		try:
+			versions = _orchestrator(workflow_id).get_workflow_version().node_versions
+		except KeyError:
+			versions = {}
+		steps = _enabled_nodes(record.graph_path) or list(versions)
+		return [
+			{
+				"step_id": name,
+				"node_id": versions[name].node_id if name in versions else None,
+				"version": versions[name].version if name in versions else 0,
+			}
+			for name in steps
+		]
+
 	def runtime(self) -> RuntimeService:
 		if self._runtime is None:
 			raise RuntimeError("no runtime service is configured")
@@ -740,6 +766,15 @@ class AgentWorkflowEngine:
 	def build_workflow(self, prompt: str = "", *, workflow_id: str | None = None, **options: Any) -> AgentResult:
 		"""Run the whole engine on a free-text request and/or logs; later stages follow earlier changes."""
 		return self.run(AgentRequest(prompt=prompt, workflow_id=workflow_id, **options))
+
+	def evolve(
+		self, workflow_id: str, command: str, *, target: str | None = None, **options: Any,
+	) -> AgentResult:
+		"""Evolve ``workflow_id`` by ``command``: all of it (``target="workflow"``), one node (its step id or
+		node id), or, without ``target``, whatever the judge decides the command refers to."""
+		if not command.strip():
+			raise ValueError("command must be a non-empty string")
+		return self.run(AgentRequest(prompt=command, workflow_id=workflow_id, target=target, **options))
 
 	def run_service(self, workflow_id: str) -> dict[str, Any]:
 		"""Start the workflow's main entrypoint as a service, replacing a previous run of it."""

@@ -239,6 +239,17 @@ with FlowXClient(workspace="./workflows") as flowx:
 
 Each build call returns an `AgentResult` with per-stage outcomes, unresolved errors, logs and artifact paths; stage failures are reported there rather than raised.
 
+To change an existing workflow, choose what to evolve with `evolve(workflow_id, command, target=...)`. `list_nodes` returns each node's step id and node id to use as a target; without a `target` the engine decides what the command refers to. A runnable walkthrough is in [examples/sdk_evolve.py](examples/sdk_evolve.py).
+
+```python
+from flowx_sdk import WORKFLOW_TARGET
+
+nodes = flowx.list_nodes(workflow_id)   # [{"step_id": ..., "node_id": ..., "version": ...}]
+flowx.evolve(workflow_id, "Add a language-detection step.", target=WORKFLOW_TARGET)  # the workflow
+flowx.evolve(workflow_id, "Validate empty input.", target=nodes[0]["step_id"])       # one node (step id or node id)
+flowx.evolve(workflow_id, "Also return a one-line summary.")                         # engine judges
+```
+
 ### A2A server
 
 Let another agent delegate workflow generation to FlowX through the non-streaming Agent2Agent endpoint:
@@ -272,7 +283,7 @@ Update the draft_reply node: for urgent tickets, include an escalation note.
 Then rerun the service.
 ```
 
-The client uses `build_workflow` (or `build_workflow_json`, `build_nodes` and `build_main_entrypoint` one stage at a time) to create and refine the workflow, and `run_service` to start or restart it. `list_workflows` and `get_workflow` show the workflow ids and artifact locations. Exact step IDs come from the generated workflow—not from a fixed demo schema.
+The client uses `build_workflow` (or `build_workflow_json`, `build_nodes` and `build_main_entrypoint` one stage at a time) to create and refine the workflow, and `run_service` to start or restart it. `evolve_workflow` changes an existing workflow or one node (`target="workflow"`, a node step id or node id from `list_nodes`, or no target to let FlowX decide). `list_workflows`, `list_nodes` and `get_workflow` show the workflow ids, node ids and artifact locations. Exact step IDs come from the generated workflow—not from a fixed demo schema.
 
 This is the distinction: the agent does not only answer the ticket. It builds and evolves the process for handling the next one.
 
@@ -340,9 +351,11 @@ These MCP tools let the host agent operate the workflow layer from the same conv
 | Build | `build_nodes` | Build a workflow's nodes, or amend specific nodes by step id; unchanged nodes are reused. |
 | Build | `build_main_entrypoint` | Create or regenerate the main entrypoint from the latest nodes. |
 | Build | `build_workflow` | Create or modify the whole workflow from a request and/or run logs; later stages follow earlier changes. |
+| Build | `evolve_workflow` | Evolve an existing workflow (`target="workflow"`) or one node (step id or node id) with a change command; without `target` the engine decides. |
 | Runtime | `run_service` | Run a built workflow as a service; calling it again reruns the service with the latest files. |
 | Runtime | `stop_service` | Stop a workflow's running service. |
 | Inspection | `list_workflows` | List workflow ids with their node ids, versions and unresolved errors. |
+| Inspection | `list_nodes` | List a workflow's nodes as step id, node id and version; use them as `evolve_workflow` targets. |
 | Inspection | `get_workflow` | Locate a workflow's requirement, `workflow.json`, node versions and main entrypoint. |
 
 ## Example workflows

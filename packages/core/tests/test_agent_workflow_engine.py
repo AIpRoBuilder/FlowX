@@ -411,6 +411,86 @@ def test_the_engine_exposes_each_build_function_separately(world):
 	assert again.artifacts["main_entrypoint"]["version"] == 2
 
 
+def test_list_nodes_reports_step_ids_and_node_ids_once_built(world):
+	agent = world.agent()
+	created = agent.build_workflow_json("collect and publish")
+
+	assert agent.list_nodes(created.workflow_id) == [
+		{"step_id": "Collect", "node_id": None, "version": 0},
+		{"step_id": "Publish", "node_id": None, "version": 0},
+	]
+
+	built = agent.build_nodes(created.workflow_id)
+	listed = agent.list_nodes(created.workflow_id)
+
+	assert [node["step_id"] for node in listed] == ["Collect", "Publish"]
+	assert {node["step_id"]: node["node_id"] for node in listed} == {
+		name: node["node_id"] for name, node in built.artifacts["nodes"].items()
+	}
+	with pytest.raises(KeyError):
+		agent.list_nodes("missing")
+
+
+def test_evolve_a_node_by_step_id_or_node_id_skips_the_judge_and_follows_to_main(world):
+	agent = world.agent()
+	built = agent.build_workflow("collect and publish")
+	publish_id = agent.list_nodes(built.workflow_id)[1]["node_id"]
+
+	by_name = agent.evolve(built.workflow_id, "validate the input", target="Collect")
+	by_id = agent.evolve(built.workflow_id, "also log", target=publish_id)
+
+	assert by_name.ok and by_id.ok, (by_name.errors, by_id.errors)
+	assert not world.prompts
+	assert _statuses(by_name) == ["completed", "skipped", "completed", "completed"]
+	assert by_name.stages["nodes"].artifacts["changed_nodes"] == ["Collect"]
+	assert by_id.stages["nodes"].artifacts["changed_nodes"] == ["Publish"]
+	assert by_id.artifacts["main_entrypoint"]["version"] == 3
+	amended = [request for request in world.generation.requests[2:] if request.node_amendment]
+	assert [(r.node_meta.name, r.node_amendment) for r in amended] == [
+		("Collect", "validate the input"), ("Publish", "also log"),
+	]
+
+
+def test_evolve_the_workflow_amends_the_graph_without_the_judge(world):
+	agent = world.agent()
+	built = agent.build_workflow("collect and publish")
+
+	result = agent.evolve(built.workflow_id, "add auditing", target="workflow")
+
+	assert result.ok, result.errors
+	assert not world.prompts
+	assert result.stages["graph"].status == "completed"
+	request = world.graph.requests[-1]
+	assert request.graph_action == "amend" and request.amendment == "add auditing"
+	assert request.requirement_amendment == "add auditing"
+
+
+def test_evolve_without_a_target_lets_the_judge_decide(world):
+	agent = world.agent()
+	built = agent.build_workflow("collect and publish")
+	world.answer = {"node_amendments": {"Publish": "also log"}}
+
+	result = agent.evolve(built.workflow_id, "make Publish log more")
+
+	assert result.ok, result.errors
+	assert len(world.prompts) == 1
+	assert set(result.intent.node_amendments) == {"Publish"}
+
+
+def test_evolve_rejects_bad_commands_and_targets(world):
+	agent = world.agent()
+	built = agent.build_workflow("collect and publish")
+
+	with pytest.raises(ValueError, match="command"):
+		agent.evolve(built.workflow_id, "  ")
+	result = agent.evolve(built.workflow_id, "change it", target="Ghost", max_retries=0)
+	assert not result.ok and "unknown target" in result.errors["reformat"]
+	with pytest.raises(ValueError, match="target"):
+		AgentRequest(prompt="x", target=" ")
+	with pytest.raises(ValueError, match="either target or intent"):
+		AgentRequest(target="workflow", intent=AgentIntent(workflow_id=built.workflow_id))
+
+
 def test_the_main_entrypoint_follows_the_latest_workflow_version_only_when_stale(world):
 	agent = world.agent()
 	result = agent.build_workflow("collect and publish")

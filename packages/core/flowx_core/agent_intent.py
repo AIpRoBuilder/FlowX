@@ -20,6 +20,7 @@ from flowx_core.tools.text_tools import truncate_context
 Mode = Literal["skip", "create", "modify"]
 _MODES = ("skip", "create", "modify")
 FIX_HEADER = "Fix the following output log:"
+WORKFLOW_TARGET = "workflow"
 
 INTENT_SYSTEM_PROMPT = """\
 You route requests for a workflow generator. Answer with one JSON object and no commentary.
@@ -221,6 +222,23 @@ def merge_intents(first: AgentIntent, second: AgentIntent) -> AgentIntent:
 	)
 
 
+def intent_for_target(
+	target: str, instruction: str, *, workflow_id: str, catalog: Mapping[str, Mapping[str, Any]],
+) -> AgentIntent:
+	"""Evolve the whole workflow (``WORKFLOW_TARGET``) or one node, named by step id or node id."""
+	if target == WORKFLOW_TARGET:
+		return AgentIntent(workflow_id=workflow_id, graph=StagePlan("modify", instruction))
+	nodes = catalog[workflow_id]["nodes"]
+	name = target if target in nodes else next((step for step, node_id in nodes.items() if node_id == target), None)
+	if name is None:
+		raise ValueError(
+			f"unknown target {target!r}: use {WORKFLOW_TARGET!r} or a node step id or node id of {sorted(nodes)}"
+		)
+	return AgentIntent(
+		workflow_id=workflow_id, nodes=StagePlan("modify"), node_amendments={name: instruction},
+	)
+
+
 def resolve_intent(intent: AgentIntent, catalog: Mapping[str, Mapping[str, Any]]) -> AgentIntent:
 	"""Check ids against the catalog; a new workflow always starts with a graph create."""
 	if intent.workflow_id is None:
@@ -291,44 +309,57 @@ def build_intent(
 	logs: Iterable[str] = (),
 	fix_errors: bool = False,
 	workflow_id: str | None = None,
+	target: str | None = None,
 	catalog: Mapping[str, Mapping[str, Any]],
 	judge: Callable[[str], str] | None = None,
 	feedback: str = "",
 ) -> AgentIntent:
-	"""Reformat a request: rules place logs and retained errors, the judge reads free text."""
+	"""Reformat a request: rules place logs and retained errors, the judge reads free text.
+
+	With ``target`` (``WORKFLOW_TARGET`` or a node) the prompt is the evolve command for that
+	part and the judge is not consulted.
+	"""
 	text, logs = prompt.strip(), list(logs)
-	target = workflow_id
-	if target is None and (logs or fix_errors) and len(catalog) == 1:
-		target = next(iter(catalog))
-	if target is not None and target not in catalog:
-		raise ValueError(f"unknown workflow_id: {target}")
+	workflow = workflow_id
+	if workflow is None and (logs or fix_errors or target) and len(catalog) == 1:
+		workflow = next(iter(catalog))
+	if target is not None and workflow is None:
+		raise ValueError("target needs an existing workflow: pass workflow_id")
+	if workflow is not None and workflow not in catalog:
+		raise ValueError(f"unknown workflow_id: {workflow}")
 	rule, unmatched = AgentIntent(), logs
-	if target is not None:
-		meta = catalog[target]
+	if workflow is not None:
+		meta = catalog[workflow]
 		rule, unmatched = intent_from_logs(
-			logs, workflow_id=target, node_ids=meta["nodes"], errors=meta["errors"] if fix_errors else None,
+			logs, workflow_id=workflow, node_ids=meta["nodes"], errors=meta["errors"] if fix_errors else None,
 		)
+	if target is not None:
+		if not text and not unmatched:
+			raise ValueError("target needs an evolve command: give a prompt")
+		command = join_text(text, *(fix_text(log) for log in unmatched))
+		evolved = intent_for_target(target, command, workflow_id=workflow, catalog=catalog)
+		return resolve_intent(merge_intents(evolved, rule), catalog)
 	if not text and not unmatched:
 		if rule.is_empty:
 			raise ValueError("nothing to do: give a prompt, output logs or fix_errors with retained errors")
 		return resolve_intent(rule, catalog)
-	if target is None and not catalog:
+	if workflow is None and not catalog:
 		if not text:
 			raise ValueError("a new workflow needs a prompt")
 		return resolve_intent(AgentIntent(requirement=text, graph=StagePlan("create")), catalog)
 	if judge is None:
 		raise ValueError("a judge is required to interpret free text; pass an explicit intent instead")
 	response = judge(build_judge_prompt(
-		prompt=text, logs=unmatched, catalog=catalog, workflow_id=target, feedback=feedback,
+		prompt=text, logs=unmatched, catalog=catalog, workflow_id=workflow, feedback=feedback,
 	))
 	judged = AgentIntent.from_dict(_json_object(response))
-	if target is not None:
-		judged = replace(judged, workflow_id=target)
+	if workflow is not None:
+		judged = replace(judged, workflow_id=workflow)
 	return resolve_intent(merge_intents(judged, rule), catalog)
 
 
 __all__ = [
-	"AgentIntent", "FIX_HEADER", "INTENT_SYSTEM_PROMPT", "StagePlan", "build_intent",
-	"build_judge_prompt", "error_key", "fix_text", "intent_from_logs", "join_text",
+	"AgentIntent", "FIX_HEADER", "INTENT_SYSTEM_PROMPT", "StagePlan", "WORKFLOW_TARGET", "build_intent",
+	"build_judge_prompt", "error_key", "fix_text", "intent_for_target", "intent_from_logs", "join_text",
 	"match_log_to_stage", "merge_intents", "resolve_intent",
 ]

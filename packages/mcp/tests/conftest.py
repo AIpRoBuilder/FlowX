@@ -50,6 +50,12 @@ class FakeClient:
     def build_workflow(self, *args, **kwargs):
         return self._record("build_workflow", *args, **kwargs)
 
+    def evolve(self, *args, **kwargs):
+        return self._record("evolve", *args, **kwargs)
+
+    def list_nodes(self, *args):
+        return self._record("list_nodes", *args)
+
     def run_service(self, *args, **kwargs):
         return self._record("run_service", *args, **kwargs)
 

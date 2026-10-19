@@ -61,6 +61,22 @@ def test_build_methods_delegate_to_the_engine_api(sdk):
     builder.build_workflow.assert_called_once_with("Add a node", workflow_id="wf1", logs=("trace",))
 
 
+def test_evolve_and_list_nodes_delegate_to_the_engine(sdk):
+    builder, client = sdk.builder, sdk.client
+    builder.engine.list_nodes.return_value = [{"step_id": "Reply", "node_id": "n1", "version": 1}]
+
+    client.evolve("wf1", "  Add a summary  ", target="workflow", cascade=False)
+    client.evolve("wf1", "Escalate urgent tickets")
+
+    assert builder.evolve.call_args_list[0].args == ("wf1", "Add a summary")
+    assert builder.evolve.call_args_list[0].kwargs == {"target": "workflow", "cascade": False}
+    assert builder.evolve.call_args_list[1].kwargs == {"target": None}
+    assert client.list_nodes("wf1") == [{"step_id": "Reply", "node_id": "n1", "version": 1}]
+    builder.engine.list_nodes.assert_called_once_with("wf1")
+    with pytest.raises(ValueError, match="command"):
+        client.evolve("wf1", "  ")
+
+
 def test_build_workflow_json_rejects_an_empty_prompt(sdk):
     with pytest.raises(ValueError, match="prompt"):
         sdk.client.build_workflow_json("   ")

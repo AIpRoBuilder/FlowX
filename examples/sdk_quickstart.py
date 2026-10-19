@@ -4,7 +4,7 @@
 Setup (from the repository root):
 
     pip install -e .
-    export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-chat FLOWX_LLM_API_KEY=<your key>
+    export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-flash FLOWX_LLM_API_KEY=<your key>
     python examples/sdk_quickstart.py
 
 Generated workflows are written under ``$FLOWX_DEFAULT_WORKSPACE`` (default ``./.flowx_workspaces``).
@@ -45,13 +45,13 @@ def main() -> None:
         print(f"entrypoint: {entrypoint.artifacts['main_entrypoint']['path']}")
 
         # 4. Modify one node by step id; cascade regenerates main.py because the nodes changed.
-        last_node = node_names[-1]
-        flowx.build_nodes(
-            workflow_id,
-            {last_node: "Validate the input and raise a clear error when it is empty."},
-            cascade=True,
-            fastapi_port=PORT,
-        ).raise_for_failure()
+        # last_node = node_names[-1]
+        # flowx.build_nodes(
+        #     workflow_id,
+        #     {last_node: "Validate the input and raise a clear error when it is empty."},
+        #     cascade=True,
+        #     fastapi_port=PORT,
+        # ).raise_for_failure()
 
         # 5. Evolve the whole workflow from one request; the engine decides which stages to rerun.
         evolved = flowx.build_workflow(
@@ -68,3 +68,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

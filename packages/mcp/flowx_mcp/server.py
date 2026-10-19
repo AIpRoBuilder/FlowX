@@ -6,6 +6,7 @@
 # Modified 2026-10-14: dispose discarded builders and roll back failed new attachments.
 # Modified 2026-10-15: document deferred batch orchestration and partial-update risks.
 # Modified 2026-10-16: rewrite the tool surface on the AgentBuilder engine (build_*, run_service).
+# Modified 2026-10-19: add evolve_workflow and list_nodes.
 """FastMCP server exposing the FlowX workflow engine."""
 
 from __future__ import annotations
@@ -134,7 +135,9 @@ def create_server() -> Any:
             "its nodes (all of them, or specific ones by step id), its main entrypoint, or the whole "
             "workflow from one request; then run or rerun it as a service. Workflows are identified "
             "by the workflow_id returned when they are created. Stage failures come back as "
-            "ok=false with the per-stage errors; pass them to build_workflow(fix_errors=true) to repair."
+            "ok=false with the per-stage errors; pass them to build_workflow(fix_errors=true) to repair. "
+            "To change an existing workflow, use evolve_workflow (target the workflow or one node from "
+            "list_nodes, or omit target to let the engine decide)."
         ),
     )
 
@@ -235,6 +238,36 @@ def create_server() -> Any:
         )
 
     @flowx_mcp.tool()
+    def evolve_workflow(
+        workflow_id: str,
+        command: str,
+        target: Optional[str] = None,
+        cascade: bool = True,
+        fastapi_port: int = 8000,
+        smoke_test: bool = False,
+        serve: bool = False,
+    ) -> str:
+        """Evolve an existing workflow, or one of its nodes, with a change command.
+
+        Args:
+            workflow_id: Id of the workflow to evolve.
+            command: The change to make.
+            target: "workflow" to change the workflow itself, or a node step id / node id
+                (see list_nodes) to change only that node; omit to let the engine decide.
+            cascade: Rebuild later stages (nodes, main entrypoint) when an earlier one changed.
+            fastapi_port: Port the generated service listens on.
+            smoke_test: Run the entrypoint once and audit its log before accepting it.
+            serve: Start the workflow as a service when everything succeeded.
+        """
+        if not str(command or "").strip():
+            return _error("evolve_workflow", "command must be a non-empty string")
+        return _build(
+            "evolve_workflow", "evolve", workflow_id, command,
+            target=target or None, cascade=cascade, fastapi_port=fastapi_port,
+            smoke_test_main=smoke_test, serve=serve,
+        )
+
+    @flowx_mcp.tool()
     def run_service(workflow_id: str) -> str:
         """Run a built workflow's main entrypoint as a service; a running one is replaced (rerun).
 
@@ -263,6 +296,19 @@ def create_server() -> Any:
     def list_workflows() -> str:
         """List every workflow with its node ids, versions and unresolved errors."""
         return _tool_call("list_workflows", lambda: {"ok": True, "workflows": _get_client().workflows()})
+
+    @flowx_mcp.tool()
+    def list_nodes(workflow_id: str) -> str:
+        """List a workflow's nodes as step_id, node_id and version (node_id is null until built).
+
+        Use a step_id or node_id as the target of evolve_workflow.
+
+        Args:
+            workflow_id: Id of the workflow.
+        """
+        return _tool_call(
+            "list_nodes", lambda: {"ok": True, "nodes": _get_client().list_nodes(workflow_id)},
+        )
 
     @flowx_mcp.tool()
     def get_workflow(workflow_id: str) -> str:

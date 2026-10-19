@@ -195,6 +195,10 @@ class AgentBuilder:
         """Create or modify a whole workflow from a request and/or output logs."""
         return self.engine.build_workflow(*args, **kwargs)
 
+    def evolve(self, *args: Any, **kwargs: Any) -> AgentResult:
+        """Evolve a workflow, or one node of it, by a command; without a target the engine judges."""
+        return self.engine.evolve(*args, **kwargs)
+
     def run_service(self, workflow_id: str) -> Dict[str, Any]:
         """Run or rerun a built workflow as a service through the runtime service."""
         return self.engine.run_service(workflow_id)

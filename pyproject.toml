@@ -19,7 +19,8 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
-classDevelopment Status :: 3 - Alpha",
+classifiers = [
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
@@ -33,8 +34,7 @@ flowx-a2a = "flowx_a2a.server:main"
 
 [project.urls]
 Repository = "https://github.com/AIpRoBuilder/FlowX"
-Issues = "https://github.com/AIpRoBuilder/FlowX/issues
-Repository = "https://github.com/AIpRoBuilder/FlowX"
+Issues = "https://github.com/AIpRoBuilder/FlowX/issues"
 "Attribution and provenance" = "https://github.com/AIpRoBuilder/FlowX/blob/main/docs/PROVENANCE.md"
 
 [tool.setuptools]

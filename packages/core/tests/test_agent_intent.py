@@ -169,6 +169,39 @@ def test_invalid_judge_answers_are_rejected(response, message):
 		build_intent(prompt="change something", catalog=CATALOG, judge=lambda _prompt: response)
 
 
+def test_target_workflow_modifies_the_graph_without_the_judge():
+	intent = build_intent(prompt="add a node", workflow_id="wf1", target="workflow", catalog=CATALOG, judge=_refuse)
+
+	assert intent.workflow_id == "wf1" and intent.graph == StagePlan("modify", "add a node")
+	assert intent.nodes.mode == "skip" and not intent.node_amendments
+
+
+@pytest.mark.parametrize("target", ["Publish", "node-2"])
+def test_target_node_by_step_id_or_node_id_amends_only_that_node(target):
+	intent = build_intent(prompt="log more", workflow_id="wf1", target=target, catalog=CATALOG, judge=_refuse)
+
+	assert dict(intent.node_amendments) == {"Publish": "log more"}
+	assert (intent.graph.mode, intent.nodes.mode, intent.main.mode) == ("skip", "modify", "skip")
+
+
+def test_target_uses_the_only_workflow_and_adds_unmatched_logs_to_the_command():
+	catalog = {"wf1": CATALOG["wf1"]}
+
+	intent = build_intent(prompt="fix it", target="Collect", logs=["odd failure"], catalog=catalog, judge=_refuse)
+
+	assert intent.workflow_id == "wf1"
+	assert intent.node_amendments["Collect"] == "fix it\n\nFix the following output log:\nodd failure"
+
+
+def test_target_problems_are_rejected():
+	with pytest.raises(ValueError, match="unknown target"):
+		build_intent(prompt="x", workflow_id="wf1", target="Ghost", catalog=CATALOG, judge=_refuse)
+	with pytest.raises(ValueError, match="pass workflow_id"):
+		build_intent(prompt="x", target="workflow", catalog=CATALOG, judge=_refuse)
+	with pytest.raises(ValueError, match="needs an evolve command"):
+		build_intent(workflow_id="wf1", target="workflow", catalog=CATALOG, judge=_refuse)
+
+
 def test_free_text_needs_a_judge_when_workflows_exist():
 	with pytest.raises(ValueError, match="judge is required"):
 		build_intent(prompt="change something", workflow_id="wf1", catalog=CATALOG)

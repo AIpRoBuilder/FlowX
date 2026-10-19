@@ -13,8 +13,8 @@ def call(mcp_server, name, **kwargs):
 
 def test_registers_one_tool_per_engine_function(mcp_server):
     assert set(mcp_server.tools) == {
-        "build_workflow_json", "build_nodes", "build_main_entrypoint", "build_workflow",
-        "run_service", "stop_service", "list_workflows", "get_workflow",
+        "build_workflow_json", "build_nodes", "build_main_entrypoint", "build_workflow", "evolve_workflow",
+        "run_service", "stop_service", "list_workflows", "list_nodes", "get_workflow",
     }
 
 
@@ -74,6 +74,35 @@ def test_build_workflow_accepts_logs_without_a_prompt(mcp_server):
     })
     assert second[1] == ("Build a ticket triage workflow",)
     assert second[2]["workflow_id"] is None and second[2]["logs"] == ()
+
+
+def test_evolve_workflow_passes_the_target_or_leaves_it_to_the_engine(mcp_server):
+    call(mcp_server, "evolve_workflow", workflow_id="wf1", command="Add a summary", target="workflow")
+    call(mcp_server, "evolve_workflow", workflow_id="wf1", command="Escalate urgent tickets", target="Reply", serve=True)
+    call(mcp_server, "evolve_workflow", workflow_id="wf1", command="Be brief", cascade=False)
+
+    options = {"cascade": True, "fastapi_port": 8000, "smoke_test_main": False, "serve": False}
+    assert mcp_server.client.calls == [
+        ("evolve", ("wf1", "Add a summary"), {**options, "target": "workflow"}),
+        ("evolve", ("wf1", "Escalate urgent tickets"), {**options, "target": "Reply", "serve": True}),
+        ("evolve", ("wf1", "Be brief"), {**options, "target": None, "cascade": False}),
+    ]
+
+
+def test_evolve_workflow_rejects_an_empty_command(mcp_server):
+    result = call(mcp_server, "evolve_workflow", workflow_id="wf1", command="  ")
+
+    assert result["ok"] is False and result["tool"] == "evolve_workflow"
+    assert mcp_server.client.calls == []
+
+
+def test_list_nodes_returns_step_and_node_ids(mcp_server):
+    mcp_server.client.results["list_nodes"] = [{"step_id": "Reply", "node_id": "n1", "version": 1}]
+
+    assert call(mcp_server, "list_nodes", workflow_id="wf1") == {
+        "ok": True, "nodes": [{"step_id": "Reply", "node_id": "n1", "version": 1}],
+    }
+    assert mcp_server.client.calls == [("list_nodes", ("wf1",), {})]
 
 
 def test_service_and_inspection_tools(mcp_server):

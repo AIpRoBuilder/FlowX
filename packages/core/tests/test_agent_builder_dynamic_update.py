@@ -770,6 +770,7 @@ def test_builder_build_functions_delegate_to_the_engine(monkeypatch, tmp_path):
         ("build_nodes", ("w", {"Node": "change"}), {}),
         ("build_main_entrypoint", ("w",), {"amendment": "change"}),
         ("build_workflow", ("request",), {"max_retries": 2}),
+        ("evolve", ("w", "change"), {"target": "workflow"}),
         ("run_service", ("w",), {}),
     ):
         assert getattr(builder, name)(*args, **kwargs) is getattr(builder._agent, name).return_value
