@@ -60,7 +60,7 @@ class AgentBuilder:
     def __init__(
         self,
         api_key: str,
-        model: str = "deepseek-chat",
+        model: str = "deepseek-flash",
         provider: str = "deepseek",
         root_dir: str = "./example",
         log_level: str | int | None = None,

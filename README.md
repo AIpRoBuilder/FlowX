@@ -191,7 +191,7 @@ Set at least `FLOWX_LLM_PROVIDER`, `FLOWX_LLM_MODEL`, `FLOWX_LLM_API_KEY`, and `
 
 ```dotenv
 FLOWX_LLM_PROVIDER=deepseek
-FLOWX_LLM_MODEL=deepseek-chat
+FLOWX_LLM_MODEL=deepseek-flash
 FLOWX_LLM_API_KEY=
 FLOWX_DEFAULT_WORKSPACE=./.flowx_workspaces
 ```
@@ -211,7 +211,7 @@ flowx-mcp --verbose
 python3.10 run_server.py
 ```
 
-If you are using Poetry or uv without activating the environment, prefix the command with `poetry run` or `uv run`.
+For interactive terminal use, prefix with `poetry run` or `uv run` if the environment is not activated. For MCP client configuration, use the absolute executable path and arguments described below; an MCP host may not inherit your shell's `PATH`.
 
 ### 3. Register FlowX in an MCP client
 
@@ -222,7 +222,7 @@ If you are using Poetry or uv without activating the environment, prefix the com
       "command": "flowx-mcp",
       "env": {
         "FLOWX_LLM_PROVIDER": "deepseek",
-        "FLOWX_LLM_MODEL": "deepseek-chat",
+        "FLOWX_LLM_MODEL": "deepseek-flash",
         "FLOWX_LLM_API_KEY": "<your key>",
         "FLOWX_DEFAULT_WORKSPACE": "/Users/user/Desktop/codes/flowx_workspaces"
       }
@@ -231,7 +231,6 @@ If you are using Poetry or uv without activating the environment, prefix the com
 }
 ```
 
-If your environment is isolated behind Poetry or uv, set the command to `poetry` with args `['run', 'flowx-mcp']` or to `uv` with args `['run', 'flowx-mcp']`.
 
 ### Python SDK
 
