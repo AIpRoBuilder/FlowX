@@ -5,6 +5,8 @@ Modified: immutable request inputs, request-local execution data and terminal cl
 Modified 2026-10-14: native-free request execution; pooled nodes keep only dependencies.
 Modified 2026-10-15: mutable repair requests own outputs; each run uses a fresh copy.
 Modified 2026-10-15: remove unused workflow name and write-only stage bookkeeping.
+Modified 2026-10-20: gate the amendment on user input that guides it or skips it.
+Modified 2026-10-20: interactive runs ask for guidance after the node test result.
 """
 
 from __future__ import annotations
@@ -24,12 +26,67 @@ from flowx_core.runtime.run_node_test import _execute_node_test
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.tools.file_tools import parse_json_file
 from flowx_core.tools.workflow_engine import (
+	_RUN_REQUEST,
 	close_workflow_engine,
 	init_workflow_engine,
 	run_workflow,
 )
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
+
+
+# Exact, case-insensitive inputs that skip the amendment instead of guiding it.
+_SKIP_AMENDMENT_INPUTS = frozenset({
+	"skip", "/skip", "skip amendment", "skip_amendment", "skip-amendment",
+})
+
+
+def _amendment_input_parts(user_input: Any) -> tuple[bool, str]:
+	"""Split user input into (skip amendment, guidance), accepting text or JSON.
+
+	The workflow engine normalizes object inputs to JSON text, so ``{"skip": true}``
+	and ``{"guidance": "..."}`` are accepted alongside the plain-text forms.
+	"""
+	if isinstance(user_input, Mapping):
+		payload: Mapping[str, Any] | None = user_input
+		text = ""
+	else:
+		text = str(user_input or "").strip()
+		payload = None
+		if text.startswith("{"):
+			try:
+				parsed = json.loads(text)
+			except (TypeError, ValueError):
+				parsed = None
+			if isinstance(parsed, Mapping):
+				payload = parsed
+	if payload is None:
+		skip = text.lower() in _SKIP_AMENDMENT_INPUTS
+		return skip, "" if skip else text
+	skip = bool(payload.get("skip", payload.get("skip_amendment", False)))
+	recognized = "skip" in payload or "skip_amendment" in payload
+	for key in ("guidance", "amendment", "input", "text"):
+		if key in payload:
+			recognized = True
+			guidance = str(payload.get(key) or "").strip()
+			if guidance:
+				return skip, guidance
+			break
+	return skip, "" if recognized or not payload else json.dumps(dict(payload), ensure_ascii=False)
+
+
+def _compose_amendment(test_log: str, guidance: str) -> str:
+	"""Append authoritative user guidance to the test log without changing the log alone."""
+	guidance = guidance.strip()
+	if not guidance:
+		return test_log
+	if not test_log.strip():
+		return guidance
+	return (
+		f"{test_log.rstrip()}\n\n"
+		"User guidance for this amendment (authoritative):\n"
+		f"{guidance}\n"
+	)
 
 
 @dataclass(kw_only=True)
@@ -199,13 +256,35 @@ class ExecuteNodeTest(RunNodeTest):
 
 
 class AmendNodeFromTestLog(PromptNodeFileCoderBase):
-	"""Apply the pytest log to the original node with graph-aware node context."""
+	"""Apply the pytest log and optional user guidance, or skip the amendment on request."""
 
 	STEP_ID = "amend_node"
 	DEPENDENCIES = ["run_node_test"]
-	INPUT_REQUIRED = False
+	INPUT_REQUIRED = True
 
 	__hash__ = object.__hash__
+
+	def __post_init__(self) -> None:
+		"""Install the input gate after the base coder prepares the workflow node."""
+		super().__post_init__()
+		self.setWaitFunc(self.wait_function)
+
+	def wait_function(self) -> bool:
+		"""Pause until the caller supplies guidance, a skip instruction, or a blank proceed."""
+		param = self.get_workflow_param()
+		with param.condition:
+			if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
+				return True
+			request = param.state.get("node_runtime_modifier")
+			if not isinstance(request, NodeRuntimeModifierRequest):
+				param.set_state(self.STEP_ID, "running")
+				return True
+			if request.skip_amend_node or (request.test_result is not None and request.test_result["ok"]):
+				param.set_state(self.STEP_ID, "running")
+				return True
+			ready = self.STEP_ID in param.inputs
+			param.set_state(self.STEP_ID, "running" if ready else "awaiting_input")
+			return ready
 
 	def get_node_contract_text(self) -> str:
 		return ""
@@ -219,11 +298,14 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 		dependency_results: dict[str, StepRunOutput],
 		session_state: dict[str, Any],
 	) -> StepRunOutput:
-		del user_input, dependency_results
+		del dependency_results
 		request = _request_from_state(session_state)
 		working_directory = Path(request.working_directory).expanduser().resolve()
 		node_path = _resolve_path(request.node_file_name, working_directory)
 		node_name = request.node_name or node_path.stem
+		skip_input, guidance = _amendment_input_parts(user_input)
+		if skip_input:
+			request.skip_amend_node = True
 		if request.skip_amend_node or (request.test_result is not None and request.test_result["ok"]):
 			request.amended_node_file_path = str(node_path.resolve())
 		else:
@@ -234,7 +316,7 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 				raise FileNotFoundError(f"Workflow graph not found: {graph_path}")
 			amended_path = self.amend_code_with_feedback(
 				str(node_path),
-				request.test_log,
+				_compose_amendment(request.test_log, guidance),
 				graph_plan_path=str(graph_path),
 				current_node_name=node_name,
 				temperature=request.amendment_temperature,
@@ -294,15 +376,8 @@ class NodeRuntimeModifierPipeline:
 		if engine is not None:
 			close_workflow_engine(engine)
 
-	def run(
-		self,
-		request: NodeRuntimeModifierRequest,
-	) -> NodeRuntimeModifierRequest:
-		"""Return a fresh repair request with outputs; leave caller inputs unchanged."""
-
-		engine = self._engine
-		if engine is None:
-			raise RuntimeError("node runtime modifier is closed or not initialized")
+	def _prepare_request(self, request: NodeRuntimeModifierRequest) -> NodeRuntimeModifierRequest:
+		"""Resolve request-local paths and snapshot mapping-backed graphs."""
 		workdir = Path(request.working_directory).expanduser().resolve()
 		if not workdir.is_dir():
 			raise NotADirectoryError(f"Working directory not found: {workdir}")
@@ -324,12 +399,74 @@ class NodeRuntimeModifierPipeline:
 			graph_path.parent.mkdir(parents=True, exist_ok=True)
 			graph_path.write_text(json.dumps(dict(request.workflow_graph), ensure_ascii=False, indent=2), encoding="utf-8")
 			request.workflow_graph = str(graph_path)
+		return request
+
+	def run(
+		self,
+		request: NodeRuntimeModifierRequest,
+		user_input: str = "",
+	) -> NodeRuntimeModifierRequest:
+		"""Return a fresh repair request with outputs; leave caller inputs unchanged.
+
+		``user_input`` is fed to the gated amendment step: non-empty text guides the
+		amendment alongside the test log, exact skip values (``skip``, ``/skip``,
+		``skip amendment``, ``skip_amendment`` or ``skip-amendment``) skip it, and
+		an empty value proceeds from the test log alone.
+		"""
+
+		engine = self._engine
+		if engine is None:
+			raise RuntimeError("node runtime modifier is closed or not initialized")
+		request = self._prepare_request(request)
+		skip_amendment, _ = _amendment_input_parts(user_input)
+		if skip_amendment:
+			# An explicit skip also avoids requiring an existing log when test
+			# execution is skipped for this request.
+			request.skip_amend_node = True
 		run_workflow(
 			engine, state={**request.state, "node_runtime_modifier": request},
+			inputs={AmendNodeFromTestLog.STEP_ID: user_input},
 		)
 		if not request.skip_run_node_test and request.test_result is None:
 			raise RuntimeError(f"node test execution did not produce a result for {request.node_name or request.node_file_name}")
 		return request
+
+	def run_interactive(
+		self,
+		request: NodeRuntimeModifierRequest,
+		input_callback: Callable[[NodeRuntimeModifierRequest], str],
+	) -> NodeRuntimeModifierRequest:
+		"""Run the repair pipeline, pausing for input after a failing node test.
+
+		The callback receives the run-local request after ``run_node_test`` has set
+		``test_result`` and ``test_log``. Return guidance, ``"skip"`` to skip the
+		amendment, or an empty string to amend from the test log alone.
+		"""
+
+		engine = self._engine
+		if engine is None:
+			raise RuntimeError("node runtime modifier is closed or not initialized")
+		request = self._prepare_request(request)
+		request_id = f"flowx-request-{uuid.uuid4().hex}"
+		state = {**request.state, "node_runtime_modifier": request}
+		token = _RUN_REQUEST.set((state, frozenset()))
+		try:
+			result = engine.run(request_id)
+		finally:
+			_RUN_REQUEST.reset(token)
+		try:
+			while result.status == "awaiting_input":
+				if result.awaiting["id"] != AmendNodeFromTestLog.STEP_ID:
+					raise RuntimeError(f"unexpected workflow input gate: {result.awaiting['id']}")
+				answer = input_callback(request)
+				result = engine.answer(request_id, answer)
+			if result.status != "completed":
+				raise RuntimeError(result.error or result.status)
+			if not request.skip_run_node_test and request.test_result is None:
+				raise RuntimeError(f"node test execution did not produce a result for {request.node_name or request.node_file_name}")
+			return request
+		finally:
+			engine.close(request_id)
 
 
 __all__ = [

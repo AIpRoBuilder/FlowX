@@ -119,7 +119,10 @@ amended from the violation report before the node is retested and re-audited. A
 still-failing node is not published. A failed build does not advance
 the workflow/node counters or replace historical files. Disabling the modifier
 does not imply runtime validation; old test logs are not carried into changed,
-untested node versions.
+untested node versions. When `repair_input_callback` is set, it is called after a
+failed test with a `NodeRepairInput` (node, attempt, test log and result). Its
+return value guides the amendment, `skip` skips that amendment, and the next
+retry asks again with the fresh log.
 
 ## Saved identities and versions
 

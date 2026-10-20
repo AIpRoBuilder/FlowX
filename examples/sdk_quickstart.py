@@ -26,7 +26,7 @@ REQUIREMENT = (
 
 def main() -> None:
     with FlowXClient() as flowx:  # stops any service it started on exit
-        flowx.api_key = "<your key>"
+        flowx.api_key = "sk-c01ec39cd593406fb069c82dcaf4f526"
         if not flowx.api_key:
             sys.exit("Set FLOWX_LLM_API_KEY (or pass api_key=...) before running this example.")
 

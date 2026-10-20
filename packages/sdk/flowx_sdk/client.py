@@ -6,6 +6,7 @@
 # Modified 2026-10-15: document deferred batch orchestration and partial-update risks.
 # Modified 2026-10-16: expose the AgentBuilder engine API (build_*, run_service) through one builder.
 # Modified 2026-10-19: add evolve (workflow, one node, or judged) and list_nodes.
+# Modified 2026-10-20: expose per-node user-guided repair through build_nodes/build_workflow/evolve.
 """Python SDK for building, modifying and running FlowX workflows."""
 
 from __future__ import annotations
@@ -13,10 +14,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from threading import RLock
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.agent_workflow_engine import AgentResult
+from flowx_core.dynamic_workflow_orchestrator import NodeRepairInput
+
+RepairInputCallback = Callable[[NodeRepairInput], str]
 
 
 class FlowXClient:
@@ -68,6 +72,18 @@ class FlowXClient:
                 )
             return self._builder
 
+    @staticmethod
+    def _with_repair_input(
+        options: dict[str, Any],
+        repair_input_callback: RepairInputCallback | None,
+    ) -> dict[str, Any]:
+        """Merge a guided-repair callback into ``DynamicWorkflowRequest.node_options``."""
+        if repair_input_callback is None:
+            return options
+        node_options = dict(options.get("node_options") or {})
+        node_options["repair_input_callback"] = repair_input_callback
+        return {**options, "node_options": node_options}
+
     def build_workflow_json(self, prompt: str, *, workflow_id: str | None = None, **options: Any) -> AgentResult:
         """Create (no ``workflow_id``) or modify workflow.json together with its requirement analysis."""
         text = str(prompt).strip()
@@ -76,32 +92,68 @@ class FlowXClient:
         return self.builder.build_workflow_json(text, workflow_id=workflow_id, **options)
 
     def build_nodes(
-        self, workflow_id: str, amendments: Mapping[str, str] | None = None, **options: Any,
+        self,
+        workflow_id: str,
+        amendments: Mapping[str, str] | None = None,
+        *,
+        repair_input_callback: RepairInputCallback | None = None,
+        **options: Any,
     ) -> AgentResult:
-        """Build the nodes of a workflow, or amend specific nodes by step id (``{step_id: amendment}``)."""
-        return self.builder.build_nodes(workflow_id, amendments, **options)
+        """Build the nodes of a workflow, or amend specific nodes by step id (``{step_id: amendment}``).
+
+        ``repair_input_callback`` is called after a node test fails, with the fresh
+        ``NodeRepairInput`` (node, attempt, test log, test result). Return guidance to
+        append to the log, ``"skip"`` to skip the amendment, or ``""`` for the log alone.
+        """
+        return self.builder.build_nodes(
+            workflow_id, amendments,
+            **self._with_repair_input(options, repair_input_callback),
+        )
 
     def build_main_entrypoint(self, workflow_id: str, amendment: str = "", **options: Any) -> AgentResult:
         """Create or regenerate the main entrypoint from the workflow's latest nodes."""
         return self.builder.build_main_entrypoint(workflow_id, amendment, **options)
 
-    def build_workflow(self, prompt: str = "", *, workflow_id: str | None = None, **options: Any) -> AgentResult:
-        """Run the whole engine on a free-text request and/or ``logs=[...]``; later stages follow earlier changes."""
-        return self.builder.build_workflow(prompt, workflow_id=workflow_id, **options)
+    def build_workflow(
+        self,
+        prompt: str = "",
+        *,
+        workflow_id: str | None = None,
+        repair_input_callback: RepairInputCallback | None = None,
+        **options: Any,
+    ) -> AgentResult:
+        """Run the whole engine on a free-text request and/or ``logs=[...]``; later stages follow earlier changes.
+
+        ``repair_input_callback`` guides per-node amendments after their failed tests.
+        """
+        return self.builder.build_workflow(
+            prompt, workflow_id=workflow_id,
+            **self._with_repair_input(options, repair_input_callback),
+        )
 
     def evolve(
-        self, workflow_id: str, command: str, *, target: str | None = None, **options: Any,
+        self,
+        workflow_id: str,
+        command: str,
+        *,
+        target: str | None = None,
+        repair_input_callback: RepairInputCallback | None = None,
+        **options: Any,
     ) -> AgentResult:
         """Evolve an existing workflow by ``command``.
 
         ``target="workflow"`` changes the workflow itself (its graph; nodes and main entrypoint
         follow with ``cascade``). A node step id or node id from :meth:`list_nodes` changes only
         that node. Without ``target`` the engine judges which part the command refers to.
+        ``repair_input_callback`` guides amendments after their failed tests.
         """
         text = str(command).strip()
         if not text:
             raise ValueError("command must be a non-empty string")
-        return self.builder.evolve(workflow_id, text, target=target, **options)
+        return self.builder.evolve(
+            workflow_id, text, target=target,
+            **self._with_repair_input(options, repair_input_callback),
+        )
 
     def list_nodes(self, workflow_id: str) -> list[dict[str, Any]]:
         """The workflow's nodes as ``{"step_id", "node_id", "version"}``; ``node_id`` is None until built."""

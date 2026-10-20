@@ -75,10 +75,12 @@ class FakeNodeGeneration:
 class FakeModifier:
 	def __init__(self) -> None:
 		self.failing: dict[str, int] = {}
+		self.user_inputs: list[str] = []
 		# (node, skip_generate, skip_run, skip_amend, log content when the call started)
 		self.calls: list[tuple[str, bool, bool, bool, str]] = []
 
-	def run(self, request):
+	def run(self, request, user_input: str = ""):
+		self.user_inputs.append(user_input)
 		log = Path(request.log_file_name)
 		prior_log = log.read_text(encoding="utf-8") if log.is_file() else ""
 		self.calls.append((
@@ -98,6 +100,10 @@ class FakeModifier:
 		return SimpleNamespace(
 			amended_node_file_path=request.node_file_name, test_log=text, test_result={"ok": ok},
 		)
+
+	def run_interactive(self, request, input_callback):
+		value = input_callback(request)
+		return self.run(request, user_input=value)
 
 
 class FakeRuntime:
@@ -369,6 +375,54 @@ def test_request_validates_the_repair_retry_budget(value):
 		orchestrator_module.DynamicWorkflowRequest(
 			workflow_json_path="workflow.json", requirement_md_path="requirement.md", max_repair_retries=value,
 		)
+
+
+def test_request_rejects_a_non_callable_repair_input_callback():
+	with pytest.raises(ValueError, match="repair_input_callback"):
+		orchestrator_module.DynamicWorkflowRequest(
+			workflow_json_path="workflow.json", requirement_md_path="requirement.md",
+			repair_input_callback=object(),
+		)
+
+
+def test_repair_callback_guides_each_nodes_amendment(world):
+	agent = world.agent()
+	world.modifier.failing["Collect"] = 1  # first test fails; the retest passes
+	seen = []
+
+	def repair_input(context):
+		seen.append(context)
+		return f"guide {context.node_name}"
+
+	result = agent.build_workflow(
+		"collect and publish", node_options={"repair_input_callback": repair_input},
+	)
+
+	assert result.ok, result.errors
+	assert {context.node_name for context in seen} == {"Collect", "Publish"}
+	assert all(isinstance(context, orchestrator_module.NodeRepairInput) for context in seen)
+	assert "guide Collect" in world.modifier.user_inputs
+	assert "guide Publish" in world.modifier.user_inputs
+
+
+def test_repair_input_callback_receives_the_node_test_context():
+	class Step(orchestrator_module._NodeGenerationStep):
+		STEP_ID = "Collect"
+
+	contexts = []
+
+	def callback(context):
+		contexts.append(context)
+		return "fix the comparison"
+
+	run = SimpleNamespace(request=SimpleNamespace(repair_input_callback=callback))
+	request = SimpleNamespace(test_log="pytest FAILED for Collect", test_result={"ok": False})
+
+	assert Step()._ask_repair_input(run, request, 2) == "fix the comparison"
+	assert contexts == [orchestrator_module.NodeRepairInput(
+		node_name="Collect", attempt=2,
+		test_log="pytest FAILED for Collect", test_result={"ok": False},
+	)]
 
 
 def test_a_main_run_log_error_is_routed_to_the_node_it_names(world):

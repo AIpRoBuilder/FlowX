@@ -239,6 +239,8 @@ with FlowXClient(workspace="./workflows") as flowx:
 
 Each build call returns an `AgentResult` with per-stage outcomes, unresolved errors, logs and artifact paths; stage failures are reported there rather than raised.
 
+Pass `repair_input_callback=...` to `build_nodes`, `build_workflow`, or `evolve` to guide a node's amendment after its test fails. The callback receives a `NodeRepairInput` with the node step id, attempt number, pytest log and test result, and returns guidance to combine with the log, `"skip"` to skip the amendment, or `""` to use the log alone. A runnable walkthrough is in [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py).
+
 To change an existing workflow, choose what to evolve with `evolve(workflow_id, command, target=...)`. `list_nodes` returns each node's step id and node id to use as a target; without a `target` the engine decides what the command refers to. A runnable walkthrough is in [examples/sdk_evolve.py](examples/sdk_evolve.py).
 
 ```python

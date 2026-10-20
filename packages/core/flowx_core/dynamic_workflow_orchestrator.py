@@ -9,6 +9,7 @@ Modified 2026-10-15: schedule generation nodes with JSON-built WorkflowEngine gr
 Modified 2026-10-16: native steps run generation and repair through AgentBuilder-published workflows;
 one engine reloads its pool when the workflow config changes.
 Modified 2026-10-17: repair a node again, up to max_repair_retries times, until its tests and audit pass.
+Modified 2026-10-20: ask for user repair guidance after the node test result is available.
 This coordinator does not execute the generated graph or implement a ReAct judge.
 """
 
@@ -24,7 +25,7 @@ from dataclasses import dataclass, field
 from graphlib import TopologicalSorter
 from pathlib import Path
 from threading import RLock
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
 
@@ -51,6 +52,16 @@ from flowx_core.workflows.node_runtime_modifier import (
 )
 
 
+@dataclass(frozen=True)
+class NodeRepairInput:
+	"""The fresh node-test result offered to the caller for amendment guidance."""
+
+	node_name: str
+	attempt: int
+	test_log: str
+	test_result: Mapping[str, Any] | None
+
+
 @dataclass(frozen=True, kw_only=True)
 class DynamicWorkflowRequest:
 	"""Build a JSON graph revision; state is run-local, never persisted in history.
@@ -65,6 +76,10 @@ class DynamicWorkflowRequest:
 
 	A repair that fails (tests still failing after an amendment, or an audit violation) is
 	requested again up to ``max_repair_retries`` more times; 0 restores a single pass.
+
+	``repair_input_callback`` receives each node's fresh failed test result and returns
+	guidance appended to that test log, ``skip`` to skip the amendment, or an empty
+	string to amend from the test log alone.
 	"""
 
 	workflow_json_path: str | Path
@@ -83,12 +98,15 @@ class DynamicWorkflowRequest:
 	python_command: str = ""
 	timeout: int = 60
 	max_repair_retries: int = 2
+	repair_input_callback: Callable[[NodeRepairInput], str] | None = None
 	state: Mapping[str, Any] = field(default_factory=dict)
 
 	def __post_init__(self) -> None:
 		retries = self.max_repair_retries
 		if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
 			raise ValueError("max_repair_retries must be a non-negative integer")
+		if self.repair_input_callback is not None and not callable(self.repair_input_callback):
+			raise ValueError("repair_input_callback must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -268,7 +286,7 @@ class _NodeGenerationStep(WorkflowStepNode):
 				feedback = ""
 				for attempt in range(request.max_repair_retries + 1):
 					try:
-						audit_result = self._repair(run, logs, feedback)
+						audit_result = self._repair(run, logs, attempt, feedback)
 					except Exception:
 						if attempt == request.max_repair_retries:
 							raise
@@ -300,8 +318,28 @@ class _NodeGenerationStep(WorkflowStepNode):
 			},
 		)
 
-	def _repair(self, run: _GenerationRun, logs: WorkflowNodeLogs, feedback: str = "") -> tuple[bool, list[Any]]:
-		"""Test the candidate, amend it from a failing log once, then retest and re-audit it.
+	def _ask_repair_input(
+		self,
+		run: _GenerationRun,
+		request: NodeRuntimeModifierRequest,
+		attempt: int,
+	) -> str:
+		"""Offer the fresh test result to the request's repair callback."""
+		callback = run.request.repair_input_callback
+		if callback is None:
+			return ""
+		value = callback(NodeRepairInput(
+			node_name=self.STEP_ID,
+			attempt=attempt,
+			test_log=request.test_log,
+			test_result=request.test_result,
+		))
+		return "" if value is None else str(value)
+
+	def _repair(
+		self, run: _GenerationRun, logs: WorkflowNodeLogs, attempt: int, feedback: str = "",
+	) -> tuple[bool, list[Any]]:
+		"""Test, ask for guidance after a failure, amend, then retest and re-audit.
 
 		``feedback`` (audit violations from the previous attempt) is applied as an amendment first.
 		"""
@@ -327,7 +365,16 @@ class _NodeGenerationStep(WorkflowStepNode):
 			if Path(amended.amended_node_file_path).resolve() != targets["source"]:
 				raise ValueError("modifier must keep the candidate node source path")
 			modifier_request.skip_run_node_test = False
-		result = modifier.run(modifier_request)
+
+		interactive = getattr(modifier, "run_interactive", None)
+		if interactive is None:
+			result = modifier.run(modifier_request)
+		else:
+			# The callback is invoked at the amend gate, after run_node_test.
+			result = interactive(
+				modifier_request,
+				lambda current: self._ask_repair_input(run, current, attempt),
+			)
 		logs.record_test(name, result.test_log)
 		if Path(result.amended_node_file_path).resolve() != targets["source"]:
 			raise ValueError("modifier must keep the candidate node source path")
@@ -339,10 +386,10 @@ class _NodeGenerationStep(WorkflowStepNode):
 			# A repair's original failure is not proof that the amended code passes.
 			modifier_request.skip_generate_node_test = True
 			modifier_request.skip_amend_node = True
-			result = modifier.run(modifier_request)
-			logs.record_test(name, result.test_log)
-			if result.test_result is None or not result.test_result["ok"]:
-				raise RuntimeError(f"node tests still fail after repair for {name}: {result.test_log}")
+			verified = modifier.run(modifier_request)
+			logs.record_test(name, verified.test_log)
+			if verified.test_result is None or not verified.test_result["ok"]:
+				raise RuntimeError(f"node tests still fail after repair for {name}: {verified.test_log}")
 		ok, violations = generation.node_auditor.audit_node_file(
 			str(targets["source"]), node_meta=NodeMeta.from_dict(run.raw_nodes[name]),
 			graph_plan_path=str(directory / "workflow.json"),
@@ -750,5 +797,5 @@ class DynamicWorkflowOrchestrator:
 
 __all__ = [
 	"DynamicWorkflowError", "DynamicWorkflowOrchestrator", "DynamicWorkflowRequest",
-	"NodeVersion", "WorkflowVersion",
+	"NodeRepairInput", "NodeVersion", "WorkflowVersion",
 ]

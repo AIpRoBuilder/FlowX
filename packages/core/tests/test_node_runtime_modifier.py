@@ -3,6 +3,7 @@
 # Modified 2026-10-14: plain execution boundaries and zero request-time native allocations.
 # Modified 2026-10-15: merged repair request model and same-input per-run isolation.
 # Modified 2026-10-15: verify repair outputs and native execution without stage bookkeeping.
+# Modified 2026-10-20: cover the interactive amendment gate, guidance and skip.
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
-from ag_ui_workflow import RunResult, WorkflowEngine, WorkflowStepNode
+from ag_ui_workflow import RunResult, StepRunOutput, WorkflowEngine, WorkflowParam, WorkflowStepNode
 
 from flowx_core.runtime import RunNodeTest
 from flowx_core.runtime.run_node_test import _execute_node_test
@@ -75,6 +76,14 @@ class _NodeWriter(AmendNodeFromTestLog):
         target = Path(code_path)
         target.write_text("# amended node\n", encoding="utf-8")
         return target
+
+
+@dataclass
+class _GatedNodeWriter(_NodeWriter):
+    """Record amendments through the production INPUT_REQUIRED wait callback."""
+
+    def __post_init__(self) -> None:
+        AmendNodeFromTestLog.__post_init__(self)
 
 
 def _assert_executor_pristine(node, run_subprocess, timeout_expired):
@@ -509,6 +518,150 @@ def test_node_runtime_modifier_can_skip_every_stage(tmp_path: Path) -> None:
     assert Path(request.amended_node_file_path) == node_file
     assert node_file.read_text(encoding="utf-8") == "# original node\n"
     modifier.close()
+
+
+def test_amend_node_gates_on_user_input_only_when_amendment_is_needed(tmp_path: Path) -> None:
+    amender = AmendNodeFromTestLog(client=object())
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+    )
+    request.test_result = {"ok": False}
+    param = WorkflowParam()
+    param.state = {"node_runtime_modifier": request}
+    param.outputs = {"run_node_test": StepRunOutput(derived=request.test_result)}
+    amender.get_workflow_param = lambda: param  # type: ignore[method-assign]
+
+    assert AmendNodeFromTestLog.INPUT_REQUIRED is True
+    assert amender.wait_function() is False
+    assert param.states[amender.STEP_ID] == "awaiting_input"
+
+    param.inputs[amender.STEP_ID] = "focus on the failing assertion"
+    assert amender.wait_function() is True
+    assert param.states[amender.STEP_ID] == "running"
+
+    del param.inputs[amender.STEP_ID]
+    request.test_result = {"ok": True}
+    param.outputs["run_node_test"] = StepRunOutput(derived=request.test_result)
+    assert amender.wait_function() is True
+    assert param.states[amender.STEP_ID] == "running"
+
+    request.test_result, request.skip_amend_node = {"ok": False}, True
+    assert amender.wait_function() is True
+    assert param.states[amender.STEP_ID] == "running"
+
+
+def _interactive_modifier(tmp_path: Path, returncode: int):
+    node_file = tmp_path / "ExampleNode.py"
+    node_file.write_text("# original node\n", encoding="utf-8")
+    writer, amender = _TestWriter(), _GatedNodeWriter(client=object())
+
+    def fake_run(*_args, **_kwargs):
+        return SimpleNamespace(
+            returncode=returncode,
+            stdout="1 passed\n" if returncode == 0 else "1 failed\n",
+            stderr="" if returncode == 0 else "AssertionError: expected 2, got 1\n",
+        )
+
+    modifier = NodeRuntimeModifierPipeline(writer, amender, run_subprocess=fake_run)
+    request = NodeRuntimeModifierRequest(
+        node_file_name=node_file.name,
+        workflow_graph={"nodes": [{"name": "ExampleNode", "depends": []}]},
+        working_directory=str(tmp_path),
+    )
+    return modifier, amender, request, node_file
+
+
+def test_modifier_run_interactive_asks_after_the_failed_test(tmp_path: Path) -> None:
+    modifier, amender, request, node_file = _interactive_modifier(tmp_path, returncode=1)
+    observed = []
+
+    def answer(current):
+        observed.append((current.test_result, current.test_log))
+        return "Keep the public API; fix only the comparison."
+
+    try:
+        result = modifier.run_interactive(request, answer)
+        assert observed[0][0] is result.test_result
+        assert result.test_result["ok"] is False
+        assert "AssertionError: expected 2, got 1" in observed[0][1]
+        assert len(amender.calls) == 1
+        amendment = amender.calls[0]["amendment"]
+        assert observed[0][1].rstrip() in amendment
+        assert "Keep the public API; fix only the comparison." in amendment
+        assert "User guidance for this amendment (authoritative):" in amendment
+        assert result.amended_node_file_path == str(node_file)
+    finally:
+        modifier.close()
+
+
+def test_modifier_run_interactive_skip_leaves_the_node_unchanged(tmp_path: Path) -> None:
+    modifier, amender, request, node_file = _interactive_modifier(tmp_path, returncode=1)
+
+    try:
+        result = modifier.run_interactive(
+            request, lambda current: "skip" if "AssertionError" in current.test_log else "",
+        )
+        assert amender.calls == []
+        assert result.skip_amend_node is True
+        assert result.test_result is not None and result.test_result["ok"] is False
+        assert result.amended_node_file_path == str(node_file)
+        assert node_file.read_text(encoding="utf-8") == "# original node\n"
+    finally:
+        modifier.close()
+
+
+def test_modifier_run_interactive_does_not_ask_when_the_test_passes(tmp_path: Path) -> None:
+    modifier, amender, request, _node_file = _interactive_modifier(tmp_path, returncode=0)
+    observed = []
+
+    try:
+        result = modifier.run_interactive(request, lambda current: observed.append(current) or "")
+        assert observed == []
+        assert amender.calls == []
+        assert result.test_result is not None and result.test_result["ok"] is True
+    finally:
+        modifier.close()
+
+
+def test_modifier_forwards_user_guidance_and_skip_to_amend_step(tmp_path: Path) -> None:
+    node_file = tmp_path / "ExampleNode.py"
+    node_file.write_text("# original node\n", encoding="utf-8")
+    writer, amender = _TestWriter(), _NodeWriter()
+
+    def fake_run(*_args, **_kwargs):
+        return SimpleNamespace(returncode=1, stdout="1 failed\n", stderr="AssertionError\n")
+
+    modifier = NodeRuntimeModifierPipeline(writer, amender, run_subprocess=fake_run)
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py",
+        workflow_graph={"nodes": [{"name": "ExampleNode", "depends": []}]},
+        working_directory=str(tmp_path),
+    )
+    try:
+        guided = modifier.run(request, user_input="focus on the failing assertion")
+        assert len(amender.calls) == 1
+        amendment = amender.calls[0]["amendment"]
+        assert guided.test_log.rstrip() in amendment
+        assert "focus on the failing assertion" in amendment
+        assert "User guidance for this amendment (authoritative):" in amendment
+
+        skipped = modifier.run(request, user_input="  SKIP  ")
+        assert len(amender.calls) == 1
+        assert skipped.amended_node_file_path == str(node_file)
+        assert node_file.read_text(encoding="utf-8") == "# amended node\n"
+
+        skipped_without_log = modifier.run(
+            NodeRuntimeModifierRequest(
+                node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+                skip_generate_node_test=True, skip_run_node_test=True,
+            ),
+            user_input="skip",
+        )
+        assert skipped_without_log.test_log == skipped_without_log.log_file_path == ""
+        assert skipped_without_log.amended_node_file_path == str(node_file)
+        assert len(amender.calls) == 1
+    finally:
+        modifier.close()
 
 
 def test_node_runtime_modifier_requires_existing_test_when_generation_is_disabled(tmp_path: Path) -> None:

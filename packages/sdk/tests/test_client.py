@@ -3,9 +3,11 @@ from unittest.mock import Mock
 
 import pytest
 
+import flowx_sdk
 import flowx_sdk.client as client_module
 from flowx_core.agent_intent import AgentIntent, StagePlan
 from flowx_core.agent_workflow_engine import AgentResult, StageOutcome
+from flowx_core.dynamic_workflow_orchestrator import NodeRepairInput
 
 
 @pytest.fixture
@@ -59,6 +61,47 @@ def test_build_methods_delegate_to_the_engine_api(sdk):
     assert builder.build_nodes.call_args_list[1].kwargs == {"cascade": True}
     builder.build_main_entrypoint.assert_called_once_with("wf1", "Use port 9000", fastapi_port=9000)
     builder.build_workflow.assert_called_once_with("Add a node", workflow_id="wf1", logs=("trace",))
+
+
+def test_guided_repair_callback_is_merged_into_node_options(sdk):
+    builder, client = sdk.builder, sdk.client
+    callback = lambda context: f"guide {context.node_name}"
+    previous = lambda context: ""
+
+    client.build_nodes("wf1", repair_input_callback=callback)
+    assert builder.build_nodes.call_args.kwargs == {
+        "node_options": {"repair_input_callback": callback},
+    }
+
+    builder.reset_mock()
+    client.build_workflow(
+        "Add a node", workflow_id="wf1", repair_input_callback=callback,
+        node_options={"max_repair_retries": 0, "repair_input_callback": previous},
+    )
+    assert builder.build_workflow.call_args.kwargs == {
+        "workflow_id": "wf1",
+        "node_options": {"max_repair_retries": 0, "repair_input_callback": callback},
+    }
+
+    builder.reset_mock()
+    client.evolve("wf1", "Fix the node", repair_input_callback=callback)
+    assert builder.evolve.call_args.kwargs == {
+        "target": None,
+        "node_options": {"repair_input_callback": callback},
+    }
+
+    builder.reset_mock()
+    client.build_nodes("wf1", node_options={"max_repair_retries": 1})
+    assert builder.build_nodes.call_args.kwargs == {
+        "node_options": {"max_repair_retries": 1},
+    }
+
+
+def test_sdk_exports_the_repair_input_context():
+    assert flowx_sdk.NodeRepairInput is NodeRepairInput
+    assert NodeRepairInput(
+        node_name="Collect", attempt=0, test_log="failed", test_result={"ok": False},
+    ).node_name == "Collect"
 
 
 def test_evolve_and_list_nodes_delegate_to_the_engine(sdk):
