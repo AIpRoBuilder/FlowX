@@ -1,7 +1,9 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from flowx_core.llm_client.coder import Coder
+import pytest
+
+from flowx_core.llm_client.coder import Coder, LLMGenerationError
 
 
 class _FakeStreamChunk:
@@ -153,3 +155,48 @@ def test_code_to_file_retries_without_stream_when_stream_interrupts_after_partia
     assert target_path.read_text(encoding="utf-8") == "alpha = 1\nbeta = 2\n"
     assert client.chat.completions.calls[0]["stream"] is True
     assert "stream" not in client.chat.completions.calls[1]
+
+
+class _FlakyCompletions:
+    def __init__(self, failures: int, content: str = "value = 1\n"):
+        self.failures = failures
+        self.content = content
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("upstream failed")
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self.content))]
+        )
+
+
+class _FlakyClient:
+    def __init__(self, failures: int, content: str = "value = 1\n"):
+        self.chat = SimpleNamespace(completions=_FlakyCompletions(failures, content))
+
+
+def test_code_to_file_retries_after_transient_failure(tmp_path: Path) -> None:
+    target_path = tmp_path / "generated.py"
+    client = _FlakyClient(failures=1)
+    coder = Coder(client=client, use_streaming=False, max_retries=2)
+
+    written_path = coder.code_to_file("write code", str(target_path))
+
+    assert written_path == target_path
+    assert target_path.read_text(encoding="utf-8") == "value = 1\n"
+    assert len(client.chat.completions.calls) == 2
+
+
+def test_code_to_file_raises_after_max_retries_exhausted(tmp_path: Path) -> None:
+    target_path = tmp_path / "generated.py"
+    client = _FlakyClient(failures=10)
+    coder = Coder(client=client, use_streaming=False, max_retries=2)
+
+    with pytest.raises(LLMGenerationError):
+        coder.code_to_file("write code", str(target_path))
+
+    assert len(client.chat.completions.calls) == 3
+    assert not target_path.exists()

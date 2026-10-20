@@ -196,6 +196,7 @@ class Coder(WorkflowStepNode):
     timeout: Optional[float] = None
     client: Optional[object] = None
     use_streaming: bool = True
+    max_retries: int = 3
     session_marking_prompt: str = ""
 
     def __post_init__(self, *, initialize_client: bool = True) -> None:
@@ -579,37 +580,67 @@ class Coder(WorkflowStepNode):
         temperature: float = 0.2,
         max_tokens: int = MAX_TOKENS,
     ) -> Path:
-        """Generate code from the prompt and persist it to `file_path`."""
+        """Generate code from the prompt and persist it to `file_path`.
 
-        try:
-            return self.write_code_chunks_to_file(
-                self.iter_code_chunks(user_prompt, temperature=temperature, max_tokens=max_tokens),
-                file_path,
-                overwrite=overwrite,
-            )
-        except LLMGenerationError as exc:
-            if not self._should_retry_full_request_without_stream(exc):
-                raise
-            LOGGER.warning(
-                "Streaming code generation to file was interrupted for provider=%s model=%s; retrying full request without stream: %s",
-                self.provider,
-                self.model,
-                exc,
-            )
-            target_path = Path(file_path)
-            if target_path.exists():
-                target_path.unlink(missing_ok=True)
-            return self.write_code_to_file(
-                "".join(
-                    self._iter_code_chunks_once(
-                        user_prompt,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        stream=False,
+        Failed generations are retried up to ``max_retries`` extra attempts.
+        A streaming failure switches the remaining attempts to a full
+        non-streaming request.
+        """
+
+        target_path = Path(file_path)
+        attempts = max(1, int(self.max_retries) + 1)
+        use_stream = self.use_streaming
+        last_error: Optional[LLMGenerationError] = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                if use_stream:
+                    return self.write_code_chunks_to_file(
+                        self.iter_code_chunks(
+                            user_prompt,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                        ),
+                        file_path,
+                        overwrite=overwrite,
                     )
-                ),
-                file_path,
-                overwrite=overwrite,
-            )
+                return self.write_code_to_file(
+                    "".join(
+                        self._iter_code_chunks_once(
+                            user_prompt,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            stream=False,
+                        )
+                    ),
+                    file_path,
+                    overwrite=overwrite,
+                )
+            except LLMGenerationError as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                if use_stream and self._should_retry_full_request_without_stream(exc):
+                    use_stream = False
+                LOGGER.warning(
+                    "Code generation to file failed for provider=%s model=%s attempt=%s/%s; retrying stream=%s: %s",
+                    self.provider,
+                    self.model,
+                    attempt,
+                    attempts,
+                    use_stream,
+                    exc,
+                )
+                target_path.unlink(missing_ok=True)
+
+        LOGGER.error(
+            "Code generation to file failed after %s attempt(s) for provider=%s model=%s: %s",
+            attempts,
+            self.provider,
+            self.model,
+            last_error,
+        )
+        assert last_error is not None
+        raise last_error
 
 
