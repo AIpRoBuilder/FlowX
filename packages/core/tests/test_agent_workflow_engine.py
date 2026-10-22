@@ -568,6 +568,7 @@ def test_run_rerun_and_stop_a_service_through_the_runtime_service(world):
 
 	assert first["pid"] == 100 and second["pid"] == 101
 	assert first["main_entrypoint_id"] == built.artifacts["main_entrypoint"]["id"]
+	assert first["base_url"] == "http://127.0.0.1:8000"
 	assert [call[0] for call in world.runtime.started] == [main_path, main_path]
 	assert world.runtime.started[1][1].pid == 100  # the previous process is handed over for replacement
 	agent.stop_service(built.workflow_id)
@@ -577,6 +578,21 @@ def test_run_rerun_and_stop_a_service_through_the_runtime_service(world):
 	assert served.service["pid"] == 102
 	with pytest.raises(FileNotFoundError):
 		agent.run_service(agent.build_workflow_json("only a graph").workflow_id)
+
+
+def test_base_url_maps_bind_addresses_to_loopback(tmp_path):
+	record = engine_module.WorkflowRecord("wf", tmp_path, main_entrypoint_id="main")
+	assert record.base_url == "http://127.0.0.1:8000"
+
+	record.fastapi_host, record.fastapi_port = "::", 9001
+	assert record.base_url == "http://[::1]:9001"
+
+	record.fastapi_host, record.fastapi_port = "example.test", 9002
+	assert record.base_url == "http://example.test:9002"
+
+	record.fastapi_host, record.fastapi_port = "127.0.0.1", 9123
+	record.save()
+	assert engine_module.WorkflowRecord.load(tmp_path).base_url == "http://127.0.0.1:9123"
 
 
 def test_closing_the_engine_stops_started_services_and_unregisters_orchestrators(world):

@@ -2,6 +2,8 @@
 """MCP tools delegate to the FlowX engine API and report results and failures as JSON."""
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -11,10 +13,49 @@ def call(mcp_server, name, **kwargs):
     return json.loads(mcp_server.tools[name](**kwargs))
 
 
+class _Service(BaseHTTPRequestHandler):
+    """Stand-in for the generated main entrypoint: records requests, replays one response."""
+
+    requests: list = []
+    response = b""
+
+    def log_message(self, *_args):
+        pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length)
+        type(self).requests.append({"path": self.path, "json": json.loads(body or b"{}")})
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(type(self).response)
+
+
+@pytest.fixture
+def local_service(mcp_server):
+    _Service.requests, _Service.response = [], b""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Service)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    mcp_server.module._SERVICES["wf1"] = base_url
+    yield base_url
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+
+
 def test_registers_one_tool_per_engine_function(mcp_server):
     assert set(mcp_server.tools) == {
         "build_workflow_json", "build_nodes", "build_main_entrypoint", "build_workflow", "evolve_workflow",
         "run_service", "stop_service", "list_workflows", "list_nodes", "get_workflow",
+        "run_step", "reset_session",
     }
 
 
@@ -153,3 +194,57 @@ def test_run_server_closes_the_client_so_services_stop(mcp_server, monkeypatch):
     assert ran == [True]
     assert mcp_server.client.closed is True
     assert module._client is None
+
+
+def test_run_service_caches_the_base_url_for_the_step_proxy(mcp_server):
+    mcp_server.client.results["run_service"] = {"pid": 42, "base_url": "http://127.0.0.1:8123"}
+
+    result = call(mcp_server, "run_service", workflow_id="wf1")
+    assert result["service"]["base_url"] == "http://127.0.0.1:8123"
+    assert mcp_server.module._SERVICES == {"wf1": "http://127.0.0.1:8123"}
+
+    call(mcp_server, "stop_service", workflow_id="wf1")
+    assert mcp_server.module._SERVICES == {}
+
+
+def test_run_step_reports_the_step_that_wants_input(mcp_server, local_service):
+    _Service.response = (
+        b'data: {"type": "CUSTOM", "name": "input_required", '
+        b'"value": {"stepId": "ask", "title": "Ask", "prompt": "Name?"}}\n\n'
+        b'data: {"type": "RUN_FINISHED", "result": {"ok": true, "awaitingInput": "ask"}}\n\n'
+    )
+
+    result = call(mcp_server, "run_step", workflow_id="wf1", step_id="prepare")
+
+    assert result["status"] == "input_required"
+    assert result["awaiting"] == {"stepId": "ask", "title": "Ask", "prompt": "Name?"}
+    assert result["final"] == {"ok": True, "awaitingInput": "ask"}
+    assert result["session_id"] == mcp_server.module._SESSIONS["wf1"]
+    assert _Service.requests == [{
+        "path": "/api/run-step",
+        "json": {"sessionId": result["session_id"], "stepId": "prepare", "input": None},
+    }]
+
+
+def test_run_step_resumes_the_session_and_reset_rotates_the_run(mcp_server, local_service):
+    _Service.response = b'data: {"type": "RUN_FINISHED", "result": {"ok": true, "isFinal": true}}\n\n'
+
+    answered = call(mcp_server, "run_step", workflow_id="wf1", step_id="ask", input="Ada", session_id="s1")
+    _Service.response = b'{"ok": true, "sessionId": "s1", "threadId": "t1", "runId": "r2"}'
+    reset = call(mcp_server, "reset_session", workflow_id="wf1", session_id="s1")
+
+    assert answered["status"] == "completed"
+    assert _Service.requests[0] == {
+        "path": "/api/run-step", "json": {"sessionId": "s1", "stepId": "ask", "input": "Ada"},
+    }
+    assert reset["reset"] == {"ok": True, "sessionId": "s1", "threadId": "t1", "runId": "r2"}
+    assert _Service.requests[1] == {"path": "/api/reset-session", "json": {"sessionId": "s1"}}
+
+
+def test_run_step_requires_a_running_service(mcp_server):
+    mcp_server.module._SERVICES.clear()
+
+    result = call(mcp_server, "run_step", workflow_id="wf1", step_id="ask")
+
+    assert result["ok"] is False
+    assert "call run_service first" in result["error"]

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 FlowX contributors
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
+# Modified 2026-10-22: record the service bind address and expose its connectable base URL.
 """Request-driven workflow engine: reformat request -> graph plan -> nodes orchestrate -> main entrypoint.
 
 Like ``DynamicWorkflowOrchestrator`` it is a native WorkflowEngine whose class-only steps read
@@ -173,6 +174,8 @@ class WorkflowRecord:
 	main_entrypoint_version: int = 0
 	main_workflow_version: int = 0
 	main_entrypoint_path: Path | None = None
+	fastapi_host: str = "0.0.0.0"
+	fastapi_port: int = 8000
 	errors: dict[str, str] = field(default_factory=dict)
 	process: Any = field(default=None, repr=False)
 
@@ -193,6 +196,14 @@ class WorkflowRecord:
 	def main_log_path(self) -> Path:
 		return self.storage_dir / "logs" / "main_run.log"
 
+	@property
+	def base_url(self) -> str:
+		"""Where a client reaches the running service; bind addresses map to loopback."""
+		host = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(self.fastapi_host, self.fastapi_host)
+		if ":" in host and not host.startswith("["):
+			host = f"[{host}]"
+		return f"http://{host}:{self.fastapi_port}"
+
 	def clear_errors(self, prefix: str) -> None:
 		for key in [key for key in self.errors if key == prefix or key.startswith(f"{prefix}/")]:
 			del self.errors[key]
@@ -204,6 +215,8 @@ class WorkflowRecord:
 			"main_entrypoint_version": self.main_entrypoint_version,
 			"main_workflow_version": self.main_workflow_version,
 			"main_entrypoint_path": str(self.main_entrypoint_path) if self.main_entrypoint_path else None,
+			"fastapi_host": self.fastapi_host,
+			"fastapi_port": self.fastapi_port,
 			"errors": self.errors,
 		})
 
@@ -216,6 +229,8 @@ class WorkflowRecord:
 			main_entrypoint_version=data["main_entrypoint_version"],
 			main_workflow_version=data["main_workflow_version"],
 			main_entrypoint_path=Path(data["main_entrypoint_path"]) if data["main_entrypoint_path"] else None,
+			fastapi_host=data.get("fastapi_host", "0.0.0.0"),
+			fastapi_port=int(data.get("fastapi_port", 8000)),
 			errors=dict(data["errors"]),
 		)
 
@@ -546,6 +561,7 @@ class _MainStep(_StageStep):
 		path, run_log = generated
 		record.main_entrypoint_path, record.main_entrypoint_version = Path(path), record.main_entrypoint_version + 1
 		record.main_workflow_version = version.version
+		record.fastapi_host, record.fastapi_port = request.fastapi_host, request.fastapi_port
 		record.clear_errors("main")
 		return StageOutcome(
 			self.STAGE, "completed", attempts, changed=True,
@@ -785,7 +801,12 @@ class AgentWorkflowEngine:
 		record.process, info = self.runtime().rerun_server(
 			main_entrypoint_path=str(path), previous_process=record.process,
 		)
-		return {"workflow_id": workflow_id, "main_entrypoint_id": record.main_entrypoint_id, **info}
+		return {
+			"workflow_id": workflow_id,
+			"main_entrypoint_id": record.main_entrypoint_id,
+			"base_url": record.base_url,
+			**info,
+		}
 
 	def stop_service(self, workflow_id: str) -> None:
 		record = self.record(workflow_id)

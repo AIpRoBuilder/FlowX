@@ -7,6 +7,7 @@
 # Modified 2026-10-15: document deferred batch orchestration and partial-update risks.
 # Modified 2026-10-16: rewrite the tool surface on the AgentBuilder engine (build_*, run_service).
 # Modified 2026-10-19: add evolve_workflow and list_nodes.
+# Modified 2026-10-22: proxy the generated service's run-step and reset-session endpoints.
 """FastMCP server exposing the FlowX workflow engine."""
 
 from __future__ import annotations
@@ -21,7 +22,11 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
+import urllib.error
+import urllib.request
+import uuid
 from typing import Any, Callable, Iterator, Optional
 
 from .bootstrap import bootstrap_import_paths, load_env_from_runtime_context
@@ -83,9 +88,71 @@ def _tool_call(tool: str, func: Callable[[], Any]) -> str:
         return _error(tool, str(exc), traceback=traceback.format_exc().splitlines()[-20:])
 
 
+def _http(url: str, payload: dict[str, Any], timeout: float) -> str:
+    """POST JSON and return the body (SSE text for /api/run-step)."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:  # keep the 404/422 detail visible to the client
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{exc.code} {exc.reason}: {detail}") from exc
+
+
+def _wait_until_ready(base_url: str, timeout: float = 15.0) -> None:
+    """``rerun_server`` only starts the process; probe GET / before the first step."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with urllib.request.urlopen(f"{base_url}/", timeout=1.0):
+                return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"workflow service at {base_url} did not become ready")
+            time.sleep(0.2)
+
+
+def _sse_payloads(text: str) -> list[dict[str, Any]]:
+    """``to_sse_payload`` writes one ``data: {json}`` line per AG-UI event."""
+    payloads: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            try:
+                value = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                payloads.append(value)
+    return payloads
+
+
 # One client (hence one AgentBuilder) per server process: the core publishes its workflows globally.
 _client: Any = None
 _client_lock = threading.Lock()
+
+# Services started here, and the input sessions this process keeps per workflow.
+_SERVICES: dict[str, str] = {}
+_SESSIONS: dict[str, str] = {}
+_HTTP_LOCK = threading.Lock()
+
+
+def _session_for(workflow_id: str) -> str:
+    with _HTTP_LOCK:
+        return _SESSIONS.setdefault(workflow_id, uuid.uuid4().hex)
+
+
+def _service_url(workflow_id: str) -> str:
+    with _HTTP_LOCK:
+        base_url = _SERVICES.get(workflow_id)
+    if base_url is None:
+        raise RuntimeError(f"workflow {workflow_id} is not running; call run_service first")
+    _wait_until_ready(base_url)
+    return base_url
 
 
 def _sdk() -> Any:
@@ -271,12 +338,20 @@ def create_server() -> Any:
     def run_service(workflow_id: str) -> str:
         """Run a built workflow's main entrypoint as a service; a running one is replaced (rerun).
 
+        Returns the service's ``base_url``; run_step reuses it.
+
         Args:
             workflow_id: Id of a workflow whose main entrypoint is built.
         """
-        return _tool_call(
-            "run_service", lambda: {"ok": True, "service": _get_client().run_service(workflow_id)},
-        )
+
+        def _impl() -> dict[str, Any]:
+            service = _get_client().run_service(workflow_id)
+            if service.get("base_url"):
+                with _HTTP_LOCK:
+                    _SERVICES[workflow_id] = service["base_url"]
+            return {"ok": True, "service": service}
+
+        return _tool_call("run_service", _impl)
 
     @flowx_mcp.tool()
     def stop_service(workflow_id: str) -> str:
@@ -288,9 +363,80 @@ def create_server() -> Any:
 
         def _impl() -> dict[str, Any]:
             _get_client().stop_service(workflow_id)
+            with _HTTP_LOCK:
+                _SERVICES.pop(workflow_id, None)
             return {"ok": True, "workflow_id": workflow_id}
 
         return _tool_call("stop_service", _impl)
+
+    @flowx_mcp.tool()
+    def run_step(
+        workflow_id: str,
+        step_id: str,
+        input: Any = None,
+        session_id: str = "",
+        file_path: Optional[str] = None,
+        timeout: float = 300.0,
+    ) -> str:
+        """Send one step's input to a running workflow; report whether it needs more input.
+
+        The first call starts the session's run. When the answer is ``status == "input_required"``,
+        ``awaiting`` names the step that waits (stepId, title, prompt): ask the user, then call
+        run_step again with that step id and the answer. The same session resumes the same native
+        run, so completed steps are not re-executed.
+
+        Args:
+            workflow_id: Id of a workflow whose service is running (see run_service).
+            step_id: Step id to feed, normally the one named by ``awaiting``.
+            input: Text, or one file path/base64 payload for a file node.
+            session_id: Conversation id; omit to keep one per workflow in this process.
+            file_path: Convenience alternative to passing a path in ``input``.
+            timeout: Seconds to wait for the step to settle.
+        """
+
+        def _impl() -> dict[str, Any]:
+            base_url = _service_url(workflow_id)
+            session = session_id or _session_for(workflow_id)
+            payload: dict[str, Any] = {"sessionId": session, "stepId": step_id, "input": input}
+            if file_path:
+                payload["file_path"] = file_path
+            events = _sse_payloads(_http(f"{base_url}/api/run-step", payload, timeout))
+            awaiting = next(
+                (event.get("value") for event in events if event.get("name") == "input_required"), None,
+            )
+            final = next(
+                (event["result"] for event in reversed(events) if isinstance(event.get("result"), dict)), None,
+            )
+            return {
+                "ok": True,
+                "workflow_id": workflow_id,
+                "session_id": session,
+                "step_id": step_id,
+                "status": "input_required" if awaiting else "completed",
+                "awaiting": awaiting,
+                "final": final,
+                "events": events,
+            }
+
+        return _tool_call("run_step", _impl)
+
+    @flowx_mcp.tool()
+    def reset_session(workflow_id: str, session_id: str = "") -> str:
+        """Cancel this session's paused run and start a fresh one on the next run_step call.
+
+        Args:
+            workflow_id: Id of a workflow whose service is running.
+            session_id: Session to reset; omit to reset this process's session for the workflow.
+        """
+
+        def _impl() -> dict[str, Any]:
+            base_url = _service_url(workflow_id)
+            session = session_id or _session_for(workflow_id)
+            reset = json.loads(_http(f"{base_url}/api/reset-session", {"sessionId": session}, 30.0))
+            # The service rotates its runId but keeps the sessionId, so the cache stays valid.
+            return {"ok": True, "workflow_id": workflow_id, "session_id": session, "reset": reset}
+
+        return _tool_call("reset_session", _impl)
 
     @flowx_mcp.tool()
     def list_workflows() -> str:
