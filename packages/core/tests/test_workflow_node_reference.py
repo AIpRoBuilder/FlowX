@@ -27,7 +27,7 @@ def test_workflow_node_references_derive_traits_from_meta_node_kind() -> None:
         "WorkflowFileNode",
     }
 
-    assert references["WorkflowStepNode"].step_meta.get("nodeKind") is None
+    assert dict(references["WorkflowStepNode"].step_meta).get("nodeKind") is None
     assert references["WorkflowStepNode"].capability_category == "input"
     assert references["WorkflowStepNode"].recommended_ext_data_type == "user_input"
     assert references["WorkflowStepNode"].supports_inputs_format is True
@@ -94,6 +94,7 @@ def test_workflow_step_meta_catalog_uses_meta_node_kind_metadata() -> None:
 
     assert "metaNodeKind: WorkflowStepNode" in catalog
     assert "capability category: input" in catalog
+    assert "repeatable: false" in catalog
     assert "decorator-marked main utility methods: process_input" in catalog
     assert "StepRunOutput card/derived contract methods: process_input" in catalog
     assert "process_input(file_bytes, dependency_results, session_state)" in catalog

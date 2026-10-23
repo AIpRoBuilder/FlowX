@@ -1,9 +1,17 @@
 # Workflow runtime compatibility
 
 FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream
-revision `3e1e15b` (2026-10-13). That revision still reports package version `0.1.0`;
+revision `0319046` (2026-10-23). That revision still reports package version `0.1.0`;
 the version string alone does not distinguish the older API.
 
+- Engine step metadata follows upstream `ag_ui_workflow.StepMeta`: `id` and
+  `dependencies` are required, while `title`, `prompt`, `inputRequired`,
+  `metaNodeKind`, `repeatable`, `branches`, and descriptor fields are optional.
+  `init_workflow_engine` forwards each class's `step_meta()` unchanged, and
+  generated backends annotate `STEP_CHAIN: list[StepMeta]`. Minimal metadata such
+  as `{"id": ..., "dependencies": []}` is accepted by the engine; FlowX's planner
+  metadata additionally carries builder-only `nodeKind`/`extData`/`enabled` fields
+  for UI consumers.
 - JSON pipeline pools require `node_classes`, keyed by each JSON node's `name`,
   with true concrete classes taken from a `NODES` tuple:
   `NODE_CLASSES = {node.STEP_ID: node for node in NODES}`.
@@ -22,7 +30,8 @@ the version string alone does not distinguish the older API.
   pools after changing LLM configuration.
 - `init_workflow_engine(node_classes, workflow_config)` constructs the shared
   pool and engine directly, passing `node_classes` unchanged to the pool. Nodes
-  declare fixed step IDs/dependencies and provide their own `step_meta()`.
+  declare fixed step IDs/dependencies and provide their own `step_meta()` result
+  as `StepMeta`.
   Configured workflows scope instance settings around this initialization call;
   no constructor inference or factory metadata is needed. JSON supplies the topology
   and optional `pool_size`; there is no separate configuration object or constructor map.

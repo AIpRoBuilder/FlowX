@@ -162,7 +162,7 @@ For source-checkout execution, FlowX automatically discovers each `packages/*` c
 
 ### Workflow runtime compatibility
 
-FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream revision `3e1e15b` (2026-10-13). Contract details for contributors are in [docs/RUNTIME.md](docs/RUNTIME.md).
+FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream revision `0319046` (2026-10-23), including the `StepMeta` step-metadata contract. Contract details for contributors are in [docs/RUNTIME.md](docs/RUNTIME.md).
 
 ## Setup and first workflow
 

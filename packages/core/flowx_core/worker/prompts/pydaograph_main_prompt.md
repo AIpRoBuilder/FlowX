@@ -2,6 +2,7 @@
 
 Modification note (2026-10-13): use explicit JSON node-class maps and decode HTTP file inputs to bytes for the updated runtime.
 Modification note (2026-10-14): define concrete classes in a NODES tuple and pass its NODE_CLASSES map unchanged.
+Modification note (2026-10-23): type STEP_CHAIN with the upstream `StepMeta` contract.
 
 Generate a runnable FastAPI backend using `WorkflowEngine` and `WorkflowPipelinePool` from `ag_ui_workflow`, not a `GPipeline` CLI. Follow the main entrypoint template.
 
@@ -9,7 +10,7 @@ Generate a runnable FastAPI backend using `WorkflowEngine` and `WorkflowPipeline
 
 - Load `.env` from the generated file directory and project root before creating runtime resources, with `load_dotenv(..., override=False)`.
 - Import generated node classes from the absolute root package, so script execution works. Do not use relative node imports, `.step_nodes`, import fallbacks, or dynamic module discovery.
-- Define `NODES = (NodeA, NodeB, ...)`, `NODE_CLASSES = {node.STEP_ID: node for node in NODES}`, and `STEP_CHAIN = [NodeA.step_meta(), ...]`. Preserve a trailing comma for a single-node tuple.
+- Define `NODES = (NodeA, NodeB, ...)`, `NODE_CLASSES = {node.STEP_ID: node for node in NODES}`, and `STEP_CHAIN: list[StepMeta] = [NodeA.step_meta(), ...]`. Import `StepMeta` from `ag_ui_workflow`; its required keys are `id` and `dependencies`, while `title`, `prompt`, `repeatable`, and descriptor fields are optional. Preserve a trailing comma for a single-node tuple.
 - Use a stable `GRAPH_CONFIG_ID` identifying this graph configuration, not a session or request.
 - Create **one shared pool and engine**, once at FastAPI lifespan startup. Never create/destroy pools in routes, session helpers, or reset handlers. A stopped native pool must not be rebuilt in the same process.
 - `PIPELINE_JSON_PATH` points to the **FlowX planning config**, not a native graph document. Read and parse it **once at lifespan startup** into `workflow_config`. Require a JSON object; default a missing `pool_size` to `4` for older planning files. Require a positive integer, explicitly rejecting booleans, strings, floats, null, zero, and negative values. Do not read pool size from an environment variable.

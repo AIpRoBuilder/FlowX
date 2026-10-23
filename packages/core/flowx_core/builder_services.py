@@ -18,10 +18,20 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, TypedDict
+
+from ag_ui_workflow import StepMeta
 
 from flowx_core.architect.graph import Graph
 from flowx_core.tools.workflow_node_reference import resolve_workflow_node_reference
+
+
+class PlannedStepMeta(StepMeta, total=False):
+    """Engine ``StepMeta`` plus FlowX builder-only UI fields."""
+
+    nodeKind: str
+    extData: Any
+    enabled: bool
 
 
 @dataclass(kw_only=True)
@@ -137,7 +147,14 @@ def _declared_step_metadata(node_path: Path, node_name: str) -> dict[str, Any]:
     node_class = next((node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == node_name), None)
     if node_class is None:
         return {}
-    fields = {"STEP_ID": "id", "TITLE": "title", "PROMPT": "prompt", "DEPENDENCIES": "dependencies", "INPUT_REQUIRED": "inputRequired"}
+    fields = {
+        "STEP_ID": "id",
+        "TITLE": "title",
+        "PROMPT": "prompt",
+        "DEPENDENCIES": "dependencies",
+        "INPUT_REQUIRED": "inputRequired",
+        "REPEATABLE": "repeatable",
+    }
     metadata: dict[str, Any] = {}
     for statement in node_class.body:
         if isinstance(statement, ast.Assign):
@@ -154,7 +171,7 @@ def _declared_step_metadata(node_path: Path, node_name: str) -> dict[str, Any]:
             except (ValueError, TypeError, SyntaxError):
                 continue
             field = fields[target.id]
-            if field == "inputRequired" and isinstance(parsed, bool):
+            if field in {"inputRequired", "repeatable"} and isinstance(parsed, bool):
                 metadata[field] = parsed
             elif field == "dependencies" and isinstance(parsed, (list, tuple)) and all(isinstance(dep, str) for dep in parsed):
                 metadata[field] = list(parsed)
@@ -170,8 +187,8 @@ def build_steps_meta(
     resolve_root_path: Callable[[str | Path], Path],
     expected_backend_node_path: Callable[..., Path],
     include_hidden_nodes: bool = False,
-) -> list[dict[str, Any]]:
-    steps_meta: list[dict[str, Any]] = []
+) -> list[PlannedStepMeta]:
+    steps_meta: list[PlannedStepMeta] = []
 
     for node_name in planned_graph.get_topological_sorted_nodes():
         node_meta = planned_graph.get_node_meta(node_name)
@@ -194,18 +211,18 @@ def build_steps_meta(
         node_path = resolve_root_path(backend_path) if backend_path else expected_backend_node_path(node_name)
         declared = _declared_step_metadata(node_path, node_name)
 
-        steps_meta.append(
-            {
-                "id": declared.get("id", node_name),
-                "title": declared.get("title", node_name),
-                "prompt": declared.get("prompt", prompt),
-                "dependencies": declared.get("dependencies", list(getattr(node_meta, "depends", []) or [])),
-                "inputRequired": declared.get("inputRequired", bool(input_required)),
-                "nodeKind": str(reference.capability_category or "operation"),
-                "extData": ext_data if isinstance(ext_data, Mapping) else (ext_data or {}),
-                "metaNodeKind": str(reference.meta_node_kind or ""),
-                "enabled": bool(getattr(node_meta, "enable", True)),
-            }
-        )
+        step_meta: PlannedStepMeta = {
+            "id": declared.get("id", node_name),
+            "title": declared.get("title", node_name),
+            "prompt": declared.get("prompt", prompt),
+            "dependencies": declared.get("dependencies", list(getattr(node_meta, "depends", []) or [])),
+            "inputRequired": declared.get("inputRequired", bool(input_required)),
+            "repeatable": declared.get("repeatable", False),
+            "metaNodeKind": str(reference.meta_node_kind or ""),
+            "nodeKind": str(reference.capability_category or "operation"),
+            "extData": ext_data if isinstance(ext_data, Mapping) else (ext_data or {}),
+            "enabled": bool(getattr(node_meta, "enable", True)),
+        }
+        steps_meta.append(step_meta)
 
     return steps_meta

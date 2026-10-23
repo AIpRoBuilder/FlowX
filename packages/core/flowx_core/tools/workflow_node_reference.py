@@ -7,7 +7,10 @@ from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, cast
+
+if TYPE_CHECKING:
+	from ag_ui_workflow import StepMeta
 
 
 @dataclass(frozen=True)
@@ -22,7 +25,7 @@ class WorkflowNodeReference:
 	subclass_implementation_methods: tuple[str, ...]
 	step_output_schema_methods: tuple[str, ...]
 	summary: str
-	step_meta: dict[str, Any]
+	step_meta: StepMeta
 	supports_inputs_format: bool
 
 
@@ -608,7 +611,7 @@ def _summary_from_step_meta(step_meta: Mapping[str, Any]) -> str:
 def workflow_node_references() -> tuple[WorkflowNodeReference, ...]:
 	references: list[WorkflowNodeReference] = []
 	for base_class in _base_node_classes():
-		step_meta = dict(base_class.step_meta())
+		step_meta = cast("StepMeta", dict(base_class.step_meta()))
 		meta_node_kind = _step_meta_node_kind(base_class, step_meta)
 		traits = _traits_for_meta_node_kind(meta_node_kind)
 		main_utility_methods = _main_utility_methods(base_class)
@@ -706,6 +709,7 @@ def render_workflow_step_meta_catalog() -> str:
 			[
 				"- step_meta reference:",
 				f"  - metaNodeKind: {step_meta.get('metaNodeKind', reference.meta_node_kind)}",
+				f"  - repeatable: {str(bool(step_meta.get('repeatable', False))).lower()}",
 				f"  - structure: {str(step_meta.get('structure', '')).strip() or 'n/a'}",
 				f"  - function: {str(step_meta.get('function', '')).strip() or 'n/a'}",
 				f"  - implementationGuide: {str(step_meta.get('implementationGuide', '')).strip() or 'n/a'}",
@@ -727,6 +731,7 @@ def render_workflow_node_reference(reference: WorkflowNodeReference) -> str:
 			f"- capability category: {reference.capability_category}",
 			f"- recommended ext_data.type: {reference.recommended_ext_data_type}",
 			f"- inputRequired: {str(reference.input_required).lower()}",
+			f"- repeatable: {str(bool(step_meta.get('repeatable', False))).lower()}",
 			f"- supports inputs_format: {str(reference.supports_inputs_format).lower()}",
 			f"- decorator-marked main utility methods: {', '.join(reference.main_utility_methods) if reference.main_utility_methods else 'none'}",
 			f"- StepRunOutput card/derived contract methods: {', '.join(reference.step_output_schema_methods) if reference.step_output_schema_methods else 'none'}",

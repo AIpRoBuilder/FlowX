@@ -31,7 +31,7 @@ from flowx_core.agent_intent import INTENT_SYSTEM_PROMPT
 from flowx_core.agent_workflow_engine import AgentResult, AgentWorkflowEngine
 from flowx_core.auditor import GraphJsonAuditor, NodeAuditor, MainEntryPointAuditor
 from flowx_core.builder_support import BuildSession, BuilderComponentFactory
-from flowx_core.builder_services import RuntimeService, build_steps_meta
+from flowx_core.builder_services import PlannedStepMeta, RuntimeService, build_steps_meta
 from flowx_core.llm_client.coder import Coder, compose_session_marking_prompt
 from flowx_core.worker.main_writer import PromptMainFileCoder
 from flowx_core.worker.node_writer import RequestNodeFileCoder
@@ -499,7 +499,7 @@ class AgentBuilder:
             "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes."
         )
 
-    def _build_steps_meta(self, include_hidden_nodes: bool = False) -> List[Dict[str, Any]]:
+    def _build_steps_meta(self, include_hidden_nodes: bool = False) -> List[PlannedStepMeta]:
         return build_steps_meta(
             self._load_planned_graph(), node_location_map=self.node_location_map,
             resolve_root_path=self._resolve_root_path,

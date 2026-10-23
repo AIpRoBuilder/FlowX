@@ -99,7 +99,7 @@ def test_main_entrypoint_auditor_accepts_json_content_pool(tmp_path):
 
 
 def test_main_entrypoint_auditor_rejects_aliased_old_constructor(tmp_path):
-    source = _main_source().replace("import WorkflowEngine,", "import WorkflowEngine as Engine,")
+    source = _main_source().replace(" WorkflowEngine,", " WorkflowEngine as Engine,")
     source = source.replace("ENGINE = WorkflowEngine(", "ENGINE = Engine(thread_id='old',")
     ok, violations = MainEntryPointAuditor().audit_file(_write_main_file(tmp_path, source=source))
     assert not ok

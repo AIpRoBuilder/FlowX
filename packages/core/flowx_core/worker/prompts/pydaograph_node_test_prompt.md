@@ -25,7 +25,7 @@ Guidelines:
 - Assert that behavioral tests return StepRunOutput and that the relevant card or derived content matches the node code.
 
 Preferred test shape:
-- One identity test covering import, class name, STEP_ID, and basic step_meta fields.
+- One identity test covering import, class name, STEP_ID, and basic step_meta fields (`id` and `dependencies` are required by `StepMeta`).
 - One or more behavior tests covering the node's main utility contract.
 - Small helper functions inside the test file are allowed only when they remove duplicated setup used at least twice.
 

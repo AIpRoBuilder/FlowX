@@ -190,7 +190,7 @@ class PromptNodeTestFileCoder(Coder):
             "- Create only the smallest dependency_results, session_state, user_input, file_bytes, temp files, env vars, or monkeypatches that are implied by this node code.\n"
             "- When the node would otherwise call external services, install packages, spawn processes, or hit a network/LLM API, monkeypatch only that external boundary while still running the node's internal logic.\n"
             "- Assert concrete StepRunOutput.card and StepRunOutput.derived values or keys that are deterministically produced by this node code.\n"
-            "- Include one identity test that covers importability plus STEP_ID and step_meta basics.\n"
+            "- Include one identity test that covers importability plus STEP_ID and step_meta basics (`id` and `dependencies` are required by `StepMeta`).\n"
             "- Include at least one behavioral test focused on the node's primary StepRunOutput contract.\n"
             "- For WorkflowFileNode, call process_input with one bytes payload (including empty bytes when allowed), and assert the subclass's real processing/persistence output. Do not assume inherited saved_files or upload decoding; avoid duplicating base-class tests.\n"
             "- Return only runnable Python test code with no markdown fences or commentary.\n\n"

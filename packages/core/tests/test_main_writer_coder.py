@@ -478,7 +478,7 @@ def _render_backend(tmp_path, sources=None, *, workflow_config=None):
 
     @classmethod
     def step_meta(cls):
-        return {{"id": cls.STEP_ID, "metaNodeKind": {ext_type!r}}}
+        return {{"id": cls.STEP_ID, "dependencies": list(cls.DEPENDENCIES), "metaNodeKind": {ext_type!r}}}
 '''
             for name, step_id, ext_type in (
             ("Collect", "collect", "WorkflowStepNode"),

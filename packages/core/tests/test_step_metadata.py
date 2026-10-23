@@ -45,6 +45,7 @@ def test_metadata_resolves_automatic_input_and_disabled_nodes_without_files(tmp_
     }
     hidden = {step["id"]: step for step in _metadata(builder, include_hidden_nodes=True)}
     assert hidden["Disabled"]["enabled"] is False
+    assert hidden["Disabled"]["repeatable"] is False
 
 
 def test_metadata_reads_generated_constants_without_executing_source(tmp_path):
@@ -59,6 +60,7 @@ class Custom(WorkflowStepNode):
     PROMPT = ""
     DEPENDENCIES: list[str] = ["actual-parent"]
     INPUT_REQUIRED = True
+    REPEATABLE = True
 ''', encoding="utf-8")
     metadata = _metadata(builder)[0]
     assert metadata["id"] == "actual-step"
@@ -66,6 +68,7 @@ class Custom(WorkflowStepNode):
     assert metadata["prompt"] == ""
     assert metadata["dependencies"] == ["actual-parent"]
     assert metadata["inputRequired"] is True
+    assert metadata["repeatable"] is True
 
 
 @pytest.mark.parametrize("source", [

@@ -3,6 +3,7 @@
 Modified: pass explicit concrete class maps directly; use class-declared identities.
 Modified: seed the attached WorkflowParam.state through a request-local lease bridge.
 Modified 2026-10-16: reload an engine's pool and step metadata when the workflow config changes.
+Modified 2026-10-23: type engine step metadata with ag_ui_workflow.StepMeta.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Any
 
 from ag_ui_workflow import (
     RunResult,
+    StepMeta,
     StepRunInput,
     StepRunOutput,
     WorkflowEngine,
@@ -49,11 +51,12 @@ class _WorkflowPipelinePool(WorkflowPipelinePool):
 def _prepare_graph(
     node_classes: Mapping[str, type[GElement]],
     workflow_config: Mapping[str, Any],
-) -> tuple[str, list[dict[str, Any]], int]:
+) -> tuple[str, list[StepMeta], int]:
     """Check a class map against its JSON topology; return native JSON, step metadata and pool size.
 
     Class STEP_ID and DEPENDENCIES must match the JSON topology. Metadata comes
-    directly from each class without constructing speculative node instances.
+    directly from each class without constructing speculative node instances and
+    follows the upstream ``StepMeta`` contract (``id``/``dependencies`` required).
     """
     nodes = workflow_config.get("nodes")
     if not isinstance(nodes, list) or not nodes or any(not isinstance(node, dict) for node in nodes):
@@ -67,7 +70,8 @@ def _prepare_graph(
     if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
         raise ValueError("workflow pool_size must be a positive integer")
 
-    native_nodes, steps_meta = [], []
+    native_nodes: list[dict[str, Any]] = []
+    steps_meta: list[StepMeta] = []
     for node in nodes:
         name = node["name"]
         node_class = node_classes[name]
