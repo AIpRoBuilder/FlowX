@@ -6,6 +6,7 @@ Modified 2026-10-15: merge batch context and per-node inputs into one request mo
 Modified 2026-10-15: derive node identity from metadata and keep routing data in the builder.
 Modified 2026-10-15: accept one complete node request without batch orchestration.
 Modified 2026-10-15: defer batch orchestration and allow explicit per-request planner skipping.
+Modified 2026-10-24: be the WorkflowEngine instead of wrapping one.
 """
 
 from __future__ import annotations
@@ -15,18 +16,14 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from ag_ui_workflow import WorkflowEngine, WorkflowStepNode
+from ag_ui_workflow import WorkflowStepNode
 
 from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.architect.graph import NodeMeta
 from flowx_core.tools._node_settings import node_settings
 from flowx_core.tools.file_tools import parse_json_file
-from flowx_core.tools.workflow_engine import (
-    close_workflow_engine,
-    init_workflow_engine,
-    run_workflow,
-)
+from flowx_core.tools.workflow_engine import FlowXWorkflowEngine
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
 
 
@@ -66,15 +63,16 @@ class NodeGenerationRequest:
 
 
 @dataclass
-class NodeGenerationWorkflow:
+class NodeGenerationWorkflow(FlowXWorkflowEngine):
     """Reusable ``node_plan -> node_generate -> node_audit`` workflow for any node kind."""
 
     node_planner: NodePlanElement
     node_coder: PromptNodeFileCoderBase
     node_auditor: NodeAuditor
-    _engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
-    _closed: bool = field(default=False, init=False, repr=False)
     _node_classes: dict[str, type[WorkflowStepNode]] = field(default_factory=dict, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    REQUEST_TYPES = (NodeGenerationRequest,)
+    CLOSED_MESSAGE = "node generation workflow is closed or not initialized"
 
     def __post_init__(self) -> None:
         # Build before publishing this workflow to concurrent callers. The pool
@@ -89,37 +87,31 @@ class NodeGenerationWorkflow:
             raise TypeError("Node generation configuration must be a JSON object")
         return config
 
-    def init_node_engine(self) -> WorkflowEngine:
+    def init_node_engine(self) -> NodeGenerationWorkflow:
         """Build once from exact classes and shallow dataclass settings snapshots.
 
         Later component replacements or instance monkeypatches cannot change
         native pool nodes. Per-request settings belong in the request state.
         """
         if self._closed:
-            raise RuntimeError("node generation workflow is closed")
-        if self._engine is None:
-            NODES = (type(self.node_planner), type(self.node_coder), type(self.node_auditor))
-            NODE_CLASSES = {node.STEP_ID: node for node in NODES}
-            settings = {
-                component.STEP_ID: {
-                    setting.name: getattr(component, setting.name)
-                    for setting in fields(component) if setting.init
-                }
-                for component in (self.node_planner, self.node_coder, self.node_auditor)
-                if is_dataclass(component)
+            raise RuntimeError(self.CLOSED_MESSAGE)
+        if "pool" in vars(self):
+            return self
+        NODES = (type(self.node_planner), type(self.node_coder), type(self.node_auditor))
+        NODE_CLASSES = {node.STEP_ID: node for node in NODES}
+        settings = {
+            component.STEP_ID: {
+                setting.name: getattr(component, setting.name)
+                for setting in fields(component) if setting.init
             }
-            settings.setdefault(self.node_auditor.STEP_ID, {})["white_list"] = set(self.node_auditor.white_list)
-            self._node_classes = NODE_CLASSES
-            with node_settings(settings):
-                self._engine = init_workflow_engine(NODE_CLASSES, self.json_config())
-        return self._engine
-
-    def close(self) -> None:
-        """Release the native pool once; a closed workflow cannot be restarted."""
-        self._closed = True
-        engine, self._engine = self._engine, None
-        if engine is not None:
-            close_workflow_engine(engine)
+            for component in (self.node_planner, self.node_coder, self.node_auditor)
+            if is_dataclass(component)
+        }
+        settings.setdefault(self.node_auditor.STEP_ID, {})["white_list"] = set(self.node_auditor.white_list)
+        self._node_classes = NODE_CLASSES
+        with node_settings(settings):
+            super().__init__(NODE_CLASSES, self.json_config())
+        return self
 
     @staticmethod
     def build_plan_request(request: NodeGenerationRequest) -> dict[str, Any]:
@@ -167,15 +159,12 @@ class NodeGenerationWorkflow:
             },
         }
 
-    def run(
+    def execute(
         self,
         request: NodeGenerationRequest,
     ) -> str:
         """Generate and audit one node, returning the generated file path."""
 
-        engine = self._engine
-        if engine is None:
-            raise RuntimeError("node generation workflow is closed or not initialized")
         if request.node_meta is None or not request.node_meta.name or request.target_path is None:
             raise ValueError("node generation requires named node_meta and target_path")
         node_name = request.node_meta.name
@@ -187,8 +176,7 @@ class NodeGenerationWorkflow:
         needs_plan = not request.skip_node_planner and (
             plan_request["generate_markdown"] or bool(plan_request["amendment"])
         )
-        run_result = run_workflow(
-            engine,
+        run_result = self.run_steps(
             state={
                 **request.state,
                 **self.build_node_request(request, plan_request),

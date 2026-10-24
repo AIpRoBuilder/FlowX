@@ -3,6 +3,7 @@
 Modified 2026-10-14: extract graph building into a request-controlled workflow.
 Modified 2026-10-14: initialize once and seed native state from each caller's request.
 Modified 2026-10-16: let a request amend the requirement analysis instead of rewriting it.
+Modified 2026-10-24: be the WorkflowEngine instead of wrapping one.
 """
 
 from __future__ import annotations
@@ -11,18 +12,14 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-from ag_ui_workflow import RunResult, WorkflowEngine
+from ag_ui_workflow import RunResult
 
 from flowx_core.architect.graph_planner import GraphPlanner
 from flowx_core.auditor.graph_json_auditor import GraphJsonAuditor
 from flowx_core.demand_analyzer.requirement_disector import RequirementDisector
 from flowx_core.tools._node_settings import node_settings
 from flowx_core.tools.file_tools import parse_json_file
-from flowx_core.tools.workflow_engine import (
-    close_workflow_engine,
-    init_workflow_engine,
-    run_workflow,
-)
+from flowx_core.tools.workflow_engine import FlowXWorkflowEngine
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -45,13 +42,14 @@ class GraphGenerationRequest:
 
 
 @dataclass
-class GraphGenerationWorkflow:
+class GraphGenerationWorkflow(FlowXWorkflowEngine):
     """Reuse initialized concrete nodes; only WorkflowParam holds run state."""
 
     analyzer: RequirementDisector
     planner: GraphPlanner
     graph_auditor: GraphJsonAuditor
-    _engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
+    REQUEST_TYPES = (GraphGenerationRequest,)
+    CLOSED_MESSAGE = "graph generation workflow is closed"
 
     def __post_init__(self) -> None:
         components = (self.analyzer, self.planner, self.graph_auditor)
@@ -64,13 +62,7 @@ class GraphGenerationWorkflow:
             for node in (self.analyzer, self.planner)
         }
         with node_settings(settings):
-            self._engine = init_workflow_engine(node_classes, self.json_config())
-
-    def close(self) -> None:
-        """Release this service's pool once, after all its requests finish."""
-        engine, self._engine = self._engine, None
-        if engine is not None:
-            close_workflow_engine(engine)
+            super().__init__(node_classes, self.json_config())
 
     @staticmethod
     def json_config() -> dict[str, Any]:
@@ -79,11 +71,8 @@ class GraphGenerationWorkflow:
             raise TypeError("Graph generation configuration must be a JSON object")
         return config
 
-    def run(self, request: GraphGenerationRequest) -> RunResult:
+    def execute(self, request: GraphGenerationRequest) -> RunResult:
         """Execute selected steps, raising audit feedback without amending or retrying."""
-        engine = self._engine
-        if engine is None:
-            raise RuntimeError("graph generation workflow is closed")
         if request.graph_action not in ("plan", "amend"):
             raise ValueError("graph_action must be 'plan' or 'amend'")
         if request.requirement_action not in ("write", "amend"):
@@ -95,7 +84,7 @@ class GraphGenerationWorkflow:
                 (self.graph_auditor.STEP_ID, request.skip_audit_graph),
             ) if skip
         )
-        result = run_workflow(engine, state={
+        result = self.run_steps(state={
             **request.state,
             f"{type(self.analyzer).__name__}::action": request.requirement_action,
             "requirement_disector": {

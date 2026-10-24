@@ -7,6 +7,7 @@ Modified 2026-10-15: mutable repair requests own outputs; each run uses a fresh 
 Modified 2026-10-15: remove unused workflow name and write-only stage bookkeeping.
 Modified 2026-10-20: gate the amendment on user input that guides it or skips it.
 Modified 2026-10-20: interactive runs ask for guidance after the node test result.
+Modified 2026-10-24: be the WorkflowEngine instead of wrapping one.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from ag_ui_workflow import StepRunOutput, WorkflowEngine
+from ag_ui_workflow import StepRunOutput
 
 from flowx_core.runtime import RunNodeTest
 from flowx_core.runtime.run_node_test import _execute_node_test
@@ -27,9 +28,7 @@ from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.tools.file_tools import parse_json_file
 from flowx_core.tools.workflow_engine import (
 	_RUN_REQUEST,
-	close_workflow_engine,
-	init_workflow_engine,
-	run_workflow,
+	FlowXWorkflowEngine,
 )
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
@@ -329,14 +328,16 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 
 
 @dataclass
-class NodeRuntimeModifierPipeline:
+class NodeRuntimeModifierPipeline(FlowXWorkflowEngine):
 	"""Workflow engine for test-driven repair of one workflow node."""
 
 	node_test_writer: GenerateNodeTestFile
 	node_writer: AmendNodeFromTestLog
 	run_subprocess: Callable[..., Any] = subprocess.run
 	timeout_expired: type[BaseException] = subprocess.TimeoutExpired
-	_engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
+	_closed: bool = field(default=False, init=False, repr=False)
+	REQUEST_TYPES = (NodeRuntimeModifierRequest,)
+	CLOSED_MESSAGE = "node runtime modifier is closed or not initialized"
 
 	def __post_init__(self) -> None:
 		# Eager pool construction consumes shallow snapshots, preserving client
@@ -356,7 +357,7 @@ class NodeRuntimeModifierPipeline:
 			"timeout_expired": self.timeout_expired,
 		}
 		with node_settings(settings):
-			self._engine = init_workflow_engine(NODE_CLASSES, self.json_config())
+			super().__init__(NODE_CLASSES, self.json_config())
 
 	@staticmethod
 	def json_config() -> dict[str, Any]:
@@ -369,12 +370,6 @@ class NodeRuntimeModifierPipeline:
 		if not isinstance(config, dict):
 			raise TypeError("Node runtime modifier configuration must be a JSON object")
 		return config
-
-	def close(self) -> None:
-		"""Release the native pool once; subsequent runs require a new modifier."""
-		engine, self._engine = self._engine, None
-		if engine is not None:
-			close_workflow_engine(engine)
 
 	def _prepare_request(self, request: NodeRuntimeModifierRequest) -> NodeRuntimeModifierRequest:
 		"""Resolve request-local paths and snapshot mapping-backed graphs."""
@@ -401,7 +396,7 @@ class NodeRuntimeModifierPipeline:
 			request.workflow_graph = str(graph_path)
 		return request
 
-	def run(
+	def execute(
 		self,
 		request: NodeRuntimeModifierRequest,
 		user_input: str = "",
@@ -414,17 +409,14 @@ class NodeRuntimeModifierPipeline:
 		an empty value proceeds from the test log alone.
 		"""
 
-		engine = self._engine
-		if engine is None:
-			raise RuntimeError("node runtime modifier is closed or not initialized")
 		request = self._prepare_request(request)
 		skip_amendment, _ = _amendment_input_parts(user_input)
 		if skip_amendment:
 			# An explicit skip also avoids requiring an existing log when test
 			# execution is skipped for this request.
 			request.skip_amend_node = True
-		run_workflow(
-			engine, state={**request.state, "node_runtime_modifier": request},
+		self.run_steps(
+			state={**request.state, "node_runtime_modifier": request},
 			inputs={AmendNodeFromTestLog.STEP_ID: user_input},
 		)
 		if not request.skip_run_node_test and request.test_result is None:
@@ -443,15 +435,14 @@ class NodeRuntimeModifierPipeline:
 		amendment, or an empty string to amend from the test log alone.
 		"""
 
-		engine = self._engine
-		if engine is None:
-			raise RuntimeError("node runtime modifier is closed or not initialized")
+		if self.closed:
+			raise RuntimeError(self.CLOSED_MESSAGE)
 		request = self._prepare_request(request)
 		request_id = f"flowx-request-{uuid.uuid4().hex}"
 		state = {**request.state, "node_runtime_modifier": request}
 		token = _RUN_REQUEST.set((state, frozenset()))
 		try:
-			result = engine.run(request_id)
+			result = self.run(request_id)
 		finally:
 			_RUN_REQUEST.reset(token)
 		try:
@@ -459,14 +450,14 @@ class NodeRuntimeModifierPipeline:
 				if result.awaiting["id"] != AmendNodeFromTestLog.STEP_ID:
 					raise RuntimeError(f"unexpected workflow input gate: {result.awaiting['id']}")
 				answer = input_callback(request)
-				result = engine.answer(request_id, answer)
+				result = self.answer(request_id, answer)
 			if result.status != "completed":
 				raise RuntimeError(result.error or result.status)
 			if not request.skip_run_node_test and request.test_result is None:
 				raise RuntimeError(f"node test execution did not produce a result for {request.node_name or request.node_file_name}")
 			return request
 		finally:
-			engine.close(request_id)
+			self.close(request_id)
 
 
 __all__ = [

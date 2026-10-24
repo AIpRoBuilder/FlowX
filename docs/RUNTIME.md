@@ -35,8 +35,20 @@ the version string alone does not distinguish the older API.
   Configured workflows scope instance settings around this initialization call;
   no constructor inference or factory metadata is needed. JSON supplies the topology
   and optional `pool_size`; there is no separate configuration object or constructor map.
-  Use `engine.run()` and `engine.answer()` for interactive runs; `run_workflow()`
-  requires completion for the noninteractive generation/repair workflows.
+  Use `engine.run()` and `engine.answer()` for interactive runs; `engine.run_steps()`
+  seeds request state and requires completion for the noninteractive
+  generation/repair workflows.
+- `GraphGenerationWorkflow`, `NodeGenerationWorkflow`,
+  `MainEntrypointGenerationWorkflow` and `NodeRuntimeModifierPipeline` subclass
+  `FlowXWorkflowEngine`, so each is its own `WorkflowEngine` rather than a wrapper
+  around one. Its `run(request)` dispatches the workflow's request model to
+  `execute(request)`; the native `run(request_id, inputs)`, `answer()`, `events()`
+  and `close(request_id)` forms remain available. `run_steps()` is the engine-owned
+  noninteractive run: it seeds `WorkflowParam.state`, applies skipped steps, and
+  requires every step to complete with output. `close()` without a request id
+  releases the pool and is terminal. `build_workflow_pool()` is the shared
+  construction seam that validates the class map and JSON topology, and
+  `init_workflow_engine()` returns a `FlowXWorkflowEngine`.
 - `WorkflowFileNode` subclasses implement `process_input(file_bytes, dependency_results,
   session_state)`. Generated backends decode one file path/base64 upload to bytes;
   subclasses own processing and any persistence. Multiple uploads must be handled

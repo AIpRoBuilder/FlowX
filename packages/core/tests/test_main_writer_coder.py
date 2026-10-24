@@ -27,8 +27,8 @@ from fastapi.testclient import TestClient
 from flowx_core.auditor.data import RuleViolation
 from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
 from flowx_core.llm_client.coder import Coder
+from flowx_core.tools import workflow_engine as workflow_engine_module
 from flowx_core.worker.main_writer import PromptMainFileCoder
-from flowx_core.workflows import main_entrypoint_generation
 from flowx_core.workflows.main_entrypoint_generation import (
     MainEntrypointGenerationRequest,
     MainEntrypointGenerationWorkflow,
@@ -212,10 +212,10 @@ def test_main_workflow_runs_main_writer_then_auditor_once(tmp_path, monkeypatch,
 
     monkeypatch.setattr(MainEntryPointAuditor, "process_input", capture_audit)
     monkeypatch.setattr(MainEntryPointAuditor, "audit_file", audit_file)
-    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
-    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+    close_engine = Mock(wraps=workflow_engine_module.close_workflow_engine)
+    init_engine = Mock(wraps=workflow_engine_module.build_workflow_pool)
+    monkeypatch.setattr(workflow_engine_module, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", init_engine)
 
     request = MainEntrypointGenerationRequest(
         project_root_path=str(package_dir), graph_plan_json_path=str(graph_path),
@@ -226,8 +226,7 @@ def test_main_workflow_runs_main_writer_then_auditor_once(tmp_path, monkeypatch,
     assert not hasattr(request, "temperature")
 
     with closing(_main_workflow(writer, MainEntryPointAuditor())) as workflow:
-        engine = workflow._engine
-        assert engine is not None
+        engine = workflow
         init_engine.assert_called_once()
         assert init_engine.call_args.args[0] == {
             "main_generate": PromptMainFileCoder,
@@ -258,14 +257,14 @@ def test_main_workflow_runs_main_writer_then_auditor_once(tmp_path, monkeypatch,
         assert "uvicorn.run(app, host='127.0.0.1', port=9001, reload=False)" in source
         amendment.assert_not_called()
         init_engine.assert_called_once()
-        assert workflow._engine is engine
+        assert workflow is engine
         assert not engine.pool.closed
         with engine.pool.lease() as (_, param):
             assert param.state == {}
         close_engine.assert_not_called()
 
     close_engine.assert_called_once_with(engine)
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 
@@ -291,7 +290,7 @@ def test_builder_main_workflow_preserves_template_and_explicit_amendment_context
         assert "# custom template" in Path(output).read_text(encoding="utf-8")
         assert Path(output) in writer._render_context_by_target
 
-    assert workflow._engine is None
+    assert workflow.closed
     assert writer.amend_code_with_feedback(output, "Refresh the entrypoint") == Path(output)
 
 
@@ -308,25 +307,24 @@ def test_builder_main_workflow_retains_pool_when_writer_raises(tmp_path, monkeyp
     )
     audit_input = Mock(side_effect=AssertionError("audit must not run after writer failure"))
     monkeypatch.setattr(MainEntryPointAuditor, "process_input", audit_input)
-    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
-    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+    close_engine = Mock(wraps=workflow_engine_module.close_workflow_engine)
+    init_engine = Mock(wraps=workflow_engine_module.build_workflow_pool)
+    monkeypatch.setattr(workflow_engine_module, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", init_engine)
     request = MainEntrypointGenerationRequest(
         project_root_path=str(tmp_path), graph_plan_json_path=str(graph_path),
         output_path=str(tmp_path / "main.py"), state={"failed_request": True},
     )
 
     with closing(_main_workflow(writer, MainEntryPointAuditor())) as workflow:
-        engine = workflow._engine
-        assert engine is not None
+        engine = workflow
         init_engine.assert_called_once()
         with pytest.raises(RuntimeError, match="writer failed"):
             workflow.run(request)
 
         audit_input.assert_not_called()
         close_engine.assert_not_called()
-        assert workflow._engine is engine
+        assert workflow is engine
         assert not engine.pool.closed
         assert request.state == {"failed_request": True}
         with engine.pool.lease() as (_, param):
@@ -342,13 +340,13 @@ def test_builder_main_workflow_retains_pool_when_writer_raises(tmp_path, monkeyp
         assert MainEntryPointAuditor().audit_file(recovery_request.output_path, nodes_root=str(tmp_path)) == (True, [])
         init_engine.assert_called_once()
         close_engine.assert_not_called()
-        assert workflow._engine is engine
+        assert not workflow.closed
         assert not engine.pool.closed
         with engine.pool.lease() as (_, param):
             assert param.state == {}
 
     close_engine.assert_called_once_with(engine)
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 
@@ -357,18 +355,17 @@ def test_main_entrypoint_workflow_runs_direct_build_request(tmp_path, monkeypatc
     graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
     (tmp_path / "Collect.py").write_text("class Collect: pass\n", encoding="utf-8")
     writer = PromptMainFileCoder()
-    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
-    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+    close_engine = Mock(wraps=workflow_engine_module.close_workflow_engine)
+    init_engine = Mock(wraps=workflow_engine_module.build_workflow_pool)
+    monkeypatch.setattr(workflow_engine_module, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", init_engine)
     request = MainEntrypointGenerationRequest(
         project_root_path=str(tmp_path), graph_plan_json_path=str(graph_path),
         output_path=str(tmp_path / "main.py"),
     )
 
     with closing(MainEntrypointGenerationWorkflow(writer, MainEntryPointAuditor())) as workflow:
-        engine = workflow._engine
-        assert engine is not None
+        engine = workflow
         init_engine.assert_called_once()
         close_engine.assert_not_called()
         output = workflow.run(request)
@@ -376,14 +373,14 @@ def test_main_entrypoint_workflow_runs_direct_build_request(tmp_path, monkeypatc
         assert output == request.output_path
         assert MainEntryPointAuditor().audit_file(output, nodes_root=str(tmp_path)) == (True, [])
         assert Path(output) in writer._render_context_by_target
-        assert workflow._engine is engine
+        assert workflow is engine
         assert not engine.pool.closed
         with engine.pool.lease() as (_, param):
             assert param.state == {}
         init_engine.assert_called_once()
         close_engine.assert_not_called()
 
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
     workflow.close()
     close_engine.assert_called_once_with(engine)
@@ -425,21 +422,20 @@ def test_main_entrypoint_requests_reuse_pool_with_independent_targets_and_state(
         return original_process_input(self, user_input, dependency_results, session_state)
 
     monkeypatch.setattr(PromptMainFileCoder, "process_input", capture_request)
-    close_engine = Mock(wraps=main_entrypoint_generation.close_workflow_engine)
-    init_engine = Mock(wraps=main_entrypoint_generation.init_workflow_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "close_workflow_engine", close_engine)
-    monkeypatch.setattr(main_entrypoint_generation, "init_workflow_engine", init_engine)
+    close_engine = Mock(wraps=workflow_engine_module.close_workflow_engine)
+    init_engine = Mock(wraps=workflow_engine_module.build_workflow_pool)
+    monkeypatch.setattr(workflow_engine_module, "close_workflow_engine", close_engine)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", init_engine)
     writer, auditor = PromptMainFileCoder(), MainEntryPointAuditor()
 
     with closing(MainEntrypointGenerationWorkflow(writer, auditor)) as workflow:
-        engine = workflow._engine
-        assert engine is not None
+        engine = workflow
         init_engine.assert_called_once()
         sources = []
         for request in (first_request, first_request, second_request):
             assert workflow.run(request) == request.output_path
             sources.append(Path(request.output_path).read_text(encoding="utf-8"))
-            assert workflow._engine is engine
+            assert not workflow.closed
             assert not engine.pool.closed
             assert all(native_param.state == {} for native_param in native_params)
             with engine.pool.lease() as (_, param):
@@ -463,7 +459,7 @@ def test_main_entrypoint_requests_reuse_pool_with_independent_targets_and_state(
         }
 
     close_engine.assert_called_once_with(engine)
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 

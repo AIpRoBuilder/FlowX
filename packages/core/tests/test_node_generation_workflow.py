@@ -24,6 +24,7 @@ from flowx_core.agent_builder import AgentBuilder
 from flowx_core.auditor.data import RuleViolation
 from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
+from flowx_core.tools import workflow_engine as workflow_engine_module
 from flowx_core.worker.node_writer import (
     RequestNodeFileCoder, WorkflowStepNodeCoder,
 )
@@ -87,10 +88,10 @@ def _make_builder(monkeypatch, root: Path) -> AgentBuilder:
 def _replace_node_workflow(builder: AgentBuilder) -> NodeGenerationWorkflow:
     """Explicitly replace an eager workflow after choosing new builder components."""
     old_workflow = builder._node_workflow
-    old_engine = old_workflow._engine
+    old_pool = old_workflow.pool
     old_workflow.close()
-    assert old_workflow._engine is None
-    assert old_engine is not None and old_engine.pool.closed
+    assert old_workflow.closed
+    assert old_pool.closed
     workflow = NodeGenerationWorkflow(
         node_planner=builder.node_planner,
         node_coder=builder.node_coder,
@@ -103,15 +104,28 @@ def _replace_node_workflow(builder: AgentBuilder) -> NodeGenerationWorkflow:
 def _capture_workflow_results(monkeypatch) -> list[RunResult]:
     """Observe native results without adding retained run state to production objects."""
     results: list[RunResult] = []
-    real_run_workflow = node_generation.run_workflow
+    real_run_steps = NodeGenerationWorkflow.run_steps
 
-    def capture_result(*args, **kwargs):
-        result = real_run_workflow(*args, **kwargs)
+    def capture_result(self, *args, **kwargs):
+        result = real_run_steps(self, *args, **kwargs)
         results.append(result)
         return result
 
-    monkeypatch.setattr(node_generation, "run_workflow", capture_result)
+    monkeypatch.setattr(NodeGenerationWorkflow, "run_steps", capture_result)
     return results
+
+
+def _spy_run_steps(monkeypatch) -> Mock:
+    """Record request-level run_steps calls with the workflow as their first argument."""
+    spy = Mock(name="run_steps")
+    real_run_steps = NodeGenerationWorkflow.run_steps
+
+    def capture(instance, *args, **kwargs):
+        spy(instance, *args, **kwargs)
+        return real_run_steps(instance, *args, **kwargs)
+
+    monkeypatch.setattr(NodeGenerationWorkflow, "run_steps", capture)
+    return spy
 
 
 def _make_generation_request(root: Path, name: str = "First") -> node_generation.NodeGenerationRequest:
@@ -183,12 +197,12 @@ def recording_node_workflow():
         node_planner=Planner(), node_coder=Coder(),
         node_auditor=Auditor(lambda *_args, **_kwargs: (True, [])),
     )
-    engine = workflow._engine
+    engine = workflow
     try:
         yield workflow, events, native_states
     finally:
         workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 
@@ -408,11 +422,11 @@ def test_plan_request_shallow_copies_raw_mapping_without_losing_extras(tmp_path:
 def test_generation_rejects_incomplete_requests_before_engine_run(monkeypatch, tmp_path: Path, missing: str) -> None:
     complete = _make_generation_request(tmp_path)
     request = replace(complete, **{missing: None})
-    run = Mock(name="run_workflow")
-    monkeypatch.setattr(node_generation, "run_workflow", run)
+    run = Mock(name="run_steps")
+    monkeypatch.setattr(NodeGenerationWorkflow, "run_steps", run)
     # Input validation precedes native execution; it needs no extra pool lifetime.
     workflow = object.__new__(node_generation.NodeGenerationWorkflow)
-    workflow._engine = Mock(name="unused_engine")
+    workflow._closed = False
     with pytest.raises(ValueError, match="requires named node_meta and target_path"):
         workflow.run(request)
     run.assert_not_called()
@@ -424,10 +438,10 @@ def test_generation_rejects_incomplete_requests_before_engine_run(monkeypatch, t
 def test_generation_rejects_empty_metadata_name_before_engine_run(monkeypatch, tmp_path: Path) -> None:
     complete = _make_generation_request(tmp_path)
     request = replace(complete, node_meta=replace(complete.node_meta, name=""))
-    run = Mock(name="run_workflow")
-    monkeypatch.setattr(node_generation, "run_workflow", run)
+    run = Mock(name="run_steps")
+    monkeypatch.setattr(NodeGenerationWorkflow, "run_steps", run)
     workflow = object.__new__(node_generation.NodeGenerationWorkflow)
-    workflow._engine = Mock(name="unused_engine")
+    workflow._closed = False
     with pytest.raises(ValueError, match="requires named node_meta and target_path"):
         workflow.run(request)
     run.assert_not_called()
@@ -440,10 +454,10 @@ def test_generation_rejects_empty_metadata_name_before_engine_run(monkeypatch, t
 @pytest.mark.parametrize("raw_node", [{"name": "Second"}, {"name": ""}, {}])
 def test_generation_rejects_raw_node_name_mismatch_before_engine_run(monkeypatch, tmp_path: Path, raw_node) -> None:
     request = replace(_make_generation_request(tmp_path), raw_node=raw_node)
-    run = Mock(name="run_workflow")
-    monkeypatch.setattr(node_generation, "run_workflow", run)
+    run = Mock(name="run_steps")
+    monkeypatch.setattr(NodeGenerationWorkflow, "run_steps", run)
     workflow = object.__new__(node_generation.NodeGenerationWorkflow)
-    workflow._engine = Mock(name="unused_engine")
+    workflow._closed = False
     with pytest.raises(ValueError, match=r"raw_node\.name must match node_meta\.name"):
         workflow.run(request)
     run.assert_not_called()
@@ -455,10 +469,10 @@ def test_generation_rejects_raw_node_name_mismatch_before_engine_run(monkeypatch
 
 def test_generation_rejects_missing_markdown_path_before_engine_run(monkeypatch, tmp_path: Path) -> None:
     request = replace(_make_generation_request(tmp_path), markdown_path=None, generate_markdown=False)
-    run = Mock(name="run_workflow")
-    monkeypatch.setattr(node_generation, "run_workflow", run)
+    run = Mock(name="run_steps")
+    monkeypatch.setattr(NodeGenerationWorkflow, "run_steps", run)
     workflow = object.__new__(node_generation.NodeGenerationWorkflow)
-    workflow._engine = Mock(name="unused_engine")
+    workflow._closed = False
     with pytest.raises(ValueError, match="requires markdown_path"):
         workflow.run(request)
     run.assert_not_called()
@@ -508,10 +522,13 @@ def test_node_generation_workflow_runs_single_eager_workflow_from_request(monkey
     builder.node_coder = Coder()
     builder.node_auditor = _FakeAuditor(audit)
     workflow = _replace_node_workflow(builder)
-    engine = workflow._engine
+    engine = workflow
     try:
-        assert type(engine) is WorkflowEngine
-        assert set(vars(workflow)) == {"node_planner", "node_coder", "node_auditor", "_engine"}
+        assert type(engine) is NodeGenerationWorkflow
+        assert isinstance(engine, WorkflowEngine)
+        assert not any(
+            isinstance(value, node_generation.NodeGenerationRequest) for value in vars(workflow).values()
+        )
         docs = tmp_path / "node_docs"
         docs.mkdir()
         node = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"][0]
@@ -536,11 +553,11 @@ def test_node_generation_workflow_runs_single_eager_workflow_from_request(monkey
         assert builder.artifact_state.workflow_artifacts == {}
         assert len(results) == 1
         assert results[0].outputs["node_audit"].derived["ok"] is True
-        assert workflow._engine is engine
+        assert workflow is engine
         assert not hasattr(workflow, "_last_result")
     finally:
         builder.close()
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 
@@ -559,13 +576,13 @@ def test_node_generation_has_three_ordered_stages_and_applies_explicit_amendment
     ]}), encoding="utf-8")
     events: list[str] = []
     configs = []
-    real_init_engine = node_generation.init_workflow_engine
+    real_build_pool = workflow_engine_module.build_workflow_pool
 
     def capture_config(node_classes, workflow_config):
         configs.append((node_classes, workflow_config))
-        return real_init_engine(node_classes, workflow_config)
+        return real_build_pool(node_classes, workflow_config)
 
-    monkeypatch.setattr(node_generation, "init_workflow_engine", capture_config)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", capture_config)
     (tmp_path / "Second.py").write_text("# existing Second", encoding="utf-8")
     docs = tmp_path / "node_docs"
     docs.mkdir()
@@ -622,7 +639,7 @@ def test_node_generation_has_three_ordered_stages_and_applies_explicit_amendment
         node_planner=FakePlanner(events=events), node_coder=FakeCoder(events=events),
         node_auditor=_FakeAuditor(audit),
     )
-    engine = workflow._engine
+    engine = workflow
     try:
         nodes = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]
         first = node_generation.NodeGenerationRequest(
@@ -667,11 +684,11 @@ def test_node_generation_has_three_ordered_stages_and_applies_explicit_amendment
         assert all(set(result.outputs) == {"node_plan", "node_generate", "node_audit"} for result in results)
         assert all(result.outputs["node_audit"].derived["ok"] is True for result in results)
         assert workflow._node_classes == component_classes
-        assert workflow._engine is engine
+        assert workflow is engine
         assert not hasattr(workflow, "_last_result")
     finally:
         workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 
@@ -734,7 +751,9 @@ def test_failed_audit_raises_without_repair_or_retry(monkeypatch, tmp_path: Path
         assert set(results[0].outputs) == {"node_plan", "node_generate", "node_audit"}
         assert results[0].outputs["node_audit"].derived["ok"] is False
         assert results[0].outputs["node_plan"].card == {"status": "skipped"}
-        assert set(vars(workflow)) == {"node_planner", "node_coder", "node_auditor", "_engine"}
+        assert not any(
+            isinstance(value, node_generation.NodeGenerationRequest) for value in vars(workflow).values()
+        )
         assert not hasattr(workflow, "_last_result")
     finally:
         workflow.close()
@@ -771,7 +790,7 @@ def test_generation_reuses_pool_and_constructor_snapshots_when_components_change
     workflow = NodeGenerationWorkflow(
         node_planner=Planner(events=events), node_coder=Coder(events=events), node_auditor=original_auditor,
     )
-    engine = workflow._engine
+    engine = workflow
     try:
         docs = tmp_path / "node_docs"
         docs.mkdir()
@@ -784,7 +803,7 @@ def test_generation_reuses_pool_and_constructor_snapshots_when_components_change
         first_result = results[-1]
         planned = replace(request, generate_markdown=True)
         assert workflow.run(planned) == str(planned.target_path)
-        assert workflow._engine is engine
+        assert workflow is engine
         assert results[-1].request_id != first_result.request_id
         assert events == ["write", "plan", "write"]
         replacement_auditor = _FakeAuditor(lambda *_a, **_kw: pytest.fail("replacement was not constructed into the pool"))
@@ -802,7 +821,7 @@ def test_generation_reuses_pool_and_constructor_snapshots_when_components_change
         assert workflow.node_auditor is replacement_auditor
         assert events == ["write", "plan", "write", "write"]
         assert audits == ["original", "original", "original"]
-        assert workflow._engine is engine
+        assert workflow is engine
         assert workflow._node_classes == {"node_plan": Planner, "node_generate": Coder, "node_audit": _FakeAuditor}
         assert len({result.request_id for result in results}) == 3
         assert request.state is planned.state
@@ -810,7 +829,7 @@ def test_generation_reuses_pool_and_constructor_snapshots_when_components_change
         assert not hasattr(workflow, "_last_result")
     finally:
         workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 
@@ -868,9 +887,8 @@ def test_generation_native_planner_skip_matrix(
 ) -> None:
     workflow, events, native_states = recording_node_workflow
     results = _capture_workflow_results(monkeypatch)
-    run = Mock(wraps=node_generation.run_workflow)
-    monkeypatch.setattr(node_generation, "run_workflow", run)
-    engine = workflow._engine
+    run = _spy_run_steps(monkeypatch)
+    engine = workflow
     request = replace(
         _make_generation_request(tmp_path), skip_node_planner=skip_node_planner,
         generate_markdown=generate_markdown, markdown_amendment=markdown_amendment,
@@ -928,7 +946,7 @@ def test_generation_native_planner_skip_matrix(
     assert request.skip_node_planner is skip_node_planner
     assert request.generate_markdown is generate_markdown
     assert request.markdown_amendment == markdown_amendment
-    assert workflow._engine is engine
+    assert workflow is engine
     assert not hasattr(workflow, "_last_result")
 
 
@@ -938,9 +956,8 @@ def test_generation_reused_workflow_honors_each_planner_skip_without_leakage(
 ) -> None:
     workflow, events, native_states = recording_node_workflow
     results = _capture_workflow_results(monkeypatch)
-    run = Mock(wraps=node_generation.run_workflow)
-    monkeypatch.setattr(node_generation, "run_workflow", run)
-    engine = workflow._engine
+    run = _spy_run_steps(monkeypatch)
+    engine = workflow
     base = replace(
         _make_generation_request(tmp_path), generate_markdown=generate_markdown,
         markdown_amendment="Clarify the plan",
@@ -981,7 +998,7 @@ def test_generation_reused_workflow_honors_each_planner_skip_without_leakage(
             assert identity is request.state["native_identity"]
             assert writer_meta is auditor_meta is request.node_meta
         assert set(request.state) == {"native_identity"}
-        assert workflow._engine is engine
+        assert workflow is engine
     assert len({result.request_id for result in results}) == 3
     assert [request.skip_node_planner for request in observed_requests] == [True, False, True]
     assert len({id(request.state) for request in observed_requests}) == 3
@@ -1081,13 +1098,13 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
     config = node_generation.NodeGenerationWorkflow.json_config()
     config["pool_size"] = pool_size
     monkeypatch.setattr(node_generation.NodeGenerationWorkflow, "json_config", staticmethod(lambda: config))
-    real_init_engine = node_generation.init_workflow_engine
+    real_build_pool = workflow_engine_module.build_workflow_pool
 
     def capture_config(node_classes, workflow_config):
         configs.append((node_classes, workflow_config))
-        return real_init_engine(node_classes, workflow_config)
+        return real_build_pool(node_classes, workflow_config)
 
-    monkeypatch.setattr(node_generation, "init_workflow_engine", capture_config)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", capture_config)
 
     def request(label, temperature, language="python", generate_markdown=True):
         root = tmp_path / label
@@ -1113,9 +1130,10 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
         return selected
 
     workflow = node_generation.NodeGenerationWorkflow(planner, coder, auditor)
-    engine = workflow._engine
+    engine = workflow
     try:
-        assert type(engine) is WorkflowEngine
+        assert type(engine) is node_generation.NodeGenerationWorkflow
+        assert isinstance(engine, WorkflowEngine)
         component_classes = {node.STEP_ID: node for node in (Planner, Coder, Auditor)}
         assert len(configs) == 1
         assert configs[0][0] == component_classes
@@ -1182,12 +1200,12 @@ def test_generation_constructs_real_nodes_and_isolates_reused_concurrent_slots(m
             assert item.dependency_context == f"Generated file:\n# prior {item.requirement_text}"
             assert not hasattr(item, "artifacts")  # The workflow never publishes builder-owned artifacts.
         assert not hasattr(workflow, "_last_result")
-        assert workflow._engine is engine
+        assert workflow is engine
         assert (len(planners), len(coders), len(auditors)) == (pool_size,) * 3
         assert [(cls.STEP_ID, list(cls.DEPENDENCIES)) for cls in (Planner, Coder, Auditor)] == original_metadata
     finally:
         workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
     workflow.close()
     with pytest.raises(RuntimeError, match="closed"):
@@ -1248,7 +1266,7 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
             with node_settings({Planner.STEP_ID: {"system_prompt": "outer prompt"}}):
                 workflow = node_generation.NodeGenerationWorkflow(planner, coder, auditor)
                 workflows.append(workflow)
-                engines.append(workflow._engine)
+                engines.append(workflow)
                 assert _FakePlanner().system_prompt == "outer prompt"
             assert _FakePlanner().system_prompt == NodePlanElement.system_prompt
             assert _FakeAuditor().audit is None
@@ -1278,14 +1296,14 @@ def test_generation_retains_dataclass_settings_and_restores_construction_scope(m
             auditor.white_list.add("late replacement")
             auditor.audit = lambda *_a, **_kw: pytest.fail("late audit replacement")
             assert all(node.white_list == whitelist_snapshot and node.audit is not auditor.audit for node in auditors)
-        assert workflows[0]._engine is not workflows[1]._engine
+        assert workflows[0] is not workflows[1]
         assert workflows[0]._node_classes == workflows[1]._node_classes == {
             node.STEP_ID: node for node in (Planner, Coder, Auditor)
         }
     finally:
         for workflow in workflows:
             workflow.close()
-    assert all(workflow._engine is None for workflow in workflows)
+    assert all(workflow.closed for workflow in workflows)
     assert all(engine.pool.closed for engine in engines)
 
 
@@ -1332,22 +1350,22 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
         audited_kinds.append(meta.meta_node_kind)
         return True, []
 
-    real_init_engine = node_generation.init_workflow_engine
+    real_build_pool = workflow_engine_module.build_workflow_pool
 
     def capture_config(node_classes, workflow_config):
         configs.append((node_classes, workflow_config))
-        return real_init_engine(node_classes, workflow_config)
+        return real_build_pool(node_classes, workflow_config)
 
-    monkeypatch.setattr(node_generation, "init_workflow_engine", capture_config)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", capture_config)
     workflow = NodeGenerationWorkflow(
         node_planner=_FakePlanner(),
         node_coder=Coder(client=object(), prompts=prompts),
         node_auditor=_FakeAuditor(audit),
     )
-    engine = workflow._engine
+    engine = workflow
     try:
         assert len(configs) == 1  # Construction happens before any node request.
-        assert type(engine) is WorkflowEngine
+        assert isinstance(engine, WorkflowEngine)
         component_classes = {"node_plan": _FakePlanner, "node_generate": Coder, "node_audit": _FakeAuditor}
         assert configs[0][0] == component_classes
         assert all(configs[0][0][name] is cls for name, cls in component_classes.items())
@@ -1433,12 +1451,14 @@ def test_request_node_coder_uses_one_workflow_for_mixed_contracts(monkeypatch, t
         assert all(result.outputs["node_audit"].derived["ok"] is True for result in results)
         assert all(result.outputs["node_plan"].card == {"status": "skipped"} for result in results[-1:])
         assert all(set(request.state) == {"native_identity"} for request in selected_requests)
-        assert workflow._engine is engine
-        assert set(vars(workflow)) == {"node_planner", "node_coder", "node_auditor", "_engine"}
+        assert workflow is engine
+        assert not any(
+            isinstance(value, node_generation.NodeGenerationRequest) for value in vars(workflow).values()
+        )
         assert not hasattr(workflow, "_last_result")
     finally:
         workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
 
 

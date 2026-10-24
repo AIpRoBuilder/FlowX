@@ -27,7 +27,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable, Mapping
 
-from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
+from ag_ui_workflow import StepRunOutput, WorkflowStepNode
 
 from flowx_core.architect.graph import NodeMeta
 from flowx_core.tools.artifact_tools import (
@@ -39,10 +39,10 @@ from flowx_core.tools.artifact_tools import (
 	write_json_atomic,
 )
 from flowx_core.tools.workflow_engine import (
+	FlowXWorkflowEngine,
 	close_workflow_engine,
 	init_workflow_engine,
 	reload_workflow_engine,
-	run_workflow,
 )
 from flowx_core.tools.workflow_logs import WorkflowNodeLogs
 from flowx_core.workflows.node_generation import NodeGenerationRequest, NodeGenerationWorkflow
@@ -433,7 +433,7 @@ class DynamicWorkflowOrchestrator:
 		self.keep_last_versions = keep_last_versions
 		self._lock = RLock()
 		self._closed = False
-		self._generation_engine: WorkflowEngine | None = None
+		self._generation_engine: FlowXWorkflowEngine | None = None
 		self._generation_config: dict[str, Any] | None = None
 		self._last_logs: WorkflowNodeLogs | None = None
 		self.storage_dir.mkdir(parents=True, exist_ok=True)
@@ -479,7 +479,7 @@ class DynamicWorkflowOrchestrator:
 			return {name: node["node_id"] for name, node in workflows[-1]["nodes"].items()} if workflows else {}
 
 	@property
-	def generation_engine(self) -> WorkflowEngine | None:
+	def generation_engine(self) -> FlowXWorkflowEngine | None:
 		"""The one scheduling engine, or None before the first nonempty run."""
 		with self._lock:
 			return self._generation_engine
@@ -490,7 +490,7 @@ class DynamicWorkflowOrchestrator:
 		with self._lock:
 			return self._last_logs
 
-	def _init_generation_engine(self, config: dict[str, Any]) -> WorkflowEngine | None:
+	def _init_generation_engine(self, config: dict[str, Any]) -> FlowXWorkflowEngine | None:
 		"""Create the engine once, then reload its pool when the topology or pool size changes."""
 		if not config["nodes"]:
 			return None  # Nothing to schedule; the engine keeps its last topology.
@@ -690,7 +690,7 @@ class DynamicWorkflowOrchestrator:
 				# Only the engine executes generation/repair. The loops outside it
 				# prepare immutable inputs and publish outputs after all workers stop.
 				if engine is not None:
-					result = run_workflow(engine, state={"dynamic_workflow_run": _GenerationRun(
+					result = engine.run_steps(state={"dynamic_workflow_run": _GenerationRun(
 						request=request, directory=directory,
 						requirement_text=requirement_text, raw_nodes=raw_nodes,
 						artifacts=artifacts, registry=manifest["nodes"],

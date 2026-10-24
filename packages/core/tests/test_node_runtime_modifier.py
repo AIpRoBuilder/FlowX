@@ -19,6 +19,7 @@ from ag_ui_workflow import RunResult, StepRunOutput, WorkflowEngine, WorkflowPar
 
 from flowx_core.runtime import RunNodeTest
 from flowx_core.runtime.run_node_test import _execute_node_test
+from flowx_core.tools import workflow_engine as workflow_engine_module
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.worker.node_test_writer import PromptNodeTestFileCoder
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
@@ -204,7 +205,7 @@ def test_repair_repeated_or_concurrent_same_input_uses_fresh_native_requests(
             session_state["native_visit"].append("amend_node")
             return super().process_input(user_input, dependency_results, session_state)
 
-    real_run = modifier_module.run_workflow
+    real_run = NodeRuntimeModifierPipeline.run_steps
 
     def capture_fresh_request(engine, **kwargs):
         request = kwargs["state"]["node_runtime_modifier"]
@@ -225,7 +226,7 @@ def test_repair_repeated_or_concurrent_same_input_uses_fresh_native_requests(
     config = NodeRuntimeModifierPipeline.json_config()
     config["pool_size"] = pool_size
     monkeypatch.setattr(NodeRuntimeModifierPipeline, "json_config", staticmethod(lambda: config))
-    monkeypatch.setattr(modifier_module, "run_workflow", capture_fresh_request)
+    monkeypatch.setattr(NodeRuntimeModifierPipeline, "run_steps", capture_fresh_request)
 
     def unexpected_run(*args, **kwargs):
         del args, kwargs
@@ -308,7 +309,7 @@ def test_repair_repeated_same_input_isolates_results_commands_and_log_snapshots(
         assert kwargs["timeout"] == 17
         return SimpleNamespace(returncode=1 if len(commands) == 1 else 0, stdout=f"run {len(commands)}", stderr="")
 
-    real_run = modifier_module.run_workflow
+    real_run = NodeRuntimeModifierPipeline.run_steps
 
     def capture_run_result(engine, **kwargs):
         request = kwargs["state"]["node_runtime_modifier"]
@@ -325,15 +326,15 @@ def test_repair_repeated_same_input_isolates_results_commands_and_log_snapshots(
     config = NodeRuntimeModifierPipeline.json_config()
     config["pool_size"] = pool_size
     monkeypatch.setattr(NodeRuntimeModifierPipeline, "json_config", staticmethod(lambda: config))
-    monkeypatch.setattr(modifier_module, "run_workflow", capture_run_result)
+    monkeypatch.setattr(NodeRuntimeModifierPipeline, "run_steps", capture_run_result)
     writer, amender = _TestWriter(), _NodeWriter()
     modifier = NodeRuntimeModifierPipeline(writer, amender, run_subprocess=fake_run)
-    engine = modifier._engine
+    engine = modifier
     try:
         first = modifier.run(caller)
         first_log_snapshot = first.test_log
         second = modifier.run(caller)
-        assert modifier._engine is engine
+        assert modifier is engine
         assert first is not second
         assert first.state is second.state is state
         assert first.test_result is not second.test_result
@@ -395,14 +396,14 @@ def test_repair_stale_caller_result_cannot_mask_missing_run_result_or_trigger_re
         calls.append((engine, kwargs["state"]["node_runtime_modifier"]))
         return SimpleNamespace(status="completed")
 
-    monkeypatch.setattr(modifier_module, "run_workflow", completed_without_result)
+    monkeypatch.setattr(NodeRuntimeModifierPipeline, "run_steps", completed_without_result)
     modifier = NodeRuntimeModifierPipeline(_TestWriter(), _NodeWriter())
     try:
         with pytest.raises(RuntimeError, match="node test execution did not produce a result for ExampleNode.py"):
             modifier.run(caller)
         assert len(calls) == 1
         engine, request = calls[0]
-        assert engine is modifier._engine
+        assert engine is modifier
         assert request is not caller
         assert request.test_result is None
         assert caller.test_result is stale_result
@@ -699,17 +700,17 @@ def test_modifier_reuses_pool_without_reusing_previous_request(monkeypatch, tmp_
         return SimpleNamespace(returncode=1 if len(commands) == 1 else 0, stdout="test output", stderr="")
 
     run_results: list[RunResult] = []
-    real_run = modifier_module.run_workflow
+    real_run = NodeRuntimeModifierPipeline.run_steps
 
     def capture_run_result(engine, **kwargs):
         result = real_run(engine, **kwargs)
         run_results.append(result)
         return result
 
-    monkeypatch.setattr(modifier_module, "run_workflow", capture_run_result)
+    monkeypatch.setattr(NodeRuntimeModifierPipeline, "run_steps", capture_run_result)
     modifier = NodeRuntimeModifierPipeline(writer, amender, run_subprocess=fake_run)
-    engine = modifier._engine
-    assert type(engine) is WorkflowEngine
+    engine = modifier
+    assert type(engine) is NodeRuntimeModifierPipeline
     first_request = NodeRuntimeModifierRequest(
         node_file_name=node_file.name, workflow_graph={"nodes": []}, working_directory=str(tmp_path),
     )
@@ -724,7 +725,7 @@ def test_modifier_reuses_pool_without_reusing_previous_request(monkeypatch, tmp_
         )
         assert len(run_results) == 2
         first_result, second_result = run_results
-        assert modifier._engine is engine
+        assert modifier is engine
         assert not hasattr(modifier, "_last_result")
         assert second_result.request_id != first_result.request_id
         assert first is not second
@@ -747,7 +748,7 @@ def test_modifier_reuses_pool_without_reusing_previous_request(monkeypatch, tmp_
         assert second_result.new_steps == ["generate_node_test", "run_node_test", "amend_node"]
     finally:
         modifier.close()
-    assert modifier._engine is None
+    assert modifier.closed
     assert engine.pool.closed
     modifier.close()
     with pytest.raises(RuntimeError, match="closed"):
@@ -762,14 +763,14 @@ def test_modifier_never_allocates_native_test_runners_after_eager_construction(m
     barrier = Barrier(2) if pool_size == 2 else None
     commands, allocations, run_results = [], [], []
 
-    real_run = modifier_module.run_workflow
+    real_run = NodeRuntimeModifierPipeline.run_steps
 
     def capture_run_result(engine, **kwargs):
         result = real_run(engine, **kwargs)
         run_results.append(result)
         return result
 
-    monkeypatch.setattr(modifier_module, "run_workflow", capture_run_result)
+    monkeypatch.setattr(NodeRuntimeModifierPipeline, "run_steps", capture_run_result)
 
     def fake_run(command, **kwargs):
         name = Path(kwargs["cwd"]).name
@@ -782,7 +783,7 @@ def test_modifier_never_allocates_native_test_runners_after_eager_construction(m
 
     writer, amender = _TestWriter(), _NodeWriter()
     modifier = NodeRuntimeModifierPipeline(writer, amender, run_subprocess=fake_run)
-    engine = modifier._engine
+    engine = modifier
     original_init = RunNodeTest.__init__
 
     def record_native_allocation(self, **kwargs):
@@ -803,14 +804,14 @@ def test_modifier_never_allocates_native_test_runners_after_eager_construction(m
         )
 
     try:
-        assert type(engine) is WorkflowEngine
+        assert isinstance(engine, WorkflowEngine)
         assert allocations == []
         first, second = request("First"), request("Second")
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(modifier.run, item) for item in (first, second)]
             requests = [future.result(timeout=15) for future in futures]
         requests.append(modifier.run(request("Third")))
-        assert modifier._engine is engine
+        assert modifier is engine
         assert len(commands) == len(run_results) == len(writer.calls) == 3
         assert amender.calls == []
         assert len({id(command) for command in commands}) == 3
@@ -1039,27 +1040,27 @@ def test_modifier_constructs_operational_nodes_and_isolates_concurrent_requests(
     config = NodeRuntimeModifierPipeline.json_config()
     config["pool_size"] = pool_size
     monkeypatch.setattr(NodeRuntimeModifierPipeline, "json_config", staticmethod(lambda: config))
-    real_init = modifier_module.init_workflow_engine
+    real_build_pool = workflow_engine_module.build_workflow_pool
 
     def capture_config(node_classes, workflow_config):
         configs.append((node_classes, workflow_config))
-        return real_init(node_classes, workflow_config)
+        return real_build_pool(node_classes, workflow_config)
 
-    real_run = modifier_module.run_workflow
+    real_run = NodeRuntimeModifierPipeline.run_steps
 
     def capture_run_result(engine, **kwargs):
         result = real_run(engine, **kwargs)
         run_results.append(result)
         return result
 
-    monkeypatch.setattr(modifier_module, "init_workflow_engine", capture_config)
-    monkeypatch.setattr(modifier_module, "run_workflow", capture_run_result)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", capture_config)
+    monkeypatch.setattr(NodeRuntimeModifierPipeline, "run_steps", capture_run_result)
     writer, amender = Writer(instances=writers), Amender(instances=amenders)
     writers.clear()
     amenders.clear()
     original_metadata = [(cls.STEP_ID, list(cls.DEPENDENCIES)) for cls in (Writer, ExecuteNodeTest, Amender)]
     modifier = NodeRuntimeModifierPipeline(writer, amender, run_subprocess=fake_run, timeout_expired=TimeoutError)
-    engine = modifier._engine
+    engine = modifier
 
     def request(name, timeout):
         (tmp_path / f"{name}.py").write_text(f"# original {name}", encoding="utf-8")
@@ -1071,7 +1072,8 @@ def test_modifier_constructs_operational_nodes_and_isolates_concurrent_requests(
         )
 
     try:
-        assert type(engine) is WorkflowEngine
+        assert type(engine) is NodeRuntimeModifierPipeline
+        assert isinstance(engine, WorkflowEngine)
         assert len(configs) == 1
         component_classes = {"generate_node_test": Writer, "run_node_test": ExecuteNodeTest, "amend_node": Amender}
         assert configs[0][0] == component_classes
@@ -1115,7 +1117,7 @@ def test_modifier_constructs_operational_nodes_and_isolates_concurrent_requests(
         for node in pooled_executors:
             _assert_executor_pristine(node, fake_run, TimeoutError)
             assert node.command is pooled_commands[id(node)]
-        assert modifier._engine is engine
+        assert modifier is engine
         assert len(writers) == len(amenders) == pool_size
         assert requests[0].test_result is not requests[1].test_result
         assert third.test_result is not requests[0].test_result
@@ -1153,7 +1155,7 @@ def test_modifier_constructs_operational_nodes_and_isolates_concurrent_requests(
         assert [(cls.STEP_ID, list(cls.DEPENDENCIES)) for cls in (Writer, ExecuteNodeTest, Amender)] == original_metadata
     finally:
         modifier.close()
-    assert modifier._engine is None
+    assert modifier.closed
     assert engine.pool.closed
 
 
@@ -1198,8 +1200,8 @@ def test_modifier_retains_dataclass_settings_and_restores_construction_scope(mon
             with node_settings({Writer.STEP_ID: {"system_prompt": "outer prompt"}}):
                 modifier = NodeRuntimeModifierPipeline(writer, amender)
                 modifiers.append(modifier)
-                engines.append(modifier._engine)
-                assert type(engines[-1]) is WorkflowEngine
+                engines.append(modifier)
+                assert isinstance(engines[-1], WorkflowEngine)
                 assert _TestWriter().system_prompt == "outer prompt"
             assert _TestWriter().system_prompt == GenerateNodeTestFile.system_prompt
             for prototype, instances in ((writer, writers), (amender, amenders)):
@@ -1217,12 +1219,12 @@ def test_modifier_retains_dataclass_settings_and_restores_construction_scope(mon
                 assert all(node.system_prompt == prompt_snapshot for node in instances)
                 assert all(node.client is not prototype.client for node in instances)
             assert all(node.root_dir_path == writer.root_dir_path for node in writers)
-            assert modifier._engine.steps_meta == [node.step_meta() for node in (Writer, ExecuteNodeTest, Amender)]
-        assert modifiers[0]._engine is not modifiers[1]._engine
+            assert modifier.steps_meta == [node.step_meta() for node in (Writer, ExecuteNodeTest, Amender)]
+        assert modifiers[0] is not modifiers[1]
     finally:
         for modifier in modifiers:
             modifier.close()
-    assert all(modifier._engine is None for modifier in modifiers)
+    assert all(modifier.closed for modifier in modifiers)
     assert all(engine.pool.closed for engine in engines)
 
 

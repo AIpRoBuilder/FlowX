@@ -4,6 +4,8 @@ Modified: pass explicit concrete class maps directly; use class-declared identit
 Modified: seed the attached WorkflowParam.state through a request-local lease bridge.
 Modified 2026-10-16: reload an engine's pool and step metadata when the workflow config changes.
 Modified 2026-10-23: type engine step metadata with ag_ui_workflow.StepMeta.
+Modified 2026-10-24: add FlowXWorkflowEngine so generation workflows are engines, not wrappers;
+run noninteractive graphs through the engine's own ``run_steps``.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ import uuid
 from collections.abc import Generator, Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, ClassVar
 
 from ag_ui_workflow import (
     RunResult,
@@ -91,28 +93,131 @@ def _prepare_graph(
     return json.dumps({"nodes": native_nodes}), steps_meta, pool_size
 
 
-def init_workflow_engine(
+def build_workflow_pool(
     node_classes: Mapping[str, type[GElement]],
     workflow_config: Mapping[str, Any],
-    *,
-    graph_config_id: str = "flowx",
-) -> WorkflowEngine:
-    """Pass the supplied concrete class map directly to a reusable pipeline pool."""
+) -> tuple[WorkflowPipelinePool, list[StepMeta]]:
+    """Validate a concrete class map against its JSON topology and build its pool."""
     pipeline_json, steps_meta, pool_size = _prepare_graph(node_classes, workflow_config)
     pool = _WorkflowPipelinePool(
         pipeline_json=pipeline_json,
         node_classes=node_classes,
         size=pool_size,
     )
-    try:
-        return WorkflowEngine(
-            graph_config_id=graph_config_id,
-            steps_meta=steps_meta,
-            pool=pool,
-        )
-    except BaseException:
-        pool.close()
-        raise
+    return pool, steps_meta
+
+
+def init_workflow_engine(
+    node_classes: Mapping[str, type[GElement]],
+    workflow_config: Mapping[str, Any],
+    *,
+    graph_config_id: str = "flowx",
+) -> FlowXWorkflowEngine:
+    """Build the reusable pipeline pool and its FlowX engine in one step."""
+    return FlowXWorkflowEngine(
+        node_classes,
+        workflow_config,
+        graph_config_id=graph_config_id,
+    )
+
+
+class FlowXWorkflowEngine(WorkflowEngine):
+    """A WorkflowEngine that owns its FlowX pool and runs request models directly.
+
+    Concrete workflows declare the request types they accept in ``REQUEST_TYPES``
+    and implement ``execute``. ``run`` accepts either such a request or the native
+    ``request_id``/``inputs`` form, so inherited ``answer`` and ``events`` keep the
+    upstream engine contract. ``close(request_id)`` abandons one waiting run;
+    ``close()`` releases the pool and is terminal.
+    """
+
+    REQUEST_TYPES: ClassVar[tuple[type[Any], ...]] = ()
+    CLOSED_MESSAGE: ClassVar[str] = "workflow engine is closed"
+
+    def __init__(
+        self,
+        node_classes: Mapping[str, type[GElement]],
+        workflow_config: Mapping[str, Any],
+        *,
+        graph_config_id: str = "flowx",
+    ) -> None:
+        pool, steps_meta = build_workflow_pool(node_classes, workflow_config)
+        try:
+            super().__init__(
+                graph_config_id=graph_config_id,
+                steps_meta=steps_meta,
+                pool=pool,
+            )
+        except BaseException:
+            pool.close()
+            raise
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        """Whether ``close()`` has released this engine's pool."""
+        return self._closed
+
+    def execute(self, request: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run one request model; each concrete workflow implements this."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement execute()")
+
+    def run(self, request: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run a request model, or delegate the native request-id form upstream."""
+        if self._closed:
+            raise RuntimeError(self.CLOSED_MESSAGE)
+        if isinstance(request, self.REQUEST_TYPES):
+            return self.execute(request, *args, **kwargs)
+        return super().run(request, *args, **kwargs)
+
+    def run_steps(
+        self,
+        *,
+        request_id: str | None = None,
+        state: Mapping[str, Any] | None = None,
+        inputs: Mapping[str, StepRunInput] | None = None,
+        skipped_steps: Iterable[str] = (),
+    ) -> RunResult:
+        """Seed native WorkflowParam.state and run the whole graph once.
+
+        ``state`` is only a seed mapping, not a second session object. The native
+        pool owns the attached dictionary passed by identity to every step and
+        clears it when the lease ends. Nested request values retain their identity.
+        The run must complete and produce every step's output.
+        """
+
+        step_ids = [step["id"] for step in self.steps_meta]
+        skipped = frozenset(skipped_steps)
+        unknown = (set(inputs or {}) | skipped).difference(step_ids)
+        if unknown:
+            raise ValueError(f"unknown workflow step(s): {sorted(unknown)}")
+        token = _RUN_REQUEST.set((state if state is not None else {}, skipped))
+        try:
+            # Bypass this class's request-model dispatch: a native run starts
+            # from a request id and must not be re-dispatched as a request.
+            result = super().run(
+                request_id or f"flowx-request-{uuid.uuid4().hex}", dict(inputs or {}),
+            )
+        finally:
+            _RUN_REQUEST.reset(token)
+        if result.status != "completed":
+            self.close(result.request_id)
+            step_id = result.failed_step or (result.awaiting or {}).get("id", "")
+            raise RuntimeError(f"workflow step '{step_id}' failed: {result.error or result.status}")
+        missing = set(step_ids).difference(result.outputs)
+        if missing:
+            raise RuntimeError(f"workflow execution did not produce output for step(s): {sorted(missing)}")
+        return result
+
+    def close(self, request_id: str | None = None) -> None:
+        """Abandon one waiting run, or release the pool when called without an id."""
+        if request_id is not None:
+            super().close(request_id)
+            return
+        if self._closed:
+            return
+        self._closed = True
+        close_workflow_engine(self)
 
 
 def reload_workflow_engine(
@@ -124,7 +229,7 @@ def reload_workflow_engine(
 
     The pool builds the new graph first, so an invalid config leaves the current
     graph and engine metadata untouched. Leases already out finish on the old graph;
-    ``run_workflow`` snapshots step ids when a run starts.
+    ``run_steps`` snapshots step ids when a run starts.
     """
     if not isinstance(engine.pool, _WorkflowPipelinePool):
         raise TypeError("only an engine created by init_workflow_engine can be reloaded")
@@ -135,55 +240,23 @@ def reload_workflow_engine(
     engine._step_map = {step["id"]: step for step in engine.steps_meta}
 
 
-def run_workflow(
-    engine: WorkflowEngine,
-    *,
-    request_id: str | None = None,
-    state: Mapping[str, Any] | None = None,
-    inputs: Mapping[str, StepRunInput] | None = None,
-    skipped_steps: Iterable[str] = (),
-) -> RunResult:
-    """Seed native WorkflowParam.state and run once with the original inputs.
+def close_workflow_engine(engine: WorkflowEngine) -> None:
+    """Cancel outstanding requests before destroying their pool.
 
-    ``state`` is only a seed mapping, not a second session object. The native
-    pool owns the attached dictionary passed by identity to every step and
-    clears it when the lease ends. Nested request values retain their identity.
+    Calls the upstream ``close`` directly so engines that release their pool in
+    an overridden ``close()`` do not re-enter it from here.
     """
 
-    step_ids = [step["id"] for step in engine.steps_meta]
-    skipped = frozenset(skipped_steps)
-    unknown = (set(inputs or {}) | skipped).difference(step_ids)
-    if unknown:
-        raise ValueError(f"unknown workflow step(s): {sorted(unknown)}")
-    if not isinstance(engine.pool, _WorkflowPipelinePool) and (state or skipped):
-        raise TypeError("request state/skipping requires a pool created by init_workflow_engine")
-    token = _RUN_REQUEST.set((state if state is not None else {}, skipped))
     try:
-        result = engine.run(request_id or f"flowx-request-{uuid.uuid4().hex}", dict(inputs or {}))
-    finally:
-        _RUN_REQUEST.reset(token)
-    if result.status != "completed":
-        engine.close(result.request_id)
-        step_id = result.failed_step or (result.awaiting or {}).get("id", "")
-        raise RuntimeError(f"workflow step '{step_id}' failed: {result.error or result.status}")
-    missing = set(step_ids).difference(result.outputs)
-    if missing:
-        raise RuntimeError(f"workflow execution did not produce output for step(s): {sorted(missing)}")
-    return result
-
-
-def close_workflow_engine(engine: WorkflowEngine) -> None:
-    """Cancel outstanding requests before destroying their pool."""
-
-    try:
-        engine.close()
+        WorkflowEngine.close(engine)
     finally:
         engine.pool.close()
 
 
 __all__ = [
+    "FlowXWorkflowEngine",
+    "build_workflow_pool",
     "close_workflow_engine",
     "init_workflow_engine",
     "reload_workflow_engine",
-    "run_workflow",
 ]

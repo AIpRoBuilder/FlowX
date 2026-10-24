@@ -3,6 +3,7 @@
 Modified 2026-10-14: extract the workflow from MainEntrypointService.
 Modified 2026-10-14: reuse a service-owned pool with request-local native state.
 Modified 2026-10-15: remove the unused temperature from template-only requests.
+Modified 2026-10-24: be the WorkflowEngine instead of wrapping one.
 """
 
 from __future__ import annotations
@@ -11,16 +12,10 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Mapping
 
-from ag_ui_workflow import WorkflowEngine
-
 from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
 from flowx_core.tools._node_settings import node_settings
 from flowx_core.tools.file_tools import parse_json_file
-from flowx_core.tools.workflow_engine import (
-	close_workflow_engine,
-	init_workflow_engine,
-	run_workflow,
-)
+from flowx_core.tools.workflow_engine import FlowXWorkflowEngine
 from flowx_core.worker.main_writer import PromptMainFileCoder
 
 
@@ -37,12 +32,13 @@ class MainEntrypointGenerationRequest:
 
 
 @dataclass
-class MainEntrypointGenerationWorkflow:
+class MainEntrypointGenerationWorkflow(FlowXWorkflowEngine):
 	"""Reuse ``main_generate -> main_audit`` for independent build requests."""
 
 	main_writer: PromptMainFileCoder
 	main_entry_auditor: MainEntryPointAuditor
-	_engine: WorkflowEngine | None = field(default=None, init=False, repr=False)
+	REQUEST_TYPES = (MainEntrypointGenerationRequest,)
+	CLOSED_MESSAGE = "main entrypoint workflow is closed"
 
 	def __post_init__(self) -> None:
 		writer, auditor = self.main_writer, self.main_entry_auditor
@@ -55,13 +51,7 @@ class MainEntrypointGenerationWorkflow:
 		# not a service-owned session or a retained workflow run.
 		settings["_render_context_by_target"] = writer._render_context_by_target
 		with node_settings({writer.STEP_ID: settings}):
-			self._engine = init_workflow_engine(node_classes, self.json_config())
-
-	def close(self) -> None:
-		"""Release the initialized pool once; closed workflows are terminal."""
-		engine, self._engine = self._engine, None
-		if engine is not None:
-			close_workflow_engine(engine)
+			super().__init__(node_classes, self.json_config())
 
 	@staticmethod
 	def json_config() -> dict[str, Any]:
@@ -71,17 +61,14 @@ class MainEntrypointGenerationWorkflow:
 			raise TypeError("Main entrypoint configuration must be a JSON object")
 		return config
 
-	def run(
+	def execute(
 		self,
 		request: MainEntrypointGenerationRequest,
 	) -> str:
 		"""Write and audit the entrypoint, returning its path without retrying."""
-		engine = self._engine
-		if engine is None:
-			raise RuntimeError("main entrypoint workflow is closed")
 		writer = self.main_writer
 		auditor = self.main_entry_auditor
-		result = run_workflow(engine, state={
+		result = self.run_steps(state={
 			**request.state,
 			f"{type(writer).__name__}::action": "write",
 			"main_entrypoint": {

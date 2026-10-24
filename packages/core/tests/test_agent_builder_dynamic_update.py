@@ -493,7 +493,7 @@ def test_modifier_pipeline_reuses_one_eager_workflow_for_named_node_requests(mon
         node_writer=_FakeModifierWriter(),
         run_subprocess=run_subprocess,
     )
-    engine = workflow._engine
+    engine = workflow
     assert engine is not None
     contexts = []
     requests = []
@@ -521,7 +521,7 @@ def test_modifier_pipeline_reuses_one_eager_workflow_for_named_node_requests(mon
         context = workflow.run(request)
         contexts.append(context)
         _assert_fresh_modifier_request(request, context)
-        assert workflow._engine is engine
+        assert workflow is engine
         assert context.node_name == node_name
         assert context.node_file_name == str(node_path)
         assert context.workflow_graph == str(graph_path)

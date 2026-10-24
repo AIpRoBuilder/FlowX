@@ -13,7 +13,7 @@ from types import MappingProxyType, SimpleNamespace
 from unittest.mock import DEFAULT, Mock
 
 import pytest
-from ag_ui_workflow import RunResult, StepRunOutput
+from ag_ui_workflow import RunResult, StepRunOutput, WorkflowEngine
 
 from flowx_core import agent_builder
 from flowx_core.architect.graph import Graph
@@ -21,7 +21,7 @@ from flowx_core.architect.graph_planner import GraphPlanner
 from flowx_core.auditor.graph_json_auditor import GraphJsonAuditor
 from flowx_core.builder_support import BuildSession
 from flowx_core.demand_analyzer.requirement_disector import RequirementDisector
-from flowx_core.workflows import graph_generation
+from flowx_core.tools import workflow_engine as workflow_engine_module
 from flowx_core.workflows.graph_generation import GraphGenerationRequest, GraphGenerationWorkflow
 
 
@@ -62,14 +62,21 @@ def _workflow(
 
 @pytest.fixture
 def engine_spies(monkeypatch):
+    real_run_steps = GraphGenerationWorkflow.run_steps
+    run_spy = Mock()
+
+    def run_steps(self, *args, **kwargs):
+        run_spy(self, *args, **kwargs)
+        return real_run_steps(self, *args, **kwargs)
+
     spies = SimpleNamespace(
-        init=Mock(wraps=graph_generation.init_workflow_engine),
-        run=Mock(wraps=graph_generation.run_workflow),
-        close=Mock(wraps=graph_generation.close_workflow_engine),
+        init=Mock(wraps=workflow_engine_module.build_workflow_pool),
+        run=run_spy,
+        close=Mock(wraps=workflow_engine_module.close_workflow_engine),
     )
-    monkeypatch.setattr(graph_generation, "init_workflow_engine", spies.init)
-    monkeypatch.setattr(graph_generation, "run_workflow", spies.run)
-    monkeypatch.setattr(graph_generation, "close_workflow_engine", spies.close)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", spies.init)
+    monkeypatch.setattr(GraphGenerationWorkflow, "run_steps", run_steps)
+    monkeypatch.setattr(workflow_engine_module, "close_workflow_engine", spies.close)
     return spies
 
 
@@ -142,7 +149,7 @@ def test_native_graph_workflow_honors_every_skip_combination(
 
     monkeypatch.setattr(GraphJsonAuditor, "audit_graph_json", audit)
     workflow = workflow_factory(events)
-    engine = workflow._engine
+    engine = workflow
     assert engine is not None
     engine_spies.init.assert_called_once()
     engine_spies.run.assert_not_called()
@@ -192,12 +199,12 @@ def test_native_graph_workflow_honors_every_skip_combination(
     }
     engine_spies.run.assert_called_once()
     assert engine_spies.run.call_args.args == (engine,)
-    assert workflow._engine is engine
+    assert workflow is engine
     engine_spies.close.assert_not_called()
 
     workflow.close()
     workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     engine_spies.close.assert_called_once_with(engine)
 
 
@@ -205,7 +212,7 @@ def test_full_request_uses_actual_upstream_artifact_paths(
     tmp_path, monkeypatch, workflow_factory, engine_spies,
 ):
     workflow = workflow_factory()
-    engine = workflow._engine
+    engine = workflow
     pool_close = Mock(wraps=engine.pool.close)
     monkeypatch.setattr(engine.pool, "close", pool_close)
     engine_spies.init.assert_called_once()
@@ -244,8 +251,9 @@ def test_full_request_uses_actual_upstream_artifact_paths(
     assert (tmp_path / "second_analysis.md").read_text(encoding="utf-8") == "# Second analysis"
     assert (tmp_path / "second_graph.mmd").is_file()
     assert (tmp_path / "analysis.md").read_text(encoding="utf-8") == "# Generated analysis"
-    assert workflow._engine is engine
-    assert set(vars(workflow)) == {"analyzer", "planner", "graph_auditor", "_engine"}
+    assert workflow is engine
+    assert isinstance(workflow, WorkflowEngine)
+    assert not any(isinstance(value, GraphGenerationRequest) for value in vars(workflow).values())
     engine_spies.init.assert_called_once()
     assert engine_spies.run.call_count == 2
     assert all(call.args == (engine,) for call in engine_spies.run.call_args_list)
@@ -254,7 +262,7 @@ def test_full_request_uses_actual_upstream_artifact_paths(
 
     workflow.close()
     workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     engine_spies.close.assert_called_once_with(engine)
     pool_close.assert_called_once_with()
     with pytest.raises(RuntimeError, match="graph generation workflow is closed"):
@@ -287,7 +295,10 @@ def test_agent_builder_publishes_artifacts_and_seeds_its_own_session(
     assert engine_spies.run.call_args.kwargs["state"]["caller_data"] is caller_data
     assert state["build_session"] is caller_session
     assert set(state) == {"build_session", "caller_data"}
-    assert set(vars(builder._graph_workflow)) == {"analyzer", "planner", "graph_auditor", "_engine"}
+    assert isinstance(builder._graph_workflow, WorkflowEngine)
+    assert not any(
+        isinstance(value, GraphGenerationRequest) for value in vars(builder._graph_workflow).values()
+    )
     engine_spies.init.assert_called_once()
     engine_spies.close.assert_not_called()
 
@@ -298,7 +309,7 @@ def test_failed_same_path_build_invalidates_cached_graph(
 ):
     builder = builder_factory()
     workflow = builder._graph_workflow
-    engine = workflow._engine
+    engine = workflow
     builder.analyze_requirement("Collect data")
     builder.plan_graph()
     cached_graph = builder.planned_graph
@@ -334,7 +345,7 @@ def test_failed_same_path_build_invalidates_cached_graph(
     assert Graph(graph_path).get_topological_sorted_nodes() == ["Updated"]
     assert cached_graph.get_topological_sorted_nodes() == ["Collect"]
     assert len(planner_client.calls) == 2
-    assert workflow._engine is engine
+    assert workflow is engine
     assert engine_spies.run.call_count == 3
     engine_spies.close.assert_not_called()
 
@@ -344,7 +355,7 @@ def test_failed_same_path_build_invalidates_cached_graph(
     assert builder.planned_graph is not cached_graph
     assert builder.planned_graph.get_topological_sorted_nodes() == ["Collect"]
     assert builder._graph_workflow is workflow
-    assert workflow._engine is engine
+    assert workflow is engine
     assert len(planner_client.calls) == 3
     assert engine_spies.run.call_count == 4
     engine_spies.init.assert_called_once()
@@ -402,7 +413,7 @@ def test_graph_audit_failure_runs_once_without_repair(
 
     monkeypatch.setattr(GraphJsonAuditor, "audit_graph_json", audit_graph)
     workflow = workflow_factory(events)
-    engine = workflow._engine
+    engine = workflow
     pool_close = Mock(wraps=engine.pool.close)
     monkeypatch.setattr(engine.pool, "close", pool_close)
     planner_client = workflow.planner.client
@@ -420,7 +431,7 @@ def test_graph_audit_failure_runs_once_without_repair(
     assert len(planner_client.calls) == 1
     audit.assert_called_once()
     engine_spies.run.assert_called_once()
-    assert workflow._engine is engine
+    assert workflow is engine
     engine_spies.close.assert_not_called()
     pool_close.assert_not_called()
     assert not graph_path.with_suffix(".mmd").exists()
@@ -432,7 +443,7 @@ def test_graph_audit_failure_runs_once_without_repair(
     assert len(planner_client.calls) == 2
     assert audit.call_count == 2
     assert engine_spies.run.call_count == 2
-    assert workflow._engine is engine
+    assert workflow is engine
     engine_spies.init.assert_called_once()
     engine_spies.close.assert_not_called()
     pool_close.assert_not_called()
@@ -478,7 +489,7 @@ def test_graph_workflow_step_failure_keeps_pool_open_and_recovers(
 
     monkeypatch.setattr(node_class, method, fail_once)
     workflow = workflow_factory(events)
-    engine = workflow._engine
+    engine = workflow
     pool_close = Mock(wraps=engine.pool.close)
     monkeypatch.setattr(engine.pool, "close", pool_close)
     request = GraphGenerationRequest(
@@ -491,7 +502,7 @@ def test_graph_workflow_step_failure_keeps_pool_open_and_recovers(
 
     assert events == {"analyze": [], "planner": ["analyze"], "audit": ["analyze", "planner"]}[failed_step]
     assert attempts == 1
-    assert workflow._engine is engine
+    assert workflow is engine
     engine_spies.run.assert_called_once()
     engine_spies.close.assert_not_called()
     pool_close.assert_not_called()
@@ -502,7 +513,7 @@ def test_graph_workflow_step_failure_keeps_pool_open_and_recovers(
     assert result.outputs["audit_graph"].derived["ok"] is True
     assert events == ["analyze", "planner"]
     assert attempts == 2
-    assert workflow._engine is engine
+    assert workflow is engine
     assert engine_spies.run.call_count == 2
     engine_spies.init.assert_called_once()
     engine_spies.close.assert_not_called()
@@ -519,7 +530,7 @@ def test_graph_workflow_run_error_keeps_engine_open_and_recovers(
 ):
     events = []
     workflow = workflow_factory(events)
-    engine = workflow._engine
+    engine = workflow
     pool_close = Mock(wraps=engine.pool.close)
     monkeypatch.setattr(engine.pool, "close", pool_close)
     engine_spies.run.side_effect = [RuntimeError("deliberate run failure"), DEFAULT]
@@ -532,12 +543,12 @@ def test_graph_workflow_run_error_keeps_engine_open_and_recovers(
         workflow.run(request)
 
     assert events == []
-    assert workflow._engine is engine
+    assert workflow is engine
     engine_spies.close.assert_not_called()
     pool_close.assert_not_called()
     assert workflow.run(request).status == "completed"
     assert events == ["analyze", "planner"]
-    assert workflow._engine is engine
+    assert workflow is engine
     assert engine_spies.run.call_count == 2
     engine_spies.init.assert_called_once()
     engine_spies.close.assert_not_called()
@@ -629,7 +640,7 @@ def test_workflow_seeds_native_state_by_identity_without_leaking_between_request
     for node_class in (RequirementDisector, GraphPlanner, GraphJsonAuditor):
         observe(node_class)
     workflow = workflow_factory()
-    engine = workflow._engine
+    engine = workflow
 
     first = workflow.run(GraphGenerationRequest(
         requirement_text="First request", requirement_md_path=str(tmp_path / "first.md"),
@@ -654,8 +665,8 @@ def test_workflow_seeds_native_state_by_identity_without_leaking_between_request
     assert second.outputs["analyze_requirement"].derived["requirement_md_path"] == str(tmp_path / "second.md")
     assert (tmp_path / "first.md").read_text(encoding="utf-8") == "# Generated analysis"
     assert (tmp_path / "second.md").read_text(encoding="utf-8") == "# Second analysis"
-    assert workflow._engine is engine
-    assert set(vars(workflow)) == {"analyzer", "planner", "graph_auditor", "_engine"}
+    assert workflow is engine
+    assert not any(isinstance(value, GraphGenerationRequest) for value in vars(workflow).values())
     engine_spies.init.assert_called_once()
     assert engine_spies.run.call_count == 2
     engine_spies.close.assert_not_called()
@@ -686,7 +697,7 @@ def test_graph_auditor_rejects_incomplete_requests(state, message):
 
 def test_graph_request_rejects_unknown_planner_action_before_engine_run(workflow_factory, engine_spies):
     workflow = workflow_factory()
-    engine = workflow._engine
+    engine = workflow
     assert engine is not None
     engine_spies.init.assert_called_once()
     request = GraphGenerationRequest()
@@ -696,7 +707,7 @@ def test_graph_request_rejects_unknown_planner_action_before_engine_run(workflow
         workflow.run(request)
 
     engine_spies.run.assert_not_called()
-    assert workflow._engine is engine
+    assert workflow is engine
     engine_spies.close.assert_not_called()
     assert workflow.run(GraphGenerationRequest(
         skip_analyze_requirement=True, skip_plan_graph=True, skip_audit_graph=True,

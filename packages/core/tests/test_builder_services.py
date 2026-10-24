@@ -965,7 +965,7 @@ def test_main_entrypoint_workflow_sends_template_payload_without_temperature(mon
     workflow = object.__new__(main_entrypoint_module.MainEntrypointGenerationWorkflow)
     workflow.main_writer = SimpleNamespace(STEP_ID="main_generate")
     workflow.main_entry_auditor = SimpleNamespace(STEP_ID="main_audit")
-    workflow._engine = object()
+    workflow._closed = False
     state = MappingProxyType({"marker": object()})
     output_path, normalized_path = str(tmp_path / "main.py"), str(tmp_path / "normalized_main.py")
     request = MainEntrypointGenerationRequest(
@@ -976,11 +976,11 @@ def test_main_entrypoint_workflow_sends_template_payload_without_temperature(mon
         "main_generate": StepRunOutput(derived={"main_entrypoint_path": normalized_path}),
         "main_audit": StepRunOutput(derived={"ok": True, "violations": []}),
     }))
-    monkeypatch.setattr(main_entrypoint_module, "run_workflow", native_run)
+    workflow.run_steps = native_run
 
     assert workflow.run(request) == normalized_path
 
-    native_run.assert_called_once_with(workflow._engine, state={
+    native_run.assert_called_once_with(state={
         **state,
         f"{type(workflow.main_writer).__name__}::action": "write",
         "main_entrypoint": {

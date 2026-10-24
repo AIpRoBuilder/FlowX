@@ -167,20 +167,19 @@ class _InlineEngine:
 			{node["name"]: node.get("depends", []) for node in config["nodes"]},
 		).static_order())
 
-
-@pytest.fixture
-def world(tmp_path, monkeypatch):
-	def run(engine, *, state=None, **_options):
+	def run_steps(self, *, state=None, **_options):
 		session_state, outputs = dict(state or {}), {}
-		for name in engine.order:
-			node_class = engine.classes[name]
+		for name in self.order:
+			node_class = self.classes[name]
 			dependencies = {dependency: outputs[dependency] for dependency in node_class.DEPENDENCIES}
 			outputs[name] = node_class().process_input("", dependencies, session_state)
 		return SimpleNamespace(outputs=outputs, status="completed")
 
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
 	for module in (engine_module, orchestrator_module):
 		monkeypatch.setattr(module, "init_workflow_engine", lambda classes, config, **_: _InlineEngine(classes, config))
-		monkeypatch.setattr(module, "run_workflow", run)
 		monkeypatch.setattr(module, "close_workflow_engine", lambda engine: None)
 	monkeypatch.setattr(orchestrator_module, "reload_workflow_engine", lambda engine, classes, config: engine.reload(classes, config))
 	world = _build_world(tmp_path, monkeypatch)

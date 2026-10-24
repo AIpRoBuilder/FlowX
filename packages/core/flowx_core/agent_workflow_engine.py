@@ -23,7 +23,7 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, TypeVar
 
-from ag_ui_workflow import StepRunOutput, WorkflowEngine, WorkflowStepNode
+from ag_ui_workflow import StepRunOutput, WorkflowStepNode
 
 from flowx_core.agent_intent import (
 	AgentIntent,
@@ -44,7 +44,11 @@ from flowx_core.dynamic_workflow_orchestrator import (
 )
 from flowx_core.tools.artifact_tools import text_digest, write_json_atomic
 from flowx_core.tools.text_tools import truncate_context
-from flowx_core.tools.workflow_engine import close_workflow_engine, init_workflow_engine, run_workflow
+from flowx_core.tools.workflow_engine import (
+	FlowXWorkflowEngine,
+	close_workflow_engine,
+	init_workflow_engine,
+)
 from flowx_core.workflows.graph_generation import GraphGenerationRequest, GraphGenerationWorkflow
 from flowx_core.workflows.main_entrypoint_generation import (
 	MainEntrypointGenerationRequest,
@@ -601,7 +605,7 @@ class AgentWorkflowEngine:
 		self._records: dict[str, WorkflowRecord] = {}
 		self._registry_lock, self._run_lock = RLock(), RLock()
 		self._closed = False
-		self._engine: WorkflowEngine | None = init_workflow_engine(
+		self._engine: FlowXWorkflowEngine | None = init_workflow_engine(
 			_STEP_CLASSES,
 			{
 				"pool_size": pool_size,
@@ -735,7 +739,7 @@ class AgentWorkflowEngine:
 			if self._closed or self._engine is None:
 				raise RuntimeError("agent workflow engine is closed")
 			_published()
-			outputs = run_workflow(self._engine, state={"agent_run": _AgentRun(request, self)}).outputs
+			outputs = self._engine.run_steps(state={"agent_run": _AgentRun(request, self)}).outputs
 			final = outputs[_MAIN_STEP].derived
 			stages = {name: StageOutcome(**data) for name, data in final["stages"].items()}
 			workflow_id = final["workflow_id"]

@@ -40,7 +40,6 @@ from flowx_core.workflows.node_runtime_modifier import (
 from flowx_core.tools.workflow_engine import (
     close_workflow_engine,
     init_workflow_engine,
-    run_workflow,
 )
 
 
@@ -73,7 +72,7 @@ class _SecondStep(WorkflowStepNode):
         return StepRunOutput(derived={"value": dependency_results["first"].derived["value"] + 3})
 
 
-def test_build_init_and_run_workflow() -> None:
+def test_build_init_and_run_steps() -> None:
     received = []
     NODES = (_FirstStep, _SecondStep)
     NODE_CLASSES = {node.STEP_ID: node for node in NODES}
@@ -84,7 +83,7 @@ def test_build_init_and_run_workflow() -> None:
         graph_config_id="test-workflow-engine",
     )
     try:
-        result = run_workflow(engine, request_id="first-request", state={"received": received})
+        result = engine.run_steps(request_id="first-request", state={"received": received})
         assert engine.steps_meta[1]["dependencies"] == ["first"]
         assert isinstance(engine.pool, WorkflowPipelinePool)
         assert isinstance(result, RunResult)
@@ -94,13 +93,13 @@ def test_build_init_and_run_workflow() -> None:
         assert received[0]["first"].derived == {"value": 2}
         assert result.outputs["second"].derived == {"value": 5}
         assert engine.awaiting_input(result.request_id) is None
-        assert run_workflow(engine, request_id="second-request").outputs == result.outputs
+        assert engine.run_steps(request_id="second-request").outputs == result.outputs
     finally:
         close_workflow_engine(engine)
     assert engine.pool.closed
 
 
-def test_run_workflow_preserves_native_input_normalization() -> None:
+def test_run_steps_preserves_native_input_normalization() -> None:
     class EchoStep(WorkflowStepNode):
         STEP_ID = "echo"
 
@@ -118,7 +117,7 @@ def test_run_workflow_preserves_native_input_normalization() -> None:
             (None, ""),
         ]
         for value, expected in cases:
-            result = run_workflow(engine, inputs={"echo": value}, state={"marker": 1})
+            result = engine.run_steps(inputs={"echo": value}, state={"marker": 1})
             assert result.outputs["echo"].derived == {"input": expected, "marker": 1}
     finally:
         close_workflow_engine(engine)
@@ -130,13 +129,13 @@ def test_workflow_does_not_reserve_a_hidden_control_step_name() -> None:
 
     engine = init_workflow_engine({"_flowx_run_request": ControlStep}, {"nodes": [{"name": "_flowx_run_request"}]})
     try:
-        result = run_workflow(engine, state={"marker": 1})
+        result = engine.run_steps(state={"marker": 1})
         assert result.outputs["_flowx_run_request"].derived == {"value": 2}
     finally:
         close_workflow_engine(engine)
 
 
-def test_run_workflow_rejects_failure_and_skips_dependents() -> None:
+def test_run_steps_rejects_failure_and_skips_dependents() -> None:
     events = []
 
     class FailingStep(WorkflowStepNode):
@@ -161,16 +160,16 @@ def test_run_workflow_rejects_failure_and_skips_dependents() -> None:
     engine = init_workflow_engine(steps, {"nodes": [{"name": "broken"}, {"name": "downstream", "depends": ["broken"]}]})
     try:
         with pytest.raises(RuntimeError, match="workflow step 'broken' failed:.*invalid output"):
-            run_workflow(engine)
+            engine.run_steps()
         assert events == ["broken"]
-        assert run_workflow(engine, state={"recovered": True}).status == "completed"
+        assert engine.run_steps(state={"recovered": True}).status == "completed"
         assert events == ["broken", "downstream"]
         assert workflow_engine_module._RUN_REQUEST.get() is None
     finally:
         close_workflow_engine(engine)
 
 
-def test_run_workflow_seeds_fresh_state_and_reuses_native_pool() -> None:
+def test_run_steps_seeds_fresh_state_and_reuses_native_pool() -> None:
     states = []
     native_states = []
     native_nodes = []
@@ -207,9 +206,9 @@ def test_run_workflow_seeds_fresh_state_and_reuses_native_pool() -> None:
     pool = engine.pool
     first_seed, second_seed = {"marker": 1}, {"marker": 2}
     try:
-        first = run_workflow(engine, inputs={"stateful": "one"}, state=first_seed)
-        second = run_workflow(engine, inputs={"stateful": "two"}, state=second_seed)
-        skipped = run_workflow(engine, skipped_steps=["stateful"])
+        first = engine.run_steps(inputs={"stateful": "one"}, state=first_seed)
+        second = engine.run_steps(inputs={"stateful": "two"}, state=second_seed)
+        skipped = engine.run_steps(skipped_steps=["stateful"])
         assert states == [{"marker": 1}, {"marker": 2}]
         assert first.outputs["following"].derived == {"previous": "one"}
         assert second.outputs["following"].derived == {"previous": "two"}
@@ -246,7 +245,7 @@ def test_native_pool_rejects_invalid_dependencies(nodes) -> None:
         init_workflow_engine(NODE_CLASSES, {"nodes": nodes})
 
 
-def test_run_workflow_rejects_non_step_output() -> None:
+def test_run_steps_rejects_non_step_output() -> None:
     class InvalidStep(WorkflowStepNode):
         STEP_ID = "invalid"
 
@@ -256,27 +255,30 @@ def test_run_workflow_rejects_non_step_output() -> None:
     engine = init_workflow_engine({"invalid": InvalidStep}, {"nodes": [{"name": "invalid"}]})
     try:
         with pytest.raises(RuntimeError, match="process_input must return StepRunOutput"):
-            run_workflow(engine)
+            engine.run_steps()
         with pytest.raises(ValueError, match="unknown workflow step"):
-            run_workflow(engine, inputs={"missing": "value"})
+            engine.run_steps(inputs={"missing": "value"})
     finally:
         close_workflow_engine(engine)
 
 
-def test_initializer_forwards_supplied_nodes_and_class_map_unchanged(monkeypatch) -> None:
+def test_initializer_forwards_class_map_and_normalizes_topology(monkeypatch) -> None:
     captured = {}
 
     class Pool:
         def __init__(self, *, pipeline_json, node_classes, size):
             captured.update(pipeline_json=pipeline_json, node_classes=node_classes, size=size)
 
-    class Engine:
-        def __init__(self, **kwargs):
-            self.pool = kwargs["pool"]
-            captured.update(kwargs)
+    real_build_pool = workflow_engine_module.build_workflow_pool
+
+    def capture_build_pool(node_classes_arg, workflow_config_arg):
+        captured["workflow_config"] = workflow_config_arg
+        pool, steps_meta = real_build_pool(node_classes_arg, workflow_config_arg)
+        captured["steps_meta"] = steps_meta
+        return pool, steps_meta
 
     monkeypatch.setattr(workflow_engine_module, "_WorkflowPipelinePool", Pool)
-    monkeypatch.setattr(workflow_engine_module, "WorkflowEngine", Engine)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", capture_build_pool)
     node_classes = {"first": _FirstStep, "second": _SecondStep}
     nodes = [
         {"name": "first", "type": "_FirstStep", "meta_type": "GNode", "loop": 1,
@@ -285,20 +287,24 @@ def test_initializer_forwards_supplied_nodes_and_class_map_unchanged(monkeypatch
     ]
     workflow_config = {"pool_size": 4, "nodes": nodes}
     snapshot = json.dumps(workflow_config)
-    init_workflow_engine(node_classes, workflow_config)
+    engine = init_workflow_engine(node_classes, workflow_config)
     assert captured["node_classes"] is node_classes
-    assert captured["pipeline_json"] == json.dumps({"nodes": nodes})
-    assert json.loads(captured["pipeline_json"])["nodes"] == nodes
+    assert captured["workflow_config"] is workflow_config
+    assert json.loads(captured["pipeline_json"]) == {"nodes": [
+        {"name": "first", "depends": []},
+        {"name": "second", "depends": ["first"]},
+    ]}
+    assert [step["id"] for step in captured["steps_meta"]] == ["first", "second"]
     assert json.dumps(workflow_config) == snapshot
     assert captured["size"] == 4
-    assert captured["graph_config_id"] == "flowx"
+    assert engine.graph_config_id == "flowx"
 
 
 def test_native_pool_accepts_supplied_node_fields() -> None:
     nodes = [{"name": "first", "type": "_FirstStep", "meta_type": "GNode", "loop": 1}]
     engine = init_workflow_engine({"first": _FirstStep}, {"nodes": nodes})
     try:
-        assert run_workflow(engine).outputs["first"].derived == {"value": 2}
+        assert engine.run_steps().outputs["first"].derived == {"value": 2}
         assert "depends" not in nodes[0]
     finally:
         close_workflow_engine(engine)
@@ -340,8 +346,8 @@ def _native_explicit_classes_reference() -> None:
         assert len(created) == 4
         assert len({id(node) for node in created}) == 4
         assert all(type(node) is NODE_CLASSES[node.STEP_ID] for node in created)
-        first = run_workflow(engine, state={"marker": 1})
-        second = run_workflow(engine, state={"marker": 2})
+        first = engine.run_steps(state={"marker": 1})
+        second = engine.run_steps(state={"marker": 2})
         assert first.outputs["child"].derived == {"value": 5, "marker": 1}
         assert second.outputs["child"].derived == {"value": 5, "marker": 2}
         assert len(created) == 4
@@ -391,7 +397,7 @@ def test_minimal_json_preserves_file_node_support() -> None:
 
     engine = init_workflow_engine({"file": FileNode}, {"nodes": [{"name": "file"}]})
     try:
-        assert run_workflow(engine, inputs={"file": b"Ada"}).outputs["file"].derived == {"size": 3}
+        assert engine.run_steps(inputs={"file": b"Ada"}).outputs["file"].derived == {"size": 3}
     finally:
         close_workflow_engine(engine)
 
@@ -409,12 +415,15 @@ def test_initializer_uses_class_metadata_without_constructing_nodes(monkeypatch)
         def __init__(self, *, pipeline_json, node_classes, size):
             captured["node_classes"] = node_classes
 
-    class Engine:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
+    real_build_pool = workflow_engine_module.build_workflow_pool
+
+    def capture_build_pool(node_classes, workflow_config):
+        pool, steps_meta = real_build_pool(node_classes, workflow_config)
+        captured["steps_meta"] = steps_meta
+        return pool, steps_meta
 
     monkeypatch.setattr(workflow_engine_module, "_WorkflowPipelinePool", Pool)
-    monkeypatch.setattr(workflow_engine_module, "WorkflowEngine", Engine)
+    monkeypatch.setattr(workflow_engine_module, "build_workflow_pool", capture_build_pool)
     NODES = (ConfiguredFirst,)
     NODE_CLASSES = {node.STEP_ID: node for node in NODES}
     init_workflow_engine(NODE_CLASSES, {"nodes": [{"name": "first"}]})
@@ -621,7 +630,7 @@ def _native_concurrent_request_state_reference() -> None:
     seeds = [{"marker": marker, "sink": []} for marker in ("one", "two")]
 
     def run(index):
-        result = run_workflow(engine, inputs={"mutate": seeds[index]["marker"]}, state=seeds[index])
+        result = engine.run_steps(inputs={"mutate": seeds[index]["marker"]}, state=seeds[index])
         assert workflow_engine_module._RUN_REQUEST.get() is None
         return result
 
@@ -635,7 +644,7 @@ def _native_concurrent_request_state_reference() -> None:
         with engine.pool.lease() as (_, param):
             assert param.state == {}
         assert seeds == [{"marker": "one", "sink": ["one"]}, {"marker": "two", "sink": ["two"]}]
-        skipped = run_workflow(engine, state={"marker": "three"}, skipped_steps=["mutate"])
+        skipped = engine.run_steps(state={"marker": "three"}, skipped_steps=["mutate"])
         assert skipped.outputs["read"].derived == {"marker": "three", "previous": None, "skipped": True}
         assert sorted(seen_steps) == ["one", "three", "two"]
     finally:
@@ -755,7 +764,7 @@ def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_pat
         node_planner=NodePlanElement(client=object()), node_coder=coder,
         node_auditor=_PassingNodeAuditor(),
     )
-    engine = workflow._engine
+    engine = workflow
     assert engine is not None
     pool = engine.pool
     assert workflow._node_classes["node_generate"] is _RecordingRequestCoder
@@ -815,7 +824,7 @@ def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_pat
             assert dependency_context in calls[-1]["prompt"]
             assert not request.markdown_path.exists()
             assert f"Generate a {kind} subclass" in calls[-1]["prompt"]
-            assert workflow._engine is engine
+            assert workflow is engine
             assert workflow.init_node_engine() is engine
             assert engine.pool is pool
             with pool.lease() as (_, param):
@@ -840,7 +849,7 @@ def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_pat
                 assert audit_calls[-1] == {"node_name": node_name, "state_id": calls[-1]["state_id"]}
                 assert len(audit_calls) == len(calls)
                 assert state == state_snapshot
-                assert workflow._engine is engine
+                assert workflow is engine
                 assert engine.pool is pool
                 assert "Preserve the WorkflowFileNode" in calls[-1]["prompt"]
                 assert "remote_desc: persist to request bucket" in calls[-1]["prompt"]
@@ -859,7 +868,7 @@ def test_generation_request_reuses_one_eager_workflow_for_all_node_kinds(tmp_pat
     finally:
         workflow.close()
         workflow.close()
-    assert workflow._engine is None
+    assert workflow.closed
     assert engine.pool.closed
     with pytest.raises(RuntimeError, match="closed"):
         workflow.run(request)
@@ -923,10 +932,10 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
     executors = []
     original_apply_settings = modifier_module.apply_node_settings
     native_results = []
-    original_run_workflow = modifier_module.run_workflow
+    original_run_steps = NodeRuntimeModifierPipeline.run_steps
 
-    def record_native_result(*args, **kwargs):
-        result = original_run_workflow(*args, **kwargs)
+    def record_native_result(self, *args, **kwargs):
+        result = original_run_steps(self, *args, **kwargs)
         native_results.append(result)
         return result
 
@@ -936,7 +945,7 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
             executors.append(node)
 
     monkeypatch.setattr(modifier_module, "apply_node_settings", record_executor)
-    monkeypatch.setattr(modifier_module, "run_workflow", record_native_result)
+    monkeypatch.setattr(NodeRuntimeModifierPipeline, "run_steps", record_native_result)
 
     def run_subprocess(command, **kwargs):
         execution_calls.append({"command": list(command), **kwargs})
@@ -948,7 +957,7 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
         ),
         node_writer=_RecordingAmender(client=object(), calls=amendment_calls), run_subprocess=run_subprocess,
     )
-    engine = pipeline._engine
+    engine = pipeline
     assert engine is not None
     assert len(instances) == 2
     results = []
@@ -1002,7 +1011,7 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
             assert result.test_result is not request.test_result
             assert result.node_name == request.node_name == node_name
             assert all(not hasattr(result, name) for name in removed_fields)
-            assert pipeline._engine is engine
+            assert pipeline is engine
             native_result = native_results[-1]
             assert isinstance(native_result, RunResult)
             assert native_result.status == "completed"
@@ -1061,7 +1070,7 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
     finally:
         pipeline.close()
         pipeline.close()
-    assert pipeline._engine is None
+    assert pipeline.closed
     assert engine.pool.closed
     with pytest.raises(RuntimeError, match="closed"):
         pipeline.run(request)
