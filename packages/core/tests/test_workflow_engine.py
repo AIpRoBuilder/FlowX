@@ -300,6 +300,22 @@ def test_initializer_forwards_class_map_and_normalizes_topology(monkeypatch) -> 
     assert engine.graph_config_id == "flowx"
 
 
+def test_initializer_retains_the_graph_spec_for_graph_backed_callers() -> None:
+    engine = init_workflow_engine(
+        {"first": _FirstStep, "second": _SecondStep},
+        {"nodes": [{"name": "first"}, {"name": "second", "depends": ["first"]}]},
+    )
+    try:
+        assert type(engine.graph).__name__ == "GraphSpec"
+        assert json.loads(engine.graph.pipeline_json) == {"nodes": [
+            {"name": "first", "depends": []},
+            {"name": "second", "depends": ["first"]},
+        ]}
+        assert engine.graph.node_classes["second"] is _SecondStep
+    finally:
+        close_workflow_engine(engine)
+
+
 def test_native_pool_accepts_supplied_node_fields() -> None:
     nodes = [{"name": "first", "type": "_FirstStep", "meta_type": "GNode", "loop": 1}]
     engine = init_workflow_engine({"first": _FirstStep}, {"nodes": nodes})

@@ -6,6 +6,7 @@ Modified 2026-10-16: reload an engine's pool and step metadata when the workflow
 Modified 2026-10-23: type engine step metadata with ag_ui_workflow.StepMeta.
 Modified 2026-10-24: add FlowXWorkflowEngine so generation workflows are engines, not wrappers;
 run noninteractive graphs through the engine's own ``run_steps``.
+Modified 2026-10-28: retain each engine's GraphSpec so published child workflows are graph-backed.
 """
 
 from __future__ import annotations
@@ -108,6 +109,20 @@ def build_workflow_pool(
     return pool, steps_meta
 
 
+def _graph_spec(
+    node_classes: Mapping[str, type[GElement]],
+    workflow_config: Mapping[str, Any],
+) -> GraphSpec:
+    """Build the native spec an engine built from a class map and JSON config owns.
+
+    ``WorkflowEngine`` keeps this spec for graph-backed callers (for example the
+    dynamic workflow orchestrator), while the pool still consumes the canonical
+    ``_prepare_graph`` JSON.
+    """
+    pipeline_json, steps_meta, _ = _prepare_graph(node_classes, workflow_config)
+    return GraphSpec.from_json(pipeline_json, node_classes, steps_meta=steps_meta)
+
+
 def init_workflow_engine(
     node_classes: Mapping[str, type[GElement]],
     workflow_config: Mapping[str, Any],
@@ -148,6 +163,7 @@ class FlowXWorkflowEngine(WorkflowEngine):
                 graph_config_id=graph_config_id,
                 steps_meta=steps_meta,
                 pool=pool,
+                graph=_graph_spec(node_classes, workflow_config),
             )
         except BaseException:
             pool.close()
@@ -314,10 +330,14 @@ def reload_workflow_engine(
     if not isinstance(engine.pool, _WorkflowPipelinePool):
         raise TypeError("only an engine created by init_workflow_engine can be reloaded")
     pipeline_json, steps_meta, pool_size = _prepare_graph(node_classes, workflow_config)
+    # Build the replacement spec before touching the live engine.
+    graph = GraphSpec.from_json(pipeline_json, node_classes, steps_meta=steps_meta)
     engine.pool.reload(pipeline_json=pipeline_json, node_classes=node_classes, size=pool_size)
     # The engine has no reload API and keeps its own step metadata and lookup map.
     engine.steps_meta = engine._normalize_steps_meta(steps_meta)
     engine._step_map = {step["id"]: step for step in engine.steps_meta}
+    # Keep the retained graph in sync so graph-backed callers see the new topology.
+    engine.graph = graph
 
 
 def close_workflow_engine(engine: WorkflowEngine) -> None:

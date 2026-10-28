@@ -9,29 +9,21 @@
 
 import json
 from dataclasses import dataclass, field, fields
-from inspect import Parameter, signature
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from ag_ui_workflow import StepRunOutput, WorkflowStepNode
+from ag_ui_workflow import WorkflowStepNode
 import flowx_core.agent_builder as agent_builder_module
 import flowx_core.agent_workflow_engine as agent_workflow_engine_module
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.agent_intent import INTENT_SYSTEM_PROMPT
-from flowx_core.architect.graph import NodeMeta
+from flowx_core.architect.graph import Graph, NodeMeta
 from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.node_auditor import NodeAuditor
-from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
-from flowx_core.builder_support import WorkflowArtifactState
 from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.node_formats import collect_node_formats
 from flowx_core.worker.node_writer import WorkflowStepNodeCoder
-from flowx_core.worker.main_writer import PromptMainFileCoder
-from flowx_core.workflows.main_entrypoint_generation import (
-    MainEntrypointGenerationRequest,
-    MainEntrypointGenerationWorkflow,
-)
 from flowx_core.workflows.node_generation import NodeGenerationRequest, NodeGenerationWorkflow
 from flowx_core.workflows.node_runtime_modifier import (
     NodeRuntimeModifierPipeline,
@@ -205,100 +197,8 @@ def test_builder_close_releases_all_four_initialized_workflows(monkeypatch, tmp_
         assert workflow.close.call_count == 2
 
 
-def test_builder_session_keeps_only_published_artifact_state(monkeypatch, tmp_path):
-    builder = _make_builder(monkeypatch, tmp_path)
-
-    builder.graph_plan_path = str(tmp_path / "workflow.json")
-
-    assert builder.artifact_state.graph_plan_path == str(tmp_path / "workflow.json")
-    for removed in (
-        "runtime_state", "dynamic_graph_cache", "node_coder_map", "node_docs_dir", "node_doc_paths",
-        "log_path", "backend_server_process", "output_auditor",
-    ):
-        assert not hasattr(builder, removed), removed
-    builder.close()
-
-
-def test_get_node_doc_path_reads_published_workflow_artifacts(monkeypatch, tmp_path):
-    builder = _make_builder(monkeypatch, tmp_path)
-    builder.artifact_state.workflow_artifacts["alpha"] = WorkflowArtifactState(
-        graph_plan_path=str(tmp_path / "workflow.json"),
-        node_doc_paths={"SharedNode": str(tmp_path / "SharedNode.md")},
-    )
-
-    assert builder.get_node_doc_path("SharedNode", workflow_name="alpha") == str(tmp_path / "SharedNode.md")
-    assert builder.get_node_doc_path("Other", workflow_name="alpha") is None
-    assert builder.get_node_doc_path("SharedNode", workflow_name="missing") is None
-    builder.close()
-
-
 def _write_graph(graph_path: Path, nodes: list[dict]) -> None:
     graph_path.write_text(json.dumps({"nodes": nodes}, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def test_generate_nodes_retains_public_signature():
-    assert not hasattr(AgentBuilder, "_generate_nodes")
-    parameters = signature(AgentBuilder.generate_nodes).parameters
-
-    assert list(parameters) == [
-        "self", "graph_plan_path", "requirement_md_path", "language", "temperature",
-        "node_names", "run_nodes", "generate_markdowns", "markdown_amendments",
-        "node_amendments", "workflow_name",
-    ]
-    assert all(parameter.kind is Parameter.POSITIONAL_OR_KEYWORD for parameter in parameters.values())
-    assert parameters["self"].default is Parameter.empty
-    assert {name: parameter.default for name, parameter in parameters.items() if name != "self"} == {
-        "graph_plan_path": None,
-        "requirement_md_path": None,
-        "language": "python",
-        "temperature": 0.35,
-        "node_names": None,
-        "run_nodes": None,
-        "generate_markdowns": False,
-        "markdown_amendments": None,
-        "node_amendments": None,
-        "workflow_name": "default",
-    }
-
-
-@pytest.mark.parametrize(("args", "kwargs"), [
-    pytest.param((), {}, id="no-requirement-or-graph"),
-    pytest.param((), {
-        "graph_plan_path": "missing/workflow.json",
-        "requirement_md_path": "missing/requirement.md",
-        "node_names": ["MissingNode"],
-        "run_nodes": {"MissingNode": False},
-        "generate_markdowns": True,
-        "workflow_name": "",
-    }, id="invalid-inputs-are-not-validated"),
-    pytest.param((
-        "missing/workflow.json", "missing/requirement.md", "python", 0.1,
-        ["MissingNode"], ["MissingNode"], True,
-        {"MissingNode": "Revise brief"}, {"MissingNode": "Revise code"}, "billing",
-    ), {}, id="legacy-positional-arguments"),
-])
-def test_generate_nodes_immediately_rejects_batch_generation(monkeypatch, tmp_path, args, kwargs):
-    builder = _make_builder(monkeypatch, tmp_path)
-    original_paths = set(tmp_path.rglob("*"))
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        builder.generate_nodes(*args, **kwargs)
-
-    assert str(exc_info.value) == (
-        "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes."
-    )
-    assert builder.requirement_md_path is None
-    assert builder.graph_plan_path is None
-    assert builder.planned_graph is None
-    assert builder.node_location_map == {}
-    assert builder.artifact_state.workflow_artifacts == {}
-    assert set(tmp_path.rglob("*")) == original_paths
-    for workflow in (
-        builder._graph_workflow, builder._node_workflow,
-        builder._modifier_pipeline, builder._main_workflow,
-    ):
-        workflow.run.assert_not_called()
-    builder.close()
 
 
 def test_node_generation_workflow_generates_and_amends_explicit_requests(monkeypatch, tmp_path):
@@ -470,12 +370,7 @@ def test_node_generation_workflow_generates_and_amends_explicit_requests(monkeyp
     assert node_path.read_text(encoding="utf-8") == "# amended\n# Apply revised guard\n"
     assert existing_path.read_text(encoding="utf-8") == existing_source
     assert (docs_dir / "ExistingNode.md").read_text(encoding="utf-8") == existing_markdown
-    # Direct workflow requests do not publish caller-owned builder paths or tests.
-    assert builder.requirement_md_path is None
-    assert builder.graph_plan_path is None
-    assert builder.planned_graph is None
-    assert builder.node_location_map == {}
-    assert builder.artifact_state.workflow_artifacts == {}
+    # Direct workflow requests do not create caller-owned test files.
     assert not (graph_dir / "tests").exists()
     assert not (project_root / "tests").exists()
     _assert_no_request_cache(workflow)
@@ -549,112 +444,7 @@ def test_modifier_pipeline_reuses_one_eager_workflow_for_named_node_requests(mon
     builder.close()
 
 
-def test_sync_workflow_graph_json_does_not_duplicate_relative_root_dir(monkeypatch, tmp_path):
-    project_dir = tmp_path / "demo_resume_workflow"
-    project_dir.mkdir()
-    monkeypatch.chdir(tmp_path)
-
-    builder = _make_builder(monkeypatch, project_dir.name)
-
-    graph_path = project_dir / "workflow.json"
-    _write_graph(
-        graph_path,
-        [
-            {
-                "name": "ResumeUploadNode",
-                "type": "WorkflowFileNode",
-                "desc": "upload",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "user_file_input", "desc": "upload"},
-            }
-        ],
-    )
-
-    builder.graph_plan_path = str(graph_path)
-
-    synced_path = builder._sync_workflow_graph_json()
-
-    assert Path(synced_path).resolve() == graph_path.resolve()
-    assert not (project_dir / project_dir.name / "workflow.json").exists()
-    assert builder.workflow_json_path == str(graph_path.resolve())
-    builder.close()
-
-
-def test_write_main_entrypoint_does_not_duplicate_relative_root_dir(monkeypatch, tmp_path):
-    project_dir = tmp_path / "demo_resume_workflow"
-    project_dir.mkdir()
-    monkeypatch.chdir(tmp_path)
-
-    builder = _make_builder(monkeypatch, project_dir.name)
-
-    graph_path = project_dir / "workflow.json"
-    _write_graph(
-        graph_path,
-        [
-            {
-                "name": "ResumeUploadNode",
-                "type": "WorkflowFileNode",
-                "desc": "upload",
-                "enable": True,
-                "depends": [],
-                "ext_data": {"type": "user_file_input", "desc": "upload"},
-            }
-        ],
-    )
-
-    captured = {}
-
-    class _FakeMainWriter(PromptMainFileCoder):
-        def process_input(self, _user_input, _dependency_results, session_state):
-            request = session_state["main_entrypoint"]
-            assert session_state[f"{type(self).__name__}::action"] == "write"
-            captured.update(request)
-            output_path = Path(request["output_path"])
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text("print('main')\n", encoding="utf-8")
-            return StepRunOutput(derived={"main_entrypoint_path": str(output_path)})
-
-    class _FakeMainAuditor(MainEntryPointAuditor):
-        def audit_file(self, file_path, nodes_root=None):
-            assert Path(file_path).is_file()
-            return True, []
-
-    builder.main_writer = _FakeMainWriter()
-    builder.main_entry_auditor = _FakeMainAuditor()
-    builder._main_workflow.close()
-    builder._main_workflow = MainEntrypointGenerationWorkflow(
-        main_writer=builder.main_writer,
-        main_entry_auditor=builder.main_entry_auditor,
-    )
-    workflow = builder._main_workflow
-    run_main = Mock(wraps=workflow.run)
-    monkeypatch.setattr(workflow, "run", run_main)
-
-    main_path = builder._write_main_entrypoint(
-        graph_plan_path=str(graph_path),
-        output_filename=str(Path(project_dir.name) / "main.py"),
-    )
-
-    assert Path(main_path).resolve() == (project_dir / "main.py").resolve()
-    assert Path(captured["output_path"]).resolve() == (project_dir / "main.py").resolve()
-    assert not (project_dir / project_dir.name / "main.py").exists()
-    assert builder.main_output_path == main_path
-    run_main.assert_called_once()
-    request, = run_main.call_args.args
-    assert not run_main.call_args.kwargs
-    assert isinstance(request, MainEntrypointGenerationRequest)
-    assert request.graph_plan_json_path == str(graph_path)
-    assert request.output_path == main_path
-    assert request.state["build_session"] is builder._session
-    assert workflow.main_writer is builder.main_writer
-    assert workflow.main_entry_auditor is builder.main_entry_auditor
-    builder.close()
-
-
-def test_collect_node_formats_collects_inputs_and_backend_card_schema(monkeypatch, tmp_path):
-    builder = _make_builder(monkeypatch, tmp_path)
-
+def test_collect_node_formats_collects_inputs_and_backend_card_schema(tmp_path):
     graph_path = tmp_path / "graph_plan.json"
     _write_graph(
         graph_path,
@@ -697,9 +487,7 @@ def test_collect_node_formats_collects_inputs_and_backend_card_schema(monkeypatc
         encoding="utf-8",
     )
 
-    builder.graph_plan_path = str(graph_path)
-
-    formats = collect_node_formats(builder, builder._load_planned_graph())
+    formats = collect_node_formats(Graph(str(graph_path)), root_dir=tmp_path)
 
     assert formats == {
         "CollectInput": {
@@ -716,7 +504,6 @@ def test_collect_node_formats_collects_inputs_and_backend_card_schema(monkeypatc
             "backend_node_path": str(tmp_path / "Summarize.py"),
         },
     }
-    builder.close()
 
 
 def test_builder_publishes_workflows_for_the_agent_engine_and_closes_it(monkeypatch, tmp_path):

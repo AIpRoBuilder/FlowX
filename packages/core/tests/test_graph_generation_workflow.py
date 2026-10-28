@@ -15,7 +15,6 @@ from unittest.mock import DEFAULT, Mock
 import pytest
 from ag_ui_workflow import RunResult, StepRunOutput, WorkflowEngine
 
-from flowx_core import agent_builder
 from flowx_core.architect.graph import Graph
 from flowx_core.architect.graph_planner import GraphPlanner
 from flowx_core.auditor.graph_json_auditor import GraphJsonAuditor
@@ -95,38 +94,6 @@ def workflow_factory(engine_spies):
         for resource in resources:
             cleanup.callback(resource.close)
     assert engine_spies.close.call_count == engine_spies.init.call_count
-
-
-@pytest.fixture
-def builder_factory(tmp_path, monkeypatch, workflow_factory):
-    for workflow_name in (
-        "NodeGenerationWorkflow", "NodeRuntimeModifierPipeline",
-        "MainEntrypointGenerationWorkflow", "RuntimeService",
-    ):
-        monkeypatch.setattr(agent_builder, workflow_name, Mock(name=workflow_name))
-    monkeypatch.setattr(
-        agent_builder, "configure_runtime_logging", Mock(return_value=tmp_path / "runtime.log"),
-    )
-    monkeypatch.setattr(agent_builder, "get_logger", Mock(return_value=Mock()))
-
-    def construct(*, analyzer, planner, graph_auditor):
-        def reset_components(builder):
-            builder.analyzer = analyzer
-            builder.planner = planner
-            for component_name in (
-                "node_planner", "node_coder", "main_writer", "node_test_writer", "node_modifier_writer",
-            ):
-                setattr(builder, component_name, Mock(name=component_name))
-
-        # The real graph workflow initializes eagerly, so inject offline nodes first.
-        monkeypatch.setattr(agent_builder.AgentBuilder, "_reset_llm_components", reset_components)
-        monkeypatch.setattr(agent_builder, "GraphJsonAuditor", Mock(return_value=graph_auditor))
-        return agent_builder.AgentBuilder(api_key="offline-test-key", root_dir=str(tmp_path))
-
-    def create(events=None):
-        return workflow_factory(events, constructor=construct)
-
-    return create
 
 
 @pytest.mark.parametrize("graph_action", ["plan", "amend"])
@@ -269,97 +236,6 @@ def test_full_request_uses_actual_upstream_artifact_paths(
         workflow.run(GraphGenerationRequest())
     engine_spies.init.assert_called_once()
     assert engine_spies.run.call_count == 2
-
-
-@pytest.mark.parametrize("skip_audit", [False, True])
-def test_agent_builder_publishes_artifacts_and_seeds_its_own_session(
-    tmp_path, builder_factory, engine_spies, skip_audit,
-):
-    builder = builder_factory()
-    caller_session = object()
-    caller_data = {"marker": "caller"}
-    state = MappingProxyType({"build_session": caller_session, "caller_data": caller_data})
-
-    result = builder._run_graph_request(GraphGenerationRequest(
-        requirement_text="Collect data", requirement_md_path=str(tmp_path / "analysis"),
-        graph_plan_path=str(tmp_path / "graph"), skip_audit_graph=skip_audit, state=state,
-    ))
-
-    assert isinstance(result, RunResult)
-    assert builder.requirement_md_path == str(tmp_path / "analysis.md")
-    assert builder.graph_plan_path == str(tmp_path / "graph.json")
-    assert isinstance(builder.planned_graph, Graph)
-    assert builder.planned_graph.graph_json_path == tmp_path / "graph.json"
-    assert builder.planned_graph.get_topological_sorted_nodes() == ["Collect"]
-    assert engine_spies.run.call_args.kwargs["state"]["build_session"] is builder._session
-    assert engine_spies.run.call_args.kwargs["state"]["caller_data"] is caller_data
-    assert state["build_session"] is caller_session
-    assert set(state) == {"build_session", "caller_data"}
-    assert isinstance(builder._graph_workflow, WorkflowEngine)
-    assert not any(
-        isinstance(value, GraphGenerationRequest) for value in vars(builder._graph_workflow).values()
-    )
-    engine_spies.init.assert_called_once()
-    engine_spies.close.assert_not_called()
-
-
-@pytest.mark.parametrize("graph_action", ["plan", "amend"])
-def test_failed_same_path_build_invalidates_cached_graph(
-    tmp_path, monkeypatch, builder_factory, engine_spies, graph_action,
-):
-    builder = builder_factory()
-    workflow = builder._graph_workflow
-    engine = workflow
-    builder.analyze_requirement("Collect data")
-    builder.plan_graph()
-    cached_graph = builder.planned_graph
-    assert cached_graph.get_topological_sorted_nodes() == ["Collect"]
-    graph_path = str(tmp_path / "workflow.json")
-    assert builder.graph_plan_path == graph_path
-    planner_client = builder.planner.client
-    planner_client.response = json.dumps({"nodes": [
-        {"name": "Updated", "type": "WrongType", "depends": []},
-    ]})
-    original_write = GraphPlanner.code_to_file
-    cache_at_write = []
-
-    def write(self, *args, **kwargs):
-        cache_at_write.append(builder.planned_graph)
-        assert builder.planned_graph is None
-        assert builder.graph_plan_path == graph_path
-        return original_write(self, *args, **kwargs)
-
-    monkeypatch.setattr(GraphPlanner, "code_to_file", write)
-
-    def rebuild():
-        if graph_action == "plan":
-            return builder.plan_graph()
-        return builder.amend_workflow_json("Replace Collect with Updated")
-
-    with pytest.raises(RuntimeError, match="audit did not pass"):
-        rebuild()
-
-    assert cache_at_write == [None]
-    assert builder.planned_graph is None
-    assert builder.graph_plan_path == graph_path
-    assert Graph(graph_path).get_topological_sorted_nodes() == ["Updated"]
-    assert cached_graph.get_topological_sorted_nodes() == ["Collect"]
-    assert len(planner_client.calls) == 2
-    assert workflow is engine
-    assert engine_spies.run.call_count == 3
-    engine_spies.close.assert_not_called()
-
-    planner_client.response = json.dumps(_GRAPH)
-    assert rebuild() == graph_path
-    assert cache_at_write == [None, None]
-    assert builder.planned_graph is not cached_graph
-    assert builder.planned_graph.get_topological_sorted_nodes() == ["Collect"]
-    assert builder._graph_workflow is workflow
-    assert workflow is engine
-    assert len(planner_client.calls) == 3
-    assert engine_spies.run.call_count == 4
-    engine_spies.init.assert_called_once()
-    engine_spies.close.assert_not_called()
 
 
 @pytest.mark.parametrize("graph_action", ["plan", "amend"])

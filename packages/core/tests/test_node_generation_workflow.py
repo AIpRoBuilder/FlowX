@@ -267,23 +267,6 @@ def test_generation_and_modifier_requests_are_flat_keyword_only_models(tmp_path:
     }
 
 
-def test_builder_batch_helpers_are_absent_and_public_generation_is_disabled() -> None:
-    for name in (
-        "_generate_nodes", "_normalize_requested_names", "_node_path_for",
-        "_render_dependency_context", "_read_node_artifact", "_supports_backend_node_tests",
-        "_start_progress", "_advance_progress", "_print_progress_bar",
-    ):
-        assert not hasattr(AgentBuilder, name)
-    # No constructor state or valid paths are needed: the boundary must fail immediately.
-    builder = object.__new__(AgentBuilder)
-    with pytest.raises(NotImplementedError) as error:
-        builder.generate_nodes()
-    assert str(error.value) == (
-        "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes."
-    )
-    assert vars(builder) == {}
-
-
 @pytest.mark.parametrize("missing", [
     "graph_plan_path", "requirement_md_path", "requirement_text", "node_meta",
     "raw_node", "target_path", "markdown_path",
@@ -516,8 +499,6 @@ def test_node_generation_workflow_runs_single_eager_workflow_from_request(monkey
         assert meta is request.node_meta
         return True, []
 
-    builder.graph_plan_path = str(graph_path)
-    builder.requirement_md_path = str(requirement_path)
     builder.node_planner = Planner()
     builder.node_coder = Coder()
     builder.node_auditor = _FakeAuditor(audit)
@@ -549,8 +530,6 @@ def test_node_generation_workflow_runs_single_eager_workflow_from_request(monkey
         assert request.markdown_path.read_text(encoding="utf-8") == "# Standalone plan"
         assert Path(generated_path).read_text(encoding="utf-8") == "class Standalone: pass\n"
         assert not hasattr(request, "artifacts")  # Publishing belongs to the builder, not the workflow.
-        assert builder.node_location_map == {}
-        assert builder.artifact_state.workflow_artifacts == {}
         assert len(results) == 1
         assert results[0].outputs["node_audit"].derived["ok"] is True
         assert workflow is engine

@@ -11,11 +11,8 @@ Modified 2026-10-16: drop the removed workflow service wrappers; AgentBuilder ow
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import MISSING, FrozenInstanceError, fields
 from inspect import Parameter, signature
-from itertools import product
-import json
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType, SimpleNamespace
@@ -29,10 +26,8 @@ from flowx_core.agent_builder import AgentBuilder
 from flowx_core.architect.graph import NodeMeta
 from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.node_auditor import NodeAuditor
-from flowx_core.builder_support import BuildSession, WorkflowArtifactState
 from flowx_core.worker.node_writer import PromptNodeFileCoderBase
 from flowx_core.workflows import main_entrypoint_generation as main_entrypoint_module
-from flowx_core.workflows.graph_generation import GraphGenerationRequest
 from flowx_core.workflows.main_entrypoint_generation import MainEntrypointGenerationRequest
 from flowx_core.workflows.node_generation import (
     NodeGenerationRequest,
@@ -125,7 +120,6 @@ def builder(tmp_path):
     """Exercise real facade methods without clients, native pools, or subprocesses."""
     instance = object.__new__(AgentBuilder)
     instance.root_dir = str(tmp_path)
-    instance._session = BuildSession()
     instance._artifact_publication_lock = RLock()
     instance._logger = Mock(name="logger")
     for name in (
@@ -137,7 +131,6 @@ def builder(tmp_path):
     instance._popen_subprocess = Mock()
     instance._run_subprocess = Mock()
     instance._subprocess_timeout_expired = Mock(return_value=TimeoutError)
-    instance._instantiate_graph = Mock()
     for *_, name in _WORKFLOW_CASES:
         setattr(instance, name, Mock(name=name, spec_set=["run", "close"]))
     instance._runtime_service = Mock(spec_set=[
@@ -274,36 +267,6 @@ def test_node_generation_request_requires_one_node_and_has_independent_dict_defa
             NodeGenerationRequest(**inputs, **{removed: object()})
 
 
-def test_node_generation_api_removes_batch_helpers_but_preserves_public_signature(builder) -> None:
-    for name in (
-        "_generate_nodes", "_normalize_requested_names", "_node_path_for",
-        "_render_dependency_context", "_read_node_artifact", "_supports_backend_node_tests",
-        "_read_requirement_text", "_start_progress", "_advance_progress", "_print_progress_bar",
-        "_generate_node_request", "_run_requested_workflows",
-    ):
-        assert not hasattr(AgentBuilder, name), name
-        assert not hasattr(builder, name), name
-    assert not hasattr(NodeGenerationWorkflow, "_run_requested_workflows")
-    parameters = signature(AgentBuilder.generate_nodes).parameters
-    assert tuple(parameters) == (
-        "self", "graph_plan_path", "requirement_md_path", "language", "temperature",
-        "node_names", "run_nodes", "generate_markdowns", "markdown_amendments",
-        "node_amendments", "workflow_name",
-    )
-    assert all(parameter.kind is Parameter.POSITIONAL_OR_KEYWORD for parameter in parameters.values())
-    assert parameters["self"].default is Parameter.empty
-    assert {name: parameter.default for name, parameter in parameters.items() if name != "self"} == {
-        "graph_plan_path": None, "requirement_md_path": None, "language": "python",
-        "temperature": 0.35, "node_names": None, "run_nodes": None,
-        "generate_markdowns": False, "markdown_amendments": None, "node_amendments": None,
-        "workflow_name": "default",
-    }
-    for name in ("callback", "workflow_requests", "workflow_registry"):
-        with pytest.raises(TypeError, match="unexpected keyword"):
-            builder.generate_nodes(**{name: object()})
-    builder._node_workflow.run.assert_not_called()
-
-
 def test_agent_builder_initialization_has_no_batch_progress_fields(monkeypatch, tmp_path) -> None:
     reset_components, init_services = Mock(), Mock()
     monkeypatch.setattr(AgentBuilder, "_reset_llm_components", reset_components)
@@ -320,100 +283,6 @@ def test_agent_builder_initialization_has_no_batch_progress_fields(monkeypatch, 
         assert not hasattr(instance, name), name
     reset_components.assert_called_once_with()
     init_services.assert_called_once_with()
-
-
-@pytest.mark.parametrize("populated", (False, True), ids=("fresh-session", "published-session"))
-@pytest.mark.parametrize("arguments", (
-    "defaults", "valid", "missing-paths", "empty-graph", "empty-selection",
-    "disabled-selection", "empty-arguments", "invalid-workflow",
-))
-def test_public_node_generation_immediately_rejects_without_side_effects(
-    builder, monkeypatch, tmp_path, capsys, populated, arguments,
-) -> None:
-    graph_path = tmp_path / "requested.json"
-    graph_path.write_text(json.dumps({"nodes": [{
-        "name": "Shared", "type": "WorkflowStepNode", "desc": "Requested step", "depends": [],
-    }]}), encoding="utf-8")
-    requirement_path = tmp_path / "requested.md"
-    requirement_path.write_text("Build the requested graph.", encoding="utf-8")
-    empty_graph_path = tmp_path / "empty.json"
-    empty_graph_path.write_text(json.dumps({"nodes": []}), encoding="utf-8")
-    node_path, doc_path, test_path = (
-        tmp_path / "Shared.py", tmp_path / "Shared.md", tmp_path / "test_Shared.py",
-    )
-    for path in (node_path, doc_path, test_path):
-        path.write_text("# existing artifact\n", encoding="utf-8")
-    record = WorkflowArtifactState(
-        graph_plan_path="published.json", node_location_map={"Shared": str(node_path)},
-        node_doc_paths={"Shared": str(doc_path)},
-    )
-    if populated:
-        builder.graph_plan_path = record.graph_plan_path
-        builder.requirement_md_path = "published.md"
-        builder.planned_graph = SimpleNamespace(snapshot="published graph")
-        builder.workflow_json_path = "published-workflow.json"
-        builder.main_output_path = "published-main.py"
-        builder.node_location_map = dict(record.node_location_map)
-        builder.artifact_state.workflow_artifacts["named"] = record
-
-    options = {
-        "graph_plan_path": str(graph_path), "requirement_md_path": str(requirement_path),
-        "language": "python", "temperature": 0.45, "node_names": ["Shared"],
-        "run_nodes": {"Shared": True}, "generate_markdowns": True,
-        "markdown_amendments": {"Shared": "Explain validation"},
-        "node_amendments": {"Shared": "Add validation"}, "workflow_name": "named",
-    }
-    if arguments == "defaults":
-        options = {}
-    elif arguments == "missing-paths":
-        options.update(graph_plan_path=str(tmp_path / "missing.json"), requirement_md_path=str(tmp_path / "missing.md"))
-    elif arguments == "empty-graph":
-        options.update(graph_plan_path=str(empty_graph_path), node_names=None, run_nodes=None)
-    elif arguments == "empty-selection":
-        options.update(node_names=[], run_nodes=[])
-    elif arguments == "disabled-selection":
-        options["run_nodes"] = {"Shared": False}
-    elif arguments == "empty-arguments":
-        options.update(
-            graph_plan_path="", requirement_md_path="", language="", node_names=[],
-            run_nodes={}, markdown_amendments={}, node_amendments={}, workflow_name="",
-        )
-    elif arguments == "invalid-workflow":
-        options["workflow_name"] = "   "
-    for name in ("_load_planned_graph", "_request_state", "_resolve_root_path"):
-        monkeypatch.setattr(builder, name, Mock(name=name))
-    storage_snapshots = [
-        (owner, dict(vars(owner)))
-        for owner in (builder, builder._session, builder.artifact_state, record)
-    ]
-    artifact_snapshot = deepcopy(builder.artifact_state)
-    options_snapshot = deepcopy(options)
-    files_before = {
-        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
-        for path in tmp_path.rglob("*")
-    }
-
-    with pytest.raises(NotImplementedError) as raised:
-        builder.generate_nodes(**options)
-
-    assert raised.value.args == (
-        "Batch node generation is not implemented; use build_nodes() to generate a workflow's nodes.",
-    )
-    for owner, snapshot in storage_snapshots:
-        assert vars(owner).keys() == snapshot.keys()
-        for name, value in snapshot.items():
-            assert vars(owner)[name] is value, name
-    assert builder.artifact_state == artifact_snapshot
-    assert options == options_snapshot
-    assert {
-        path.relative_to(tmp_path): path.read_bytes() if path.is_file() else None
-        for path in tmp_path.rglob("*")
-    } == files_before
-    for value in vars(builder).values():
-        if isinstance(value, Mock):
-            assert value.mock_calls == []
-    captured = capsys.readouterr()
-    assert captured.out == captured.err == ""
 
 
 def test_runtime_service_exposes_only_explicit_keyword_dependencies() -> None:
@@ -660,304 +529,6 @@ def test_agent_builder_initialization_still_cleans_up_if_an_earlier_workflow_clo
     for kind in ("graph", "node", "artifact"):
         workflows[kind].close.assert_called_once_with()
     workflows["main"].close.assert_not_called()
-
-
-def test_agent_builder_request_state_is_fresh_and_references_its_own_session(builder) -> None:
-    first, second = builder._request_state(), builder._request_state()
-    assert first == second == {"build_session": builder._session}
-    assert first is not second
-    assert first["build_session"] is second["build_session"] is builder._session
-    first["caller_value"] = object()
-    assert "caller_value" not in second
-
-
-def _generation_files(builder, tmp_path):
-    graph_path = tmp_path / "workflow.json"
-    graph_path.write_text(json.dumps({"nodes": [{
-        "name": "Shared", "type": "WorkflowStepNode", "meta_node_kind": "WorkflowStepNode",
-        "desc": "Original step", "depends": [], "ext_data": {"type": "none"},
-    }]}), encoding="utf-8")
-    requirement = tmp_path / "requirement.md"
-    requirement.write_text("Build the current graph.", encoding="utf-8")
-    builder.graph_plan_path = str(graph_path)
-    builder.requirement_md_path = str(requirement)
-    return graph_path
-
-
-@pytest.mark.parametrize("explicit_path", (False, True), ids=("session-path", "explicit-path"))
-def test_load_planned_graph_refreshes_same_path_without_mutating_existing_snapshots(
-    builder, tmp_path, explicit_path,
-) -> None:
-    graph_path = _generation_files(builder, tmp_path)
-    original_graph = builder._load_planned_graph()
-    original_nodes = deepcopy(original_graph.nodes)
-    original_meta = original_graph.get_node_meta("Shared")
-    original_meta_values = deepcopy(original_meta.to_dict())
-    replacement = {"nodes": [{
-        "name": "Shared", "type": "WorkflowFileNode", "meta_node_kind": "WorkflowFileNode",
-        "desc": "Replacement upload", "depends": [],
-        "ext_data": {"type": "user_file_input", "remote_desc": "Store uploads"},
-    }, {
-        "name": "Added", "type": "WorkflowStepNode", "meta_node_kind": "WorkflowStepNode",
-        "desc": "New step", "depends": ["Shared"], "inputs_format": {"summary": "string"},
-        "ext_data": {"type": "user_input"},
-    }]}
-    graph_path.write_text(json.dumps(replacement), encoding="utf-8")
-    selected_path = str(graph_path) if explicit_path else None
-    assert builder._load_planned_graph(selected_path) is original_graph
-
-    refreshed = builder._load_planned_graph(selected_path, refresh=True)
-
-    assert refreshed is builder.planned_graph
-    assert refreshed is not original_graph
-    assert refreshed.graph_json_path == graph_path
-    assert builder.graph_plan_path == str(graph_path)
-    assert refreshed.get_topological_sorted_nodes() == ["Shared", "Added"]
-    assert refreshed.nodes == replacement["nodes"]
-    for raw_node in replacement["nodes"]:
-        meta = refreshed.get_node_meta(raw_node["name"])
-        assert meta is not original_meta
-        assert meta.meta_node_kind == raw_node["meta_node_kind"]
-        assert meta.desc == raw_node["desc"]
-        assert meta.depends == raw_node["depends"]
-    assert refreshed.get_node_meta("Added").inputs_format == {"summary": "string"}
-    assert builder._load_planned_graph(selected_path) is refreshed
-    assert original_graph.get_topological_sorted_nodes() == ["Shared"]
-    assert original_graph.nodes == original_nodes
-    assert original_graph.get_node_meta("Shared") is original_meta
-    assert original_meta.to_dict() == original_meta_values
-    assert original_graph.get_node_meta("Added") is None
-    assert builder.artifact_state.workflow_artifacts == {}
-    assert builder.node_location_map == {}
-    builder._node_workflow.run.assert_not_called()
-    builder._modifier_pipeline.run.assert_not_called()
-
-
-@pytest.mark.parametrize("explicit_path", (False, True), ids=("session-path", "explicit-path"))
-def test_failed_planned_graph_refresh_does_not_retain_old_topology(builder, tmp_path, explicit_path) -> None:
-    graph_path = _generation_files(builder, tmp_path)
-    old_graph = builder._load_planned_graph()
-    old_nodes = deepcopy(old_graph.nodes)
-    graph_path.write_text("not JSON", encoding="utf-8")
-    with pytest.raises(json.JSONDecodeError):
-        builder._load_planned_graph(str(graph_path) if explicit_path else None, refresh=True)
-    assert builder.planned_graph is None
-    assert builder.graph_plan_path == str(graph_path)
-    assert old_graph.get_topological_sorted_nodes() == ["Shared"]
-    assert old_graph.nodes == old_nodes
-    assert old_graph.get_node_meta("Shared").desc == "Original step"
-    assert builder.artifact_state.workflow_artifacts == {}
-    builder._node_workflow.run.assert_not_called()
-    builder._modifier_pipeline.run.assert_not_called()
-
-
-def test_agent_builder_graph_facade_delegates_and_publishes_shared_artifacts(builder, tmp_path) -> None:
-    planned_path, amended_path = str(tmp_path / "planned.json"), str(tmp_path / "amended.json")
-    existing_requirement = str(tmp_path / "existing.md")
-    planned_graph, amended_graph = object(), object()
-    builder._instantiate_graph.side_effect = [planned_graph, amended_graph]
-    builder._graph_workflow.run.side_effect = [
-        SimpleNamespace(outputs={
-            "analyze_requirement": StepRunOutput(derived={"requirement_md_path": "analyzed.md"}),
-        }),
-        SimpleNamespace(outputs={
-            "plan_graph": StepRunOutput(derived={"graph_plan_json_path": "unused-plan.json"}),
-            "audit_graph": StepRunOutput(derived={
-                "graph_plan_json_path": planned_path, "ok": True, "violations": [],
-            }),
-        }),
-        SimpleNamespace(outputs={
-            "plan_graph": StepRunOutput(derived={"graph_plan_json_path": "unused-amendment.json"}),
-            "audit_graph": StepRunOutput(derived={
-                "graph_plan_json_path": amended_path, "ok": True, "violations": [],
-            }),
-        }),
-        SimpleNamespace(outputs={}),
-    ]
-
-    assert builder.analyze_requirement("Build a workflow") == "analyzed.md"
-    assert builder._session.requirement_md_path == "analyzed.md"
-    builder._instantiate_graph.assert_not_called()
-    assert builder.plan_graph(temperature=0.45) == planned_path
-    assert builder._session.graph_plan_path == planned_path
-    assert builder._session.planned_graph is planned_graph
-    assert builder.amend_workflow_json("Add validation", temperature=0.55) == amended_path
-    assert builder._session.graph_plan_path == amended_path
-    assert builder._session.planned_graph is amended_graph
-    assert builder.analyze_requirement(requirement_file=existing_requirement) == existing_requirement
-    assert builder._session.requirement_md_path == existing_requirement
-    assert builder._session.graph_plan_path == amended_path
-    assert builder._session.planned_graph is amended_graph
-    assert builder._instantiate_graph.call_args_list == [call(planned_path), call(amended_path)]
-    state = {"build_session": builder._session}
-    assert builder._graph_workflow.run.call_args_list == [
-        call(GraphGenerationRequest(
-            requirement_text="Build a workflow",
-            requirement_md_path=str(tmp_path / "requirement_analysis.md"),
-            skip_plan_graph=True, skip_audit_graph=True, state=state,
-        )),
-        call(GraphGenerationRequest(
-            requirement_md_path="analyzed.md", graph_plan_path=str(tmp_path / "workflow.json"),
-            temperature=0.45, skip_analyze_requirement=True, state=state,
-        )),
-        call(GraphGenerationRequest(
-            graph_plan_path=planned_path, graph_action="amend", amendment="Add validation",
-            temperature=0.55, skip_analyze_requirement=True, state=state,
-        )),
-        call(GraphGenerationRequest(
-            requirement_md_path=existing_requirement,
-            skip_analyze_requirement=True, skip_plan_graph=True, skip_audit_graph=True, state=state,
-        )),
-    ]
-    for actual in builder._graph_workflow.run.call_args_list:
-        assert actual.args[0].state["build_session"] is builder._session
-    builder.analyzer.assert_not_called()
-    builder.planner.assert_not_called()
-    builder.graph_auditor.assert_not_called()
-
-
-@pytest.mark.parametrize("skip_analysis, skip_plan, skip_audit", product((False, True), repeat=3))
-def test_agent_builder_graph_request_merges_state_and_publishes_selected_normalized_outputs(
-    builder, tmp_path, skip_analysis, skip_plan, skip_audit,
-) -> None:
-    builder.requirement_md_path = "old.md"
-    builder.graph_plan_path = "old.json"
-    builder.planned_graph = object()
-    caller_session, callback, marker = BuildSession(), Mock(), object()
-    state = MappingProxyType({"build_session": caller_session, "callback": callback, "marker": marker})
-    requested_requirement, requested_graph = "requested.txt", "requested.plan"
-    analyzed, planned, audited = "analyzed.md", "planned.json", "audited.graph.json"
-    graph = object()
-    # Include conflicting skipped-step outputs to ensure they are not published.
-    result = SimpleNamespace(outputs={
-        "analyze_requirement": StepRunOutput(derived={"requirement_md_path": analyzed}),
-        "plan_graph": StepRunOutput(derived={"graph_plan_json_path": planned}),
-        "audit_graph": StepRunOutput(derived={"graph_plan_json_path": audited, "ok": True, "violations": []}),
-    })
-    request = GraphGenerationRequest(
-        requirement_text="Build a workflow", requirement_md_path=requested_requirement,
-        graph_plan_path=requested_graph, requirement_temperature=0.15, temperature=0.6,
-        skip_analyze_requirement=skip_analysis, skip_plan_graph=skip_plan, skip_audit_graph=skip_audit,
-        state=state,
-    )
-
-    def run(forwarded):
-        assert builder.requirement_md_path == requested_requirement
-        assert builder.graph_plan_path == requested_graph
-        assert builder.planned_graph is None
-        assert forwarded is not request
-        for field in fields(request):
-            if field.name != "state":
-                assert getattr(forwarded, field.name) is getattr(request, field.name)
-        assert forwarded.state is not state
-        assert forwarded.state["build_session"] is builder._session
-        assert forwarded.state["callback"] is callback
-        assert forwarded.state["marker"] is marker
-        return result
-
-    builder._graph_workflow.run.side_effect = run
-    expected_graph = requested_graph if skip_plan and skip_audit else (planned if skip_audit else audited)
-
-    def instantiate(path):
-        assert path == builder.graph_plan_path == expected_graph
-        assert builder.planned_graph is None
-        return graph
-
-    builder._instantiate_graph.side_effect = instantiate
-
-    assert builder._run_graph_request(request) is result
-
-    builder._graph_workflow.run.assert_called_once()
-    assert builder.requirement_md_path == (requested_requirement if skip_analysis else analyzed)
-    assert builder.graph_plan_path == expected_graph
-    if skip_plan and skip_audit:
-        assert builder.planned_graph is None
-        builder._instantiate_graph.assert_not_called()
-    else:
-        assert builder.planned_graph is graph
-        builder._instantiate_graph.assert_called_once_with(expected_graph)
-    assert request.state is state
-    assert state["build_session"] is caller_session
-    callback.assert_not_called()
-
-
-@pytest.mark.parametrize("action, skip_plan, skip_audit, path_choice, invalidates", [
-    pytest.param("plan", False, False, "same", True, id="same-path-plan"),
-    pytest.param("amend", False, False, "same", True, id="same-path-amendment"),
-    pytest.param("plan", True, False, "different", True, id="changed-path-audit"),
-    pytest.param("plan", True, True, "different", True, id="changed-path-all-skipped"),
-    pytest.param("plan", True, False, "same", False, id="same-path-audit-only"),
-    pytest.param("plan", True, True, "same", False, id="same-path-all-skipped"),
-    pytest.param("plan", True, True, None, False, id="no-path-all-skipped"),
-])
-def test_agent_builder_graph_failure_does_not_expose_stale_written_or_replaced_topology(
-    builder, action, skip_plan, skip_audit, path_choice, invalidates,
-) -> None:
-    old_graph = object()
-    builder.graph_plan_path = "existing.json"
-    builder.planned_graph = old_graph
-    path = "existing.json" if path_choice == "same" else ("replacement.json" if path_choice else None)
-    request = GraphGenerationRequest(
-        graph_plan_path=path, graph_action=action, amendment="Update graph",
-        skip_analyze_requirement=True, skip_plan_graph=skip_plan, skip_audit_graph=skip_audit,
-    )
-    failure = RuntimeError("graph request failed")
-
-    def fail(forwarded):
-        assert builder.planned_graph is (None if invalidates else old_graph)
-        assert builder.graph_plan_path == (path or "existing.json")
-        assert forwarded.state["build_session"] is builder._session
-        raise failure
-
-    builder._graph_workflow.run.side_effect = fail
-    with pytest.raises(RuntimeError) as raised:
-        builder._run_graph_request(request)
-    assert raised.value is failure
-    assert builder.planned_graph is (None if invalidates else old_graph)
-    builder._graph_workflow.run.assert_called_once()
-    builder._instantiate_graph.assert_not_called()
-
-
-def test_agent_builder_graph_instantiation_failure_cannot_restore_the_old_topology(builder) -> None:
-    builder.graph_plan_path = "existing.json"
-    builder.planned_graph = object()
-    builder._graph_workflow.run.return_value = SimpleNamespace(outputs={
-        "audit_graph": StepRunOutput(derived={"graph_plan_json_path": "normalized.json"}),
-    })
-    failure = RuntimeError("graph cannot be loaded")
-    builder._instantiate_graph.side_effect = failure
-    with pytest.raises(RuntimeError) as raised:
-        builder._run_graph_request(GraphGenerationRequest(
-            graph_plan_path="existing.json", skip_analyze_requirement=True,
-        ))
-    assert raised.value is failure
-    assert builder.graph_plan_path == "normalized.json"
-    assert builder.planned_graph is None
-    builder._instantiate_graph.assert_called_once_with("normalized.json")
-
-
-def test_agent_builder_main_facade_seeds_session_and_publishes_normalized_output(builder, tmp_path) -> None:
-    graph_path = str(tmp_path / "workflow.json")
-    normalized_path = str(tmp_path / "normalized_main.py")
-    builder._main_workflow.run.return_value = normalized_path
-
-    assert builder.generate_main_entrypoint(
-        graph_path, output_filename="entrypoints/main.py", fastapi_host="127.0.0.1",
-        temperature=0.4, fastapi_port=9000,
-    ) == normalized_path
-
-    builder._main_workflow.run.assert_called_once_with(MainEntrypointGenerationRequest(
-        project_root_path=str(tmp_path), graph_plan_json_path=graph_path,
-        output_path=str(tmp_path / "entrypoints" / "main.py"), fastapi_host="127.0.0.1",
-        fastapi_port=9000, state={"build_session": builder._session},
-    ))
-    forwarded = builder._main_workflow.run.call_args.args[0]
-    assert "temperature" in signature(AgentBuilder.generate_main_entrypoint).parameters
-    assert "temperature" not in signature(MainEntrypointGenerationRequest).parameters
-    assert "temperature" not in {field.name for field in fields(MainEntrypointGenerationRequest)}
-    assert not hasattr(forwarded, "temperature")
-    assert forwarded.state["build_session"] is builder._session
-    assert builder._session.main_output_path == normalized_path
 
 
 def test_main_entrypoint_workflow_sends_template_payload_without_temperature(monkeypatch, tmp_path) -> None:

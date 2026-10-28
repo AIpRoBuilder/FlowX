@@ -1,14 +1,30 @@
 """Collect graph-declared inputs and existing backend output formats."""
+# Modified 2026-10-28: resolve backend paths from an explicit root; AgentBuilder no longer tracks them.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Mapping
 
+from flowx_core.tools.agent_builder_tools import get_language_extension
 from flowx_core.tools.file_tools import compile_node_file_and_get_step_output_card_schema
 
 
-def collect_node_formats(builder: Any, planned_graph: Any, backend_language: str = "python") -> dict[str, dict[str, Any]]:
+def _resolve_node_path(root: Path, path_value: str) -> Path:
+    candidate = Path(path_value).expanduser()
+    return (candidate if candidate.is_absolute() else root / candidate).resolve()
+
+
+def collect_node_formats(
+    planned_graph: Any,
+    *,
+    root_dir: str | Path,
+    node_location_map: Mapping[str, str] | None = None,
+    backend_language: str = "python",
+) -> dict[str, dict[str, Any]]:
     """Describe each node's user inputs and compiled output card, if present."""
+    root = Path(root_dir).expanduser().resolve()
+    locations = node_location_map or {}
     formats: dict[str, dict[str, Any]] = {}
     for node_name in planned_graph.get_topological_sorted_nodes():
         node_meta = planned_graph.get_node_meta(node_name)
@@ -27,11 +43,11 @@ def collect_node_formats(builder: Any, planned_graph: Any, backend_language: str
             if ext_type == "user_input"
             else {}
         )
-        backend_path_value = builder.node_location_map.get(node_name)
+        backend_path_value = locations.get(node_name)
         backend_path = (
-            builder._resolve_root_path(backend_path_value)
+            _resolve_node_path(root, backend_path_value)
             if backend_path_value
-            else builder._expected_backend_node_path(node_name, backend_language)
+            else (root / f"{node_name}{get_language_extension(backend_language)}").resolve()
         )
         schema = None
         if backend_path.is_file():

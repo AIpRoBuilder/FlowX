@@ -13,7 +13,6 @@ import pytest
 import flowx_core.agent_builder as agent_builder_module
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.architect.node_planner import NodePlanElement
-from flowx_core.builder_support import WorkflowArtifactState
 from flowx_core.llm_client.coder import compose_session_marking_prompt
 from flowx_core.tools.workflow_node_reference import (
     render_workflow_method_signatures,
@@ -24,7 +23,6 @@ from flowx_core.worker.node_writer import (
     WorkflowFileNodeCoder,
     WorkflowStepNodeCoder,
 )
-from flowx_core.workflows.graph_generation import GraphGenerationRequest
 
 
 class _FakeComponent:
@@ -52,16 +50,6 @@ def _fake_builder_components(monkeypatch):
         "RequestNodeFileCoder", "GenerateNodeTestFile", "AmendNodeFromTestLog",
     ):
         monkeypatch.setattr(agent_builder_module, name, _FakeComponent)
-
-
-@pytest.fixture
-def _fake_builder_workflows(monkeypatch, _fake_builder_components):
-    """Factory/configuration tests do not need eagerly initialized native pools."""
-    for name in (
-        "GraphGenerationWorkflow", "NodeGenerationWorkflow",
-        "NodeRuntimeModifierPipeline", "MainEntrypointGenerationWorkflow",
-    ):
-        monkeypatch.setattr(agent_builder_module, name, Mock(name=name))
 
 
 def test_main_writer_always_renders_step_execution_route(tmp_path):
@@ -179,19 +167,6 @@ def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tm
     }
     initial_workflows = {name: getattr(builder, name) for name in workflow_constructors}
     initial_runtime_service = builder._runtime_service
-    initial_session = builder._session
-    initial_artifact_state = builder.artifact_state
-    published_artifacts = builder.artifact_state.workflow_artifacts
-    graph_path = str(tmp_path / "workflow.json")
-    node_path = str(tmp_path / "CollectInput.py")
-    node_doc_path = str(tmp_path / "node_docs" / "CollectInput.md")
-    published_artifact = WorkflowArtifactState(
-        graph_plan_path=graph_path,
-        node_location_map={"CollectInput": node_path},
-        node_doc_paths={"CollectInput": node_doc_path},
-    )
-    published_artifacts["default"] = published_artifact
-    builder.graph_plan_path = graph_path
 
     for name, dependencies in workflow_dependencies().items():
         workflow = initial_workflows[name]
@@ -227,15 +202,6 @@ def test_agent_builder_reset_llm_config_recreates_llm_components(monkeypatch, tm
         workflow.close.assert_not_called()
 
     assert builder._runtime_service is not initial_runtime_service
-    assert builder._session is initial_session
-    assert builder.artifact_state is initial_artifact_state
-    assert builder.artifact_state.workflow_artifacts is published_artifacts
-    assert published_artifacts == {"default": published_artifact}
-    assert published_artifacts["default"] is published_artifact
-    assert published_artifact.graph_plan_path == graph_path
-    assert published_artifact.node_location_map == {"CollectInput": node_path}
-    assert published_artifact.node_doc_paths == {"CollectInput": node_doc_path}
-    assert builder.graph_plan_path == graph_path
 
 
 def test_node_planner_system_prompt_includes_session_marking_prompt():
@@ -267,57 +233,3 @@ def test_node_writer_contract_text_uses_reference_hook_signatures() -> None:
     file_contract_text = WorkflowFileNodeCoder(client=_FakeClient()).get_node_contract_text()
     assert file_main_utility in file_contract_text
     assert "save_files_remote(files, session_state)" not in file_contract_text
-
-
-@pytest.mark.usefixtures("_fake_builder_workflows")
-def test_plan_graph_delegates_failure_once_without_repair(monkeypatch, tmp_path):
-    analyzer = Mock(STEP_ID="analyze_requirement")
-    planner = Mock(STEP_ID="plan_graph")
-    graph_auditor = Mock(STEP_ID="audit_graph")
-    monkeypatch.setattr(agent_builder_module, "RequirementDisector", Mock(return_value=analyzer))
-    monkeypatch.setattr(agent_builder_module, "GraphPlanner", Mock(return_value=planner))
-    monkeypatch.setattr(agent_builder_module, "GraphJsonAuditor", Mock(return_value=graph_auditor))
-    graph_constructor = Mock()
-    monkeypatch.setattr(agent_builder_module, "Graph", graph_constructor)
-    feedback = "graph plan audit did not pass. Feedback:\nLine 3: invalid_graph - graph invalid"
-    workflow_constructor = Mock()
-    workflow = workflow_constructor.return_value
-    workflow.run.side_effect = RuntimeError(feedback)
-    # This is a facade test: arbitrary component mocks must not enter native pools.
-    monkeypatch.setattr(agent_builder_module, "GraphGenerationWorkflow", workflow_constructor)
-
-    builder = AgentBuilder(
-        api_key="key",
-        model="model",
-        provider="provider",
-        root_dir=str(tmp_path),
-    )
-    workflow_constructor.assert_called_once_with(
-        analyzer=analyzer, planner=planner, graph_auditor=graph_auditor,
-    )
-    assert builder._graph_workflow is workflow
-    workflow.run.assert_not_called()
-    requirement_path = str(tmp_path / "requirement.md")
-    graph_path = str(tmp_path / "custom.json")
-
-    with pytest.raises(RuntimeError) as error:
-        builder.plan_graph(
-            requirement_md_path=requirement_path, graph_plan_filename="custom.json", temperature=0.6,
-        )
-
-    assert str(error.value) == feedback
-    workflow_constructor.assert_called_once()
-    workflow.run.assert_called_once_with(GraphGenerationRequest(
-        requirement_md_path=requirement_path, graph_plan_path=graph_path,
-        graph_action="plan", temperature=0.6, skip_analyze_requirement=True,
-        state={"build_session": builder._session},
-    ))
-    assert workflow.run.call_args.args[0].state["build_session"] is builder._session
-    assert builder.requirement_md_path == requirement_path
-    assert builder.graph_plan_path == graph_path
-    assert builder.planned_graph is None
-    planner.process_input.assert_not_called()
-    planner.amend_file_with_feedback.assert_not_called()
-    planner._write_mermaid_from_graph_json.assert_not_called()
-    graph_auditor.audit_graph_json.assert_not_called()
-    graph_constructor.assert_not_called()
