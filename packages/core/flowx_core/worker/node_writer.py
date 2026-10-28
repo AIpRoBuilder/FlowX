@@ -39,6 +39,7 @@ from flowx_core.llm_client.coder import Coder, MAX_TOKENS
 from flowx_core.architect.graph import Graph, NodeMeta
 from flowx_core.tools._node_settings import apply_node_settings
 from flowx_core.tools.file_tools import compile_node_file_and_get_derived_keys
+from flowx_core.tools.node_state import get_node_state
 from flowx_core.tools.workflow_node_reference import (
     render_workflow_method_signatures,
     render_workflow_node_reference,
@@ -745,7 +746,7 @@ class RequestNodeFileCoder(PromptNodeFileCoderBase):
 
     def _writer_request(self) -> Mapping[str, Any]:
         try:
-            state = self.get_workflow_param().state
+            state = get_node_state(self)
         except RuntimeError:
             # Direct prompt-building calls can supply NodeMeta explicitly.
             return {}

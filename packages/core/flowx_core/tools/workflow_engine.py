@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from typing import Any, ClassVar
 
 from ag_ui_workflow import (
+    GraphSpec,
     RunResult,
     StepMeta,
     StepRunInput,
@@ -152,6 +153,85 @@ class FlowXWorkflowEngine(WorkflowEngine):
             pool.close()
             raise
         self._closed = False
+
+    @classmethod
+    def from_graph_spec(
+        cls,
+        graph: GraphSpec,
+        *,
+        graph_config_id: str,
+        pool_size: int = 1,
+    ) -> "FlowXWorkflowEngine":
+        """Build an engine from an already merged graph, including loop wrappers.
+
+        ``build_workflow_pool`` derives step metadata from top-level node classes,
+        which cannot represent a ``GRegion``/``WorkflowLoopRegion`` factory.  This
+        constructor uses the spec's materialized JSON, class map and step metadata
+        directly while retaining the FlowX state-seeding pool and ``run_steps``.
+        """
+        engine = cls.__new__(cls)
+        engine._init_from_graph_spec(
+            graph,
+            graph_config_id=graph_config_id,
+            pool_size=pool_size,
+        )
+        return engine
+
+    def _init_from_graph_spec(
+        self,
+        graph: GraphSpec,
+        *,
+        graph_config_id: str,
+        pool_size: int = 1,
+    ) -> None:
+        """Initialize this instance from an already merged graph spec."""
+        if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
+            raise ValueError("pool_size must be a positive integer")
+        pool = _WorkflowPipelinePool(
+            pipeline_json=graph.pipeline_json,
+            node_classes=graph.node_classes,
+            size=pool_size,
+        )
+        try:
+            WorkflowEngine.__init__(
+                self,
+                graph_config_id=graph_config_id,
+                steps_meta=graph.steps_meta,
+                pool=pool,
+                graph=graph,
+            )
+            self._closed = False
+        except BaseException:
+            pool.close()
+            raise
+
+    def reload_graph_spec(
+        self,
+        graph: GraphSpec,
+        *,
+        pool_size: int | None = None,
+    ) -> None:
+        """Serve new runs from a merged graph while retaining this engine.
+
+        The pool builds the replacement graph before swapping it in, so a failed
+        build leaves the current graph and metadata untouched.  Active leases
+        finish on their old pipelines.  Callers must not change step metadata
+        while a run is still consuming the old graph.
+        """
+        if self._closed:
+            raise RuntimeError(self.CLOSED_MESSAGE)
+        if not isinstance(self.pool, _WorkflowPipelinePool):
+            raise TypeError("only a FlowX workflow engine can reload a graph spec")
+        self.pool.reload(
+            pipeline_json=graph.pipeline_json,
+            node_classes=graph.node_classes,
+            size=pool_size,
+        )
+        self.graph = graph
+        self.steps_meta = self._normalize_steps_meta(graph.steps_meta)
+        self._step_map = {step["id"]: step for step in self.steps_meta}
+        self._loop_bindings = dict(graph.loop_bindings)
+        self.loop_key = graph.loop_key
 
     @property
     def closed(self) -> bool:

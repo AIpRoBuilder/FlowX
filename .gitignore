@@ -6,4 +6,5 @@ __pycache__/
 *.egg-info/
 *.pytest_cache/
 *.flowx_workspaces
+examples/output/
 *build/

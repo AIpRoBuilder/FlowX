@@ -3,6 +3,8 @@
 Modified 2026-10-15: document the initial versioned generation coordinator.
 Modified 2026-10-15: schedule generation through JSON-built WorkflowEngine graphs.
 Modified 2026-10-16: AgentBuilder publishes the child workflows; one engine reloads its pool.
+Modified 2026-10-28: expand each business node into namespaced generation, audit-guard, repair-loop and finalizer steps in one engine.
+Modified 2026-10-28: expose the expanded graph as `ExpandedWorkflowEngine` and diff it in place from a changed business DAG.
 
 `DynamicWorkflowOrchestrator` coordinates node generation and isolated node repair.
 It does **not** execute the generated business workflow, edit graph topology through
@@ -24,57 +26,83 @@ The keyword-only constructor accepts:
 
 The node generation workflow and runtime modifier are **not** constructor
 arguments. `AgentBuilder` creates them and publishes them as the module globals
-`NODE_GENERATION_WORKFLOW` and `NODE_RUNTIME_MODIFIER_PIPELINE`, because the
-native scheduling steps are class-only and cannot take constructor arguments.
+`NODE_GENERATION_WORKFLOW` and `NODE_RUNTIME_MODIFIER_PIPELINE`.
 `AgentBuilder.close()` unpublishes only its own workflows before closing them.
 `run()` fails before creating any files if they are not published, so a
 `DynamicWorkflowOrchestrator` needs a live `AgentBuilder` in the process. The
 globals are process-wide: with several builders, the most recently initialized one
 is used. The orchestrator never closes them; `close()` releases only its engine.
 
-## Generation scheduling engine
+## Expanded business engine
 
-The input workflow JSON supplies generation-step names and `depends` edges.
-Each enabled business node becomes a concrete automatic `WorkflowStepNode`
-subclass with that `STEP_ID` and `DEPENDENCIES`. The coordinator passes the exact
-class map and a normalized JSON graph to `init_workflow_engine()`; it never imports
-the generated business code to construct this generation graph.
+When the published workflows expose native `GraphSpec`s, the coordinator expands
+each enabled business node into prefixed native steps inside one engine:
 
-Each scheduling step performs incremental reuse, or runs the published
-`NodeGenerationWorkflow` followed by the published `NodeRuntimeModifierPipeline`,
-as the request selects with `run_node_generation` and `run_runtime_modifier`
-(both default `True`, at least one is required). With generation disabled, a
-changed node's latest saved source is repaired in place of being regenerated; a
-node with no saved source fails, and amendments are rejected because only
-generation applies them. A downstream step cannot start until its parents have
-finished generation, repair and validation. Independent branches can run
-concurrently, subject to the child workflows' pipeline capacities.
+```text
+<node>__enter
+  -> <node>__node_plan
+  -> <node>__node_generate
+  -> <node>__node_audit
+  -> <node>__repair_audit_guard
+  -> <node>__generate_node_test
+  -> <node>__repair_loop
+       <node>__run_node_test
+       -> <node>__amend_node
+       -> <node>__verify_node_test
+       -> <node>__audit_amended_node
+       -> <node>__amend_from_audit
+  -> <node>__finalize
+```
 
-The native `WorkflowParam.state` carries one request-local generation-run payload.
-Pooled scheduling nodes retain no requests or results. After the entire engine
-finishes, the caller publishes its returned node records and updates the manifest.
-Generation exceptions become failed step outputs and block their descendants;
+A business edge `A -> B` becomes `B__enter depends on A__finalize`. The
+finalizer is therefore the completion boundary for the whole generation, audit,
+repair and re-audit chain. `B__enter` receives only its direct parents'
+finalizer outputs; each finalizer carries cumulative ancestor artifacts.
+
+The repair chain is a native loop region. Its loop policy stops when the verify
+test and amended audit both pass, when the request's `max_repair_retries` budget
+is exhausted, or when the node is reused/repair was disabled. The guard sits
+outside the loop and disables repair when generation's audit failed. If tests
+pass but the audit fails, `amend_from_audit` applies the violation report before
+the next verification pass; one extra pass is allowed to verify that amendment.
+
+Each business node has a request namespace in `WorkflowParam.state` containing
+its generation state and runtime-modifier request. Namespaced step classes read
+only their own namespace. This lets independent business branches run
+concurrently without overwriting another node's `node_writer`, `auditor` or
+`node_runtime_modifier` state, and keeps prompt context local to the node.
+
+The published node-generation workflow and runtime modifier must expose their
+native `GraphSpec`s. Publishing graph-less workflow objects is rejected at
+engine construction time; there is no wrapper-step fallback.
+
+The native `WorkflowParam.state` carries one request-local generation-run payload,
+the node namespaces and the node logs. Pooled steps retain no requests or results.
+After the engine finishes, the caller publishes finalizer records and updates the
+manifest. Child-step exceptions become failed step outputs and block descendants;
 independent branches drain before the caller raises and removes the candidate.
-This avoids deleting files while another branch is still generating.
 
-`generation_engine` exposes the one scheduling `WorkflowEngine`, or `None` before
-the first nonempty run. It is created once. When the enabled topology or JSON
-`pool_size` changes, `reload_workflow_engine()` calls the pool's `reload()` and
-refreshes the engine's step metadata, so the same engine serves the new graph.
-The pool builds the new graph first: an invalid config leaves the current graph
-serving, and leases already out finish on the graph they started on. Node order
-in the JSON and content-only changes do not reload. The JSON `pool_size` defaults
-to 1 and controls outer pipeline slots, not child workflow pool sizes; calls on one
-orchestrator remain serialized. Generation nodes must have `loop=1`.
-
-An all-disabled graph publishes a workflow snapshot with an empty node map and
-schedules nothing; the engine keeps its last topology. Nonempty graphs always run
-through `WorkflowEngine`, including no-op reuse decisions.
+`generation_engine` exposes the one `ExpandedWorkflowEngine`, or `None` before
+the first nonempty run. `ExpandedWorkflowEngine.__init__` builds the merged
+generation/repair graph, and `update(business_nodes=...)` diffs the newly
+supplied business DAG against the current one. Unchanged chains keep their
+existing graph classes and metadata; only added, removed, changed, and their
+dependent chains are rebuilt. The underlying pipeline pool builds the replacement
+before swapping it in, so active leases finish on the old graph and a failed
+build leaves the current graph serving. A changed enabled topology updates the
+engine in place while preserving unaffected chains; request content changes do
+not rebuild it. The JSON `pool_size` defaults to 1 and controls concurrent
+whole-workflow runs. An all-disabled graph publishes a workflow snapshot with an
+empty node map and schedules nothing.
 
 ## Requests and incremental generation
 
 Create `DynamicWorkflowRequest(workflow_json_path=..., requirement_md_path=...)`
 and pass it to `orchestrator.run(request)`. The result is a `WorkflowVersion`.
+A runnable, LLM-free expanded-engine smoke example is in
+[`examples/dynamic_workflow_orchestrator.py`](../examples/dynamic_workflow_orchestrator.py).
+It writes a persistent bundle under `examples/output/dynamic_workflow_orchestrator`
+with generated node source/test files and runs an incremental business-graph update.
 
 The coordinator validates node names, dependencies, disabled-node dependencies,
 duplicate names and cycles before invoking either child. Nodes are processed in

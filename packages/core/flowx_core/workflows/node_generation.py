@@ -62,6 +62,53 @@ class NodeGenerationRequest:
         return "\n".join(sections)
 
 
+def build_plan_request(request: NodeGenerationRequest) -> dict[str, Any]:
+    """Seed the markdown planner from one node request."""
+    return {
+        "node": dict(request.raw_node),
+        "requirement_text": request.requirement_text,
+        "generate_markdown": request.generate_markdown and not request.markdown_path.is_file(),
+        "amendment": request.markdown_amendment,
+        "output_path": str(request.markdown_path),
+        "temperature": min(request.temperature, 0.2),
+    }
+
+
+def build_node_request(
+    request: NodeGenerationRequest,
+    node_generate_step_name: str,
+    plan_request: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the seed for WorkflowParam.state consumed by the native steps."""
+    node_meta, target_path = request.node_meta, request.target_path
+    if node_meta is None or target_path is None:
+        raise ValueError("node generation requires node_meta and target_path")
+    node_name = node_meta.name
+    generation_context = request.render_generation_context()
+    amendment = request.node_amendment
+    action = "amend" if amendment and target_path.is_file() else "write"
+    if amendment and action == "write":
+        generation_context += f"\n\nRequested amendment (apply while generating):\n{amendment}\n"
+
+    return {
+        "node_plan_request": plan_request,
+        "node_writer": {
+            "node_name": node_name, "node_meta": node_meta,
+            "requirement_md_path": request.requirement_md_path,
+            "output_path": str(target_path), "code_path": str(target_path), "amendment": amendment,
+            "graph_plan_path": request.graph_plan_path,
+            "language": request.language, "temperature": request.temperature,
+            "root_dir_path": str(Path(request.graph_plan_path).parent),
+            "additional_generation_context": generation_context,
+        },
+        f"{node_generate_step_name}::action": action,
+        "auditor": {
+            "file_path": str(target_path), "node_meta": node_meta,
+            "graph_plan_path": request.graph_plan_path,
+        },
+    }
+
+
 @dataclass
 class NodeGenerationWorkflow(FlowXWorkflowEngine):
     """Reusable ``node_plan -> node_generate -> node_audit`` workflow for any node kind."""
@@ -115,14 +162,7 @@ class NodeGenerationWorkflow(FlowXWorkflowEngine):
 
     @staticmethod
     def build_plan_request(request: NodeGenerationRequest) -> dict[str, Any]:
-        return {
-            "node": dict(request.raw_node),
-            "requirement_text": request.requirement_text,
-            "generate_markdown": request.generate_markdown and not request.markdown_path.is_file(),
-            "amendment": request.markdown_amendment,
-            "output_path": str(request.markdown_path),
-            "temperature": min(request.temperature, 0.2),
-        }
+        return build_plan_request(request)
 
     def build_node_request(
         self,
@@ -130,34 +170,11 @@ class NodeGenerationWorkflow(FlowXWorkflowEngine):
         plan_request: dict[str, Any],
     ) -> dict[str, Any]:
         """Build the seed for WorkflowParam.state consumed by the native steps."""
-
-        node_meta, target_path = request.node_meta, request.target_path
-        if node_meta is None or target_path is None:
-            raise ValueError("node generation requires node_meta and target_path")
-        node_name = node_meta.name
-        generation_context = request.render_generation_context()
-        amendment = request.node_amendment
-        action = "amend" if amendment and target_path.is_file() else "write"
-        if amendment and action == "write":
-            generation_context += f"\n\nRequested amendment (apply while generating):\n{amendment}\n"
-
-        return {
-            "node_plan_request": plan_request,
-            "node_writer": {
-                "node_name": node_name, "node_meta": node_meta,
-                "requirement_md_path": request.requirement_md_path,
-                "output_path": str(target_path), "code_path": str(target_path), "amendment": amendment,
-                "graph_plan_path": request.graph_plan_path,
-                "language": request.language, "temperature": request.temperature,
-                "root_dir_path": str(Path(request.graph_plan_path).parent),
-                "additional_generation_context": generation_context,
-            },
-            f"{self._node_classes['node_generate'].__name__}::action": action,
-            "auditor": {
-                "file_path": str(target_path), "node_meta": node_meta,
-                "graph_plan_path": request.graph_plan_path,
-            },
-        }
+        return build_node_request(
+            request,
+            self._node_classes["node_generate"].__name__,
+            plan_request,
+        )
 
     def execute(
         self,

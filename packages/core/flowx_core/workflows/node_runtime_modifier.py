@@ -26,6 +26,7 @@ from flowx_core.runtime import RunNodeTest
 from flowx_core.runtime.run_node_test import _execute_node_test
 from flowx_core.tools._node_settings import apply_node_settings, node_settings
 from flowx_core.tools.file_tools import parse_json_file
+from flowx_core.tools.node_state import get_node_state
 from flowx_core.tools.workflow_engine import (
 	_RUN_REQUEST,
 	FlowXWorkflowEngine,
@@ -125,6 +126,32 @@ def _resolve_path(path_value: str, working_directory: Path) -> Path:
 	return path if path.is_absolute() else working_directory / path
 
 
+def prepare_request(request: NodeRuntimeModifierRequest) -> NodeRuntimeModifierRequest:
+	"""Resolve request-local paths and snapshot mapping-backed graphs."""
+	workdir = Path(request.working_directory).expanduser().resolve()
+	if not workdir.is_dir():
+		raise NotADirectoryError(f"Working directory not found: {workdir}")
+	# replace is shallow for inputs/state and reconstructs every init=False
+	# output, so repeated/concurrent runs cannot reuse caller-owned results.
+	request = replace(request, working_directory=str(workdir))
+	if request.skip_generate_node_test and not request.skip_run_node_test:
+		test_path = _resolve_path(
+			request.test_file_name or str(Path("tests") / f"test_{request.node_name or Path(request.node_file_name).stem}.py"),
+			workdir,
+		)
+		if not test_path.is_file():
+			raise FileNotFoundError(f"Skipped node test generation requires an existing test file: {test_path}")
+
+	if isinstance(request.workflow_graph, Mapping):
+		# Keep mapping-backed graphs request-local even when repairs share a
+		# workdir. Retain the snapshot for the returned request's provenance.
+		graph_path = workdir / ".flowx" / "runtime_modifier" / uuid.uuid4().hex / "workflow.json"
+		graph_path.parent.mkdir(parents=True, exist_ok=True)
+		graph_path.write_text(json.dumps(dict(request.workflow_graph), ensure_ascii=False, indent=2), encoding="utf-8")
+		request.workflow_graph = str(graph_path)
+	return request
+
+
 class GenerateNodeTestFile(PromptNodeTestFileCoder):
 	"""Generate the single-node pytest module through ``PromptNodeTestFileCoder``."""
 
@@ -136,7 +163,7 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 
 	def _build_user_prompt(self, node_file_path: str) -> str:
 		prompt = super()._build_user_prompt(node_file_path)
-		request = _request_from_state(self.get_workflow_param().state)
+		request = _request_from_state(get_node_state(self))
 		working_directory = Path(request.working_directory).expanduser().resolve()
 		node_path = _resolve_path(node_file_path, working_directory).resolve()
 		return (
@@ -274,7 +301,7 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 		with param.condition:
 			if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
 				return True
-			request = param.state.get("node_runtime_modifier")
+			request = get_node_state(self).get("node_runtime_modifier")
 			if not isinstance(request, NodeRuntimeModifierRequest):
 				param.set_state(self.STEP_ID, "running")
 				return True
@@ -373,28 +400,7 @@ class NodeRuntimeModifierPipeline(FlowXWorkflowEngine):
 
 	def _prepare_request(self, request: NodeRuntimeModifierRequest) -> NodeRuntimeModifierRequest:
 		"""Resolve request-local paths and snapshot mapping-backed graphs."""
-		workdir = Path(request.working_directory).expanduser().resolve()
-		if not workdir.is_dir():
-			raise NotADirectoryError(f"Working directory not found: {workdir}")
-		# replace is shallow for inputs/state and reconstructs every init=False
-		# output, so repeated/concurrent runs cannot reuse caller-owned results.
-		request = replace(request, working_directory=str(workdir))
-		if request.skip_generate_node_test and not request.skip_run_node_test:
-			test_path = _resolve_path(
-				request.test_file_name or str(Path("tests") / f"test_{request.node_name or Path(request.node_file_name).stem}.py"),
-				workdir,
-			)
-			if not test_path.is_file():
-				raise FileNotFoundError(f"Skipped node test generation requires an existing test file: {test_path}")
-
-		if isinstance(request.workflow_graph, Mapping):
-			# Keep mapping-backed graphs request-local even when repairs share a
-			# workdir. Retain the snapshot for the returned request's provenance.
-			graph_path = workdir / ".flowx" / "runtime_modifier" / uuid.uuid4().hex / "workflow.json"
-			graph_path.parent.mkdir(parents=True, exist_ok=True)
-			graph_path.write_text(json.dumps(dict(request.workflow_graph), ensure_ascii=False, indent=2), encoding="utf-8")
-			request.workflow_graph = str(graph_path)
-		return request
+		return prepare_request(request)
 
 	def execute(
 		self,
