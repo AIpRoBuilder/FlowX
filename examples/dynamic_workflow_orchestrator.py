@@ -230,8 +230,9 @@ def main() -> None:
             assert set(engine.finalize_ids) == {"Collect", "Publish"}
 
             # Adding a node changes the enabled business topology. The orchestrator
-            # calls ExpandedWorkflowEngine.update(...), which rebuilds only the
-            # changed/added chains and reloads the existing pool.
+            # calls ExpandedWorkflowEngine.update(...), which rebuilds the merged
+            # graph (the transit exit node is bridged from every leaf finalizer) and
+            # reloads the existing pool.
             graph_path, requirement_path = _write_plan(run_dir, [
                 {"name": "Collect", "type": "", "desc": "Collect a message."},
                 {"name": "Publish", "type": "", "desc": "Publish it.", "depends": ["Collect"]},

@@ -2,14 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Modified 2026-10-22: record the service bind address and expose its connectable base URL.
-"""Request-driven workflow engine: reformat request -> graph plan -> nodes orchestrate -> main entrypoint.
+"""Request-driven workflow engine: reformat request -> graph plan -> nodes -> main entrypoint.
 
-Like ``DynamicWorkflowOrchestrator`` it is a native WorkflowEngine whose class-only steps read
-module globals published by ``AgentBuilder``: the graph and main-entrypoint workflows, and a map
-of one orchestrator per workflow id. Each stage retries until it reports no error or its retry
-budget is spent; failures are returned in the result and retained per workflow so a later request
-can repair them. The engine keeps the map of workflow ids, node ids, main entrypoint ids and
-their artifacts; successive requests find the workflow to modify through it.
+The engine's own native graph runs ``reformat_request -> graph_plan``. The nodes stage and the
+main entrypoint are not steps here: ``DynamicWorkflowOrchestrator`` (one per workflow id) is an
+``ExpandedWorkflowEngine`` whose graph contains every node build chain, a transit
+``nodes_stage_exit`` step that publishes the revision, and a continuation holding
+``main_entrypoint_generation``. The engine seeds the run payload and the previous stage's context
+into that run, then reads the merged stage records back.
+
+Like the orchestrator it is a native WorkflowEngine whose class-only steps read module globals
+published by ``AgentBuilder``: the graph and main-entrypoint workflows. Each stage retries until
+it reports no error or its retry budget is spent; failures are returned in the result and
+retained per workflow so a later request can repair them. The engine keeps the map of workflow
+ids, node ids, main entrypoint ids and their artifacts; successive requests find the workflow to
+modify through it.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ from pathlib import Path
 from threading import Lock, RLock
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, TypeVar
 
-from ag_ui_workflow import StepRunOutput, WorkflowStepNode
+from ag_ui_workflow import GraphSpec, StepRunOutput, WorkflowStepNode, rebind_step_class
 
 from flowx_core.agent_intent import (
 	AgentIntent,
@@ -447,68 +454,6 @@ def _nodes_stale(record: WorkflowRecord, orchestrator: DynamicWorkflowOrchestrat
 	)
 
 
-class _NodesStep(_StageStep):
-	STEP_ID = "nodes_orchestrate"
-	TITLE = "Orchestrate nodes"
-	STAGE = "nodes"
-	DEPENDENCIES = ["graph_plan"]
-
-	def execute(self, run: _AgentRun, record: WorkflowRecord, intent: AgentIntent) -> StageOutcome:
-		plan, request = intent.nodes, run.request
-		orchestrator = _orchestrator(record.workflow_id)
-		if not (
-			plan.mode != "skip" or intent.node_amendments
-				or (request.cascade and _nodes_stale(record, orchestrator))
-		):
-			return StageOutcome(self.STAGE, "skipped")
-		if not record.graph_path.is_file():
-			raise ValueError(f"workflow {record.workflow_id} has no graph; build it first")
-		amendments = dict(intent.node_amendments)
-		if plan.amendment:
-			for name in _enabled_nodes(record.graph_path):
-				amendments[name] = join_text(plan.amendment, amendments.get(name, ""))
-		before = orchestrator.workflow_version
-		failures: dict[str, str] = {}
-
-		def attempt(_attempt: int, _failure: str) -> WorkflowVersion:
-			# Failed nodes are amended from their own failure and logs; the rest is reused.
-			retry = {
-				name: join_text(amendments.get(name, ""), fix_text(text)) for name, text in failures.items()
-			}
-			try:
-				return orchestrator.run(DynamicWorkflowRequest(
-					workflow_json_path=record.graph_path, requirement_md_path=record.requirement_path,
-					node_amendments={**amendments, **retry}, **request.node_options,
-				))
-			except DynamicWorkflowError as exc:
-				failures.clear()
-				failures.update({
-					name: _failure_text(name, text, orchestrator.last_logs) for name, text in exc.failures.items()
-				})
-				raise
-
-		version, attempts, error = _with_retries(request.retries(self.STAGE), attempt)
-		logs = orchestrator.last_logs
-		artifacts: dict[str, Any] = {
-			"test_logs": dict(logs.test) if logs else {}, "audit_logs": dict(logs.audit) if logs else {},
-		}
-		if version is None:
-			record.clear_errors("nodes")
-			if failures:
-				record.errors.update({error_key("nodes", name): text for name, text in failures.items()})
-			else:
-				record.errors["nodes"] = error
-			return StageOutcome(self.STAGE, "failed", attempts, error, artifacts=artifacts)
-		record.clear_errors("nodes")
-		artifacts.update(
-			workflow_version=version.version, changed_nodes=list(version.changed_nodes),
-			node_ids=orchestrator.generated_node_id_map,
-		)
-		return StageOutcome(
-			self.STAGE, "completed", attempts, changed=version.version != before, artifacts=artifacts,
-		)
-
-
 def _materialize(version: WorkflowVersion, package_dir: Path) -> None:
 	"""Copy the published bundle into an importable package that pruning cannot remove."""
 	package_dir.mkdir(parents=True, exist_ok=True)
@@ -523,7 +468,8 @@ class _MainStep(_StageStep):
 	STEP_ID = "main_entrypoint_generation"
 	TITLE = "Generate main entrypoint"
 	STAGE = "main"
-	DEPENDENCIES = ["nodes_orchestrate"]
+	# Rebound by the orchestrator after its transit nodes-stage exit step.
+	DEPENDENCIES: list[str] = []
 
 	def execute(self, run: _AgentRun, record: WorkflowRecord, intent: AgentIntent) -> StageOutcome:
 		plan, request, agent = intent.main, run.request, run.agent
@@ -577,8 +523,17 @@ class _MainStep(_StageStep):
 		)
 
 
-_STEP_CLASSES = {step.STEP_ID: step for step in (_ReformatStep, _GraphStep, _NodesStep, _MainStep)}
+# The agent engine runs reformat -> graph natively; the orchestrator then runs the
+# expanded node chains and, through this continuation graph, the main entrypoint.
+_HEAD_STEP_CLASSES = {step.STEP_ID: step for step in (_ReformatStep, _GraphStep)}
+_GRAPH_STAGE = _GraphStep.STEP_ID
 _MAIN_STEP = _MainStep.STEP_ID
+_MAIN_ROOT_CLASS = rebind_step_class(_MainStep, dependencies=[])
+_MAIN_CONTINUATION = GraphSpec(
+	nodes=[{"name": _MAIN_STEP}],
+	classes={_MAIN_STEP: _MAIN_ROOT_CLASS},
+	steps_meta=[_MAIN_ROOT_CLASS.step_meta()],
+)
 
 
 class AgentWorkflowEngine:
@@ -606,10 +561,10 @@ class AgentWorkflowEngine:
 		self._registry_lock, self._run_lock = RLock(), RLock()
 		self._closed = False
 		self._engine: FlowXWorkflowEngine | None = init_workflow_engine(
-			_STEP_CLASSES,
+			_HEAD_STEP_CLASSES,
 			{
 				"pool_size": pool_size,
-				"nodes": [{"name": step.STEP_ID, "depends": list(step.DEPENDENCIES)} for step in _STEP_CLASSES.values()],
+				"nodes": [{"name": step.STEP_ID, "depends": list(step.DEPENDENCIES)} for step in _HEAD_STEP_CLASSES.values()],
 			},
 			graph_config_id="flowx-agent",
 		)
@@ -624,6 +579,7 @@ class AgentWorkflowEngine:
 		orchestrator = DynamicWorkflowOrchestrator(
 			storage_dir=record.storage_dir, workflow_id=record.workflow_id,
 			keep_last_versions=self._keep_last_versions,
+			continuation=_MAIN_CONTINUATION,
 		)
 		with _ORCHESTRATORS_LOCK:
 			if record.workflow_id in ORCHESTRATORS:
@@ -739,9 +695,13 @@ class AgentWorkflowEngine:
 			if self._closed or self._engine is None:
 				raise RuntimeError("agent workflow engine is closed")
 			_published()
-			outputs = self._engine.run_steps(state={"agent_run": _AgentRun(request, self)}).outputs
-			final = outputs[_MAIN_STEP].derived
+			head = self._engine.run_steps(state={"agent_run": _AgentRun(request, self)})
+			final = dict(head.outputs[_GRAPH_STAGE].derived)
+			if not final["error"]:
+				final = self._run_nodes_stage(request, final)
 			stages = {name: StageOutcome(**data) for name, data in final["stages"].items()}
+			for name in ("nodes", "main"):
+				stages.setdefault(name, StageOutcome(name, "blocked"))
 			workflow_id = final["workflow_id"]
 			service = self.run_service(workflow_id) if request.serve and not final["error"] else None
 			errors = dict(self.record(workflow_id).errors) if workflow_id else {"reformat": stages["reformat"].error}
@@ -758,6 +718,101 @@ class AgentWorkflowEngine:
 				stages=stages, errors=errors, logs=logs,
 				artifacts=self.artifacts(workflow_id) if workflow_id else {}, service=service,
 			)
+
+	def _run_nodes_stage(self, request: AgentRequest, context: dict[str, Any]) -> dict[str, Any]:
+		"""Run the nodes stage, which also runs the main entrypoint merged after it.
+
+		``DynamicWorkflowOrchestrator`` owns this stage: its expanded graph runs every
+		node chain, the transit exit step publishes the revision, and the continuation
+		graph then runs ``main_entrypoint_generation``. The orchestrator reports the
+		nodes and main stage records in ``last_stage_output``.
+		"""
+		record = self.record(context["workflow_id"])
+		orchestrator = _orchestrator(record.workflow_id)
+		intent = AgentIntent.from_dict(context["intent"])
+		plan = intent.nodes
+		skipped = (
+			plan.mode == "skip"
+			and not intent.node_amendments
+			and not (request.cascade and _nodes_stale(record, orchestrator))
+		)
+		if not record.graph_path.is_file():
+			message = f"workflow {record.workflow_id} has no graph; build it first"
+			stage = {
+				"stage": "nodes", "attempts": 0, "changed": False, "artifacts": {},
+				"status": "skipped" if skipped else "failed",
+				"error": "" if skipped else message,
+			}
+			if not skipped:
+				record.errors["nodes"] = message
+				record.save()
+			return {
+				**context,
+				"stages": {**context["stages"], "nodes": stage},
+				"error": context["error"] or stage["error"],
+			}
+		amendments = dict(intent.node_amendments)
+		if plan.amendment:
+			for name in _enabled_nodes(record.graph_path):
+				amendments[name] = join_text(plan.amendment, amendments.get(name, ""))
+		failures: dict[str, str] = {}
+
+		def attempt(attempt_no: int, _failure: str) -> WorkflowVersion:
+			# Failed nodes are amended from their own failure and logs; the rest is reused.
+			retry = {
+				name: join_text(amendments.get(name, ""), fix_text(text)) for name, text in failures.items()
+			}
+			try:
+				return orchestrator.run(
+					DynamicWorkflowRequest(
+						workflow_json_path=record.graph_path, requirement_md_path=record.requirement_path,
+						node_amendments={**amendments, **retry}, **request.node_options,
+					),
+					agent_state={
+						"agent_run": _AgentRun(request, self),
+						"agent_context": context,
+						"agent_nodes_attempt": attempt_no,
+						"agent_nodes_skipped": skipped,
+					},
+				)
+			except DynamicWorkflowError as exc:
+				failures.clear()
+				failures.update({
+					name: _failure_text(name, text, orchestrator.last_logs) for name, text in exc.failures.items()
+				})
+				raise
+
+		version, attempts, error = _with_retries(request.retries("nodes"), attempt)
+		record.clear_errors("nodes")
+		if version is None:
+			if failures:
+				record.errors.update({error_key("nodes", name): text for name, text in failures.items()})
+			else:
+				record.errors["nodes"] = error
+		record.save()
+		last_stage = orchestrator.last_stage_output
+		if last_stage is None:
+			# An all-disabled graph publishes a snapshot and schedules nothing, so the
+			# merged main-entrypoint stage never ran.
+			stage = {
+				"stage": "nodes", "attempts": attempts, "changed": False,
+				"artifacts": {"workflow_version": version.version if version else 0},
+				"status": "failed" if version is None else ("skipped" if skipped else "completed"),
+				"error": error,
+			}
+			return {
+				**context,
+				"stages": {
+					**context["stages"],
+					"nodes": stage,
+					"main": {
+						"stage": "main", "status": "skipped", "attempts": 0,
+						"error": "", "changed": False, "artifacts": {},
+					},
+				},
+				"error": context["error"] or error,
+			}
+		return dict(last_stage)
 
 	def build_workflow_json(self, prompt: str, *, workflow_id: str | None = None, **options: Any) -> AgentResult:
 		"""Create (no ``workflow_id``) or modify workflow.json together with its requirement analysis."""

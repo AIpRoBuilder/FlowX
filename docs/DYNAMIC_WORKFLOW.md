@@ -5,6 +5,8 @@ Modified 2026-10-15: schedule generation through JSON-built WorkflowEngine graph
 Modified 2026-10-16: AgentBuilder publishes the child workflows; one engine reloads its pool.
 Modified 2026-10-28: expand each business node into namespaced generation, audit-guard, repair-loop and finalizer steps in one engine.
 Modified 2026-10-28: expose the expanded graph as `ExpandedWorkflowEngine` and diff it in place from a changed business DAG.
+Modified 2026-10-30: the orchestrator is an `ExpandedWorkflowEngine`; a transit `nodes_stage_exit` step
+publishes the run, and an optional continuation graph is bridged after every leaf finalizer.
 
 `DynamicWorkflowOrchestrator` coordinates node generation and isolated node repair.
 It does **not** execute the generated business workflow, edit graph topology through
@@ -23,6 +25,9 @@ The keyword-only constructor accepts:
   is rejected.
 - `keep_last_versions`: `None` keeps all history; a positive integer retains the
   most recent N workflow revisions and, independently, N revisions per node.
+- `continuation`: optional `GraphSpec` merged after every leaf finalizer. The
+  agent engine passes its `main_entrypoint_generation` stage here, so one native
+  run covers node generation, publication and that stage.
 
 The node generation workflow and runtime modifier are **not** constructor
 arguments. `AgentBuilder` creates them and publishes them as the module globals
@@ -59,6 +64,20 @@ finalizer is therefore the completion boundary for the whole generation, audit,
 repair and re-audit chain. `B__enter` receives only its direct parents'
 finalizer outputs; each finalizer carries cumulative ancestor artifacts.
 
+Every leaf finalizer is bridged into a transit step, so the graph always ends
+with a join that publishes the run:
+
+```text
+<leaf>__finalize -> nodes_stage_exit -> <continuation root>  (optional)
+```
+
+`nodes_stage_exit` publishes this revision (node records, manifest, retention)
+inside the native run, because a continuation stage reads the published workflow
+version in the same run. A failed node chain makes it discard the candidate and
+report the per-node root causes instead. `merge_graphs` rewrites the native
+dependencies but not class attributes, so the exit step and every continuation
+root are rebound with `rebind_step_class`.
+
 The repair chain is a native loop region. Its loop policy stops when the verify
 test and amended audit both pass, when the request's `max_repair_retries` budget
 is exhausted, or when the node is reused/repair was disabled. The guard sits
@@ -77,28 +96,31 @@ native `GraphSpec`s. Publishing graph-less workflow objects is rejected at
 engine construction time; there is no wrapper-step fallback.
 
 The native `WorkflowParam.state` carries one request-local generation-run payload,
-the node namespaces and the node logs. Pooled steps retain no requests or results.
-After the engine finishes, the caller publishes finalizer records and updates the
-manifest. Child-step exceptions become failed step outputs and block descendants;
-independent branches drain before the caller raises and removes the candidate.
+the orchestrator, the node namespaces and the node logs. Pooled steps retain no
+requests or results. Child-step exceptions become failed step outputs and block
+descendants; independent branches drain before the transit exit step discards the
+candidate and `run()` raises.
 
-`generation_engine` exposes the one `ExpandedWorkflowEngine`, or `None` before
-the first nonempty run. `ExpandedWorkflowEngine.__init__` builds the merged
-generation/repair graph, and `update(business_nodes=...)` diffs the newly
-supplied business DAG against the current one. Unchanged chains keep their
-existing graph classes and metadata; only added, removed, changed, and their
-dependent chains are rebuilt. The underlying pipeline pool builds the replacement
-before swapping it in, so active leases finish on the old graph and a failed
-build leaves the current graph serving. A changed enabled topology updates the
-engine in place while preserving unaffected chains; request content changes do
-not rebuild it. The JSON `pool_size` defaults to 1 and controls concurrent
-whole-workflow runs. An all-disabled graph publishes a workflow snapshot with an
-empty node map and schedules nothing.
+`DynamicWorkflowOrchestrator` **is** an `ExpandedWorkflowEngine`: `generation_engine`
+returns the orchestrator itself (or `None` before the first nonempty run).
+`ExpandedWorkflowEngine._init_expanded` builds the merged graph on the first run and
+`update(business_nodes=...)` reloads the existing pool afterwards. Because the
+transit exit step is bridged from every leaf finalizer, a changed business DAG
+rebuilds the whole graph; a bare `ExpandedWorkflowEngine` without a continuation
+still diffs and preserves unaffected chains. The
+underlying pipeline pool builds the replacement before swapping it in, so active
+leases finish on the old graph and a failed build leaves the current graph
+serving. Request content changes do not rebuild the graph. The JSON `pool_size`
+defaults to 1 and controls concurrent whole-workflow runs. An all-disabled graph
+publishes a workflow snapshot with an empty node map and schedules nothing.
 
 ## Requests and incremental generation
 
 Create `DynamicWorkflowRequest(workflow_json_path=..., requirement_md_path=...)`
 and pass it to `orchestrator.run(request)`. The result is a `WorkflowVersion`.
+The agent engine calls the same entry point with `agent_state`, which seeds the
+run payload (`agent_run`), the previous stage's context (`agent_context`) and the
+nodes-stage attempt/skip flags for the continuation; standalone callers omit it.
 A runnable, LLM-free expanded-engine smoke example is in
 [`examples/dynamic_workflow_orchestrator.py`](../examples/dynamic_workflow_orchestrator.py).
 It writes a persistent bundle under `examples/output/dynamic_workflow_orchestrator`

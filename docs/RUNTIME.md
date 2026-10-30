@@ -41,8 +41,12 @@ the version string alone does not distinguish the older API.
 - `GraphGenerationWorkflow`, `NodeGenerationWorkflow`,
   `MainEntrypointGenerationWorkflow` and `NodeRuntimeModifierPipeline` subclass
   `FlowXWorkflowEngine`, so each is its own `WorkflowEngine` rather than a wrapper
-  around one. Its `run(request)` dispatches the workflow's request model to
-  `execute(request)`; the native `run(request_id, inputs)`, `answer()`, `events()`
+  around one. `ExpandedWorkflowEngine` and `DynamicWorkflowOrchestrator` extend
+  that chain: the orchestrator *is* the expanded business-node engine, whose graph
+  ends in a transit `nodes_stage_exit` step and an optional continuation graph
+  (the agent's main-entrypoint stage). Its `run(request)` dispatches the workflow's
+  request model to `execute(request)`; the native `run(request_id, inputs)`,
+  `answer()`, `events()`
   and `close(request_id)` forms remain available. `run_steps()` is the engine-owned
   noninteractive run: it seeds `WorkflowParam.state`, applies skipped steps, and
   requires every step to complete with output. `close()` without a request id

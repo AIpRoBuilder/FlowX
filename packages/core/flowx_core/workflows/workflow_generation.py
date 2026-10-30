@@ -3,10 +3,12 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 """User-confirmed build pipeline: one gate after each generation stage.
 
-``AgentWorkflowEngine`` runs ``graph_plan -> nodes_orchestrate -> main_entrypoint_generation``
-and inserts a confirmation gate after every stage that completed. A gate installs its own
-``setWaitFunc`` callback (``INPUT_REQUIRED`` is UI metadata only) and reports
-``awaiting_input`` through ``WorkflowParam`` until the caller supplies an answer:
+``AgentWorkflowEngine`` runs ``reformat_request -> graph_plan`` and then hands the
+nodes stage to ``DynamicWorkflowOrchestrator``, whose expanded graph also runs
+``main_entrypoint_generation``. A gate can follow any of those stages. It installs
+its own ``setWaitFunc`` callback (``INPUT_REQUIRED`` is UI metadata only) and
+reports ``awaiting_input`` through ``WorkflowParam`` until the caller supplies an
+answer:
 
 - an empty string, ``continue``, ``ok``, ``yes``, ``approve`` or ``next`` proceeds unchanged;
 - ``{"node": "<step id>", "amendment": "..."}`` amends one node of the next stage;

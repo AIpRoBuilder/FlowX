@@ -24,6 +24,7 @@ from ag_ui_workflow import (
 	StepRunOutput,
 	WorkflowStepNode,
 	merge_graphs,
+	rebind_step_class,
 )
 
 from flowx_core.architect.graph import NodeMeta
@@ -1198,6 +1199,54 @@ def _strip_expanded_chains(graph: GraphSpec, node_names: set[str]) -> GraphSpec:
 	)
 
 
+def _leaf_finalizer_ids(
+	business_nodes: list[dict[str, Any]],
+	finalize_ids: Mapping[str, str],
+) -> list[str]:
+	"""Finalizer step ids of business nodes that no other enabled node depends on."""
+	parents = {parent for node in business_nodes for parent in node.get("depends", [])}
+	return [finalize_ids[node["name"]] for node in business_nodes if node["name"] not in parents]
+
+
+def _with_continuation(
+	graph: GraphSpec,
+	continuation: GraphSpec | None,
+	finalize_ids: Mapping[str, str],
+	business_nodes: list[dict[str, Any]],
+) -> GraphSpec:
+	"""Chain ``continuation`` after every leaf finalizer with bridge dependencies.
+
+	The continuation is a transit join: its root steps wait for all leaf finalizers,
+	so whatever follows them runs only once every node chain finished.  The merge
+	rewrites the native nodes and step metadata, but a ``WorkflowStepNode`` reads
+	``DEPENDENCIES`` from its class, so each bridged root is rebound.
+	"""
+	if continuation is None or not continuation.nodes:
+		return graph
+	leaves = _leaf_finalizer_ids(business_nodes, finalize_ids)
+	roots = [node["name"] for node in continuation.nodes if not node.get("depends")]
+	if not leaves or not roots:
+		return graph
+	merged = merge_graphs(
+		graph,
+		continuation,
+		bridges={root: leaves for root in roots},
+	)
+	classes = dict(merged.classes)
+	for root in roots:
+		classes[root] = rebind_step_class(continuation.classes[root], dependencies=leaves)
+	return GraphSpec(
+		nodes=merged.nodes,
+		classes=classes,
+		steps_meta=merged.steps_meta,
+		loop=merged.loop,
+		loop_key=merged.loop_key,
+		loop_policies=merged.loop_policies,
+		loop_bindings=merged.loop_bindings,
+		hidden_steps=merged.hidden_steps,
+	)
+
+
 def _validate_business_nodes(nodes: list[dict[str, Any]]) -> None:
 	"""Check names and dependencies before using a new business DAG."""
 	names: set[str] = set()
@@ -1261,6 +1310,12 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 	underlying pool builds the replacement graph before swapping it in, so active
 	leases finish on their old pipelines and a failed build leaves the current
 	graph serving.
+
+	``continuation`` is an optional graph chained after the business chains: each of
+	its root steps waits for every leaf finalizer, so callers put the stages that
+	must run once all node chains finished there (a transit join, then more work).
+	A continuation cannot be diffed per business node, so ``update`` rebuilds the
+	whole graph whenever the business DAG or the child workflows change.
 	"""
 
 	def __init__(
@@ -1271,24 +1326,52 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 		modifier: NodeRuntimeModifierPipeline,
 		pool_size: int = 1,
 		graph_config_id: str = "flowx",
+		continuation: GraphSpec | None = None,
 	) -> None:
+		self._init_expanded(
+			business_nodes=business_nodes,
+			generation=generation,
+			modifier=modifier,
+			pool_size=pool_size,
+			graph_config_id=graph_config_id,
+			continuation=continuation,
+		)
+
+	def _init_expanded(
+		self,
+		*,
+		business_nodes: list[dict[str, Any]],
+		generation: NodeGenerationWorkflow,
+		modifier: NodeRuntimeModifierPipeline,
+		pool_size: int = 1,
+		graph_config_id: str = "flowx",
+		continuation: GraphSpec | None = None,
+	) -> None:
+		"""Build the merged graph and initialize the native engine part exactly once.
+
+		Subclasses that only learn their business DAG later (``DynamicWorkflowOrchestrator``
+		reads it from workflow JSON) call this directly instead of ``__init__``; every
+		rebuild after it goes through ``update``.
+		"""
+		nodes = [dict(node) for node in business_nodes]
 		graph, finalize_ids, settings = _build_expanded_graph(
-			business_nodes=list(business_nodes),
+			business_nodes=nodes,
 			generation=generation,
 			modifier=modifier,
 		)
+		graph = _with_continuation(graph, continuation, finalize_ids, nodes)
 		self.generation = generation
 		self.modifier = modifier
-		self.business_nodes = [dict(node) for node in business_nodes]
+		self.business_nodes = nodes
 		self._finalize_ids = dict(finalize_ids)
 		self._native_settings = settings
+		self._continuation = continuation
 		with node_settings(settings):
 			self._init_from_graph_spec(
 				graph,
 				graph_config_id=graph_config_id,
 				pool_size=pool_size,
 			)
-
 	@property
 	def finalize_ids(self) -> dict[str, str]:
 		"""Business node name to its finalizer step id for the current graph."""
@@ -1324,25 +1407,33 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 		new_names = [node["name"] for node in new_nodes]
 
 		workflow_changed = generation is not self.generation or modifier is not self.modifier
-		if workflow_changed:
+		added, removed, changed = _business_graph_diff(self.business_nodes, new_nodes)
+		new_name_set = set(new_names)
+		descendants = _business_descendants(self.business_nodes, removed.union(changed))
+		affected_new = added.union(changed).union(
+			name for name in descendants
+			if name in new_name_set and name not in removed
+		)
+		if (
+			not workflow_changed
+			and not removed
+			and not affected_new
+			and pool_size in (None, self.pool.size)
+		):
+			self.business_nodes = new_nodes
+			return self.finalize_ids
+
+		if workflow_changed or self._continuation is not None:
+			# A continuation is bridged from every leaf finalizer, so its edges cannot
+			# be diffed per business node: rebuild the whole graph instead.
 			graph, finalize_ids, settings = _build_expanded_graph(
 				business_nodes=new_nodes,
 				generation=generation,
 				modifier=modifier,
 			)
+			graph = _with_continuation(graph, self._continuation, finalize_ids, new_nodes)
 		else:
-			added, removed, changed = _business_graph_diff(self.business_nodes, new_nodes)
-			new_name_set = set(new_names)
-			descendants = _business_descendants(self.business_nodes, removed.union(changed))
-			affected_new = added.union(changed).union(
-				name for name in descendants
-				if name in new_name_set and name not in removed
-			)
 			finalize_ids = {name: f"{name}__finalize" for name in new_names}
-			if not removed and not affected_new and pool_size in (None, self.pool.size):
-				self.business_nodes = new_nodes
-				return self.finalize_ids
-
 			base = _strip_expanded_chains(self.graph, removed.union(affected_new))
 			if affected_new:
 				graph, _, settings = _build_expanded_graph(
@@ -1385,6 +1476,7 @@ def build_expanded_engine(
 	modifier: NodeRuntimeModifierPipeline,
 	pool_size: int = 1,
 	graph_config_id: str = "flowx",
+	continuation: GraphSpec | None = None,
 ) -> tuple[ExpandedWorkflowEngine, dict[str, str]]:
 	"""Backward-compatible constructor for :class:`ExpandedWorkflowEngine`."""
 	engine = ExpandedWorkflowEngine(
@@ -1393,6 +1485,7 @@ def build_expanded_engine(
 		modifier=modifier,
 		pool_size=pool_size,
 		graph_config_id=graph_config_id,
+		continuation=continuation,
 	)
 	return engine, engine.finalize_ids
 
