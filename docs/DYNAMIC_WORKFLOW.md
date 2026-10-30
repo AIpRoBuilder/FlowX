@@ -6,7 +6,9 @@ Modified 2026-10-16: AgentBuilder publishes the child workflows; one engine relo
 Modified 2026-10-28: expand each business node into namespaced generation, audit-guard, repair-loop and finalizer steps in one engine.
 Modified 2026-10-28: expose the expanded graph as `ExpandedWorkflowEngine` and diff it in place from a changed business DAG.
 Modified 2026-10-30: the orchestrator is an `ExpandedWorkflowEngine`; a transit `nodes_stage_exit` step
-publishes the run, and an optional continuation graph is bridged after every leaf finalizer.
+publishes the run, an optional continuation graph is bridged after every leaf finalizer, and an
+optional `head` graph (`reformat_request -> graph_plan`) is bridged into every root entry so the
+connected graph runs one or two passes on the same engine.
 
 `DynamicWorkflowOrchestrator` coordinates node generation and isolated node repair.
 It does **not** execute the generated business workflow, edit graph topology through
@@ -28,6 +30,10 @@ The keyword-only constructor accepts:
 - `continuation`: optional `GraphSpec` merged after every leaf finalizer. The
   agent engine passes its `main_entrypoint_generation` stage here, so one native
   run covers node generation, publication and that stage.
+- `head`: optional `GraphSpec` run before the chains. The agent engine passes
+  `reformat_request -> graph_plan`, which is bridged into every business root's
+  `__enter` step; the shared head engine still runs those two steps alone when a
+  request has to resolve which workflow it targets.
 
 The node generation workflow and runtime modifier are **not** constructor
 arguments. `AgentBuilder` creates them and publishes them as the module globals
@@ -68,15 +74,29 @@ Every leaf finalizer is bridged into a transit step, so the graph always ends
 with a join that publishes the run:
 
 ```text
-<leaf>__finalize -> nodes_stage_exit -> <continuation root>  (optional)
+reformat_request -> graph_plan                                        (head)
+  -> <root>__enter ... <leaf>__finalize                               (chains)
+  -> nodes_stage_exit -> <continuation root>                          (optional)
 ```
+
+Because the business DAG is an output of `graph_plan`, the connected graph runs
+in one or two `run_steps` passes on the same engine and pool:
+
+- one pass when `workflow.json` exists and the graph stage will not rewrite it
+  (`agent_graph_stable`), so reformat, graph, chains, publication and the
+  continuation share a single native run;
+- two passes otherwise. Pass 1 skips every body step and runs the head only
+  (`agent_head_done`); the orchestrator then reloads the graph from the new
+  `workflow.json` and runs pass 2 with the head steps skipped. A graph-only
+  request never runs the body: the agent reports the nodes and main stages as
+  skipped.
 
 `nodes_stage_exit` publishes this revision (node records, manifest, retention)
 inside the native run, because a continuation stage reads the published workflow
 version in the same run. A failed node chain makes it discard the candidate and
 report the per-node root causes instead. `merge_graphs` rewrites the native
-dependencies but not class attributes, so the exit step and every continuation
-root are rebound with `rebind_step_class`.
+dependencies but not class attributes, so the exit step, every continuation
+root and every bridged business root are rebound with `rebind_step_class`.
 
 The repair chain is a native loop region. Its loop policy stops when the verify
 test and amended audit both pass, when the request's `max_repair_retries` budget

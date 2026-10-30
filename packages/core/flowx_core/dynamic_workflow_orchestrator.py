@@ -213,13 +213,18 @@ class _NodesStageExitStep(WorkflowStepNode):
 				card={"status": "failed"},
 				derived={"error": "nodes stage state is missing"},
 			)
-		outcome = orchestrator.finish_nodes_run(run, self.get_workflow_param().outputs)
 		context = dict(session_state.get("agent_context") or {})
+		if not context:
+			# Single connected pass: the head ran inside this same graph.
+			head_id = orchestrator.head_terminal_id
+			head_output = self.get_workflow_param().outputs.get(head_id) if head_id else None
+			context = dict(head_output.derived) if head_output is not None else {}
 		logs = session_state.get("dynamic_workflow_logs")
 		artifacts: dict[str, Any] = {
 			"test_logs": dict(logs.test) if isinstance(logs, WorkflowNodeLogs) else {},
 			"audit_logs": dict(logs.audit) if isinstance(logs, WorkflowNodeLogs) else {},
 		}
+		outcome = orchestrator.finish_nodes_run(run, self.get_workflow_param().outputs)
 		if outcome.status == "failed":
 			stage = {
 				"stage": "nodes",
@@ -289,6 +294,7 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 		workflow_id: str | None = None,
 		keep_last_versions: int | None = None,
 		continuation: GraphSpec | None = None,
+		head: GraphSpec | None = None,
 	) -> None:
 		if keep_last_versions is not None and (
 			isinstance(keep_last_versions, bool)
@@ -305,6 +311,7 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 		self._run_lock = RLock()
 		self._closed = False
 		self._engine_ready = False
+		self._head = head
 		self._tail, self._terminal_id = self._build_tail(continuation)
 		self._last_logs: WorkflowNodeLogs | None = None
 		self._last_stage_output: Mapping[str, Any] | None = None
@@ -409,6 +416,25 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 		"""
 		return self._last_stage_output
 
+	@property
+	def head_step_ids(self) -> tuple[str, ...]:
+		"""Step ids of the connected head graph, or empty without one."""
+		return tuple(node["name"] for node in self._head.nodes) if self._head is not None else ()
+
+	@property
+	def head_terminal_id(self) -> str:
+		"""The head step that feeds every business root entry, or an empty string."""
+		if self._head is None or not self._head.nodes:
+			return ""
+		parents = {dep for node in self._head.nodes for dep in node.get("depends", [])}
+		terminals = [node["name"] for node in self._head.nodes if node["name"] not in parents]
+		return terminals[-1] if terminals else ""
+
+	def _body_step_ids(self) -> tuple[str, ...]:
+		"""Every scheduled step except the head, for a head-only pass."""
+		head = set(self.head_step_ids)
+		return tuple(step["id"] for step in self.steps_meta if step["id"] not in head)
+
 	@staticmethod
 	def _expanded_pool_size(
 		graph: Mapping[str, Any],
@@ -443,6 +469,7 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 				pool_size=pool_size,
 				graph_config_id=f"{self.workflow_id}:expanded",
 				continuation=self._tail,
+				head=self._head,
 			)
 			self._engine_ready = True
 			return
@@ -580,13 +607,25 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 		self,
 		request: DynamicWorkflowRequest,
 		agent_state: Mapping[str, Any] | None = None,
-	) -> WorkflowVersion:
+	) -> WorkflowVersion | None:
 		"""Publish a complete revision, or return the existing revision for a no-op.
 
-		The expanded engine runs every business node chain and then the transit exit
-		step, which publishes this revision. ``agent_state`` is seeded into the native
-		state for the continuation graph (the agent run payload and the previous
-		stage's derived context); standalone callers omit it.
+		The connected graph runs the optional head, every business node chain and then
+		the transit exit step, which publishes this revision. ``agent_state`` is seeded
+		into the native state: the agent run payload, the previous stage's context, and
+		the flags that select the pass layout:
+
+		``agent_head_done``
+			The head already ran (the agent's shared head engine resolved which
+			workflow this request targets); only the body runs and the head steps are
+			skipped.
+		``agent_graph_stable``
+			The head cannot rewrite ``workflow.json`` in this request, so the connected
+			graph runs once with no skips.
+		``agent_nodes_skipped``
+			The nodes stage is reported as skipped. The chains still run in reuse mode,
+			because the main-entrypoint continuation may need their published revision;
+			the agent skips the whole body when both stages are skipped.
 
 		Source is included in child generation context, so a changed parent source
 		invalidates its children. No requests, native nodes or state dictionaries
@@ -600,8 +639,34 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 				raise ValueError("enable node generation, the runtime modifier, or both")
 			if not request.run_node_generation and (request.node_amendments or request.markdown_amendments):
 				raise ValueError("node and markdown amendments require node generation")
-			graph, order = self._load_graph(request.workflow_json_path)
-			requirement_text = Path(request.requirement_md_path).expanduser().resolve().read_text(encoding="utf-8")
+			graph_path = Path(request.workflow_json_path).expanduser().resolve()
+			requirement_path = Path(request.requirement_md_path).expanduser().resolve()
+			state_extra = dict(agent_state or {})
+			head_done = bool(state_extra.get("agent_head_done"))
+			graph_stable = bool(state_extra.get("agent_graph_stable"))
+			graph, order = self._load_business(graph_path)
+			self._last_logs = WorkflowNodeLogs()
+			self._last_stage_output = None
+			self._nodes_outcome = None
+
+			if not head_done and self._head is not None and order and not graph_stable:
+				# The graph stage may rewrite workflow.json, and the chains were built
+				# from the previous revision, so this pass runs the head steps only.
+				head_state = {
+					key: value for key, value in state_extra.items()
+					if key not in ("agent_context", "agent_graph_stable")
+				}
+				head_result = self.run_steps(
+					state=head_state,
+					skipped_steps=self._body_step_ids(),
+				)
+				self._last_stage_output = dict(head_result.outputs[self.head_terminal_id].derived)
+				if self._last_stage_output.get("error"):
+					raise RuntimeError(self._last_stage_output["error"])
+				head_done = True
+				graph, order = self._load_business(graph_path)
+
+			requirement_text = requirement_path.read_text(encoding="utf-8") if requirement_path.is_file() else ""
 			selected = set(request.force_nodes) | set(request.node_amendments) | set(request.markdown_amendments) | set(request.node_formats)
 			if selected.difference(order):
 				raise ValueError(f"unknown or disabled requested nodes: {sorted(selected.difference(order))}")
@@ -627,9 +692,7 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 			directory = self.storage_dir / "workflows" / f"{version:08d}"
 			# Never overwrite another writer's candidate or an interrupted build.
 			directory.mkdir(parents=True, exist_ok=False)
-			logs = self._last_logs = WorkflowNodeLogs()
-			self._nodes_outcome = None
-			self._last_stage_output = None
+			logs = self._last_logs
 			try:
 				self._write_json(directory / "workflow.json", graph)
 				self._write_json(directory / "generation_workflow.json", generation_config)
@@ -652,16 +715,20 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 				)
 				if not business_nodes:
 					return self._publish_empty_graph(run, manifest)
-				# The expanded engine runs every node chain, the transit exit step
-				# publishes the revision, and the continuation graph runs after that.
-				result = self.run_steps(state={
-					"dynamic_workflow_run": run,
-					"dynamic_workflow_orchestrator": self,
-					"dynamic_workflow_logs": logs,
-					NAMESPACE_KEY: {},
-					"dynamic_workflow_namespace_lock": RLock(),
-					**dict(agent_state or {}),
-				})
+				skipped: list[str] = []
+				if head_done:
+					skipped.extend(self.head_step_ids)
+				result = self.run_steps(
+					state={
+						"dynamic_workflow_run": run,
+						"dynamic_workflow_orchestrator": self,
+						"dynamic_workflow_logs": logs,
+						NAMESPACE_KEY: {},
+						"dynamic_workflow_namespace_lock": RLock(),
+						**state_extra,
+					},
+					skipped_steps=skipped,
+				)
 				self._last_stage_output = dict(result.outputs[self._terminal_id].derived)
 			except BaseException:
 				if self._nodes_outcome is None:
@@ -673,6 +740,13 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 			if outcome.status == "failed":
 				raise DynamicWorkflowError(outcome.error, outcome.failures)
 			return outcome.version
+
+	@staticmethod
+	def _load_business(graph_path: Path) -> tuple[dict[str, Any], list[str]]:
+		"""The workflow JSON and its enabled node order, or ``({}, [])`` when absent."""
+		if not graph_path.is_file():
+			return {}, []
+		return DynamicWorkflowOrchestrator._load_graph(graph_path)
 
 	def _publish_empty_graph(
 		self, run: _GenerationRun, manifest: dict[str, Any],

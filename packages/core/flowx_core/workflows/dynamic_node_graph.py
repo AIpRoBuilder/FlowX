@@ -1199,6 +1199,52 @@ def _strip_expanded_chains(graph: GraphSpec, node_names: set[str]) -> GraphSpec:
 	)
 
 
+def _head_terminals(head: GraphSpec) -> list[str]:
+	"""Steps of ``head`` that no other head step depends on."""
+	parents = {dep for node in head.nodes for dep in node.get("depends", [])}
+	return [node["name"] for node in head.nodes if node["name"] not in parents]
+
+
+def _with_head(
+	graph: GraphSpec,
+	head: GraphSpec | None,
+	business_nodes: list[dict[str, Any]],
+) -> GraphSpec:
+	"""Run ``head`` before the business chains; its terminal step feeds every root entry.
+
+	The merge rewrites the native nodes and step metadata, but a ``WorkflowStepNode``
+	reads ``DEPENDENCIES`` from its class, so each root entry is rebound.
+	"""
+	if head is None or not head.nodes or not graph.nodes:
+		return graph
+	terminals = _head_terminals(head)
+	if len(terminals) != 1:
+		raise ValueError("the head graph needs exactly one terminal step")
+	entries = [
+		f"{node['name']}__enter" for node in business_nodes if not node.get("depends")
+	]
+	if not entries:
+		return graph
+	merged = merge_graphs(
+		head,
+		graph,
+		bridges={entry: terminals for entry in entries},
+	)
+	classes = dict(merged.classes)
+	for entry in entries:
+		classes[entry] = rebind_step_class(graph.classes[entry], dependencies=terminals)
+	return GraphSpec(
+		nodes=merged.nodes,
+		classes=classes,
+		steps_meta=merged.steps_meta,
+		loop=merged.loop,
+		loop_key=merged.loop_key,
+		loop_policies=merged.loop_policies,
+		loop_bindings=merged.loop_bindings,
+		hidden_steps=merged.hidden_steps,
+	)
+
+
 def _leaf_finalizer_ids(
 	business_nodes: list[dict[str, Any]],
 	finalize_ids: Mapping[str, str],
@@ -1311,11 +1357,13 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 	leases finish on their old pipelines and a failed build leaves the current
 	graph serving.
 
-	``continuation`` is an optional graph chained after the business chains: each of
-	its root steps waits for every leaf finalizer, so callers put the stages that
-	must run once all node chains finished there (a transit join, then more work).
-	A continuation cannot be diffed per business node, so ``update`` rebuilds the
-	whole graph whenever the business DAG or the child workflows change.
+	``head`` is an optional graph run before the chains; its terminal step feeds every
+	business root's ``__enter`` step. ``continuation`` is an optional graph chained
+	after the business chains: each of its root steps waits for every leaf finalizer,
+	so callers put the stages that must run once all node chains finished there (a
+	transit join, then more work). Neither can be diffed per business node, so
+	``update`` rebuilds the whole graph whenever the business DAG, the child workflows
+	or either extra graph change.
 	"""
 
 	def __init__(
@@ -1327,6 +1375,7 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 		pool_size: int = 1,
 		graph_config_id: str = "flowx",
 		continuation: GraphSpec | None = None,
+		head: GraphSpec | None = None,
 	) -> None:
 		self._init_expanded(
 			business_nodes=business_nodes,
@@ -1335,6 +1384,7 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 			pool_size=pool_size,
 			graph_config_id=graph_config_id,
 			continuation=continuation,
+			head=head,
 		)
 
 	def _init_expanded(
@@ -1346,6 +1396,7 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 		pool_size: int = 1,
 		graph_config_id: str = "flowx",
 		continuation: GraphSpec | None = None,
+		head: GraphSpec | None = None,
 	) -> None:
 		"""Build the merged graph and initialize the native engine part exactly once.
 
@@ -1359,6 +1410,7 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 			generation=generation,
 			modifier=modifier,
 		)
+		graph = _with_head(graph, head, nodes)
 		graph = _with_continuation(graph, continuation, finalize_ids, nodes)
 		self.generation = generation
 		self.modifier = modifier
@@ -1366,6 +1418,7 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 		self._finalize_ids = dict(finalize_ids)
 		self._native_settings = settings
 		self._continuation = continuation
+		self._head = head
 		with node_settings(settings):
 			self._init_from_graph_spec(
 				graph,
@@ -1423,14 +1476,15 @@ class ExpandedWorkflowEngine(FlowXWorkflowEngine):
 			self.business_nodes = new_nodes
 			return self.finalize_ids
 
-		if workflow_changed or self._continuation is not None:
-			# A continuation is bridged from every leaf finalizer, so its edges cannot
-			# be diffed per business node: rebuild the whole graph instead.
+		if workflow_changed or self._continuation is not None or self._head is not None:
+			# The head feeds every root entry and the continuation hangs off every leaf
+			# finalizer, so neither can be diffed per business node: rebuild the graph.
 			graph, finalize_ids, settings = _build_expanded_graph(
 				business_nodes=new_nodes,
 				generation=generation,
 				modifier=modifier,
 			)
+			graph = _with_head(graph, self._head, new_nodes)
 			graph = _with_continuation(graph, self._continuation, finalize_ids, new_nodes)
 		else:
 			finalize_ids = {name: f"{name}__finalize" for name in new_names}
@@ -1477,6 +1531,7 @@ def build_expanded_engine(
 	pool_size: int = 1,
 	graph_config_id: str = "flowx",
 	continuation: GraphSpec | None = None,
+	head: GraphSpec | None = None,
 ) -> tuple[ExpandedWorkflowEngine, dict[str, str]]:
 	"""Backward-compatible constructor for :class:`ExpandedWorkflowEngine`."""
 	engine = ExpandedWorkflowEngine(
@@ -1486,6 +1541,7 @@ def build_expanded_engine(
 		pool_size=pool_size,
 		graph_config_id=graph_config_id,
 		continuation=continuation,
+		head=head,
 	)
 	return engine, engine.finalize_ids
 

@@ -43,9 +43,11 @@ the version string alone does not distinguish the older API.
   `FlowXWorkflowEngine`, so each is its own `WorkflowEngine` rather than a wrapper
   around one. `ExpandedWorkflowEngine` and `DynamicWorkflowOrchestrator` extend
   that chain: the orchestrator *is* the expanded business-node engine, whose graph
-  ends in a transit `nodes_stage_exit` step and an optional continuation graph
-  (the agent's main-entrypoint stage). Its `run(request)` dispatches the workflow's
-  request model to `execute(request)`; the native `run(request_id, inputs)`,
+  starts with the agent's `reformat_request -> graph_plan` head, ends in a transit
+  `nodes_stage_exit` step and an optional continuation graph (the agent's
+  main-entrypoint stage), and runs one or two `run_steps` passes as the business
+  DAG becomes known. Its `run(request)` dispatches the workflow's request model to
+  `execute(request)`; the native `run(request_id, inputs)`,
   `answer()`, `events()`
   and `close(request_id)` forms remain available. `run_steps()` is the engine-owned
   noninteractive run: it seeds `WorkflowParam.state`, applies skipped steps, and
