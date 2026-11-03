@@ -4,6 +4,7 @@ Modified: native state identity, request isolation and reusable generation/repai
 Modified 2026-10-15: direct generation requests and fresh mutable repair requests.
 Modified 2026-10-15: metadata-selected batches and repair outputs without stage bookkeeping.
 Modified 2026-10-15: complete per-node generation requests without batch fields.
+Modified 2026-11-02: cover safe orchestrator cancellation, publication and retry lifecycles.
 """
 
 import json
@@ -14,12 +15,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import MISSING, FrozenInstanceError, dataclass, field, fields, replace
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from ag_ui_workflow import RunResult, StepRunOutput, WorkflowFileNode, WorkflowPipelinePool, WorkflowStepNode
 from pydaograph import GElement
 
+import flowx_core.dynamic_workflow_orchestrator as dynamic_orchestrator_module
 import flowx_core.tools.workflow_engine as workflow_engine_module
 import flowx_core.workflows.node_runtime_modifier as modifier_module
 from flowx_core.architect.node_planner import NodePlanElement
@@ -1006,6 +1009,7 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
             stale_outputs = {
                 "test_file_path": "stale-test.py", "log_file_path": "stale.log", "test_log": "stale log",
                 "test_result": {"node_name": "stale", "ok": True}, "amended_node_file_path": "stale.py",
+                "amended_test_file_path": "stale-test.py", "amendment_target": "stale",
             }
             assert {setting.name for setting in fields(request) if not setting.init} == stale_outputs.keys()
             for name, value in stale_outputs.items():
@@ -1038,7 +1042,11 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
                 **result.test_result, "log_file_path": result.log_file_path,
             }
             assert native_result.outputs["run_node_test"].derived is not result.test_result
-            assert native_result.outputs["amend_node"].derived == {"amended_node_file_path": result.amended_node_file_path}
+            assert native_result.outputs["amend_node"].derived == {
+                "amended_node_file_path": result.amended_node_file_path,
+                "amended_test_file_path": result.amended_test_file_path,
+                "amendment_target": result.amendment_target,
+            }
             assert json.loads(Path(result.workflow_graph).read_text()) == graph
             assert execution_calls[-1]["cwd"] == str(workdir)
             assert execution_calls[-1]["timeout"] == 40 + index
@@ -1068,6 +1076,8 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
         assert native_results[-1].outputs["run_node_test"].derived == {"log_file_path": ""}
         assert native_results[-1].outputs["amend_node"].derived == {
             "amended_node_file_path": skipped.amended_node_file_path,
+            "amended_test_file_path": "",
+            "amendment_target": "skipped",
         }
         assert skipped.workflow_graph != results[1].workflow_graph
         assert len(generation_calls) == len(execution_calls) == 2
@@ -1090,3 +1100,831 @@ def test_modifier_requests_reuse_pool_without_retaining_request_or_execution_dat
     assert engine.pool.closed
     with pytest.raises(RuntimeError, match="closed"):
         pipeline.run(request)
+
+
+class _DynamicLifecycleAbort(BaseException):
+    """Exercise cleanup for exceptions outside the ordinary Exception hierarchy."""
+
+
+@pytest.fixture
+def dynamic_lifecycle(tmp_path, monkeypatch):
+    """Prepare real candidate bundles while replacing only the native engine boundary."""
+    graph_path = tmp_path / "workflow.json"
+    graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
+    requirement_path = tmp_path / "requirement.md"
+    requirement_path.write_text("collect a message", encoding="utf-8")
+    child_workflow = SimpleNamespace(graph=object(), json_config=lambda: {"pool_size": 1})
+    monkeypatch.setattr(dynamic_orchestrator_module, "NODE_GENERATION_WORKFLOW", child_workflow)
+    monkeypatch.setattr(dynamic_orchestrator_module, "NODE_RUNTIME_MODIFIER_PIPELINE", child_workflow)
+    orchestrator = dynamic_orchestrator_module.DynamicWorkflowOrchestrator(
+        storage_dir=tmp_path / "storage", workflow_id="lifecycle-test",
+    )
+    request = dynamic_orchestrator_module.DynamicWorkflowRequest(
+        workflow_json_path=graph_path, requirement_md_path=requirement_path,
+        skip_node_planner=True, generate_markdown=False,
+    )
+    candidate = orchestrator.storage_dir / "workflows" / "00000001"
+    orchestrator._finalize_ids = {"Collect": "Collect__finalize"}
+    monkeypatch.setattr(orchestrator, "_ensure_engine", lambda **kwargs: setattr(orchestrator, "_engine_ready", True))
+    native_closes = []
+
+    def close_native(engine, request_id=None):
+        assert engine is orchestrator
+        native_closes.append((request_id, candidate.is_dir()))
+
+    monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", close_native)
+    monkeypatch.setattr(dynamic_orchestrator_module, "close_workflow_engine", close_native)
+    return SimpleNamespace(
+        orchestrator=orchestrator, request=request, candidate=candidate, native_closes=native_closes,
+    )
+
+
+def _dynamic_awaiting(request_id):
+    return SimpleNamespace(status="awaiting_input", request_id=request_id, awaiting={"id": "Collect__amend_node"})
+
+
+def _dynamic_completed(request_id):
+    return SimpleNamespace(status="completed", request_id=request_id, outputs={})
+
+
+def _commit_dynamic_candidate(orchestrator, run, *, set_outcome):
+    """Exercise the real manifest and artifact publisher without LLM/native steps."""
+    source = run.artifacts["Collect"]["source"]
+    source.write_text("# lifecycle test node\n", encoding="utf-8")
+    previous = run.registry.get("Collect")
+    output = StepRunOutput(
+        card={"status": "completed"},
+        derived={
+            "node_id": previous["node_id"] if previous else "lifecycle-node",
+            "version": previous["version"] + 1 if previous else 1,
+            "input_fingerprint": "lifecycle-test",
+            "changed": True,
+        },
+    )
+    outputs = {"Collect__finalize": output}
+    if set_outcome:
+        outcome = orchestrator.finish_nodes_run(run, outputs)
+        assert outcome.status == "completed"
+        return outcome.version
+    # This is the interval after the manifest commit but before finish_nodes_run
+    # assigns _nodes_outcome; it must also count as a published revision.
+    return orchestrator._publish_nodes(run, outputs)
+
+
+@pytest.mark.parametrize("failure_point", ["start_steps", "advance"])
+def test_dynamic_orchestrator_start_failure_cleans_and_can_retry(dynamic_lifecycle, monkeypatch, failure_point):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    starts = []
+
+    def start_steps(*, request_id, state, skipped_steps):
+        del skipped_steps
+        starts.append(request_id)
+        assert lifecycle.candidate.is_dir()
+        if len(starts) == 1:
+            if failure_point == "start_steps":
+                raise _DynamicLifecycleAbort("start failed")
+            return _dynamic_completed(request_id)
+        _commit_dynamic_candidate(orchestrator, state["dynamic_workflow_run"], set_outcome=True)
+        return _dynamic_completed(request_id)
+
+    monkeypatch.setattr(orchestrator, "start_steps", start_steps)
+    if failure_point == "advance":
+        real_publish = orchestrator._publish
+
+        def publish(result):
+            if len(starts) == 1:
+                raise _DynamicLifecycleAbort("advance failed")
+            return real_publish(result)
+
+        monkeypatch.setattr(orchestrator, "_publish", publish)
+
+    with pytest.raises(_DynamicLifecycleAbort, match="failed"):
+        orchestrator.start(lifecycle.request)
+    assert orchestrator._pending == {}
+    assert not lifecycle.candidate.exists()
+    assert lifecycle.native_closes == [(starts[0], True)]
+
+    completed = orchestrator.start(lifecycle.request)
+    assert completed.status == "completed"
+    assert completed.version.version == 1
+    assert completed.version.workflow_path.is_file()
+    assert completed.version.node_versions["Collect"].source_path.is_file()
+    assert orchestrator._pending == {}
+    assert starts[0] != starts[1]
+
+
+@pytest.mark.parametrize("failure_point", ["resume_steps", "advance"])
+def test_dynamic_orchestrator_resume_failure_cleans_pending_run(dynamic_lifecycle, monkeypatch, failure_point):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    monkeypatch.setattr(orchestrator, "start_steps", lambda **kwargs: _dynamic_awaiting(kwargs["request_id"]))
+    paused = orchestrator.start(lifecycle.request)
+    assert paused.status == "awaiting_input"
+
+    def resume_steps(request_id, step_id, value):
+        assert (request_id, step_id, value) == (paused.request_id, "Collect__amend_node", "repair")
+        if failure_point == "resume_steps":
+            raise _DynamicLifecycleAbort("resume failed")
+        return _dynamic_completed(request_id)
+
+    monkeypatch.setattr(orchestrator, "resume_steps", resume_steps)
+    if failure_point == "advance":
+        def fail_publish(result):
+            raise _DynamicLifecycleAbort("advance failed")
+
+        monkeypatch.setattr(orchestrator, "_publish", fail_publish)
+
+    with pytest.raises(_DynamicLifecycleAbort, match="failed"):
+        orchestrator.resume(paused.request_id, "Collect__amend_node", "repair")
+    assert orchestrator._pending == {}
+    assert not lifecycle.candidate.exists()
+    assert lifecycle.native_closes == [(paused.request_id, True)]
+
+
+@pytest.mark.parametrize("publication", ["none", "outcome", "manifest"])
+def test_dynamic_orchestrator_execute_cleans_publish_failure(dynamic_lifecycle, monkeypatch, publication):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    request_ids, published = [], []
+
+    def run_steps(*, request_id, state, skipped_steps):
+        request_ids.append(request_id)
+        if publication != "none":
+            published.append(_commit_dynamic_candidate(
+                orchestrator, state["dynamic_workflow_run"], set_outcome=publication == "outcome",
+            ))
+        return _dynamic_completed(request_id)
+
+    monkeypatch.setattr(orchestrator, "run_steps", run_steps)
+    if publication != "none":
+        def fail_publish(result):
+            raise _DynamicLifecycleAbort("publish failed")
+
+        monkeypatch.setattr(orchestrator, "_publish", fail_publish)
+    error = RuntimeError if publication == "none" else _DynamicLifecycleAbort
+    with pytest.raises(error):
+        orchestrator.execute(lifecycle.request)
+    assert orchestrator._pending == {}
+    assert lifecycle.native_closes == [(request_ids[0], True)]
+    if publication == "none":
+        assert not lifecycle.candidate.exists()
+    else:
+        assert published[0].workflow_path.is_file()
+        assert published[0].node_versions["Collect"].source_path.is_file()
+        assert orchestrator.workflow_version == 1
+
+
+@pytest.mark.parametrize("entry", ["start", "resume", "execute"])
+@pytest.mark.parametrize("set_outcome", [False, True])
+def test_dynamic_orchestrator_exception_joins_concurrent_publication(
+    dynamic_lifecycle, monkeypatch, entry, set_outcome,
+):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    run = []
+    published = []
+
+    def start_steps(*, request_id, state, skipped_steps):
+        run.append(state["dynamic_workflow_run"])
+        if entry == "resume":
+            return _dynamic_awaiting(request_id)
+        raise _DynamicLifecycleAbort("native run failed")
+
+    def resume_steps(*args):
+        raise _DynamicLifecycleAbort("native run failed")
+
+    def close_native(engine, request_id=None):
+        assert lifecycle.candidate.is_dir()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_commit_dynamic_candidate, orchestrator, run[0], set_outcome=set_outcome)
+            published.append(future.result(timeout=5))
+
+    monkeypatch.setattr(orchestrator, "start_steps", start_steps)
+    monkeypatch.setattr(orchestrator, "run_steps", start_steps)
+    monkeypatch.setattr(orchestrator, "resume_steps", resume_steps)
+    monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", close_native)
+    if entry == "resume":
+        paused = orchestrator.start(lifecycle.request)
+        with pytest.raises(_DynamicLifecycleAbort, match="native run failed"):
+            orchestrator.resume(paused.request_id, "Collect__amend_node", "repair")
+    else:
+        with pytest.raises(_DynamicLifecycleAbort, match="native run failed"):
+            getattr(orchestrator, entry)(lifecycle.request)
+    assert orchestrator._pending == {}
+    assert orchestrator.workflow_version == published[0].version == 1
+    assert published[0].workflow_path.is_file()
+    assert published[0].node_versions["Collect"].source_path.is_file()
+    assert (orchestrator._nodes_outcome is not None) is set_outcome
+
+
+@pytest.mark.parametrize("close_all", [False, True])
+@pytest.mark.parametrize("publication", ["none", "outcome", "manifest"])
+def test_dynamic_orchestrator_close_joins_before_discard_or_concurrent_publication(
+    dynamic_lifecycle, monkeypatch, close_all, publication,
+):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    monkeypatch.setattr(orchestrator, "start_steps", lambda **kwargs: _dynamic_awaiting(kwargs["request_id"]))
+    paused = orchestrator.start(lifecycle.request)
+    live = orchestrator._pending[paused.request_id]
+    published = []
+
+    def close_native(engine, request_id=None):
+        assert engine is orchestrator
+        assert request_id == (None if close_all else paused.request_id)
+        assert lifecycle.candidate.is_dir()
+        if publication != "none":
+            # Model a pooled publisher completing while cancellation is joining it.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    _commit_dynamic_candidate, orchestrator, live.state["dynamic_workflow_run"],
+                    set_outcome=publication == "outcome",
+                )
+                published.append(future.result(timeout=5))
+
+    if close_all:
+        monkeypatch.setattr(dynamic_orchestrator_module, "close_workflow_engine", close_native)
+        orchestrator.close()
+        assert orchestrator.closed
+    else:
+        monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", close_native)
+        orchestrator.close(paused.request_id)
+        assert not orchestrator.closed
+    assert orchestrator._pending == {}
+    if publication == "none":
+        assert not lifecycle.candidate.exists()
+    else:
+        version = published[0]
+        assert orchestrator.workflow_version == version.version == 1
+        assert version.workflow_path.is_file()
+        assert version.node_versions["Collect"].source_path.is_file()
+        assert (orchestrator._nodes_outcome is not None) is (publication == "outcome")
+
+
+@pytest.mark.parametrize("entry", ["execute", "start_failed"])
+@pytest.mark.parametrize("set_outcome", [False, True])
+def test_dynamic_orchestrator_preserves_published_candidate_on_failure(
+    dynamic_lifecycle, monkeypatch, entry, set_outcome,
+):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    published = []
+
+    def run_steps(*, request_id, state, skipped_steps):
+        del skipped_steps
+        published.append(_commit_dynamic_candidate(orchestrator, state["dynamic_workflow_run"], set_outcome=set_outcome))
+        if entry == "execute":
+            assert not state["dynamic_workflow_run"].request.await_repair_input
+            raise _DynamicLifecycleAbort("native run failed")
+        return SimpleNamespace(status="failed", request_id=request_id, error="native failure", failed_step="Collect")
+
+    if entry == "execute":
+        monkeypatch.setattr(orchestrator, "run_steps", run_steps)
+        with pytest.raises(_DynamicLifecycleAbort, match="native run failed"):
+            orchestrator.execute(lifecycle.request)
+        assert lifecycle.request.await_repair_input
+        assert lifecycle.native_closes and lifecycle.native_closes[0][1]
+    else:
+        monkeypatch.setattr(orchestrator, "start_steps", run_steps)
+        failed = orchestrator.start(lifecycle.request)
+        assert failed.status == "failed"
+        assert failed.error == "native failure"
+    assert orchestrator._pending == {}
+    assert orchestrator.workflow_version == published[0].version == 1
+    assert published[0].workflow_path.is_file()
+    assert published[0].node_versions["Collect"].source_path.is_file()
+
+
+@pytest.mark.parametrize("close_all", [False, True])
+def test_dynamic_orchestrator_failed_native_close_keeps_candidate_for_retry(dynamic_lifecycle, monkeypatch, close_all):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    monkeypatch.setattr(orchestrator, "start_steps", lambda **kwargs: _dynamic_awaiting(kwargs["request_id"]))
+    paused = orchestrator.start(lifecycle.request)
+
+    def failed_close(engine, request_id=None):
+        assert lifecycle.candidate.is_dir()
+        raise RuntimeError("native cancellation failed")
+
+    target = dynamic_orchestrator_module if close_all else workflow_engine_module.FlowXWorkflowEngine
+    attribute = "close_workflow_engine" if close_all else "close"
+    monkeypatch.setattr(target, attribute, failed_close)
+    with pytest.raises(RuntimeError, match="native cancellation failed"):
+        orchestrator.close(None if close_all else paused.request_id)
+    assert lifecycle.candidate.is_dir()
+    assert paused.request_id in orchestrator._pending
+    assert orchestrator.closed is close_all
+    if close_all:
+        with pytest.raises(RuntimeError, match="closed"):
+            orchestrator.start(lifecycle.request)
+        with pytest.raises(RuntimeError, match="closed"):
+            orchestrator.resume(paused.request_id, "Collect__amend_node", "repair")
+        with pytest.raises(RuntimeError, match="closed"):
+            orchestrator.execute(lifecycle.request)
+
+    monkeypatch.setattr(target, attribute, lambda *args, **kwargs: None)
+    orchestrator.close(None if close_all else paused.request_id)
+    assert not lifecycle.candidate.exists()
+    assert orchestrator._pending == {}
+
+
+def test_dynamic_orchestrator_failed_global_close_retries_without_pending(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    monkeypatch.setattr(orchestrator, "run_steps", lambda **kwargs: _dynamic_completed(kwargs["request_id"]))
+    with pytest.raises(RuntimeError, match="did not publish"):
+        orchestrator.execute(lifecycle.request)
+    attempts = []
+
+    def close_native(engine):
+        attempts.append(engine)
+        if len(attempts) == 1:
+            raise RuntimeError("native cancellation failed")
+
+    monkeypatch.setattr(dynamic_orchestrator_module, "close_workflow_engine", close_native)
+    with pytest.raises(RuntimeError, match="native cancellation failed"):
+        orchestrator.close()
+    assert orchestrator.closed
+    with pytest.raises(RuntimeError, match="closed"):
+        orchestrator.start(lifecycle.request)
+    orchestrator.close()
+    orchestrator.close()
+    assert attempts == [orchestrator, orchestrator]
+
+
+def test_dynamic_orchestrator_failed_global_close_with_real_helper(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    monkeypatch.setattr(orchestrator, "start_steps", lambda **kwargs: _dynamic_awaiting(kwargs["request_id"]))
+    paused = orchestrator.start(lifecycle.request)
+    pool, attempts = SimpleNamespace(close=lambda: attempts.append("pool")), []
+    orchestrator.pool = pool
+
+    def close_native(engine, request_id=None):
+        attempts.append("native")
+        assert lifecycle.candidate.is_dir()
+        if attempts.count("native") == 1:
+            raise RuntimeError("native cancellation failed")
+
+    monkeypatch.setattr(dynamic_orchestrator_module, "close_workflow_engine", close_workflow_engine)
+    monkeypatch.setattr(workflow_engine_module.WorkflowEngine, "close", close_native)
+    with pytest.raises(RuntimeError, match="native cancellation failed"):
+        orchestrator.close()
+    assert attempts == ["native", "pool"]
+    assert orchestrator.closed and paused.request_id in orchestrator._pending
+    assert lifecycle.candidate.is_dir()
+    with pytest.raises(RuntimeError, match="closed"):
+        orchestrator.resume(paused.request_id, "Collect__amend_node", "repair")
+
+    # A per-request cleanup must finish the incomplete global close first.
+    def fail_again(*args):
+        raise RuntimeError("global cancellation still failing")
+
+    monkeypatch.setattr(workflow_engine_module.WorkflowEngine, "close", fail_again)
+    with pytest.raises(RuntimeError, match="global cancellation still failing"):
+        orchestrator.close(paused.request_id)
+    assert lifecycle.candidate.is_dir() and paused.request_id in orchestrator._pending
+    monkeypatch.setattr(workflow_engine_module.WorkflowEngine, "close", close_native)
+    orchestrator.close()
+    assert attempts == ["native", "pool", "pool", "native", "pool"]
+    assert not lifecycle.candidate.exists() and orchestrator._pending == {}
+
+
+def test_dynamic_orchestrator_failed_exception_cleanup_keeps_candidate(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+
+    def start_steps(**kwargs):
+        raise _DynamicLifecycleAbort("start failed")
+
+    def failed_close(engine, request_id=None):
+        assert lifecycle.candidate.is_dir()
+        raise RuntimeError("native cancellation failed")
+
+    monkeypatch.setattr(orchestrator, "start_steps", start_steps)
+    monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", failed_close)
+    with pytest.raises(RuntimeError, match="native cancellation failed") as failure:
+        orchestrator.start(lifecycle.request)
+    assert isinstance(failure.value.__context__, _DynamicLifecycleAbort)
+    assert lifecycle.candidate.is_dir()
+    assert len(orchestrator._pending) == 1
+
+    request_id = next(iter(orchestrator._pending))
+    monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", lambda *args, **kwargs: None)
+    orchestrator.close(request_id)
+    assert orchestrator._pending == {}
+    assert not lifecycle.candidate.exists()
+
+
+def test_dynamic_orchestrator_failed_execute_cleanup_can_be_retried(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+
+    def failed_run(**kwargs):
+        raise _DynamicLifecycleAbort("execute failed")
+
+    def failed_close(engine, request_id=None):
+        assert lifecycle.candidate.is_dir()
+        raise RuntimeError("native cancellation failed")
+
+    monkeypatch.setattr(orchestrator, "run_steps", failed_run)
+    monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", failed_close)
+    with pytest.raises(RuntimeError, match="native cancellation failed") as failure:
+        orchestrator.execute(lifecycle.request)
+    assert isinstance(failure.value.__context__, _DynamicLifecycleAbort)
+    assert lifecycle.candidate.is_dir()
+    assert len(orchestrator._pending) == 1
+    with pytest.raises(RuntimeError, match="paused build"):
+        orchestrator.start(lifecycle.request)
+
+    request_id = next(iter(orchestrator._pending))
+    monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", lambda *args, **kwargs: None)
+    orchestrator.close(request_id)
+    assert orchestrator._pending == {}
+    assert not lifecycle.candidate.exists()
+
+
+@pytest.mark.parametrize("close_all", [False, True])
+def test_dynamic_orchestrator_manifest_read_failure_keeps_candidate(dynamic_lifecycle, monkeypatch, close_all):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    monkeypatch.setattr(orchestrator, "start_steps", lambda **kwargs: _dynamic_awaiting(kwargs["request_id"]))
+    paused = orchestrator.start(lifecycle.request)
+    read_manifest = orchestrator._read_manifest
+
+    def failed_read():
+        raise OSError("manifest unavailable")
+
+    monkeypatch.setattr(orchestrator, "_read_manifest", failed_read)
+    with pytest.raises(OSError, match="manifest unavailable"):
+        orchestrator.close(None if close_all else paused.request_id)
+    assert lifecycle.native_closes == [(None if close_all else paused.request_id, True)]
+    assert paused.request_id in orchestrator._pending
+    assert lifecycle.candidate.is_dir()
+    assert orchestrator.closed is close_all
+
+    monkeypatch.setattr(orchestrator, "_read_manifest", read_manifest)
+    orchestrator.close(None if close_all else paused.request_id)
+    assert not lifecycle.candidate.exists()
+    assert orchestrator._pending == {}
+
+
+def test_dynamic_orchestrator_abandon_new_candidate_keeps_previous_revision(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    starts = []
+
+    def start_steps(*, request_id, state, skipped_steps):
+        starts.append(request_id)
+        if len(starts) == 1:
+            _commit_dynamic_candidate(orchestrator, state["dynamic_workflow_run"], set_outcome=True)
+            return _dynamic_completed(request_id)
+        return _dynamic_awaiting(request_id)
+
+    monkeypatch.setattr(orchestrator, "start_steps", start_steps)
+    completed = orchestrator.start(lifecycle.request)
+    paused = orchestrator.start(lifecycle.request)
+    second_candidate = orchestrator.storage_dir / "workflows" / "00000002"
+    assert second_candidate.is_dir()
+    orchestrator.close(paused.request_id)
+    assert not second_candidate.exists()
+    assert completed.version.workflow_path.is_file()
+    assert completed.version.node_versions["Collect"].source_path.is_file()
+    assert orchestrator.workflow_version == 1
+
+
+def test_dynamic_orchestrator_close_keeps_candidate_published_before_pause(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+
+    def publish_then_pause(*, request_id, state, skipped_steps):
+        _commit_dynamic_candidate(orchestrator, state["dynamic_workflow_run"], set_outcome=True)
+        return _dynamic_awaiting(request_id)
+
+    monkeypatch.setattr(orchestrator, "start_steps", publish_then_pause)
+    paused = orchestrator.start(lifecycle.request)
+    assert paused.status == "awaiting_input"
+    version = orchestrator._nodes_outcome.version
+    orchestrator.close(paused.request_id)
+    assert lifecycle.native_closes == [(paused.request_id, True)]
+    assert orchestrator._pending == {}
+    assert version.workflow_path.is_file()
+    assert version.node_versions["Collect"].source_path.is_file()
+
+
+@pytest.mark.parametrize("empty_graph", [False, True])
+def test_dynamic_orchestrator_preserves_revision_if_manifest_write_raises_after_commit(
+    dynamic_lifecycle, monkeypatch, empty_graph,
+):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    if empty_graph:
+        lifecycle.request.workflow_json_path.write_text(
+            json.dumps({"nodes": [{"name": "Collect", "enable": False}]}), encoding="utf-8",
+        )
+    write_json = orchestrator._write_json
+
+    def write_then_fail(path, value):
+        write_json(path, value)
+        if path == orchestrator._manifest_path:
+            raise _DynamicLifecycleAbort("manifest committed")
+
+    def start_steps(*, request_id, state, skipped_steps):
+        _commit_dynamic_candidate(orchestrator, state["dynamic_workflow_run"], set_outcome=True)
+        return _dynamic_completed(request_id)
+
+    monkeypatch.setattr(orchestrator, "_write_json", write_then_fail)
+    monkeypatch.setattr(orchestrator, "start_steps", start_steps)
+    with pytest.raises(_DynamicLifecycleAbort, match="manifest committed"):
+        orchestrator.start(lifecycle.request)
+    assert orchestrator.workflow_version == 1
+    version = orchestrator.get_workflow_version()
+    assert version.workflow_path.is_file()
+    if not empty_graph:
+        assert version.node_versions["Collect"].source_path.is_file()
+        node_history = orchestrator.list_node_versions(version.node_versions["Collect"].node_id)
+        assert node_history[0].source_path.is_file()
+
+
+@pytest.mark.parametrize("empty_graph", [False, True])
+def test_dynamic_orchestrator_rolls_back_artifacts_if_manifest_write_fails_before_commit(
+    dynamic_lifecycle, monkeypatch, empty_graph,
+):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    if empty_graph:
+        lifecycle.request.workflow_json_path.write_text(
+            json.dumps({"nodes": [{"name": "Collect", "enable": False}]}), encoding="utf-8",
+        )
+    write_json = orchestrator._write_json
+
+    def fail_before_commit(path, value):
+        if path == orchestrator._manifest_path:
+            raise _DynamicLifecycleAbort("manifest not committed")
+        write_json(path, value)
+
+    def start_steps(*, request_id, state, skipped_steps):
+        _commit_dynamic_candidate(orchestrator, state["dynamic_workflow_run"], set_outcome=True)
+        return _dynamic_completed(request_id)
+
+    monkeypatch.setattr(orchestrator, "_write_json", fail_before_commit)
+    monkeypatch.setattr(orchestrator, "start_steps", start_steps)
+    with pytest.raises(_DynamicLifecycleAbort, match="manifest not committed"):
+        orchestrator.start(lifecycle.request)
+    assert orchestrator.workflow_version == 0
+    assert not lifecycle.candidate.exists()
+    assert not (orchestrator.storage_dir / "nodes" / "lifecycle-node" / "00000001").exists()
+    assert orchestrator._pending == {}
+
+
+def test_dynamic_orchestrator_preserves_revision_if_publication_conversion_fails(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    convert = orchestrator._workflow_version
+
+    def fail_conversion(record):
+        raise _DynamicLifecycleAbort("conversion failed")
+
+    def start_steps(*, request_id, state, skipped_steps):
+        _commit_dynamic_candidate(orchestrator, state["dynamic_workflow_run"], set_outcome=True)
+        return _dynamic_completed(request_id)
+
+    monkeypatch.setattr(orchestrator, "_workflow_version", fail_conversion)
+    monkeypatch.setattr(orchestrator, "start_steps", start_steps)
+    with pytest.raises(_DynamicLifecycleAbort, match="conversion failed"):
+        orchestrator.start(lifecycle.request)
+    monkeypatch.setattr(orchestrator, "_workflow_version", convert)
+    version = orchestrator.get_workflow_version()
+    assert version.workflow_path.is_file()
+    assert version.node_versions["Collect"].source_path.is_file()
+    assert orchestrator.list_node_versions(version.node_versions["Collect"].node_id)[0].source_path.is_file()
+
+
+def test_dynamic_orchestrator_close_without_native_engine(tmp_path, monkeypatch):
+    orchestrator = dynamic_orchestrator_module.DynamicWorkflowOrchestrator(storage_dir=tmp_path / "storage")
+    candidate = orchestrator.storage_dir / "workflows" / "00000001"
+    candidate.mkdir(parents=True)
+    orchestrator._pending["offline"] = dynamic_orchestrator_module._LiveRun("offline", candidate, {}, [])
+
+    def unexpected_native_close(*args, **kwargs):
+        pytest.fail("a native engine was never initialized")
+
+    monkeypatch.setattr(workflow_engine_module.FlowXWorkflowEngine, "close", unexpected_native_close)
+    monkeypatch.setattr(dynamic_orchestrator_module, "close_workflow_engine", unexpected_native_close)
+    orchestrator.close("unknown")
+    assert candidate.is_dir()
+    orchestrator.close("offline")
+    assert not candidate.exists()
+    assert orchestrator._pending == {}
+    orchestrator.close()
+    orchestrator.close()
+    assert orchestrator.closed
+
+
+def test_dynamic_orchestrator_execute_preserves_unknown_step_error(dynamic_lifecycle, monkeypatch):
+    lifecycle = dynamic_lifecycle
+    orchestrator = lifecycle.orchestrator
+    orchestrator.steps_meta = [{"id": "known"}]
+    real_begin = orchestrator._begin
+
+    def begin_with_unknown_step(request, agent_state):
+        ready, live = real_begin(request, agent_state)
+        live.skipped.append("missing")
+        return ready, live
+
+    monkeypatch.setattr(orchestrator, "_begin", begin_with_unknown_step)
+    with pytest.raises(ValueError, match=r"unknown workflow step\(s\): \['missing'\]"):
+        orchestrator.execute(lifecycle.request)
+    assert not lifecycle.candidate.exists()
+    assert lifecycle.native_closes and lifecycle.native_closes[0][1]
+
+
+def _native_dynamic_orchestrator_lifecycle_reference() -> None:
+    """Use a real native pause, an invalid step, cancellation and repeated starts."""
+    from tempfile import TemporaryDirectory
+
+    WorkflowEngine = workflow_engine_module.WorkflowEngine
+    real_close = WorkflowEngine.close
+    close_checks = []
+
+    class Gate(WorkflowStepNode):
+        STEP_ID = "gate"
+        INPUT_REQUIRED = True
+
+        def __init__(self):
+            super().__init__()
+            self.setWaitFunc(self.wait_function)
+
+        def wait_function(self):
+            param = self.get_workflow_param()
+            with param.condition:
+                if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
+                    return True
+                ready = self.STEP_ID in param.inputs
+                param.set_state(self.STEP_ID, "running" if ready else "awaiting_input")
+                return ready
+
+        def process_input(self, user_input, dependency_results, session_state):
+            assert session_state["dynamic_workflow_run"].directory.is_dir()
+            return StepRunOutput(derived={"answer": user_input})
+
+    class Publish(WorkflowStepNode):
+        STEP_ID = dynamic_orchestrator_module.NODES_STAGE_EXIT_ID
+        DEPENDENCIES = ["gate"]
+        INPUT_REQUIRED = False
+
+        def process_input(self, user_input, dependency_results, session_state):
+            orchestrator = session_state["dynamic_workflow_orchestrator"]
+            _commit_dynamic_candidate(orchestrator, session_state["dynamic_workflow_run"], set_outcome=True)
+            return StepRunOutput(derived={"answer": dependency_results["gate"].derived["answer"]})
+
+    def close_with_directory_check(engine, request_id=None):
+        if isinstance(engine, dynamic_orchestrator_module.DynamicWorkflowOrchestrator):
+            for live in engine._pending.values():
+                if request_id is None or request_id == live.request_id:
+                    close_checks.append((request_id, live.directory.is_dir()))
+        return real_close(engine, request_id)
+
+    with TemporaryDirectory() as root:
+        root = Path(root)
+        graph_path = root / "workflow.json"
+        graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
+        requirement_path = root / "requirement.md"
+        requirement_path.write_text("collect a message", encoding="utf-8")
+        generation, modifier = (
+            dynamic_orchestrator_module.NODE_GENERATION_WORKFLOW,
+            dynamic_orchestrator_module.NODE_RUNTIME_MODIFIER_PIPELINE,
+        )
+        child_workflow = SimpleNamespace(graph=object(), json_config=lambda: {"pool_size": 1})
+        dynamic_orchestrator_module.NODE_GENERATION_WORKFLOW = child_workflow
+        dynamic_orchestrator_module.NODE_RUNTIME_MODIFIER_PIPELINE = child_workflow
+        WorkflowEngine.close = close_with_directory_check
+        orchestrator = dynamic_orchestrator_module.DynamicWorkflowOrchestrator(storage_dir=root / "storage")
+        orchestrator._finalize_ids = {"Collect": "Collect__finalize"}
+
+        def initialize_native(**kwargs):
+            if orchestrator._engine_ready:
+                return
+            workflow_engine_module.FlowXWorkflowEngine.__init__(
+                orchestrator,
+                {"gate": Gate, dynamic_orchestrator_module.NODES_STAGE_EXIT_ID: Publish},
+                {"nodes": [{"name": "gate"}, {"name": dynamic_orchestrator_module.NODES_STAGE_EXIT_ID,
+                                                 "depends": ["gate"]}]},
+            )
+            orchestrator._engine_ready = True
+
+        orchestrator._ensure_engine = initialize_native
+        request = dynamic_orchestrator_module.DynamicWorkflowRequest(
+            workflow_json_path=graph_path, requirement_md_path=requirement_path,
+        )
+        first_candidate = orchestrator.storage_dir / "workflows" / "00000001"
+        second_candidate = orchestrator.storage_dir / "workflows" / "00000002"
+        try:
+            paused = orchestrator.start(request)
+            assert paused.status == "awaiting_input"
+            assert paused.awaiting["id"] == "gate"
+            unknown = orchestrator.resume(paused.request_id, "unknown", "ignored")
+            assert unknown.status == "awaiting_input"
+            assert unknown.awaiting["id"] == "gate"
+            assert first_candidate.is_dir()
+
+            orchestrator.close(paused.request_id)
+            assert close_checks == [(paused.request_id, True)]
+            assert not first_candidate.exists()
+            assert orchestrator._pending == {}
+
+            second = orchestrator.start(request)
+            assert second.status == "awaiting_input"
+            result = orchestrator.resume(second.request_id, "gate", "accepted")
+            assert result.status == "completed"
+            assert result.version.version == 1
+            assert result.version.workflow_path.is_file()
+            assert result.version.node_versions["Collect"].source_path.is_file()
+            assert orchestrator.last_stage_output == {"answer": "accepted"}
+
+            third = orchestrator.start(request)
+            assert third.status == "awaiting_input"
+            assert second_candidate.is_dir()
+            orchestrator.close()
+            assert close_checks[-1] == (None, True)
+            assert not second_candidate.exists()
+            assert result.version.workflow_path.is_file()
+            assert orchestrator._pending == {}
+            assert orchestrator.pool.closed
+        finally:
+            orchestrator.close()
+            WorkflowEngine.close = real_close
+            dynamic_orchestrator_module.NODE_GENERATION_WORKFLOW = generation
+            dynamic_orchestrator_module.NODE_RUNTIME_MODIFIER_PIPELINE = modifier
+
+
+def test_dynamic_orchestrator_real_native_pause_close_and_retry() -> None:
+    # Isolate native pool lifetime just like the other interactive reference tests.
+    script = f"import runpy; runpy.run_path({__file__!r})['_native_dynamic_orchestrator_lifecycle_reference']()"
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _native_dynamic_orchestrator_expanded_reference() -> None:
+    """Start the actual expanded business graph, not just a stand-in graph."""
+    import runpy
+    from tempfile import TemporaryDirectory
+
+    example = runpy.run_path(str(Path(__file__).resolve().parents[3] / "examples" / "dynamic_workflow_orchestrator.py"))
+    generation, modifier = example["_fake_workflows"]()
+    old_generation = dynamic_orchestrator_module.NODE_GENERATION_WORKFLOW
+    old_modifier = dynamic_orchestrator_module.NODE_RUNTIME_MODIFIER_PIPELINE
+    dynamic_orchestrator_module.NODE_GENERATION_WORKFLOW = generation
+    dynamic_orchestrator_module.NODE_RUNTIME_MODIFIER_PIPELINE = modifier
+    try:
+        with TemporaryDirectory() as root:
+            root = Path(root)
+            graph_path, requirement_path = example["_write_plan"](root, [
+                {"name": "Collect", "type": "", "desc": "Collect a message."},
+            ])
+            orchestrator = dynamic_orchestrator_module.DynamicWorkflowOrchestrator(storage_dir=root / "storage")
+            try:
+                request = dynamic_orchestrator_module.DynamicWorkflowRequest(
+                    workflow_json_path=graph_path, requirement_md_path=requirement_path,
+                    skip_node_planner=True, generate_markdown=False, max_repair_retries=0,
+                )
+                completed = orchestrator.start(request)
+                assert completed.status == "completed", completed.error
+                assert completed.version.version == 1
+                assert completed.version.workflow_path.is_file()
+                assert completed.version.node_versions["Collect"].source_path.is_file()
+                assert orchestrator._pending == {}
+            finally:
+                orchestrator.close()
+    finally:
+        dynamic_orchestrator_module.NODE_GENERATION_WORKFLOW = old_generation
+        dynamic_orchestrator_module.NODE_RUNTIME_MODIFIER_PIPELINE = old_modifier
+
+
+def test_dynamic_orchestrator_actual_expanded_graph_start() -> None:
+    script = f"import runpy; runpy.run_path({__file__!r})['_native_dynamic_orchestrator_expanded_reference']()"
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_dynamic_orchestrator_reuses_unchanged_all_disabled_graph(dynamic_lifecycle):
+    lifecycle = dynamic_lifecycle
+    lifecycle.request.workflow_json_path.write_text(
+        json.dumps({"nodes": [{"name": "Collect", "enable": False}]}), encoding="utf-8",
+    )
+    try:
+        first = lifecycle.orchestrator.start(lifecycle.request)
+        again = lifecycle.orchestrator.start(lifecycle.request)
+        assert first.version.version == again.version.version == 1
+        assert first.version.workflow_path == again.version.workflow_path
+        assert first.version.workflow_path.is_file()
+        assert not (lifecycle.orchestrator.storage_dir / "workflows" / "00000002").exists()
+    finally:
+        lifecycle.orchestrator.close()

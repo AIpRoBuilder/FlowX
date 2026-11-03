@@ -7,44 +7,39 @@ Setup (from the repository root):
     export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-flash FLOWX_LLM_API_KEY=<your key>
     python examples/sdk_guided_repair.py
 
-``repair_input_callback`` is called after a node's test fails. It receives a
-``NodeRepairInput`` containing the node name, attempt, pytest log and test result.
-Return guidance to combine with the log, ``"skip"`` to skip the amendment, or an
-empty string to amend from the test log alone.
+``build_nodes(...)`` pauses when a node's test fails (gating is on by default).
+The result carries ``status="input_required"``, a ``request_id`` and ``awaiting``
+(node, prompt, pytest log and test result). Answer with ``flowx.answer(...)``:
+guidance amends the node, ``test: <guidance>`` amends the generated test instead,
+``"skip"`` skips the amendment, and an empty string amends the node from the test
+log alone.
 """
 
 from __future__ import annotations
 
 import sys
-from threading import Lock
 
-from flowx_sdk import FlowXClient, NodeRepairInput
+from flowx_sdk import FlowXClient
 
 REQUIREMENT = (
     "Build a workflow that accepts a support ticket, classifies its category, "
     "assigns a priority, and drafts a reply."
 )
 
-_PROMPT_LOCK = Lock()
-_PROMPTS: list[NodeRepairInput] = []
 
-
-def ask_for_repair_input(context: NodeRepairInput) -> str:
+def answer_prompt(awaiting: dict) -> str:
     """Prompt for guidance after one node's test fails."""
-    with _PROMPT_LOCK:
-        _PROMPTS.append(context)
-        print(
-            f"\n=== {context.node_name} test failed (attempt {context.attempt + 1}) ==="
-        )
-        print(context.test_log[-4000:])
-        answer = input(
-            "\nHow should I modify this node?\n"
-            "  - enter a direction to guide the amendment\n"
-            "  - enter 'skip' to skip this amendment attempt\n"
-            "  - press Enter to amend from the test log alone\n"
-            "> "
-        )
-    return answer.strip()
+    print(f"\n=== {awaiting.get('node', 'node')} test failed ===")
+    print(awaiting.get("prompt", ""))
+    print((awaiting.get("test_log") or "")[-4000:])
+    return input(
+        "\nHow should I modify this node?\n"
+        "  - enter a direction to guide the node amendment\n"
+        "  - enter 'test: <direction>' to fix the generated test instead\n"
+        "  - enter 'skip' to skip this amendment attempt\n"
+        "  - press Enter to amend the node from the test log alone\n"
+        "> "
+    ).strip()
 
 
 def main() -> None:
@@ -57,27 +52,28 @@ def main() -> None:
         workflow_id = created.workflow_id
         print(f"workflow {workflow_id}: {created.artifacts['graph']}")
 
-        # 2. Build the nodes. After a node test fails, the callback asks for
-        # amendment guidance; the node is retested and asked again until it passes
-        # or max_repair_retries is exhausted.
+        # 2. Build the nodes. A failed node test pauses at that node's own gate (the
+        # default); answer each question and continue until the build finishes.
         #
-        # For non-interactive automation, use a deterministic callback instead, e.g.:
-        #   repair_input_callback=lambda context: (
-        #       "skip" if context.node_name == "DraftReply" else ""
-        #   )
+        # For non-interactive automation, pass await_repair_input=False: the engine
+        # then amends from the test log without asking.
         built = flowx.build_nodes(
             workflow_id,
-            repair_input_callback=ask_for_repair_input,
+            await_repair_input=True,
             node_options={"max_repair_retries": 5},
-        ).raise_for_failure()
+        )
+        asked = 0
+        while built.status == "input_required":
+            awaiting = built.awaiting
+            asked += 1
+            answer = answer_prompt(dict(awaiting))
+            built = flowx.answer(built.request_id, answer, awaiting["stepId"])
+        built.raise_for_failure()
         print(f"nodes: {', '.join(built.artifacts['nodes'])}")
-        if _PROMPTS:
-            print(f"guided repair prompts: {len(_PROMPTS)}")
+        if asked:
+            print(f"guided repair prompts: {asked}")
         else:
-            print(
-                "No repair prompt was needed: every node test passed, so there was "
-                "nothing to amend. The callback runs only after a failing node test."
-            )
+            print("No repair prompt was needed: every node test passed.")
 
         # 3. Generate the main entrypoint from the built nodes.
         entrypoint = flowx.build_main_entrypoint(workflow_id).raise_for_failure()

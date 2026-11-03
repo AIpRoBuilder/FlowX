@@ -9,6 +9,9 @@ Modified 2026-10-30: the orchestrator is an `ExpandedWorkflowEngine`; a transit 
 publishes the run, an optional continuation graph is bridged after every leaf finalizer, and an
 optional `head` graph (`reformat_request -> graph_plan`) is bridged into every root entry so the
 connected graph runs one or two passes on the same engine.
+Modified 2026-11-01: an initial generation audit failure enters the repair loop and is amended from
+its violation report; only failing tests use the interactive gate.
+Modified 2026-11-02: correct the audit guard behavior and default repair retry count.
 
 `DynamicWorkflowOrchestrator` coordinates node generation and isolated node repair.
 It does **not** execute the generated business workflow, edit graph topology through
@@ -101,9 +104,10 @@ root and every bridged business root are rebound with `rebind_step_class`.
 The repair chain is a native loop region. Its loop policy stops when the verify
 test and amended audit both pass, when the request's `max_repair_retries` budget
 is exhausted, or when the node is reused/repair was disabled. The guard sits
-outside the loop and disables repair when generation's audit failed. If tests
-pass but the audit fails, `amend_from_audit` applies the violation report before
-the next verification pass; one extra pass is allowed to verify that amendment.
+outside the loop and records generation's audit result without disabling repair
+on failure. If tests pass but the audit fails, `amend_from_audit` applies the
+violation report before the next verification pass; one extra pass is allowed to
+verify that amendment.
 
 Each business node has a request namespace in `WorkflowParam.state` containing
 its generation state and runtime-modifier request. Namespaced step classes read
@@ -170,7 +174,7 @@ Request options include:
 - `node_formats` for extra generation contract context.
 - `generate_markdown` and `skip_node_planner` for planner control.
 - `run_runtime_modifier` (default `True`) for isolated pytest generation/repair.
-- `max_repair_retries` (default `2`) for how many more times a failing repair is requested.
+- `max_repair_retries` (default `5`) for how many more times a failing repair is requested.
 - `state` for request-local context; it is not serialized in the manifest.
 - Generation/test temperatures, Python command and per-test timeout.
 
@@ -182,6 +186,9 @@ language for this initial coordinator.
 
 A repair pass tests the node, and when its test fails it amends the source from the
 log, reruns the existing test without another amendment, and re-audits the source.
+An initial generation audit failure is not terminal: the node enters this same repair
+loop and is amended from its audit violations. Audit repairs never pause; only a
+failing test uses the interactive gate described below.
 If a pass still fails its test or audit, another pass is requested, up to
 `max_repair_retries` more times (`0` restores a single pass). The generated test is
 reused; a failing test is amended from its fresh log, and an audit violation is
@@ -189,10 +196,17 @@ amended from the violation report before the node is retested and re-audited. A
 still-failing node is not published. A failed build does not advance
 the workflow/node counters or replace historical files. Disabling the modifier
 does not imply runtime validation; old test logs are not carried into changed,
-untested node versions. When `repair_input_callback` is set, it is called after a
-failed test with a `NodeRepairInput` (node, attempt, test log and result). Its
-return value guides the amendment, `skip` skips that amendment, and the next
-retry asks again with the fresh log.
+untested node versions. With `await_repair_input=True`, a failing test pauses at the
+node's own `amend_node` wait callback (`DynamicWorkflowRequest.await_repair_input` ->
+`NodeRuntimeModifierRequest.await_input`); the orchestrator's `start()` returns an
+`OrchestratorRun` with `status="awaiting_input"` and the waiting step's metadata, and
+`resume(request_id, step_id, value)` feeds the answer. Guidance amends the node, which
+stays the default target; `test: <guidance>` (or `tests=...`, `fix the test`, or a JSON
+`{"target": "test"}`) amends the generated test instead; `skip` skips that amendment; an
+empty string amends the node from the log alone; the next repair pass asks again with the
+fresh log. `await_repair_input` defaults to `True`; `execute()` always runs
+non-interactively, and `await_repair_input=False` makes `start()` amend from the test log
+automatically.
 
 ## Saved identities and versions
 

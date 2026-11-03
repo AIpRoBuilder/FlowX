@@ -37,7 +37,9 @@ the version string alone does not distinguish the older API.
   and optional `pool_size`; there is no separate configuration object or constructor map.
   Use `engine.run()` and `engine.answer()` for interactive runs; `engine.run_steps()`
   seeds request state and requires completion for the noninteractive
-  generation/repair workflows.
+  generation/repair workflows. `engine.start_steps()`/`resume_steps()` are the
+  FlowX seams with the same seeding that keep a paused run alive instead of closing
+  it, so the orchestrator can resume a node's own wait gate by step id.
 - `GraphGenerationWorkflow`, `NodeGenerationWorkflow`,
   `MainEntrypointGenerationWorkflow` and `NodeRuntimeModifierPipeline` subclass
   `FlowXWorkflowEngine`, so each is its own `WorkflowEngine` rather than a wrapper

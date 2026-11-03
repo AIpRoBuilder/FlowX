@@ -2,6 +2,7 @@
 # Modified: abstract bytes file hooks, explicit persistence, and configured concrete-node prompts.
 # Modified: fixed automatic-stage metadata and scoped settings before prompt composition.
 # Modified: concrete request-driven generator selects all node contracts from WorkflowParam.state.
+# Modified: rule-specific audit remediation; the ancestor-key rule never suggests DEFAULT_CONFIG.
 import json
 import ast
 from dataclasses import dataclass
@@ -306,14 +307,27 @@ class PromptNodeFileCoderBase(Coder):
         return json.dumps(normalized, ensure_ascii=False) if normalized else "none"
 
     @staticmethod
-    def _has_default_config_audit_rule(amendment: str) -> bool:
+    def _audit_remediation_text(amendment: str) -> str:
+        """Rule-specific repair guidance; DEFAULT_CONFIG cannot satisfy the ancestor-key rule."""
         if not amendment:
-            return False
+            return ""
         text = amendment.lower()
-        return (
-            "dependency_results_missing_dependency_keys" in text
-            or "session_state_ancestor_key_invalid" in text
-        )
+        lines: list[str] = []
+        if "dependency_results_missing_dependency_keys" in text:
+            lines.append(
+                "- dependency_results_missing_dependency_keys: read only dependency ids declared in "
+                "DEPENDENCIES and derived keys the dependency actually returns; use DEFAULT_CONFIG only "
+                "when the missing value is a genuine configuration default."
+            )
+        if "session_state_ancestor_key_invalid" in text:
+            lines.append(
+                "- session_state_ancestor_key_invalid: remove the reported session_state read, or read a "
+                "key that an ancestor node already declares. Do not add DEFAULT_CONFIG for these keys: the "
+                "auditor only accepts keys present in ancestor node files and excludes the current node."
+            )
+        if not lines:
+            return ""
+        return "\nAudit remediation rule (authoritative):\n" + "\n".join(lines) + "\n"
 
     def _build_requirement_prompt(
         self,
@@ -543,13 +557,9 @@ class PromptNodeFileCoderBase(Coder):
             f"{amendment}\n"
         )
 
-        if self._has_default_config_audit_rule(amendment):
-            user_prompt += (
-                "\nAudit remediation rule (authoritative):\n"
-                "- If audit reports dependency_results_missing_dependency_keys or session_state_ancestor_key_invalid, treat missing variables as potential config variables.\n"
-                "- Add/ensure class-level DEFAULT_CONFIG = { ... } in the node file with placeholders for those missing keys.\n"
-                "- If the value is still missing/invalid after resolution attempts, return an explicit validation error.\n"
-            )
+        audit_remediation = self._audit_remediation_text(amendment)
+        if audit_remediation:
+            user_prompt += audit_remediation
         if additional_generation_context.strip():
             user_prompt += (
                 "\n\nAdditional node-generation context (authoritative; preserve the current node contract):\n"

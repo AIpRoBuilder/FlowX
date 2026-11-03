@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+# Modified 2026-11-02: cover iterative node retries and paused-run cleanup.
+# Modified 2026-11-03: cover allocated workflow creation and recovery-state reporting.
+# Modified 2026-11-03: cover allocated graph creation, modification, and overwrite safeguards.
+
 import json
+from dataclasses import replace
 from graphlib import TopologicalSorter
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -376,52 +382,12 @@ def test_request_validates_the_repair_retry_budget(value):
 		)
 
 
-def test_request_rejects_a_non_callable_repair_input_callback():
-	with pytest.raises(ValueError, match="repair_input_callback"):
+def test_request_rejects_a_non_boolean_await_repair_input():
+	with pytest.raises(ValueError, match="await_repair_input"):
 		orchestrator_module.DynamicWorkflowRequest(
 			workflow_json_path="workflow.json", requirement_md_path="requirement.md",
-			repair_input_callback=object(),
+			await_repair_input="yes",
 		)
-
-
-def test_repair_callback_guides_each_nodes_amendment(world):
-	agent = world.agent()
-	world.modifier.failing["Collect"] = 1  # first test fails; the retest passes
-	seen = []
-
-	def repair_input(context):
-		seen.append(context)
-		return f"guide {context.node_name}"
-
-	result = agent.build_workflow(
-		"collect and publish", node_options={"repair_input_callback": repair_input},
-	)
-
-	assert result.ok, result.errors
-	assert {context.node_name for context in seen} == {"Collect", "Publish"}
-	assert all(isinstance(context, orchestrator_module.NodeRepairInput) for context in seen)
-	assert "guide Collect" in world.modifier.user_inputs
-	assert "guide Publish" in world.modifier.user_inputs
-
-
-def test_repair_input_callback_receives_the_node_test_context():
-	class Step(orchestrator_module._NodeGenerationStep):
-		STEP_ID = "Collect"
-
-	contexts = []
-
-	def callback(context):
-		contexts.append(context)
-		return "fix the comparison"
-
-	run = SimpleNamespace(request=SimpleNamespace(repair_input_callback=callback))
-	request = SimpleNamespace(test_log="pytest FAILED for Collect", test_result={"ok": False})
-
-	assert Step()._ask_repair_input(run, request, 2) == "fix the comparison"
-	assert contexts == [orchestrator_module.NodeRepairInput(
-		node_name="Collect", attempt=2,
-		test_log="pytest FAILED for Collect", test_result={"ok": False},
-	)]
 
 
 def test_a_main_run_log_error_is_routed_to_the_node_it_names(world):
@@ -679,3 +645,711 @@ def test_real_native_engines_run_the_whole_request_pipeline(native_world):
 	assert modified.ok and _statuses(modified) == ["completed", "skipped", "completed", "completed"], modified.errors
 	assert any("validate its input" in request.node_amendment for request in native_world.generation.requests)
 	assert modified.artifacts["main_entrypoint"]["version"] == 2
+
+
+def test_allocated_workflow_builds_with_create_intent(native_world):
+	agent = native_world.agent()
+	workflow_id = agent.resolve_record(None).workflow_id
+	result = agent.build_new_workflow(workflow_id, "collect and publish", cascade=False)
+	assert result.ok, result.errors
+	assert result.workflow_id == workflow_id and result.intent.graph.mode == "create"
+	assert native_world.graph.requests[0].requirement_text == "collect and publish"
+	with pytest.raises(ValueError, match="already has"):
+		agent.build_new_workflow(workflow_id, "do not overwrite")
+
+
+def test_allocated_graph_creates_and_modifies_without_building_nodes(native_world):
+	agent = native_world.agent()
+	workflow_id = agent.resolve_record(None).workflow_id
+	created = agent.build_allocated_workflow_json(workflow_id, "collect and publish", temperature=0.17)
+	assert created.ok, created.errors
+	assert created.workflow_id == workflow_id and created.intent.graph.mode == "create"
+	assert _statuses(created) == ["completed", "completed", "skipped", "skipped"]
+	assert native_world.graph.requests[0].requirement_text == "collect and publish"
+	modified = agent.build_allocated_workflow_json(workflow_id, "add auditing", temperature=0.23)
+	assert modified.ok, modified.errors
+	assert modified.intent.graph.mode == "modify"
+	assert _statuses(modified) == ["completed", "completed", "skipped", "skipped"]
+	assert native_world.graph.requests[1].requirement_amendment == "add auditing"
+	assert not modified.artifacts["nodes"] and not native_world.main.requests
+
+
+@pytest.fixture
+def allocated_graph_unit(tmp_path, monkeypatch):
+	"""Exercise the request wrapper without the stale world fixtures or native pools."""
+	monkeypatch.setattr(engine_module, "init_workflow_engine", lambda *args, **kwargs: None)
+	agent = AgentWorkflowEngine(storage_dir=tmp_path / "agent")
+	record = engine_module.WorkflowRecord("allocated-unit", agent.storage_dir / "allocated-unit", "main")
+	agent._records[record.workflow_id] = record
+	result = object()
+	run = Mock(return_value=result)
+	monkeypatch.setattr(agent, "run", run)
+	try:
+		yield SimpleNamespace(agent=agent, record=record, run=run, result=result)
+	finally:
+		agent.close()
+
+
+def test_allocated_graph_creates_from_prompt_without_cascade(allocated_graph_unit):
+	unit = allocated_graph_unit
+	prompt = "Collect and publish tickets"
+
+	result = unit.agent.build_allocated_workflow_json(unit.record.workflow_id, prompt, temperature=0.17)
+
+	assert result is unit.result
+	unit.run.assert_called_once()
+	request = unit.run.call_args.args[0]
+	assert isinstance(request, AgentRequest)
+	assert request.intent == AgentIntent(
+		workflow_id=unit.record.workflow_id, requirement=prompt, graph=StagePlan("create"),
+	)
+	assert request.cascade is False
+	assert request.temperature == 0.17
+
+
+def test_allocated_graph_modifies_existing_graph_without_cascade(allocated_graph_unit):
+	unit = allocated_graph_unit
+	unit.record.graph_path.parent.mkdir(parents=True)
+	unit.record.graph_path.write_text(json.dumps({"nodes": [{"name": "Collect"}]}), encoding="utf-8")
+	unit.record.requirement_path.write_text("# Existing requirements", encoding="utf-8")
+	prompt = "Add priority to collected tickets"
+
+	result = unit.agent.build_allocated_workflow_json(unit.record.workflow_id, prompt, temperature=0.23)
+
+	assert result is unit.result
+	unit.run.assert_called_once()
+	request = unit.run.call_args.args[0]
+	assert isinstance(request, AgentRequest)
+	assert request.intent == AgentIntent(
+		workflow_id=unit.record.workflow_id, graph=StagePlan("modify", prompt),
+	)
+	assert request.cascade is False
+	assert request.temperature == 0.23
+
+
+@pytest.mark.parametrize("existing_artifact", ["graph", "requirement"])
+def test_allocated_graph_rejects_partial_artifacts_without_overwriting(allocated_graph_unit, existing_artifact):
+	unit = allocated_graph_unit
+	path = unit.record.graph_path if existing_artifact == "graph" else unit.record.requirement_path
+	path.parent.mkdir(parents=True)
+	content = '{"nodes": [{"name": "Collect"}]}' if existing_artifact == "graph" else "# Existing requirements"
+	path.write_text(content, encoding="utf-8")
+
+	with pytest.raises(ValueError):
+		unit.agent.build_allocated_workflow_json(unit.record.workflow_id, "Do not overwrite")
+
+	unit.run.assert_not_called()
+	assert path.read_text(encoding="utf-8") == content
+	missing = unit.record.requirement_path if existing_artifact == "graph" else unit.record.graph_path
+	assert not missing.exists()
+
+
+@pytest.mark.parametrize("prompt", ["", " \t\n"])
+@pytest.mark.parametrize("has_graph", [False, True])
+def test_allocated_graph_rejects_empty_prompt(allocated_graph_unit, prompt, has_graph):
+	unit = allocated_graph_unit
+	if has_graph:
+		unit.record.graph_path.parent.mkdir(parents=True)
+		unit.record.graph_path.write_text('{"nodes": [{"name": "Collect"}]}', encoding="utf-8")
+		unit.record.requirement_path.write_text("# Existing requirements", encoding="utf-8")
+
+	with pytest.raises(ValueError, match="prompt"):
+		unit.agent.build_allocated_workflow_json(unit.record.workflow_id, prompt)
+
+	unit.run.assert_not_called()
+
+
+class _PauseOrchestrator:
+	"""Minimal orchestrator: pause once at Reply's gate, then publish the stage."""
+
+	def __init__(self, workflow_id: str) -> None:
+		self.workflow_id = workflow_id
+		self.workflow_version = 1
+		self.generated_node_id_map = {}
+		self.last_logs = SimpleNamespace(test={}, audit={})
+		self.last_stage_output = None
+		self.started, self.resumed, self.closed = [], [], []
+
+	def get_workflow_version(self):
+		return SimpleNamespace(version=1, node_versions={})
+
+	def start(self, request, agent_state=None):
+		self.started.append(request)
+		self.last_logs.test["Reply"] = "pytest FAILED for Reply"
+		return orchestrator_module.OrchestratorRun(
+			request_id="r1", status="awaiting_input",
+			awaiting={"id": "Reply__amend_node", "title": "Amend Reply", "prompt": "Fix Reply"},
+		)
+
+	def resume(self, request_id, step_id, value):
+		self.resumed.append((request_id, step_id, value))
+		stage = {"attempts": 1, "error": "", "changed": True, "artifacts": {}}
+		self.last_stage_output = {
+			"workflow_id": self.workflow_id, "intent": None, "error": "",
+			"stages": {
+				"reformat": {"stage": "reformat", "status": "completed", **stage},
+				"graph": {"stage": "graph", "status": "completed", **stage},
+				"nodes": {"stage": "nodes", "status": "completed", **stage},
+				"main": {"stage": "main", "status": "completed", **stage},
+			},
+		}
+		return orchestrator_module.OrchestratorRun(
+			request_id=request_id, status="completed", version=SimpleNamespace(version=1),
+		)
+
+	def close(self, request_id=None):
+		self.closed.append(request_id)
+
+
+def _pause_agent(tmp_path, monkeypatch):
+	monkeypatch.setattr(engine_module, "init_workflow_engine", lambda classes, config, **_: _InlineEngine(classes, config))
+	monkeypatch.setattr(engine_module, "close_workflow_engine", lambda engine: None)
+	monkeypatch.setattr(engine_module, "GRAPH_GENERATION_WORKFLOW", SimpleNamespace())
+	monkeypatch.setattr(engine_module, "MAIN_ENTRYPOINT_GENERATION_WORKFLOW", SimpleNamespace())
+	agent = AgentWorkflowEngine(storage_dir=tmp_path / "agent")
+	record = agent.resolve_record(None)
+	record.graph_path.parent.mkdir(parents=True, exist_ok=True)
+	record.graph_path.write_text(json.dumps({"nodes": [{"name": "Reply"}]}), encoding="utf-8")
+	real = engine_module.ORCHESTRATORS.pop(record.workflow_id)
+	real.close()
+	fake = _PauseOrchestrator(record.workflow_id)
+	engine_module.ORCHESTRATORS[record.workflow_id] = fake
+	request = AgentRequest(
+		workflow_id=record.workflow_id,
+		intent=AgentIntent(workflow_id=record.workflow_id, nodes=StagePlan("create")),
+		await_repair_input=True,
+	)
+	return agent, fake, request
+
+
+def test_a_failed_node_test_pauses_the_build_and_answer_resumes_it(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	try:
+		paused = agent.run(request)
+
+		assert paused.status == "input_required" and paused.ok
+		assert paused.request_id == "r1"
+		assert paused.awaiting["stepId"] == "Reply__amend_node"
+		assert paused.awaiting["node"] == "Reply"
+		assert paused.awaiting["test_log"] == "pytest FAILED for Reply"
+		assert paused.stages["nodes"].status == "awaiting"
+		assert fake.started[0].await_repair_input is True
+
+		with pytest.raises(RuntimeError, match="waiting for input"):
+			agent.run(request)
+		assert agent.pending_requests()[0]["request_id"] == "r1"
+
+		done = agent.answer("r1", "use a fallback", "Reply__amend_node")
+
+		assert done.status == "completed" and done.ok
+		assert _statuses(done) == ["completed"] * 4
+		assert fake.resumed == [("r1", "Reply__amend_node", "use a fallback")]
+		assert agent.pending_requests() == []
+	finally:
+		agent.close()
+
+
+def test_abort_releases_a_paused_build(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	try:
+		assert agent.run(request).status == "input_required"
+
+		agent.abort("r1")
+
+		assert fake.closed == ["r1"]
+		assert agent.pending_requests() == []
+	finally:
+		agent.close()
+
+
+def test_recovery_state_distinguishes_paused_and_native_cleanup(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	try:
+		assert agent.build_recovery_state(request.workflow_id)["status"] == "clear"
+		paused = agent.run(request)
+		state = agent.build_recovery_state(request.workflow_id)
+		assert state["status"] == "input_required" and state["request_id"] == paused.request_id
+		agent.abort(paused.request_id)
+		fake._pending = {"native-id": object()}
+		assert agent.build_recovery_state(request.workflow_id)["status"] == "cleanup_required"
+	finally:
+		agent.close()
+
+
+def test_abort_can_retry_if_native_cancellation_fails(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	close = fake.close
+
+	def fail_close(request_id=None):
+		raise RuntimeError("cancellation failed")
+
+	try:
+		agent.run(request)
+		monkeypatch.setattr(fake, "close", fail_close)
+		with pytest.raises(RuntimeError, match="cancellation failed"):
+			agent.abort("r1")
+		assert [item["request_id"] for item in agent.pending_requests()] == ["r1"]
+		monkeypatch.setattr(fake, "close", close)
+		agent.abort("r1")
+		assert fake.closed == ["r1"]
+		assert agent.pending_requests() == []
+	finally:
+		monkeypatch.setattr(fake, "close", close)
+		agent.close()
+
+
+def test_answer_defaults_to_the_current_waiting_step(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	try:
+		paused = agent.run(request)
+		# Caller-visible payloads are copies, not the retained waiting metadata.
+		paused.awaiting["stepId"] = "wrong"
+		agent.pending_requests()[0]["awaiting"]["stepId"] = "wrong"
+		result = agent.answer("r1", "repair it")
+		assert result.status == "completed" and result.ok
+		assert fake.resumed == [("r1", "Reply__amend_node", "repair it")]
+	finally:
+		agent.close()
+
+
+def test_node_start_exception_retries_then_pauses(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	starts, original_start = [], fake.start
+
+	def fail_once(build, agent_state=None):
+		starts.append(agent_state["agent_nodes_attempt"])
+		if len(starts) == 1:
+			raise RuntimeError("temporary node start failure")
+		return original_start(build, agent_state)
+
+	monkeypatch.setattr(fake, "start", fail_once)
+	try:
+		paused = agent.run(replace(request, max_retries={"nodes": 1}))
+		assert paused.status == "input_required"
+		assert paused.stages["nodes"].attempts == 2
+		assert starts == [1, 2]
+		assert agent.answer(paused.request_id).ok
+		assert agent.pending_requests() == []
+	finally:
+		agent.close()
+
+
+def test_exhausted_node_start_errors_report_blocked_unobserved_head(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	starts = []
+
+	def always_fail(build, agent_state=None):
+		starts.append(agent_state["agent_nodes_attempt"])
+		raise RuntimeError("cannot initialize nodes")
+
+	monkeypatch.setattr(fake, "start", always_fail)
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 2}))
+		assert starts == [1, 2, 3]
+		assert not result.ok and result.status == "completed"
+		assert _statuses(result) == ["blocked", "blocked", "failed", "blocked"]
+		assert result.stages["nodes"].attempts == 3
+		assert result.errors == {"nodes": "RuntimeError: cannot initialize nodes"}
+		assert agent.record(request.workflow_id).errors == result.errors
+		assert agent.pending_requests() == []
+	finally:
+		agent.close()
+
+
+def test_node_failure_uses_observed_head_context(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	observed = {
+		"workflow_id": request.workflow_id,
+		"intent": request.intent.to_dict(),
+		"stages": {
+			"reformat": engine_module.StageOutcome("reformat", "completed", 1).to_dict(),
+			"graph": engine_module.StageOutcome("graph", "skipped").to_dict(),
+		},
+		"error": "",
+	}
+
+	def fail_after_head(build, agent_state=None):
+		fake.last_stage_output = observed
+		raise RuntimeError("failure after the head")
+
+	monkeypatch.setattr(fake, "start", fail_after_head)
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 0}))
+		assert _statuses(result) == ["completed", "skipped", "failed", "blocked"]
+		assert result.intent == request.intent
+		assert result.errors == {"nodes": "RuntimeError: failure after the head"}
+	finally:
+		agent.close()
+
+
+def test_head_failure_blocks_nodes_without_spending_node_retries(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	starts = []
+
+	def fail_head(build, agent_state=None):
+		starts.append(agent_state["agent_nodes_attempt"])
+		record = agent.record(request.workflow_id)
+		record.errors["graph"] = "graph planning failed"
+		fake.last_stage_output = {
+			"workflow_id": request.workflow_id,
+			"intent": request.intent.to_dict(),
+			"stages": {
+				"reformat": engine_module.StageOutcome("reformat", "completed", 1).to_dict(),
+				"graph": engine_module.StageOutcome("graph", "failed", 1, "graph planning failed").to_dict(),
+			},
+			"error": "graph planning failed",
+		}
+		raise RuntimeError("graph planning failed")
+
+	monkeypatch.setattr(fake, "start", fail_head)
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 2}))
+		assert starts == [1]
+		assert not result.ok
+		assert _statuses(result) == ["completed", "failed", "blocked", "blocked"]
+		assert result.errors == {"graph": "graph planning failed"}
+	finally:
+		agent.close()
+
+
+def test_disabled_graph_keeps_head_context_when_body_publishes_without_steps(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	record = agent.record(request.workflow_id)
+	record.graph_path.write_text(json.dumps({"nodes": [{"name": "Reply", "enable": False}]}), encoding="utf-8")
+	monkeypatch.setattr(fake, "start", lambda *args, **kwargs: orchestrator_module.OrchestratorRun(
+		request_id="", status="completed", version=SimpleNamespace(version=1),
+	))
+	try:
+		result = agent.run(request)
+		assert result.ok
+		assert _statuses(result) == ["completed", "skipped", "completed", "skipped"]
+		assert result.intent == request.intent
+	finally:
+		agent.close()
+
+
+def test_node_start_exception_does_not_reuse_an_old_head_context(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	fake.last_stage_output = {
+		"workflow_id": request.workflow_id,
+		"intent": request.intent.to_dict(),
+		"stages": {
+			"reformat": engine_module.StageOutcome("reformat", "completed", 1).to_dict(),
+			"graph": engine_module.StageOutcome("graph", "completed", 1).to_dict(),
+		},
+		"error": "",
+	}
+
+	def fail(*args, **kwargs):
+		raise RuntimeError("failed before a new head")
+
+	monkeypatch.setattr(fake, "start", fail)
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 0}))
+		assert _statuses(result) == ["blocked", "blocked", "failed", "blocked"]
+	finally:
+		agent.close()
+
+
+def test_node_failure_with_only_node_context_blocks_unknown_head(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+
+	def fail_with_node_context(build, agent_state=None):
+		fake.last_stage_output = {
+			"stages": {"nodes": engine_module.StageOutcome("nodes", "failed", 1, "failed").to_dict()},
+			"error": "failed",
+		}
+		return orchestrator_module.OrchestratorRun(request_id="", status="failed", error="failed")
+
+	monkeypatch.setattr(fake, "start", fail_with_node_context)
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 0}))
+		assert _statuses(result) == ["blocked", "blocked", "failed", "blocked"]
+		assert result.workflow_id == request.workflow_id
+		assert result.errors == {"nodes": "failed"}
+	finally:
+		agent.close()
+
+
+@pytest.mark.parametrize("observed_stage", [False, True])
+@pytest.mark.parametrize("entry", ["start", "resume"])
+def test_exhausted_node_failure_preserves_structured_logs(tmp_path, monkeypatch, observed_stage, entry):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+
+	def fail_with_logs(request_id):
+		fake.last_logs.test["Reply"] = "pytest FAILED for Reply"
+		fake.last_logs.audit["Reply"] = "audit violation"
+		if observed_stage:
+			fake.last_stage_output = {
+				"stages": {"nodes": {"artifacts": {"other": "preserved"}}},
+				"error": "node failed",
+			}
+		return orchestrator_module.OrchestratorRun(
+			request_id=request_id, status="failed", error="node failed", failures={"Reply": "node failed"},
+		)
+
+	if entry == "start":
+		monkeypatch.setattr(fake, "start", lambda *args, **kwargs: fail_with_logs(""))
+	else:
+		monkeypatch.setattr(fake, "resume", lambda request_id, step_id, value: fail_with_logs(request_id))
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 0}))
+		if entry == "resume":
+			assert result.status == "input_required"
+			result = agent.answer(result.request_id)
+		assert result.logs == {
+			"nodes_test": {"Reply": "pytest FAILED for Reply"},
+			"nodes_audit": {"Reply": "audit violation"},
+		}
+		if observed_stage:
+			assert result.stages["nodes"].artifacts["other"] == "preserved"
+		fake.last_logs.test["Reply"] = "later test"
+		assert result.logs["nodes_test"]["Reply"] == "pytest FAILED for Reply"
+	finally:
+		agent.close()
+
+
+def test_node_start_exception_does_not_expose_previous_run_logs(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	fake.last_logs.test["Reply"] = "previous build's test"
+	fake.last_logs.audit["Reply"] = "previous build's audit"
+
+	def fail_before_new_run(*args, **kwargs):
+		raise RuntimeError("could not start")
+
+	monkeypatch.setattr(fake, "start", fail_before_new_run)
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 0}))
+		assert not result.ok
+		assert result.logs == {}
+	finally:
+		agent.close()
+
+
+def test_node_start_failure_preserves_a_completed_head_context(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	context = {
+		"workflow_id": request.workflow_id,
+		"intent": request.intent.to_dict(),
+		"stages": {
+			"reformat": engine_module.StageOutcome("reformat", "completed", 1).to_dict(),
+			"graph": engine_module.StageOutcome("graph", "skipped").to_dict(),
+		},
+		"error": "",
+	}
+
+	def fail(*args, **kwargs):
+		raise RuntimeError("failed")
+
+	monkeypatch.setattr(fake, "start", fail)
+	try:
+		paused, final = agent._nodes_start(
+			replace(request, max_retries={"nodes": 0}), agent.record(request.workflow_id), context,
+			head_done=True, graph_stable=False,
+		)
+		assert paused is None
+		result = agent._result(request, final)
+		assert _statuses(result) == ["completed", "skipped", "failed", "blocked"]
+		assert result.intent == request.intent
+		assert result.errors == {"nodes": "RuntimeError: failed"}
+	finally:
+		agent.close()
+
+
+def test_node_start_does_not_swallow_base_exception(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+
+	def interrupted(*args, **kwargs):
+		raise KeyboardInterrupt()
+
+	monkeypatch.setattr(fake, "start", interrupted)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			agent.run(request)
+		assert agent.pending_requests() == []
+	finally:
+		agent.close()
+
+
+def test_node_start_does_not_retry_when_native_cleanup_failed(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	starts = []
+
+	def fail_cleanup(build, agent_state=None):
+		starts.append(agent_state["agent_nodes_attempt"])
+		fake._pending = {"native-request": object()}
+		raise RuntimeError("native cancellation failed")
+
+	monkeypatch.setattr(fake, "start", fail_cleanup)
+	try:
+		with pytest.raises(RuntimeError, match="native cancellation failed"):
+			agent.run(replace(request, max_retries={"nodes": 2}))
+		assert starts == [1]
+	finally:
+		agent.close()
+
+
+def test_large_node_retry_budget_does_not_recurse(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	starts = []
+
+	def always_fail(build, agent_state=None):
+		starts.append(agent_state["agent_nodes_attempt"])
+		return orchestrator_module.OrchestratorRun(request_id="", status="failed", error="still failing")
+
+	monkeypatch.setattr(fake, "start", always_fail)
+	try:
+		result = agent.run(replace(request, max_retries={"nodes": 1500}))
+		assert len(starts) == 1501
+		assert starts[0] == 1 and starts[-1] == 1501
+		assert result.stages["nodes"].attempts == 1501
+		assert result.errors == {"nodes": "still failing"}
+	finally:
+		agent.close()
+
+
+def test_pause_failure_retries_with_node_feedback_and_new_request_id(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	starts, original_start, original_resume = [], fake.start, fake.resume
+
+	def start(build, agent_state=None):
+		starts.append((build, agent_state["agent_nodes_attempt"]))
+		if len(starts) == 1:
+			return original_start(build, agent_state)
+		return orchestrator_module.OrchestratorRun(
+			request_id="r2", status="awaiting_input", awaiting={"id": "Reply__amend_node"},
+		)
+
+	def resume(request_id, step_id, value):
+		if request_id == "r1":
+			fake.resumed.append((request_id, step_id, value))
+			fake.last_logs.test["Reply"] = "assertion failed after repair"
+			return orchestrator_module.OrchestratorRun(
+				request_id=request_id, status="failed", error="node tests failed",
+				failures={"Reply": "node tests failed"},
+			)
+		return original_resume(request_id, step_id, value)
+
+	monkeypatch.setattr(fake, "start", start)
+	monkeypatch.setattr(fake, "resume", resume)
+	try:
+		first = agent.run(replace(request, max_retries={"nodes": 1}))
+		second = agent.answer(first.request_id, "first answer")
+		assert second.status == "input_required" and second.request_id == "r2"
+		assert second.stages["nodes"].attempts == 2
+		assert [attempt for _, attempt in starts] == [1, 2]
+		feedback = starts[1][0].node_amendments["Reply"]
+		assert "node tests failed" in feedback and "assertion failed after repair" in feedback
+		assert [item["request_id"] for item in agent.pending_requests()] == ["r2"]
+		done = agent.answer("r2", "second answer")
+		assert done.ok and done.status == "completed"
+		assert fake.resumed == [
+			("r1", "Reply__amend_node", "first answer"),
+			("r2", "Reply__amend_node", "second answer"),
+		]
+		assert agent.pending_requests() == []
+	finally:
+		agent.close()
+
+
+def test_paused_build_keeps_its_original_retry_budget(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	retries = {"nodes": 0}
+	request = replace(request, max_retries=retries)
+
+	def fail_resume(request_id, step_id, value):
+		return orchestrator_module.OrchestratorRun(
+			request_id=request_id, status="failed", error="test still fails",
+			failures={"Reply": "test still fails"},
+		)
+
+	monkeypatch.setattr(fake, "resume", fail_resume)
+	try:
+		paused = agent.run(request)
+		retries["nodes"] = 9
+		result = agent.answer(paused.request_id)
+		assert not result.ok and result.stages["nodes"].attempts == 1
+		assert len(fake.started) == 1
+		assert "test still fails" in result.errors["nodes/Reply"]
+	finally:
+		agent.close()
+
+
+@pytest.mark.parametrize("cleanup_pending", [False, True])
+def test_resume_exception_retries_unless_cleanup_failed(
+	tmp_path, monkeypatch, cleanup_pending,
+):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	request = replace(request, max_retries={"nodes": 0})
+
+	def fail_resume(request_id, step_id, value):
+		if cleanup_pending:
+			fake._pending = {request_id: object()}
+		raise RuntimeError("resume failed")
+
+	monkeypatch.setattr(fake, "resume", fail_resume)
+	try:
+		agent.run(request)
+		if cleanup_pending:
+			with pytest.raises(RuntimeError, match="resume failed"):
+				agent.answer("r1", "answer")
+			assert len(agent.pending_requests()) == 1
+			agent.abort("r1")
+			assert fake.closed == ["r1"]
+		else:
+			result = agent.answer("r1", "answer")
+			assert not result.ok
+			assert result.errors == {"nodes": "RuntimeError: resume failed"}
+		assert agent.pending_requests() == []
+	finally:
+		agent.close()
+
+
+def test_resume_exception_starts_a_fresh_attempt(tmp_path, monkeypatch):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+	starts, original_start = [], fake.start
+
+	def start(build, agent_state=None):
+		starts.append(agent_state["agent_nodes_attempt"])
+		if len(starts) == 1:
+			return original_start(build, agent_state)
+		return orchestrator_module.OrchestratorRun(
+			request_id="r2", status="awaiting_input", awaiting={"id": "Reply__amend_node"},
+		)
+
+	def fail_resume(*args):
+		raise RuntimeError("native resume failed")
+
+	monkeypatch.setattr(fake, "start", start)
+	monkeypatch.setattr(fake, "resume", fail_resume)
+	try:
+		first = agent.run(replace(request, max_retries={"nodes": 1}))
+		second = agent.answer(first.request_id)
+		assert second.status == "input_required" and second.request_id == "r2"
+		assert second.stages["nodes"].attempts == 2
+		assert starts == [1, 2]
+		assert [item["request_id"] for item in agent.pending_requests()] == ["r2"]
+		agent.abort("r2")
+	finally:
+		agent.close()
+
+
+@pytest.mark.parametrize("cleanup_pending", [False, True])
+def test_resume_base_exception_propagates_and_keeps_only_live_pending(tmp_path, monkeypatch, cleanup_pending):
+	agent, fake, request = _pause_agent(tmp_path, monkeypatch)
+
+	def interrupted(request_id, step_id, value):
+		if cleanup_pending:
+			fake._pending = {request_id: object()}
+		raise KeyboardInterrupt()
+
+	monkeypatch.setattr(fake, "resume", interrupted)
+	try:
+		agent.run(request)
+		with pytest.raises(KeyboardInterrupt):
+			agent.answer("r1")
+		assert bool(agent.pending_requests()) is cleanup_pending
+		if cleanup_pending:
+			agent.abort("r1")
+	finally:
+		agent.close()

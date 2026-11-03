@@ -11,10 +11,12 @@
 # Modified 2026-10-14: own one initialized workflow per service; accept all run state in requests.
 # Modified 2026-10-15: repair results use the unified request model.
 # Modified 2026-10-16: remove the workflow service wrappers; AgentBuilder owns those workflows directly.
+# Modified 2026-11-03: isolate service subprocess output from MCP stdio.
 from __future__ import annotations
 
 import ast
 import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -82,6 +84,7 @@ class RuntimeService:
             backend_command,
             cwd=str(main_path.parent),
             env=os.environ.copy(),
+            stdout=subprocess.DEVNULL,
         )
         return process, {
             "pid": getattr(process, "pid", None),

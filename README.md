@@ -1,4 +1,7 @@
 <a name="readme-top"></a>
+<!-- Modified 2026-11-02: clarify SDK repair behavior and paused-result fields. -->
+<!-- Modified 2026-11-03: document workflow-indexed background builds and review. -->
+<!-- Modified 2026-11-03: document the background-only MCP build interface. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -46,7 +49,7 @@ FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 - **[2026.10.24]** ⚙️ **WorkflowEngine-native generation.** Graph, node, and entrypoint workflows are now `WorkflowEngine` subclasses.
 - **[2026.10.22]** 🚀 **Interactive runtime.** `run_service` returns a connectable `base_url`; MCP adds `run_step` and `reset_session`.
 - **[2026.10.20]** 🛠️ **Guided node repair.** A failed node test can be amended with user guidance before it is retried.
-- **[2026.10.19]** 🔁 **Evolve API.** `evolve` / `evolve_workflow` can target the whole workflow, a single node, or let the engine decide.
+- **[2026.10.19]** 🔁 **Evolve API.** SDK `evolve` and MCP workflow evolution can target the whole workflow, a single node, or let the engine decide.
 
 <a name="why-flowx"></a>
 ## 🌟 Why FlowX?
@@ -263,7 +266,16 @@ Return the category, priority, and draft reply as structured output.
 
 ### 2. Build and inspect
 
-The agent calls `build_workflow` (or `build_workflow_json`, `build_nodes`, and `build_main_entrypoint` one stage at a time) to create the graph, node implementations, and backend. Use `list_workflows`, `list_nodes`, and `get_workflow` to inspect workflow ids, node ids, and artifact locations. Exact step IDs come from the generated workflow—not from a fixed demo schema.
+Call `create_workflow` to allocate an empty workflow, then choose `start_new_workflow(workflow_id, prompt)` to build the whole workflow, or `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` to build only its graph and requirement analysis. The graph tool also modifies an existing workflow. For a staged build, follow it with `start_build_nodes` and `start_build_main_entrypoint(workflow_id, amendment='', fastapi_port=8000, smoke_test=false)` as needed. For an existing workflow, `start_build_workflow` and `start_evolve_workflow` can build or evolve multiple stages. Use `list_workflows`, `list_nodes`, and `get_workflow` to inspect workflow ids, node ids, and artifact locations. Exact step IDs come from the generated workflow—not from a fixed demo schema.
+
+All MCP builds run in the background and return immediately. Poll `get_build_status(workflow_id)` until the build completes, fails, requires input, or needs recovery; inspect the final result for stage errors. Top-level `ok` means the status query succeeded, not that the build succeeded: check `status` and `result.ok`. When it returns `input_required`, show `awaiting.prompt` and `awaiting.test_log` and ask the user. Resume with `submit_background_build_input`, supplying the exact `workflow_id`, `revision`, `request_id`, `awaiting.stepId` as `step_id`, and the user's `input`; then poll again. Guidance amends the node, `test: <guidance>` amends its test, `skip` skips the amendment, and an empty answer uses the test log alone. Use `abort_background_build` with the exact `workflow_id`, `revision`, and `request_id` to abandon a paused build. For `recovery_required`, call `recover_background_build` with the exact `workflow_id` and `revision` before attempting another build.
+
+Status represents the latest build for a workflow and is stored only in the MCP server process; after a server restart the prior in-memory build cannot be resumed. The engine allows one active build across workflows; a paused build holds that slot. For background tools that support `interactive`, it defaults to `true`; `interactive=false` amends from the test log without asking. `list_pending_builds` only reports paused background builds and can recover a question after a timeout or client restart only while the original server process remains alive. The host decides whether to poll and how to display results.
+
+> [!IMPORTANT]
+> **Breaking change for MCP clients:** synchronous MCP tools `build_workflow_json`, `build_nodes`, `build_main_entrypoint`, `build_workflow`, `evolve_workflow`, `submit_build_input`, and `abort_build` are removed. Migrate to the corresponding `start_*` and background input/abort tools and poll for results. Creating a workflow now requires `create_workflow` before starting a build. The Python SDK's synchronous build methods remain available. Finish or abort any old synchronous paused build using the old server before upgrading; do not restart an active build just to upgrade.
+
+If `recover_background_build` continues to report native candidate cleanup is required, it does not delete files or release the writer slot automatically. Stop the original server, confirm that no other writer is active, and inspect unpublished candidates as described in the [dynamic workflow documentation](docs/DYNAMIC_WORKFLOW.md). If a graph-only build leaves just one of the requirement or graph files, `start_build_workflow_json` refuses to overwrite the partial plan; inspect the artifacts and use an appropriate existing-workflow repair rather than retrying creation blindly. If neither file was written, the original create request can be retried after confirming no writer or retained candidate remains.
 
 ### 3. Run, evolve, and reuse
 
@@ -274,7 +286,7 @@ Update the draft_reply node: for urgent tickets, include an escalation note.
 Then rerun the service.
 ```
 
-`run_service` starts or restarts the generated service. `run_step` feeds one step's input to the running service and reports when the workflow pauses for more input; `reset_session` cancels a paused run. `evolve_workflow` changes the whole workflow (`target="workflow"`), one node (a step id or node id from `list_nodes`), or lets the engine decide.
+`run_service` starts or restarts the generated service. `run_step` feeds one step's input to the running service and reports when the workflow pauses for more input; `reset_session` cancels a paused run. `start_evolve_workflow` changes the whole workflow (`target="workflow"`), one node (a step id or node id from `list_nodes`), or lets the engine decide; poll its background build as above.
 
 This is the distinction: the agent does not only answer the ticket. It builds and evolves the process for handling the next one.
 
@@ -285,17 +297,23 @@ These MCP tools let the host agent operate the workflow layer from the same conv
 
 | Category | Tool | Purpose |
 | --- | --- | --- |
-| Build | `build_workflow_json` | Create (no `workflow_id`) or modify `workflow.json` together with its requirement analysis. |
-| Build | `build_nodes` | Build a workflow's nodes, or amend specific nodes by step id; unchanged nodes are reused. |
-| Build | `build_main_entrypoint` | Create or regenerate the main entrypoint from the latest nodes. |
-| Build | `build_workflow` | Create or modify the whole workflow from a request and/or run logs; later stages follow earlier changes. |
-| Build | `evolve_workflow` | Evolve an existing workflow (`target="workflow"`) or one node (step id or node id) with a change command; without `target` the engine decides. |
+| Background | `create_workflow` | Allocate an empty workflow and return its `workflow_id`. |
+| Background | `start_new_workflow` | Start building an allocated empty workflow and immediately return. |
+| Background | `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` | Create the graph and requirement analysis for an allocated empty workflow or modify them for an existing workflow; does not build nodes or the entrypoint. |
+| Background | `start_build_nodes` | Build nodes or amend specific nodes by step id; unchanged nodes are reused. |
+| Background | `start_build_main_entrypoint(workflow_id, amendment='', fastapi_port=8000, smoke_test=false)` | Create or regenerate the main entrypoint from the latest nodes, optionally smoke-testing it. |
+| Background | `start_build_workflow` | Modify an existing workflow from a request and/or run logs; later stages can follow earlier changes. |
+| Background | `start_evolve_workflow` | Evolve an existing workflow (`target="workflow"`) or one node (step id or node id); without `target` the engine decides. |
+| Background | `get_build_status` | Query the latest in-process status and any review question by `workflow_id`. |
+| Background | `submit_background_build_input` | Guard and accept an answer for a paused build, resume in the background, and return immediately. |
+| Background | `abort_background_build`, `recover_background_build` | Abort a paused build or recheck an uncertain engine state. |
+| Background | `list_pending_builds` | List paused background builds and their awaiting questions; recover `request_id` and `revision` after a timeout or client restart while the server remains alive. |
 | Runtime | `run_service` | Run a built workflow as a service and return its `base_url`; calling it again reruns the service with the latest files. |
 | Runtime | `run_step` | Feed one step's input to the running service; returns `awaiting` when the workflow pauses for more input. |
 | Runtime | `reset_session` | Cancel a paused session so the next `run_step` starts a fresh run. |
 | Runtime | `stop_service` | Stop a workflow's running service. |
 | Inspection | `list_workflows` | List workflow ids with their node ids, versions and unresolved errors. |
-| Inspection | `list_nodes` | List a workflow's nodes as step id, node id and version; use them as `evolve_workflow` targets. |
+| Inspection | `list_nodes` | List a workflow's nodes as step id, node id and version; use them as `start_evolve_workflow` targets. |
 | Inspection | `get_workflow` | Locate a workflow's requirement, `workflow.json`, node versions and main entrypoint. |
 
 <a name="python-sdk"></a>
@@ -311,15 +329,15 @@ with FlowXClient(workspace="./workflows") as flowx:
         "Build a workflow that categorizes and prioritizes support tickets.",
     ).raise_for_failure()                                  # workflow.json + requirements
     workflow_id = created.workflow_id
-    flowx.build_nodes(workflow_id).raise_for_failure()     # all nodes, or {step_id: amendment}
+    flowx.build_nodes(workflow_id, await_repair_input=False).raise_for_failure()  # all nodes, or {step_id: amendment}
     flowx.build_main_entrypoint(workflow_id).raise_for_failure()
-    flowx.build_workflow("Also return a summary.", workflow_id=workflow_id)  # whole engine
+    flowx.build_workflow("Also return a summary.", workflow_id=workflow_id, await_repair_input=False)  # whole engine
     print(flowx.run_service(workflow_id))                  # run / rerun as a service
 ```
 
 Each build call returns an `AgentResult` with per-stage outcomes, unresolved errors, logs and artifact paths; stage failures are reported there rather than raised.
 
-Pass `repair_input_callback=...` to `build_nodes`, `build_workflow`, or `evolve` to guide a node's amendment after its test fails. The callback receives a `NodeRepairInput` with the node step id, attempt number, pytest log and test result, and returns guidance to combine with the log, `"skip"` to skip the amendment, or `""` to use the log alone. A runnable walkthrough is in [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py).
+`build_nodes`, `build_workflow` and `evolve` pause at a node's own gate when its test fails (`await_repair_input` defaults to `True`). The result then has `status="input_required"`, a `request_id`, and `awaiting` with step metadata, `stepId`, `node`, `workflow_id`, `test_log` (up to its last 6,000 characters) and `test_log_chars` (the full log length). Answer it with `flowx.answer(request_id, input, awaiting["stepId"])`. A paused result can have `ok=True`, so `raise_for_failure()` alone does not establish completion. Guidance amends the node (the default), `input="test: <guidance>"` fixes the generated test instead, `input="skip"` skips the amendment, and `""` amends the node from the log alone. Pass `await_repair_input=False` to amend from the test log automatically. A runnable walkthrough is in [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py).
 
 To change an existing workflow, choose what to evolve with `evolve(workflow_id, command, target=...)`. `list_nodes` returns each node's step id and node id to use as a target; without a `target` the engine decides what the command refers to. A runnable walkthrough is in [examples/sdk_evolve.py](examples/sdk_evolve.py).
 

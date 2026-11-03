@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: 2026 FlowX contributors
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
+# Modified 2026-11-01: the amend gate can target the generated test; the node stays the default.
+# Modified 2026-11-01: an initial audit failure enters the repair loop and is amended from its violations.
 """Expanded business-node graph with per-node request namespaces.
 
 Every business node is expanded into its generation, guard, repair-loop and
@@ -16,7 +18,7 @@ import uuid
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from graphlib import TopologicalSorter
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 from ag_ui_workflow import (
 	GraphSpec,
@@ -65,16 +67,6 @@ EXPANDED_STEP_SUFFIXES = (
 )
 
 
-@dataclass(frozen=True)
-class NodeRepairInput:
-	"""The fresh node-test result offered to the caller for amendment guidance."""
-
-	node_name: str
-	attempt: int
-	test_log: str
-	test_result: Mapping[str, Any] | None
-
-
 @dataclass
 class NodeBuildNamespace:
 	"""All request-local data for one business node expansion."""
@@ -97,21 +89,6 @@ class NodeBuildNamespace:
 	error: str = ""
 	generation_state: dict[str, Any] = field(default_factory=dict)
 	repair_state: dict[str, Any] = field(default_factory=dict)
-	repair_attempt: int = 0
-	repair_callback: Callable[[NodeRepairInput], str] | None = None
-
-	def repair_guidance(self, request: NodeRuntimeModifierRequest) -> str:
-		"""Invoke the caller's per-attempt repair guidance callback."""
-		if self.repair_callback is None:
-			return ""
-		self.repair_attempt += 1
-		value = self.repair_callback(NodeRepairInput(
-			node_name=self.node_name,
-			attempt=self.repair_attempt,
-			test_log=request.test_log,
-			test_result=request.test_result,
-		))
-		return "" if value is None else str(value)
 
 
 def _audit_text(violations: list[Any]) -> str:
@@ -267,44 +244,41 @@ def _amend_scoped_class(
 	)
 
 	class ScopedAmend(base):
+		TITLE = f"Amend {node_name} after a failed test"
+		PROMPT = (
+			f"{node_name} failed its test. Reply 'test: <guidance>' (or '测试: <guidance>') "
+			"to fix the generated test, any other text to amend the node (the default), "
+			"'skip' to skip this amendment, or an empty string to amend the node from the "
+			"log alone."
+		)
+
 		def wait_function(self) -> bool:
-			"""The expanded graph resolves guidance in process_input, not a native pause."""
+			"""The node's own gate: pause until this pass has an answer."""
 			param = self.get_workflow_param()
 			namespace = get_namespace(param.state, self.NODE_KEY)
 			request = namespace.repair_state.get("node_runtime_modifier")
 			with param.condition:
-				if _skip_stage(namespace, "amend_node"):
-					param.set_state(self.STEP_ID, "running")
-					return True
-				if not isinstance(request, NodeRuntimeModifierRequest):
-					param.set_state(self.STEP_ID, "running")
-					return True
-				if request.skip_amend_node or (
-					request.test_result is not None and request.test_result["ok"]
+				if _skip_stage(namespace, "amend_node") or not isinstance(
+					request, NodeRuntimeModifierRequest
 				):
 					param.set_state(self.STEP_ID, "running")
 					return True
-				param.set_state(self.STEP_ID, "running")
-				return True
+				if (
+					request.skip_amend_node
+					or (request.test_result is not None and request.test_result["ok"])
+					or not request.await_input
+				):
+					param.set_state(self.STEP_ID, "running")
+					return True
+				ready = self.STEP_ID in param.inputs
+				param.set_state(self.STEP_ID, "running" if ready else "awaiting_input")
+				return ready
 
 		def process_input(self, user_input, dependency_results, session_state):
-			namespace = get_namespace(session_state, self.NODE_KEY)
-			if _skip_stage(namespace, "amend_node"):
-				return StepRunOutput(
-					card={"status": "skipped", "node_name": self.NODE_KEY},
-					derived={"skipped": True},
-				)
-			request = namespace.repair_state.get("node_runtime_modifier")
-			if (
-				isinstance(request, NodeRuntimeModifierRequest)
-				and not user_input
-				and request.test_result is not None
-				and not request.test_result["ok"]
-				and not request.skip_amend_node
-			):
-				guidance = namespace.repair_guidance(request)
-				if guidance:
-					user_input = guidance
+			# Each repair pass consumes its answer; the next pass must ask again.
+			param = self.get_workflow_param()
+			with param.condition:
+				param.inputs.pop(self.STEP_ID, None)
 			return super().process_input(
 				user_input,
 				dependency_results,
@@ -407,7 +381,12 @@ def _amend_from_audit_class(
 
 
 class _RepairAuditGuard(WorkflowStepNode):
-	"""Stop the repair branch when generation's audit did not pass."""
+	"""Record generation's audit; the repair loop repairs a failure from its log.
+
+	An initial audit failure must not disable the repair branch: the loop audits
+	the amended source and ``amend_from_audit`` repairs it within the same
+	bounded retry budget a failing test gets.
+	"""
 
 	INPUT_REQUIRED = False
 	NODE_KEY = ""
@@ -422,15 +401,11 @@ class _RepairAuditGuard(WorkflowStepNode):
 			)
 		audit = dependency_results.get(f"{self.NODE_KEY}__node_audit")
 		ok = bool(audit and audit.derived.get("ok"))
-		namespace.repair_enabled = ok
-		request = namespace.repair_state.get("node_runtime_modifier")
-		if not ok and isinstance(request, NodeRuntimeModifierRequest):
-			request.skip_generate_node_test = True
-			request.skip_run_node_test = True
-			request.skip_amend_node = True
+		# ``repair_enabled`` was prepared from dirty/run_runtime_modifier. Keep it
+		# untouched: an audit failure is repaired by ``amend_from_audit``.
 		return StepRunOutput(
-			card={"kind": "repair-audit-guard", "status": "passed" if ok else "skipped"},
-			derived={"audit_ok": ok, "repair_enabled": ok},
+			card={"kind": "repair-audit-guard", "status": "passed" if ok else "repairing"},
+			derived={"audit_ok": ok, "repair_enabled": namespace.repair_enabled},
 		)
 
 
@@ -538,7 +513,6 @@ def _prepare_namespace(run: Any, namespace: NodeBuildNamespace) -> None:
 	namespace.skip_generation = not request.run_node_generation
 	namespace.skip_repair = not request.run_runtime_modifier or not dirty
 	namespace.repair_enabled = dirty and request.run_runtime_modifier
-	namespace.repair_callback = request.repair_input_callback
 
 	if dirty:
 		for path in targets.values():
@@ -609,6 +583,7 @@ def _prepare_namespace(run: Any, namespace: NodeBuildNamespace) -> None:
 		skip_generate_node_test=skip_repair or test_exists,
 		skip_run_node_test=skip_repair,
 		skip_amend_node=skip_repair,
+		await_input=request.await_repair_input,
 		state=dict(request.state),
 	)
 	modifier_request = prepare_request(modifier_request)
@@ -1550,6 +1525,5 @@ __all__ = [
 	"NAMESPACE_KEY",
 	"ExpandedWorkflowEngine",
 	"NodeBuildNamespace",
-	"NodeRepairInput",
 	"build_expanded_engine",
 ]

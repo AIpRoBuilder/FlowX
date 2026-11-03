@@ -170,7 +170,7 @@ class AgentBuilder:
         return Coder(
             api_key=self.api_key, model=self.model, provider=self.provider,
             system_prompt=INTENT_SYSTEM_PROMPT,
-        ).generate_code(prompt, temperature=0.0, max_tokens=2000)
+        ).generate_code(prompt, temperature=0.0, max_tokens=20000)
 
     def build_workflow_json(self, *args: Any, **kwargs: Any) -> AgentResult:
         """Create or modify workflow.json and its requirements; see ``AgentWorkflowEngine``."""

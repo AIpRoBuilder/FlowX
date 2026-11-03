@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Modified 2026-10-22: record the service bind address and expose its connectable base URL.
+# Modified 2026-11-01: the node repair gate is on by default; answers can target the test.
+# Modified 2026-11-02: retry failed node starts iteratively and derive the waiting step from its metadata.
+# Modified 2026-11-03: build explicitly allocated empty workflows for background clients.
+# Modified 2026-11-03: create or modify allocated workflow graphs without cascading.
 """Request-driven workflow engine: reformat request -> graph plan -> nodes -> main entrypoint.
 
 The engine's own native graph runs ``reformat_request -> graph_plan``. The nodes stage and the
@@ -47,6 +51,7 @@ from flowx_core.dynamic_workflow_orchestrator import (
 	DynamicWorkflowError,
 	DynamicWorkflowOrchestrator,
 	DynamicWorkflowRequest,
+	OrchestratorRun,
 	WorkflowVersion,
 )
 from flowx_core.tools.artifact_tools import text_digest, write_json_atomic
@@ -102,6 +107,11 @@ class AgentRequest:
 
 	``target`` names what ``prompt`` evolves: ``"workflow"`` for the workflow itself, or a node
 	step id or node id of ``workflow_id`` for that node only. Without it the judge decides.
+
+	``await_repair_input`` (default ``True``) pauses a build at a failing node's ``amend_node``
+	gate and returns ``status="input_required"`` with ``request_id``/``awaiting``; answer it
+	with :meth:`AgentWorkflowEngine.answer` (``test: ...`` fixes the generated test, any other
+	text amends the node). Pass ``False`` to amend from the test log automatically.
 	"""
 
 	prompt: str = ""
@@ -118,6 +128,7 @@ class AgentRequest:
 	node_options: Mapping[str, Any] = field(default_factory=dict)
 	smoke_test_main: bool = False
 	serve: bool = False
+	await_repair_input: bool = True
 
 	def __post_init__(self) -> None:
 		if self.target is not None and (not isinstance(self.target, str) or not self.target.strip()):
@@ -140,7 +151,7 @@ class AgentRequest:
 @dataclass(frozen=True)
 class StageOutcome:
 	stage: str
-	status: Literal["completed", "skipped", "failed", "blocked"]
+	status: Literal["completed", "skipped", "failed", "blocked", "awaiting"]
 	attempts: int = 0
 	error: str = ""
 	changed: bool = False
@@ -162,6 +173,9 @@ class AgentResult:
 	logs: Mapping[str, Any]
 	artifacts: Mapping[str, Any]
 	service: Mapping[str, Any] | None = None
+	status: Literal["completed", "input_required"] = "completed"
+	request_id: str = ""
+	awaiting: Mapping[str, Any] | None = None
 
 	def raise_for_failure(self) -> AgentResult:
 		if not self.ok:
@@ -250,6 +264,13 @@ def _error_text(exc: BaseException) -> str:
 	return f"{type(exc).__name__}: {exc}"
 
 
+def _failed_run(exc: Exception, request_id: str = "") -> OrchestratorRun:
+	return OrchestratorRun(
+		request_id=request_id, status="failed", error=_error_text(exc),
+		failures=exc.failures if isinstance(exc, DynamicWorkflowError) else {},
+	)
+
+
 def _with_retries(retries: int, action: Callable[[int, str], T]) -> tuple[T | None, int, str]:
 	"""Call ``action(attempt, previous_error)`` until it returns; each failure earns one more try."""
 	error = ""
@@ -289,6 +310,24 @@ def _agent_run(session_state: Mapping[str, Any]) -> _AgentRun:
 	if not isinstance(run, _AgentRun):
 		raise TypeError("agent run is missing")
 	return run
+
+
+@dataclass
+class _PendingBuild:
+	"""A nodes stage paused at a node's own gate; it still owns its orchestrator run."""
+
+	request: AgentRequest
+	record: WorkflowRecord
+	context: dict[str, Any]
+	head_done: bool
+	graph_stable: bool
+	skipped: bool
+	amendments: dict[str, str]
+	request_id: str = ""
+	failures: dict[str, str] = field(default_factory=dict)
+	attempt_no: int = 1
+	retries: int = 1
+	awaiting: dict[str, Any] = field(default_factory=dict)
 
 
 class _ReformatStep(WorkflowStepNode):
@@ -612,7 +651,9 @@ class AgentWorkflowEngine:
 		self.log_auditor = OutputAuditor()
 		self._keep_last_versions = keep_last_versions
 		self._records: dict[str, WorkflowRecord] = {}
-		self._registry_lock, self._run_lock = RLock(), RLock()
+		self._pending: dict[str, _PendingBuild] = {}
+		self._registry_lock, self._run_lock, self._service_lock = RLock(), RLock(), RLock()
+		self._services_closed = False
 		self._closed = False
 		self._engine: FlowXWorkflowEngine | None = init_workflow_engine(
 			_HEAD_STEP_CLASSES,
@@ -745,11 +786,12 @@ class AgentWorkflowEngine:
 		)
 
 	def run(self, request: AgentRequest) -> AgentResult:
-		"""Reformat the request, then build what it asks for; stage failures are returned, not raised."""
+		"""Reformat the request, then build what it asks for; a node gate pauses the build."""
 		with self._run_lock:
 			if self._closed or self._engine is None:
 				raise RuntimeError("agent workflow engine is closed")
 			_published()
+			self._reject_if_pending()
 			record = self.record(request.workflow_id) if request.workflow_id else None
 			intent = request.intent
 			body_needed = True
@@ -763,46 +805,98 @@ class AgentWorkflowEngine:
 				intent is not None
 				and record is not None
 				and record.graph_path.is_file()
+				and bool(_enabled_nodes(record.graph_path))
 				and body_needed
 			)
 			if connected:
 				# The orchestrator's connected graph runs the head too: one pass when the
 				# graph stage cannot rewrite workflow.json, two when it can (the chains
 				# were built from the previous revision).
-				final = self._run_nodes_stage(
+				pending, final = self._nodes_start(
 					request, record, {},
 					head_done=False,
 					graph_stable=intent.graph.mode == "skip",
 				)
 			else:
 				head = self._engine.run_steps(state={"agent_run": _AgentRun(request, self)})
-				final = dict(head.outputs[_GRAPH_STAGE].derived)
-				if not final["error"]:
-					record = self.record(final["workflow_id"])
-					final = self._run_nodes_stage(
-						request, record, final, head_done=True, graph_stable=False,
+				context = dict(head.outputs[_GRAPH_STAGE].derived)
+				if context["error"]:
+					pending, final = None, context
+				else:
+					record = self.record(context["workflow_id"])
+					pending, final = self._nodes_start(
+						request, record, context, head_done=True, graph_stable=False,
 					)
-			stages = {name: StageOutcome(**data) for name, data in final["stages"].items()}
-			for name in ("nodes", "main"):
-				stages.setdefault(name, StageOutcome(name, "blocked"))
-			workflow_id = final["workflow_id"]
-			service = self.run_service(workflow_id) if request.serve and not final["error"] else None
-			errors = dict(self.record(workflow_id).errors) if workflow_id else {"reformat": stages["reformat"].error}
-			logs = {
-				name: stage.artifacts[key]
-				for name, stage, key in (
-					("nodes_test", stages["nodes"], "test_logs"), ("nodes_audit", stages["nodes"], "audit_logs"),
-					("main_run", stages["main"], "run_log"),
-				) if key in stage.artifacts
-			}
-			return AgentResult(
-				workflow_id=workflow_id, ok=not final["error"],
-				intent=AgentIntent.from_dict(final["intent"]) if final["intent"] else None,
-				stages=stages, errors=errors, logs=logs,
-				artifacts=self.artifacts(workflow_id) if workflow_id else {}, service=service,
+			if pending is not None:
+				return self._paused_result(pending)
+			return self._result(request, final)
+
+	def answer(self, request_id: str, value: Any = "", step_id: str = "") -> AgentResult:
+		"""Resume a build paused at a node's own gate; ``step_id`` targets one node chain."""
+		with self._run_lock:
+			pending = self._pending.get(request_id)
+			if pending is None:
+				raise LookupError(f"no paused build for request {request_id}")
+			orchestrator = _orchestrator(pending.record.workflow_id)
+			try:
+				run = orchestrator.resume(
+					request_id, step_id or str(pending.awaiting.get("stepId", "")), value,
+				)
+			except Exception as exc:
+				if request_id in getattr(orchestrator, "_pending", {}):
+					raise
+				run = _failed_run(exc, request_id)
+			except BaseException:
+				if request_id not in getattr(orchestrator, "_pending", {}):
+					self._pending.pop(request_id, None)
+				raise
+			paused, final = self._nodes_follow_up(pending, run)
+			if paused is not None:
+				return self._paused_result(paused)
+			return self._result(pending.request, final)
+
+	def abort(self, request_id: str) -> None:
+		"""Cancel a paused build and release its unpublished candidate revision."""
+		with self._run_lock:
+			pending = self._pending.get(request_id)
+			if pending is not None:
+				_orchestrator(pending.record.workflow_id).close(request_id)
+				self._pending.pop(request_id, None)
+
+	def pending_requests(self) -> list[dict[str, Any]]:
+		"""Paused builds and the question each node chain waits on."""
+		with self._run_lock:
+			return [
+				{
+					"request_id": request_id,
+					"workflow_id": pending.record.workflow_id,
+					"awaiting": dict(pending.awaiting),
+				}
+				for request_id, pending in self._pending.items()
+			]
+
+	def build_recovery_state(self, workflow_id: str) -> dict[str, Any]:
+		"""Report a paused question or native candidate retained after cleanup failure."""
+		with self._run_lock:
+			for request_id, pending in self._pending.items():
+				if pending.record.workflow_id == workflow_id:
+					return {"status": "input_required", "request_id": request_id,
+							"workflow_id": workflow_id, "awaiting": dict(pending.awaiting)}
+			with self._registry_lock:
+				known = workflow_id in self._records
+			if known and getattr(_orchestrator(workflow_id), "_pending", {}):
+				return {"status": "cleanup_required", "workflow_id": workflow_id}
+			return {"status": "clear", "workflow_id": workflow_id}
+
+	def _reject_if_pending(self) -> None:
+		"""One paused build per engine: it owns its orchestrator run and candidate version."""
+		if self._pending:
+			request_id = next(iter(self._pending))
+			raise RuntimeError(
+				f"build {request_id} is waiting for input; answer or abort it first"
 			)
 
-	def _run_nodes_stage(
+	def _nodes_start(
 		self,
 		request: AgentRequest,
 		record: WorkflowRecord,
@@ -810,14 +904,8 @@ class AgentWorkflowEngine:
 		*,
 		head_done: bool,
 		graph_stable: bool,
-	) -> dict[str, Any]:
-		"""Run the nodes stage, which also runs the main entrypoint merged after it.
-
-		``DynamicWorkflowOrchestrator`` owns this stage: its connected graph runs the head
-		(head optional), every node chain, the transit exit step that publishes the revision
-		and the ``main_entrypoint_generation`` continuation. With ``head_done=False`` the
-		head runs in that same graph (one pass); otherwise only the body runs.
-		"""
+	) -> tuple[_PendingBuild | None, dict[str, Any] | None]:
+		"""Start the nodes stage (main runs in its continuation); return a pause or the stage."""
 		orchestrator = _orchestrator(record.workflow_id)
 		intent = AgentIntent.from_dict(context["intent"]) if context.get("intent") else request.intent
 		if intent is None:
@@ -826,7 +914,7 @@ class AgentWorkflowEngine:
 		skipped = _nodes_stage_skipped(request, record, orchestrator, intent)
 		if skipped and _main_stage_skipped(request, record, orchestrator, intent) and context.get("stages"):
 			# Nothing in the body has to run; the head already produced the context.
-			return _with_skipped_stages(context, nodes_skipped=True, main_skipped=True)
+			return None, _with_skipped_stages(context, nodes_skipped=True, main_skipped=True)
 		if not record.graph_path.is_file():
 			message = f"workflow {record.workflow_id} has no graph; build it first"
 			stage = {
@@ -837,7 +925,7 @@ class AgentWorkflowEngine:
 			if not skipped:
 				record.errors["nodes"] = message
 				record.save()
-			return {
+			return None, {
 				**context,
 				"stages": {**context["stages"], "nodes": stage},
 				"error": context["error"] or stage["error"],
@@ -846,68 +934,231 @@ class AgentWorkflowEngine:
 		if plan.amendment:
 			for name in _enabled_nodes(record.graph_path):
 				amendments[name] = join_text(plan.amendment, amendments.get(name, ""))
-		failures: dict[str, str] = {}
+		pending = _PendingBuild(
+			request=request, record=record, context=context,
+			head_done=head_done, graph_stable=graph_stable, skipped=skipped,
+			amendments=amendments, retries=request.retries("nodes"),
+		)
+		return self._nodes_follow_up(pending)
 
-		def attempt(attempt_no: int, _failure: str) -> WorkflowVersion | None:
-			# Failed nodes are amended from their own failure and logs; the rest is reused.
-			retry = {
-				name: join_text(amendments.get(name, ""), fix_text(text)) for name, text in failures.items()
-			}
-			try:
-				return orchestrator.run(
-					DynamicWorkflowRequest(
-						workflow_json_path=record.graph_path, requirement_md_path=record.requirement_path,
-						node_amendments={**amendments, **retry}, **request.node_options,
-					),
-					agent_state={
-						"agent_run": _AgentRun(request, self),
-						"agent_context": context,
-						"agent_nodes_attempt": attempt_no,
-						"agent_nodes_skipped": skipped,
-						"agent_head_done": head_done,
-						"agent_graph_stable": graph_stable,
-					},
-				)
-			except DynamicWorkflowError as exc:
-				failures.clear()
-				failures.update({
-					name: _failure_text(name, text, orchestrator.last_logs) for name, text in exc.failures.items()
-				})
-				raise
+	def _start_attempt(self, pending: _PendingBuild) -> OrchestratorRun:
+		"""Run one nodes attempt; a failed node test may pause it at its own gate."""
+		retry = {
+			name: join_text(pending.amendments.get(name, ""), fix_text(text))
+			for name, text in pending.failures.items()
+		}
+		run = _orchestrator(pending.record.workflow_id).start(
+			DynamicWorkflowRequest(
+				workflow_json_path=pending.record.graph_path,
+				requirement_md_path=pending.record.requirement_path,
+				node_amendments={**pending.amendments, **retry},
+				await_repair_input=pending.request.await_repair_input,
+				**pending.request.node_options,
+			),
+			agent_state={
+				"agent_run": _AgentRun(pending.request, self),
+				"agent_context": pending.context,
+				"agent_nodes_attempt": pending.attempt_no,
+				"agent_nodes_skipped": pending.skipped,
+				"agent_head_done": pending.head_done,
+				"agent_graph_stable": pending.graph_stable,
+			},
+		)
+		if run.request_id:
+			pending.request_id = run.request_id
+		return run
 
-		version, attempts, error = _with_retries(request.retries("nodes"), attempt)
-		last_stage = orchestrator.last_stage_output
+	def _nodes_follow_up(
+		self,
+		pending: _PendingBuild,
+		run: OrchestratorRun | None = None,
+	) -> tuple[_PendingBuild | None, dict[str, Any] | None]:
+		"""Move one nodes attempt forward: pause, retry a failed attempt, or finish the stage."""
+		orchestrator = _orchestrator(pending.record.workflow_id)
+		stage_context = orchestrator.last_stage_output
+		logs = orchestrator.last_logs
+		while True:
+			if run is None:
+				previous_context = orchestrator.last_stage_output
+				previous_logs = orchestrator.last_logs
+				exceptional = False
+				try:
+					run = self._start_attempt(pending)
+				except Exception as exc:
+					# Cleanup may itself fail before the caller receives a request id.
+					# Do not retry while that candidate still owns a native run.
+					if getattr(orchestrator, "_pending", {}):
+						raise
+					exceptional = True
+					run = _failed_run(exc)
+				stage_context = orchestrator.last_stage_output
+				logs = orchestrator.last_logs
+				if exceptional and stage_context is previous_context:
+					stage_context = None
+				if exceptional and logs is previous_logs:
+					logs = None
+			if run.status == "awaiting_input":
+				pending.awaiting = self._enrich_awaiting(pending, run)
+				self._pending[pending.request_id] = pending
+				return pending, None
+			self._pending.pop(pending.request_id, None)
+			if run.status != "failed":
+				return None, self._finish_nodes_stage(pending, run.version)
+			stages = (stage_context or {}).get("stages", {})
+			if any(stages.get(name, {}).get("status") == "failed" for name in ("reformat", "graph")):
+				# The head already owns its retry budget and error; the body is blocked.
+				return None, {
+					**stage_context,
+					"stages": {name: data for name, data in stages.items() if name in ("reformat", "graph")},
+				}
+			pending.failures = {
+				name: _failure_text(name, text, logs) for name, text in run.failures.items()
+			} or pending.failures
+			if pending.attempt_no > pending.retries:
+				return None, self._failed_nodes_stage(pending, run.error, stage_context, logs)
+			pending.attempt_no += 1
+			run = None
+
+	def _finish_nodes_stage(
+		self, pending: _PendingBuild, version: WorkflowVersion | None,
+	) -> dict[str, Any]:
+		last_stage = _orchestrator(pending.record.workflow_id).last_stage_output
 		nodes_stage = (last_stage or {}).get("stages", {}).get("nodes")
-		record.clear_errors("nodes")
+		pending.record.clear_errors("nodes")
 		if nodes_stage is not None and nodes_stage.get("status") == "failed":
-			if failures:
-				record.errors.update({error_key("nodes", name): text for name, text in failures.items()})
+			if pending.failures:
+				pending.record.errors.update({
+					error_key("nodes", name): text for name, text in pending.failures.items()
+				})
 			else:
-				record.errors["nodes"] = nodes_stage.get("error") or error
-		record.save()
+				pending.record.errors["nodes"] = nodes_stage.get("error") or ""
+		pending.record.save()
 		if last_stage is not None:
 			return dict(last_stage)
-		# No stage output at all (all-disabled graph or a failure before the exit step):
-		# synthesize the nodes stage from the retry result and leave main to the caller.
+		# No stage output at all (all-disabled graph): synthesize it for the caller.
 		stage = {
-			"stage": "nodes", "attempts": attempts, "changed": False,
+			"stage": "nodes", "attempts": pending.attempt_no, "changed": False,
 			"artifacts": {"workflow_version": version.version if version else 0},
-			"status": "failed" if version is None else ("skipped" if skipped else "completed"),
-			"error": error,
+			"status": "completed" if version is not None else "failed",
+			"error": "",
 		}
 		return {
-			**context,
+			**pending.context,
 			"stages": {
-				**context["stages"],
+				**pending.context["stages"],
 				"nodes": stage,
 				"main": {
 					"stage": "main", "status": "skipped", "attempts": 0,
 					"error": "", "changed": False, "artifacts": {},
 				},
 			},
-			"error": context["error"] or error,
+			"error": pending.context["error"],
 		}
 
+	def _failed_nodes_stage(
+		self, pending: _PendingBuild, error: str, stage_context: Mapping[str, Any] | None, logs: Any,
+	) -> dict[str, Any]:
+		"""Record an exhausted nodes stage and shape it like a completed one."""
+		message = error or "nodes stage failed"
+		context = pending.context or dict(stage_context or {})
+		stages = dict(context.get("stages") or {})
+		# A connected run can fail before the head reports any result. Do not
+		# claim its reformat/graph stages completed without evidence.
+		for name in ("reformat", "graph"):
+			stages.setdefault(name, StageOutcome(name, "blocked").to_dict())
+		pending.record.clear_errors("nodes")
+		if pending.failures:
+			pending.record.errors.update({
+				error_key("nodes", name): text for name, text in pending.failures.items()
+			})
+		else:
+			pending.record.errors["nodes"] = message
+		pending.record.save()
+		artifacts = dict((stage_context or {}).get("stages", {}).get("nodes", {}).get("artifacts", {}))
+		if logs is not None:
+			artifacts.update(test_logs=dict(logs.test), audit_logs=dict(logs.audit))
+		stage = {
+			"stage": "nodes", "attempts": pending.attempt_no, "changed": False,
+			"artifacts": artifacts, "status": "failed", "error": message,
+		}
+		return {
+			**context,
+			"workflow_id": context.get("workflow_id", pending.record.workflow_id),
+			"intent": context.get("intent", pending.request.intent.to_dict() if pending.request.intent else None),
+			"stages": {
+				**stages,
+				"nodes": stage,
+				"main": {
+					"stage": "main", "status": "blocked", "attempts": 0,
+					"error": "", "changed": False, "artifacts": {},
+				},
+			},
+			"error": context.get("error") or message,
+		}
+
+	def _enrich_awaiting(
+		self, pending: _PendingBuild, run: OrchestratorRun,
+	) -> dict[str, Any]:
+		"""The waiting step's metadata plus the pytest log produced right before it."""
+		meta = dict(run.awaiting or {})
+		step_id = str(meta.get("id", ""))
+		node = step_id.removesuffix("__amend_node") or step_id
+		logs = _orchestrator(pending.record.workflow_id).last_logs
+		text = (logs.test.get(node) if logs else "") or ""
+		return {
+			**meta,
+			"stepId": step_id,
+			"node": node,
+			"workflow_id": pending.record.workflow_id,
+			"test_log": text[-6000:],
+			"test_log_chars": len(text),
+		}
+
+	def _paused_result(self, pending: _PendingBuild) -> AgentResult:
+		"""The result shape for a build that waits at a node gate."""
+		stages = dict(pending.context.get("stages") or {})
+		for name in ("reformat", "graph"):
+			stages.setdefault(name, {
+				"stage": name, "status": "completed", "attempts": 0,
+				"error": "", "changed": False, "artifacts": {},
+			})
+		stages["nodes"] = {
+			"stage": "nodes", "status": "awaiting", "attempts": pending.attempt_no,
+			"error": "", "changed": False, "artifacts": {},
+		}
+		stages.setdefault("main", {
+			"stage": "main", "status": "blocked", "attempts": 0,
+			"error": "", "changed": False, "artifacts": {},
+		})
+		return AgentResult(
+			workflow_id=pending.record.workflow_id, ok=True, intent=None,
+			stages={name: StageOutcome(**data) for name, data in stages.items()},
+			errors={}, logs={}, artifacts=self.artifacts(pending.record.workflow_id),
+			status="input_required", request_id=pending.request_id,
+			awaiting=dict(pending.awaiting),
+		)
+
+	def _result(self, request: AgentRequest, final: dict[str, Any]) -> AgentResult:
+		"""Build the caller-facing result from a finished stage context."""
+		stages = {name: StageOutcome(**data) for name, data in final["stages"].items()}
+		for name in ("nodes", "main"):
+			stages.setdefault(name, StageOutcome(name, "blocked"))
+		workflow_id = final["workflow_id"]
+		service = self.run_service(workflow_id) if request.serve and not final["error"] else None
+		errors = dict(self.record(workflow_id).errors) if workflow_id else {"reformat": stages["reformat"].error}
+		logs = {
+			name: stage.artifacts[key]
+			for name, stage, key in (
+				("nodes_test", stages["nodes"], "test_logs"), ("nodes_audit", stages["nodes"], "audit_logs"),
+				("main_run", stages["main"], "run_log"),
+			) if key in stage.artifacts
+		}
+		return AgentResult(
+			workflow_id=workflow_id, ok=not final["error"],
+			intent=AgentIntent.from_dict(final["intent"]) if final["intent"] else None,
+			stages=stages, errors=errors, logs=logs,
+			artifacts=self.artifacts(workflow_id) if workflow_id else {}, service=service,
+		)
 
 	def build_workflow_json(self, prompt: str, *, workflow_id: str | None = None, **options: Any) -> AgentResult:
 		"""Create (no ``workflow_id``) or modify workflow.json together with its requirement analysis."""
@@ -916,6 +1167,28 @@ class AgentWorkflowEngine:
 			graph=StagePlan("modify" if workflow_id else "create", prompt if workflow_id else ""),
 		)
 		return self.run(AgentRequest(intent=intent, **{"cascade": False, **options}))
+
+	def build_allocated_workflow_json(self, workflow_id: str, prompt: str, **options: Any) -> AgentResult:
+		"""Create or modify only the graph and requirements of an allocated workflow.
+
+		Do not overwrite a partially created plan: it requires explicit recovery instead.
+		"""
+		text = str(prompt or "").strip()
+		if not text:
+			raise ValueError("prompt must be a non-empty string")
+		with self._run_lock:
+			record = self.record(workflow_id)
+			graph_exists = record.graph_path.exists()
+			requirement_exists = record.requirement_path.exists()
+			if graph_exists != requirement_exists or (
+				graph_exists and not (record.graph_path.is_file() and record.requirement_path.is_file())
+			):
+				raise ValueError(f"workflow {workflow_id} has partial or invalid plan artifacts; recover them first")
+			intent = AgentIntent(
+				workflow_id=workflow_id, requirement="" if graph_exists else text,
+				graph=StagePlan("modify", text) if graph_exists else StagePlan("create"),
+			)
+			return self.run(AgentRequest(intent=intent, **{**options, "cascade": False}))
 
 	def build_nodes(
 		self, workflow_id: str, amendments: Mapping[str, str] | None = None, **options: Any,
@@ -937,6 +1210,17 @@ class AgentWorkflowEngine:
 		"""Run the whole engine on a free-text request and/or logs; later stages follow earlier changes."""
 		return self.run(AgentRequest(prompt=prompt, workflow_id=workflow_id, **options))
 
+	def build_new_workflow(self, workflow_id: str, prompt: str, **options: Any) -> AgentResult:
+		"""Build a newly allocated, empty workflow using an explicit graph-create intent."""
+		if not prompt.strip():
+			raise ValueError("a new workflow needs a prompt")
+		with self._run_lock:
+			record = self.record(workflow_id)
+			if record.graph_path.is_file() or record.requirement_path.is_file():
+				raise ValueError(f"workflow {workflow_id} already has a graph or requirements")
+			intent = AgentIntent(workflow_id=workflow_id, requirement=prompt, graph=StagePlan("create"))
+			return self.run(AgentRequest(intent=intent, **options))
+
 	def evolve(
 		self, workflow_id: str, command: str, *, target: str | None = None, **options: Any,
 	) -> AgentResult:
@@ -948,29 +1232,35 @@ class AgentWorkflowEngine:
 
 	def run_service(self, workflow_id: str) -> dict[str, Any]:
 		"""Start the workflow's main entrypoint as a service, replacing a previous run of it."""
-		record = self.record(workflow_id)
-		path = record.main_entrypoint_path
-		if path is None or not path.is_file():
-			raise FileNotFoundError(f"workflow {workflow_id} has no main entrypoint; build it first")
-		record.process, info = self.runtime().rerun_server(
-			main_entrypoint_path=str(path), previous_process=record.process,
-		)
-		return {
-			"workflow_id": workflow_id,
-			"main_entrypoint_id": record.main_entrypoint_id,
-			"base_url": record.base_url,
-			**info,
-		}
+		with self._service_lock:
+			if self._services_closed:
+				raise RuntimeError("workflow services are closed")
+			record = self.record(workflow_id)
+			path = record.main_entrypoint_path
+			if path is None or not path.is_file():
+				raise FileNotFoundError(f"workflow {workflow_id} has no main entrypoint; build it first")
+			record.process, info = self.runtime().rerun_server(
+				main_entrypoint_path=str(path), previous_process=record.process,
+			)
+			return {
+				"workflow_id": workflow_id,
+				"main_entrypoint_id": record.main_entrypoint_id,
+				"base_url": record.base_url,
+				**info,
+			}
 
 	def stop_service(self, workflow_id: str) -> None:
-		record = self.record(workflow_id)
-		process, record.process = record.process, None
-		if process is not None:
-			self.runtime().stop_managed_server_process(process)
+		with self._service_lock:
+			record = self.record(workflow_id)
+			process, record.process = record.process, None
+			if process is not None:
+				self.runtime().stop_managed_server_process(process)
 
 	def _stop_services(self) -> None:
-		for workflow_id in self.workflow_ids:
-			self.stop_service(workflow_id)
+		with self._service_lock:
+			self._services_closed = True
+			for workflow_id in self.workflow_ids:
+				self.stop_service(workflow_id)
 
 	def _unregister(self) -> None:
 		with self._registry_lock:
@@ -988,6 +1278,7 @@ class AgentWorkflowEngine:
 			if self._closed:
 				return
 			self._closed = True
+			self._pending.clear()
 			engine, self._engine = self._engine, None
 			with ExitStack() as cleanup:
 				cleanup.callback(self._unregister)

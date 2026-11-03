@@ -7,6 +7,9 @@
 # Modified 2026-10-16: expose the AgentBuilder engine API (build_*, run_service) through one builder.
 # Modified 2026-10-19: add evolve (workflow, one node, or judged) and list_nodes.
 # Modified 2026-10-20: expose per-node user-guided repair through build_nodes/build_workflow/evolve.
+# Modified 2026-11-01: repair gating is the default; answers can target the generated test.
+# Modified 2026-11-03: expose workflow allocation and building an allocated workflow.
+# Modified 2026-11-03: expose graph-only builds for allocated workflows.
 """Python SDK for building, modifying and running FlowX workflows."""
 
 from __future__ import annotations
@@ -14,13 +17,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.agent_workflow_engine import AgentResult
-from flowx_core.dynamic_workflow_orchestrator import NodeRepairInput
-
-RepairInputCallback = Callable[[NodeRepairInput], str]
 
 
 class FlowXClient:
@@ -72,18 +72,6 @@ class FlowXClient:
                 )
             return self._builder
 
-    @staticmethod
-    def _with_repair_input(
-        options: dict[str, Any],
-        repair_input_callback: RepairInputCallback | None,
-    ) -> dict[str, Any]:
-        """Merge a guided-repair callback into ``DynamicWorkflowRequest.node_options``."""
-        if repair_input_callback is None:
-            return options
-        node_options = dict(options.get("node_options") or {})
-        node_options["repair_input_callback"] = repair_input_callback
-        return {**options, "node_options": node_options}
-
     def build_workflow_json(self, prompt: str, *, workflow_id: str | None = None, **options: Any) -> AgentResult:
         """Create (no ``workflow_id``) or modify workflow.json together with its requirement analysis."""
         text = str(prompt).strip()
@@ -95,20 +83,16 @@ class FlowXClient:
         self,
         workflow_id: str,
         amendments: Mapping[str, str] | None = None,
-        *,
-        repair_input_callback: RepairInputCallback | None = None,
         **options: Any,
     ) -> AgentResult:
         """Build the nodes of a workflow, or amend specific nodes by step id (``{step_id: amendment}``).
 
-        ``repair_input_callback`` is called after a node test fails, with the fresh
-        ``NodeRepairInput`` (node, attempt, test log, test result). Return guidance to
-        append to the log, ``"skip"`` to skip the amendment, or ``""`` for the log alone.
+        A failing node test pauses at its own gate by default: the result has
+        ``status="input_required"`` with ``request_id``/``awaiting`` and is resumed with
+        :meth:`answer`. Answers amend the node, while ``test: <guidance>`` fixes the
+        generated test instead. Pass ``await_repair_input=False`` to amend automatically.
         """
-        return self.builder.build_nodes(
-            workflow_id, amendments,
-            **self._with_repair_input(options, repair_input_callback),
-        )
+        return self.builder.build_nodes(workflow_id, amendments, **options)
 
     def build_main_entrypoint(self, workflow_id: str, amendment: str = "", **options: Any) -> AgentResult:
         """Create or regenerate the main entrypoint from the workflow's latest nodes."""
@@ -119,17 +103,22 @@ class FlowXClient:
         prompt: str = "",
         *,
         workflow_id: str | None = None,
-        repair_input_callback: RepairInputCallback | None = None,
         **options: Any,
     ) -> AgentResult:
-        """Run the whole engine on a free-text request and/or ``logs=[...]``; later stages follow earlier changes.
+        """Run the whole engine on a free-text request and/or ``logs=[...]``; later stages follow earlier changes."""
+        return self.builder.build_workflow(prompt, workflow_id=workflow_id, **options)
 
-        ``repair_input_callback`` guides per-node amendments after their failed tests.
-        """
-        return self.builder.build_workflow(
-            prompt, workflow_id=workflow_id,
-            **self._with_repair_input(options, repair_input_callback),
-        )
+    def create_workflow(self) -> str:
+        """Allocate an empty workflow and return its identifier before building it."""
+        return self.builder.engine.resolve_record(None).workflow_id
+
+    def build_new_workflow(self, workflow_id: str, prompt: str, **options: Any) -> AgentResult:
+        """Build a workflow previously allocated by :meth:`create_workflow`."""
+        return self.builder.engine.build_new_workflow(workflow_id, prompt, **options)
+
+    def build_allocated_workflow_json(self, workflow_id: str, prompt: str, **options: Any) -> AgentResult:
+        """Create or modify only an allocated workflow's graph and requirements."""
+        return self.builder.engine.build_allocated_workflow_json(workflow_id, prompt, **options)
 
     def evolve(
         self,
@@ -137,7 +126,6 @@ class FlowXClient:
         command: str,
         *,
         target: str | None = None,
-        repair_input_callback: RepairInputCallback | None = None,
         **options: Any,
     ) -> AgentResult:
         """Evolve an existing workflow by ``command``.
@@ -145,15 +133,32 @@ class FlowXClient:
         ``target="workflow"`` changes the workflow itself (its graph; nodes and main entrypoint
         follow with ``cascade``). A node step id or node id from :meth:`list_nodes` changes only
         that node. Without ``target`` the engine judges which part the command refers to.
-        ``repair_input_callback`` guides amendments after their failed tests.
         """
         text = str(command).strip()
         if not text:
             raise ValueError("command must be a non-empty string")
-        return self.builder.evolve(
-            workflow_id, text, target=target,
-            **self._with_repair_input(options, repair_input_callback),
-        )
+        return self.builder.evolve(workflow_id, text, target=target, **options)
+
+    def answer(self, request_id: str, input: str = "", step_id: str = "") -> AgentResult:
+        """Resume a paused build with one node's guidance (``step_id`` targets one chain).
+
+        ``input`` is combined with that node's pytest log and amends the node,
+        ``test: <guidance>`` amends the generated test instead, ``"skip"`` skips the
+        amendment, and an empty string amends the node from the log alone.
+        """
+        return self.builder.engine.answer(request_id, input, step_id)
+
+    def abort(self, request_id: str) -> None:
+        """Cancel a paused build and release its unpublished candidate revision."""
+        self.builder.engine.abort(request_id)
+
+    def pending_requests(self) -> list[dict[str, Any]]:
+        """Paused builds as ``{"request_id", "workflow_id", "awaiting"}``."""
+        return self.builder.engine.pending_requests()
+
+    def build_recovery_state(self, workflow_id: str) -> dict[str, Any]:
+        """Check both the agent pause and retained native candidate state."""
+        return self.builder.engine.build_recovery_state(workflow_id)
 
     def list_nodes(self, workflow_id: str) -> list[dict[str, Any]]:
         """The workflow's nodes as ``{"step_id", "node_id", "version"}``; ``node_id`` is None until built."""
@@ -165,6 +170,13 @@ class FlowXClient:
 
     def stop_service(self, workflow_id: str) -> None:
         self.builder.stop_service(workflow_id)
+
+    def stop_all_services(self) -> None:
+        """Stop managed services without waiting for a long-running build to finish."""
+        with self._lock:
+            builder = self._builder
+        if builder is not None:
+            builder.engine._stop_services()
 
     def workflows(self) -> dict[str, dict[str, Any]]:
         """Ids, versions and unresolved errors of every workflow in the workspace."""
@@ -193,4 +205,7 @@ def result_to_dict(result: AgentResult) -> dict[str, Any]:
         "logs": dict(result.logs),
         "artifacts": dict(result.artifacts),
         "service": dict(result.service) if result.service else None,
+        "status": result.status,
+        "request_id": result.request_id,
+        "awaiting": dict(result.awaiting) if result.awaiting else None,
     }

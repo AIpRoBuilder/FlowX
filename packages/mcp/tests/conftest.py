@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# Modified 2026-11-03: add recovery-state support to the MCP test client.
+# Modified 2026-11-03: record allocated-graph and background workflow SDK calls.
 """Load the MCP server in isolation: stubbed MCP SDK, bootstrap and FlowX SDK; no core, pools or network."""
 
 from __future__ import annotations
@@ -38,8 +40,18 @@ class FakeClient:
             raise outcome
         return outcome
 
-    def build_workflow_json(self, *args, **kwargs):
-        return self._record("build_workflow_json", *args, **kwargs)
+    def create_workflow(self):
+        self.calls.append(("create_workflow", (), {}))
+        outcome = self.results.get("create_workflow", "wf1")
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def build_allocated_workflow_json(self, *args, **kwargs):
+        return self._record("build_allocated_workflow_json", *args, **kwargs)
+
+    def build_new_workflow(self, *args, **kwargs):
+        return self._record("build_new_workflow", *args, **kwargs)
 
     def build_nodes(self, *args, **kwargs):
         return self._record("build_nodes", *args, **kwargs)
@@ -52,6 +64,25 @@ class FakeClient:
 
     def evolve(self, *args, **kwargs):
         return self._record("evolve", *args, **kwargs)
+
+    def answer(self, *args, **kwargs):
+        return self._record("answer", *args, **kwargs)
+
+    def abort(self, *args, **kwargs):
+        return self._record("abort", *args, **kwargs)
+
+    def pending_requests(self):
+        self.calls.append(("pending_requests", (), {}))
+        outcome = self.results.get("pending_requests", [])
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def build_recovery_state(self, workflow_id):
+        pending = self.pending_requests()
+        return next(({**item, "status": "input_required"} for item in pending
+                     if item.get("workflow_id") == workflow_id),
+                    {"status": "clear", "workflow_id": workflow_id})
 
     def list_nodes(self, *args):
         return self._record("list_nodes", *args)

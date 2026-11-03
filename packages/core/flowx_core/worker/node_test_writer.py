@@ -1,9 +1,14 @@
 # Modified 2026-10-13: bytes-hook behavioral tests and configured concrete-node prompts.
 # Modified: apply scoped instance settings before prompt-file use and composition.
+# Modified 2026-11-01: generated tests construct native-derived nodes with Class(), never object.__new__.
+# Modified 2026-11-02: identify step metadata as a dictionary in test write/amend prompts.
+# Modified 2026-11-02: preserve Unicode offsets and multiline native-node test formatting.
 from __future__ import annotations
 
 import ast
+import io
 import json
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -35,6 +40,167 @@ _WORKFLOW_BASE_CLASS_NAMES = frozenset(
         "WorkflowFileNode",
     }
 )
+
+# Node classes derive from the native ``pydaograph.GNode`` runtime, so CPython
+# rejects ``object.__new__(cls)`` with "TypeError: object.__new__(X) is not safe".
+_NATIVE_INSTANTIATION_CONTRACT = (
+    "- Instantiate the node with `NodeClass()` (or `NodeClass.__new__(NodeClass)`); "
+    "never call `object.__new__(NodeClass)`, because node classes derive from the native "
+    "`pydaograph.GNode` runtime and that raises "
+    "`TypeError: object.__new__(X) is not safe, use X.__new__()`.\n"
+)
+
+
+def _is_dotted_name(node: ast.AST) -> bool:
+    """True for a bare name or a ``Name.attr.attr`` chain (no calls or subscripts)."""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, ast.Name)
+
+
+def _character_offset(text: str, lineno: int | None, column: int | None) -> int:
+    """Convert an AST (line, UTF-8 byte column) pair into a ``str`` index."""
+    if lineno is None or column is None or lineno < 1:
+        return 0
+    # Python's parser counts only CR, LF and CRLF as physical line breaks;
+    # str.splitlines() would also split Unicode separators inside literals.
+    lines = list(io.StringIO(text, newline=""))
+    if lineno > len(lines):
+        return len(text)
+    prefix = sum(len(line) for line in lines[: lineno - 1])
+    encoded = lines[lineno - 1].encode("utf-8")[:column]
+    return prefix + len(encoded.decode("utf-8", "ignore"))
+
+
+def _native_instantiation_replacement(source: str, argument_source: str) -> str:
+    """Replace a recognized call while retaining comments and needed parentheses."""
+    # Keep the existing compact formatting for ordinary calls. A hash can only
+    # be a comment here: AST recognition excludes string-valued expressions.
+    if "#" not in source:
+        replacement = f"{argument_source}()"
+        try:
+            ast.parse(replacement, mode="eval")
+        except SyntaxError:
+            pass
+        else:
+            return replacement
+
+    # A wrapper keeps tokenization valid even when the call itself relies on an
+    # enclosing expression for multiline continuation. Token columns count
+    # characters; the source lines retain their original physical newlines.
+    wrapped = "(\n" + source + "\n)"
+    lines = list(io.StringIO(wrapped, newline=""))
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    tokens = list(tokenize.generate_tokens(io.StringIO(wrapped, newline=None).readline))
+    tokens = [token for token in tokens if 2 <= token.start[0] <= len(lines) - 1]
+
+    def offset(position: tuple[int, int]) -> int:
+        line, column = position
+        return offsets[line - 1] + column - 2  # Skip the synthetic "(\n".
+
+    # The last parenthesis opens the call; earlier ones only group its callee.
+    depth = 0
+    opening = None
+    trailing_comma = None
+    for token in tokens:
+        if token.type != tokenize.OP:
+            continue
+        if token.string == "(":
+            if depth == 0:
+                opening = token
+            depth += 1
+        elif token.string == ")":
+            depth -= 1
+        elif token.string == "," and depth == 1:
+            trailing_comma = token
+
+    if opening is None:
+        raise ValueError("recognized call has no opening parenthesis")
+    opening_offset = offset(opening.start)
+    comma_offset = offset(trailing_comma.start) if trailing_comma is not None else None
+    comments = [token for token in tokens if token.type == tokenize.COMMENT]
+
+    # The original call parentheses provide implicit continuation and keep
+    # comments and whitespace around the argument. Remove a trailing comma so
+    # the parenthesized argument does not become a one-element tuple.
+    body = source[opening_offset:]
+    if comma_offset is not None:
+        comma_in_body = comma_offset - opening_offset
+        body = body[:comma_in_body] + body[comma_in_body + 1 :]
+
+    callee_comments = [token for token in comments if offset(token.start) < opening_offset]
+    if not callee_comments:
+        return f"{body}()"
+
+    # Comments between tokens in a multiline callee cannot remain outside an
+    # expression. Place them inside an extra grouping without moving or
+    # reformatting their physical lines.
+    prefix = source[:opening_offset]
+    preserved = []
+    position = 0
+    for token in tokens:
+        start = offset(token.start)
+        if start >= opening_offset:
+            break
+        end = offset(token.end)
+        if token.type in (tokenize.NAME, tokenize.OP):
+            preserved.extend((prefix[position:start], " " * (end - start)))
+            position = end
+    preserved.append(prefix[position:])
+    return "(" + "".join(preserved) + body + ")()"
+
+
+def normalize_native_node_instantiation(path: str | Path) -> int:
+    """Rewrite ``object.__new__(X)`` into ``X()`` in a generated node test.
+
+    Generated nodes inherit the native ``pydaograph.GNode`` runtime, where
+    ``object.__new__(cls)`` raises ``TypeError: object.__new__(X) is not safe,
+    use X.__new__()`` before any assertion runs. Only bare names and attribute
+    chains are rewritten, so expressions with calls or subscripts keep their
+    side effects untouched. Returns the number of rewritten call sites.
+    """
+    target_path = Path(path)
+    try:
+        with target_path.open(encoding="utf-8", newline="") as source_file:
+            text = source_file.read()
+        tree = ast.parse(text)
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return 0
+    edits: list[tuple[int, int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == "__new__"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "object"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            continue
+        argument = node.args[0]
+        if not _is_dotted_name(argument):
+            continue
+        argument_start = _character_offset(text, argument.lineno, argument.col_offset)
+        argument_end = _character_offset(text, argument.end_lineno, argument.end_col_offset)
+        start = _character_offset(text, node.lineno, node.col_offset)
+        end = _character_offset(text, node.end_lineno, node.end_col_offset)
+        replacement = _native_instantiation_replacement(
+            text[start:end], text[argument_start:argument_end]
+        )
+        edits.append((start, end, replacement))
+    if not edits:
+        return 0
+    for start, end, replacement in sorted(edits, reverse=True):
+        text = text[:start] + replacement + text[end:]
+    compile(text, str(target_path), "exec")
+    with target_path.open("w", encoding="utf-8", newline="") as source_file:
+        source_file.write(text)
+    return len(edits)
 
 
 def _base_name(base: ast.expr) -> str | None:
@@ -185,12 +351,15 @@ class PromptNodeTestFileCoder(Coder):
             "- Use pytest.\n"
             "- Import the node module directly from the node file path with importlib.util.spec_from_file_location so the test stays stable even when the generated package layout is minimal.\n"
             "- If the module may import sibling files, prepend the node directory to sys.path before executing the module spec.\n"
+            f"{_NATIVE_INSTANTIATION_CONTRACT}"
             "- Keep the test deterministic and offline.\n"
             "- Prefer exercising the node's own subclass hook or overridden StepRunOutput method instead of the full workflow engine.\n"
             "- Create only the smallest dependency_results, session_state, user_input, file_bytes, temp files, env vars, or monkeypatches that are implied by this node code.\n"
             "- When the node would otherwise call external services, install packages, spawn processes, or hit a network/LLM API, monkeypatch only that external boundary while still running the node's internal logic.\n"
             "- Assert concrete StepRunOutput.card and StepRunOutput.derived values or keys that are deterministically produced by this node code.\n"
-            "- Include one identity test that covers importability plus STEP_ID and step_meta basics (`id` and `dependencies` are required by `StepMeta`).\n"
+            "- Include one identity test that covers importability plus STEP_ID and step_meta basics. "
+            "`StepMeta` is a dict at runtime: assert `meta[\"id\"] == node.STEP_ID` and "
+            "`meta[\"dependencies\"] == list(node.DEPENDENCIES)`; never use `meta.id` or `meta.dependencies`.\n"
             "- Include at least one behavioral test focused on the node's primary StepRunOutput contract.\n"
             "- For WorkflowFileNode, call process_input with one bytes payload (including empty bytes when allowed), and assert the subclass's real processing/persistence output. Do not assume inherited saved_files or upload decoding; avoid duplicating base-class tests.\n"
             "- Return only runnable Python test code with no markdown fences or commentary.\n\n"
@@ -217,13 +386,15 @@ class PromptNodeTestFileCoder(Coder):
         if target_path.suffix.lower() != ".py":
             target_path = target_path.with_suffix(".py")
 
-        return self.code_to_file(
+        written = self.code_to_file(
             self._build_user_prompt(node_file_path),
             str(target_path),
             overwrite=overwrite,
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        normalize_native_node_instantiation(written)
+        return Path(written)
 
     def amend_test_with_feedback(
         self,
@@ -249,10 +420,12 @@ class PromptNodeTestFileCoder(Coder):
             f"Existing test code:\n{target_path.read_text(encoding='utf-8')}\n\n"
             f"Feedback:\n{amendment}\n"
         )
-        return self.code_to_file(
+        written = self.code_to_file(
             prompt,
             str(target_path),
             overwrite=overwrite,
             temperature=temperature,
             max_tokens=max_tokens,
         )
+        normalize_native_node_instantiation(written)
+        return Path(written)

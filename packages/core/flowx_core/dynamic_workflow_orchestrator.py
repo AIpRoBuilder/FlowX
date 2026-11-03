@@ -14,6 +14,8 @@ inside one engine, with per-node request namespaces and loop-policy bounded repa
 Modified 2026-10-30: the orchestrator is the expanded engine itself; a transit
 ``nodes_stage_exit`` step publishes the run, and an optional continuation graph (the agent
 engine's main-entrypoint stage) is merged after every leaf finalizer.
+Modified 2026-11-01: the repair gate is on by default; ``execute`` stays non-interactive.
+Modified 2026-11-02: join native runs before cleanup and preserve committed revisions on failure or close.
 This coordinator does not execute the generated business graph or implement a ReAct judge.
 """
 
@@ -25,11 +27,11 @@ import re
 import shutil
 import sys
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from graphlib import TopologicalSorter
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Mapping
+from typing import Any, Literal, Mapping
 
 from ag_ui_workflow import (
 	GraphSpec,
@@ -50,7 +52,6 @@ from flowx_core.workflows.node_runtime_modifier import NodeRuntimeModifierPipeli
 from flowx_core.workflows.dynamic_node_graph import (
 	NAMESPACE_KEY,
 	ExpandedWorkflowEngine,
-	NodeRepairInput,
 )
 
 
@@ -69,9 +70,10 @@ class DynamicWorkflowRequest:
 	A repair that fails (tests still failing after an amendment, or an audit violation) is
 	requested again up to ``max_repair_retries`` more times; 0 restores a single pass.
 
-	``repair_input_callback`` receives each node's fresh failed test result and returns
-	guidance appended to that test log, ``skip`` to skip the amendment, or an empty
-	string to amend from the test log alone.
+	``await_repair_input`` (default ``True``) pauses a failing node at its own ``amend_node``
+	gate and waits for an answer instead of amending from the test log alone. Interactive
+	callers resume the paused run with ``DynamicWorkflowOrchestrator.resume``; pass ``False``
+	to amend silently. ``execute`` always behaves as if this were ``False``.
 	"""
 
 	workflow_json_path: str | Path
@@ -89,16 +91,39 @@ class DynamicWorkflowRequest:
 	amendment_temperature: float = 0.3
 	python_command: str = ""
 	timeout: int = 60
-	max_repair_retries: int = 2
-	repair_input_callback: Callable[[NodeRepairInput], str] | None = None
+	max_repair_retries: int = 5
+	await_repair_input: bool = True
 	state: Mapping[str, Any] = field(default_factory=dict)
 
 	def __post_init__(self) -> None:
 		retries = self.max_repair_retries
 		if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
 			raise ValueError("max_repair_retries must be a non-negative integer")
-		if self.repair_input_callback is not None and not callable(self.repair_input_callback):
-			raise ValueError("repair_input_callback must be callable or None")
+		if not isinstance(self.await_repair_input, bool):
+			raise ValueError("await_repair_input must be a boolean")
+
+
+@dataclass(frozen=True)
+class OrchestratorRun:
+	"""Outcome of one start/resume: finished, paused at a node gate, or failed."""
+
+	request_id: str
+	status: Literal["completed", "awaiting_input", "failed"]
+	version: WorkflowVersion | None = None
+	awaiting: Mapping[str, Any] | None = None
+	error: str = ""
+	failed_step: str = ""
+	failures: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class _LiveRun:
+	"""One body run that may outlive the call that started it."""
+
+	request_id: str
+	directory: Path
+	state: dict[str, Any]
+	skipped: list[str]
 
 
 @dataclass(frozen=True)
@@ -311,11 +336,14 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 		self._run_lock = RLock()
 		self._closed = False
 		self._engine_ready = False
+		self._close_complete = False
 		self._head = head
 		self._tail, self._terminal_id = self._build_tail(continuation)
 		self._last_logs: WorkflowNodeLogs | None = None
 		self._last_stage_output: Mapping[str, Any] | None = None
 		self._nodes_outcome: NodesStageOutcome | None = None
+		# Paused body runs and candidates whose failed cleanup still needs close().
+		self._pending: dict[str, _LiveRun] = {}
 		self.storage_dir.mkdir(parents=True, exist_ok=True)
 		self._manifest_path = self.storage_dir / "manifest.json"
 		if self._manifest_path.is_file():
@@ -630,116 +658,241 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 		Source is included in child generation context, so a changed parent source
 		invalidates its children. No requests, native nodes or state dictionaries
 		are retained. Failed candidates do not change IDs, counters or current head.
+
+		This noninteractive form requires completion. Interactive callers use
+		``start``/``resume``, which return a paused run instead.
 		"""
+		# This form cannot answer a gate, so a failing node amends from its log instead
+		# of pausing even when the caller kept the interactive default.
+		request = replace(request, await_repair_input=False)
 		with self._run_lock:
 			if self._closed:
 				raise RuntimeError(self.CLOSED_MESSAGE)
-			generation, modifier = _published_workflows()
-			if not (request.run_node_generation or request.run_runtime_modifier):
-				raise ValueError("enable node generation, the runtime modifier, or both")
-			if not request.run_node_generation and (request.node_amendments or request.markdown_amendments):
-				raise ValueError("node and markdown amendments require node generation")
-			graph_path = Path(request.workflow_json_path).expanduser().resolve()
-			requirement_path = Path(request.requirement_md_path).expanduser().resolve()
-			state_extra = dict(agent_state or {})
-			head_done = bool(state_extra.get("agent_head_done"))
-			graph_stable = bool(state_extra.get("agent_graph_stable"))
-			graph, order = self._load_business(graph_path)
-			self._last_logs = WorkflowNodeLogs()
-			self._last_stage_output = None
-			self._nodes_outcome = None
-
-			if not head_done and self._head is not None and order and not graph_stable:
-				# The graph stage may rewrite workflow.json, and the chains were built
-				# from the previous revision, so this pass runs the head steps only.
-				head_state = {
-					key: value for key, value in state_extra.items()
-					if key not in ("agent_context", "agent_graph_stable")
-				}
-				head_result = self.run_steps(
-					state=head_state,
-					skipped_steps=self._body_step_ids(),
-				)
-				self._last_stage_output = dict(head_result.outputs[self.head_terminal_id].derived)
-				if self._last_stage_output.get("error"):
-					raise RuntimeError(self._last_stage_output["error"])
-				head_done = True
-				graph, order = self._load_business(graph_path)
-
-			requirement_text = requirement_path.read_text(encoding="utf-8") if requirement_path.is_file() else ""
-			selected = set(request.force_nodes) | set(request.node_amendments) | set(request.markdown_amendments) | set(request.node_formats)
-			if selected.difference(order):
-				raise ValueError(f"unknown or disabled requested nodes: {sorted(selected.difference(order))}")
-			# Sorted so that reordering the JSON does not reload the pool.
-			generation_config = {
-				"pool_size": graph.get("pool_size", 1),
-				"nodes": sorted(
-					({"name": node["name"], "depends": sorted(node.get("depends", []))}
-					for node in graph["nodes"] if node.get("enable", True)),
-					key=lambda node: node["name"],
-				),
-			}
-			business_nodes = generation_config["nodes"]
-			if business_nodes:
-				self._ensure_engine(
-					business_nodes=business_nodes,
-					generation=generation,
-					modifier=modifier,
-					pool_size=self._expanded_pool_size(graph, generation, modifier),
-				)
-			manifest = self._read_manifest()
-			version = manifest["workflow_version"] + 1
-			directory = self.storage_dir / "workflows" / f"{version:08d}"
-			# Never overwrite another writer's candidate or an interrupted build.
-			directory.mkdir(parents=True, exist_ok=False)
-			logs = self._last_logs
+			self._reject_if_pending()
+			ready, live = self._begin(request, agent_state)
+			if live is None:
+				return ready
 			try:
-				self._write_json(directory / "workflow.json", graph)
-				self._write_json(directory / "generation_workflow.json", generation_config)
-				(directory / "requirement_analysis.md").write_text(requirement_text, encoding="utf-8")
-				raw_nodes = {node["name"]: node for node in graph["nodes"]}
-				artifacts: dict[str, dict[str, Path]] = {}
-				# Make all prior sources available for graph-aware ancestor inspection.
-				for name in order:
-					registry = manifest["nodes"].get(name)
-					targets = self._artifact_targets(directory, name)
-					artifacts[name] = targets
-					if registry:
-						self._copy_artifacts(self._node_version(registry["versions"][-1]).artifacts, targets)
-				run = _GenerationRun(
-					request=request, directory=directory, graph=graph,
-					order=tuple(order), version=version,
-					requirement_text=requirement_text, raw_nodes=raw_nodes,
-					artifacts=artifacts, registry=manifest["nodes"],
-					generation=generation, modifier=modifier,
-				)
-				if not business_nodes:
-					return self._publish_empty_graph(run, manifest)
-				skipped: list[str] = []
-				if head_done:
-					skipped.extend(self.head_step_ids)
 				result = self.run_steps(
-					state={
-						"dynamic_workflow_run": run,
-						"dynamic_workflow_orchestrator": self,
-						"dynamic_workflow_logs": logs,
-						NAMESPACE_KEY: {},
-						"dynamic_workflow_namespace_lock": RLock(),
-						**state_extra,
-					},
-					skipped_steps=skipped,
+					request_id=live.request_id, state=live.state, skipped_steps=live.skipped,
 				)
-				self._last_stage_output = dict(result.outputs[self._terminal_id].derived)
+				return self._publish(result)
 			except BaseException:
-				if self._nodes_outcome is None:
-					shutil.rmtree(directory, ignore_errors=True)
+				self._abandon(live)
 				raise
-			outcome = self._nodes_outcome
-			if outcome is None:
-				raise RuntimeError("nodes stage did not publish an outcome")
-			if outcome.status == "failed":
-				raise DynamicWorkflowError(outcome.error, outcome.failures)
-			return outcome.version
+
+	def start(
+		self,
+		request: DynamicWorkflowRequest,
+		agent_state: Mapping[str, Any] | None = None,
+	) -> OrchestratorRun:
+		"""Run a revision, returning a paused run instead of blocking on a node gate."""
+		with self._run_lock:
+			if self._closed:
+				raise RuntimeError(self.CLOSED_MESSAGE)
+			self._reject_if_pending()
+			ready, live = self._begin(request, agent_state)
+			if live is None:
+				return OrchestratorRun(request_id="", status="completed", version=ready)
+			self._pending[live.request_id] = live
+			try:
+				return self._advance(live, self.start_steps(
+					request_id=live.request_id, state=live.state, skipped_steps=live.skipped,
+				))
+			except BaseException:
+				self._abandon(live)
+				raise
+
+	def resume(self, request_id: str, step_id: str, value: Any) -> OrchestratorRun:
+		"""Answer one waiting step by id and observe the run again."""
+		with self._run_lock:
+			if self._closed:
+				raise RuntimeError(self.CLOSED_MESSAGE)
+			live = self._pending.get(request_id)
+			if live is None:
+				raise LookupError(f"no paused build for request {request_id}")
+			try:
+				return self._advance(live, self.resume_steps(request_id, step_id, value))
+			except BaseException:
+				self._abandon(live)
+				raise
+
+	def _advance(self, live: _LiveRun, result: Any) -> OrchestratorRun:
+		"""Turn one native observation into a completed, failed or paused orchestrator run."""
+		if result.status == "awaiting_input":
+			return OrchestratorRun(
+				request_id=live.request_id, status="awaiting_input",
+				awaiting=dict(result.awaiting or {}),
+			)
+		if result.status == "failed":
+			# The native engine has already cancelled and joined this failed run.
+			self._discard_unpublished(live)
+			self._pending.pop(live.request_id, None)
+			return OrchestratorRun(
+				request_id=live.request_id, status="failed",
+				error=result.error, failed_step=result.failed_step,
+			)
+		try:
+			version = self._publish(result)
+		except DynamicWorkflowError as exc:
+			self._pending.pop(live.request_id, None)
+			return OrchestratorRun(
+				request_id=live.request_id, status="failed",
+				error=str(exc), failures=dict(exc.failures),
+			)
+		self._pending.pop(live.request_id, None)
+		return OrchestratorRun(request_id=live.request_id, status="completed", version=version)
+
+	def _is_published(self, directory: Path) -> bool:
+		"""Check both the reported outcome and the committed manifest for this bundle."""
+		outcome = self._nodes_outcome
+		if outcome is not None and outcome.version is not None and outcome.version.workflow_path.parent == directory:
+			return True
+		manifest = self._read_manifest()
+		return any(self._saved_path(record["workflow_path"]).parent == directory for record in manifest["workflows"])
+
+	def _discard_unpublished(self, live: _LiveRun) -> None:
+		"""Remove a stopped candidate only if neither the outcome nor manifest published it."""
+		if not self._is_published(live.directory):
+			shutil.rmtree(live.directory, ignore_errors=True)
+
+	def _abandon(self, live: _LiveRun) -> None:
+		"""Stop one native run before inspecting its publication and removing its candidate."""
+		# Direct execute() runs are not normally pending; retain the candidate if
+		# native cancellation or manifest inspection raises so close() can retry.
+		self._pending.setdefault(live.request_id, live)
+		if self._engine_ready:
+			super().close(live.request_id)
+		self._discard_unpublished(live)
+		self._pending.pop(live.request_id, None)
+
+	def _publish(self, result: Any) -> WorkflowVersion:
+		"""Read the terminal stage output after the native graph finished, or raise."""
+		terminal = result.outputs.get(self._terminal_id)
+		if terminal is not None:
+			self._last_stage_output = dict(terminal.derived)
+		outcome = self._nodes_outcome
+		if outcome is None:
+			raise RuntimeError("nodes stage did not publish an outcome")
+		if outcome.status == "failed":
+			raise DynamicWorkflowError(outcome.error, outcome.failures)
+		return outcome.version
+
+	def _reject_if_pending(self) -> None:
+		"""Refuse a second body run while one waits; it owns its candidate version."""
+		if self._pending:
+			request_id = next(iter(self._pending))
+			raise RuntimeError(
+				f"workflow {self.workflow_id} has a paused build ({request_id}); "
+				"resume or close it first"
+			)
+
+	def _begin(
+		self,
+		request: DynamicWorkflowRequest,
+		agent_state: Mapping[str, Any] | None = None,
+	) -> tuple[WorkflowVersion | None, _LiveRun | None]:
+		"""Validate, prepare and create the candidate revision; callers hold ``_run_lock``."""
+		generation, modifier = _published_workflows()
+		if not (request.run_node_generation or request.run_runtime_modifier):
+			raise ValueError("enable node generation, the runtime modifier, or both")
+		if not request.run_node_generation and (request.node_amendments or request.markdown_amendments):
+			raise ValueError("node and markdown amendments require node generation")
+		graph_path = Path(request.workflow_json_path).expanduser().resolve()
+		requirement_path = Path(request.requirement_md_path).expanduser().resolve()
+		state_extra = dict(agent_state or {})
+		head_done = bool(state_extra.get("agent_head_done"))
+		graph_stable = bool(state_extra.get("agent_graph_stable"))
+		graph, order = self._load_business(graph_path)
+		self._last_logs = WorkflowNodeLogs()
+		self._last_stage_output = None
+		self._nodes_outcome = None
+
+		if not head_done and self._head is not None and order and not graph_stable:
+			# The graph stage may rewrite workflow.json, and the chains were built
+			# from the previous revision, so this pass runs the head steps only.
+			head_state = {
+				key: value for key, value in state_extra.items()
+				if key not in ("agent_context", "agent_graph_stable")
+			}
+			head_result = self.run_steps(
+				state=head_state,
+				skipped_steps=self._body_step_ids(),
+			)
+			self._last_stage_output = dict(head_result.outputs[self.head_terminal_id].derived)
+			if self._last_stage_output.get("error"):
+				raise RuntimeError(self._last_stage_output["error"])
+			head_done = True
+			graph, order = self._load_business(graph_path)
+
+		requirement_text = requirement_path.read_text(encoding="utf-8") if requirement_path.is_file() else ""
+		selected = set(request.force_nodes) | set(request.node_amendments) | set(request.markdown_amendments) | set(request.node_formats)
+		if selected.difference(order):
+			raise ValueError(f"unknown or disabled requested nodes: {sorted(selected.difference(order))}")
+		# Sorted so that reordering the JSON does not reload the pool.
+		generation_config = {
+			"pool_size": graph.get("pool_size", 1),
+			"nodes": sorted(
+				({"name": node["name"], "depends": sorted(node.get("depends", []))}
+				for node in graph["nodes"] if node.get("enable", True)),
+				key=lambda node: node["name"],
+			),
+		}
+		business_nodes = generation_config["nodes"]
+		if business_nodes:
+			self._ensure_engine(
+				business_nodes=business_nodes,
+				generation=generation,
+				modifier=modifier,
+				pool_size=self._expanded_pool_size(graph, generation, modifier),
+			)
+		manifest = self._read_manifest()
+		version = manifest["workflow_version"] + 1
+		directory = self.storage_dir / "workflows" / f"{version:08d}"
+		# Never overwrite another writer's candidate or an interrupted build.
+		directory.mkdir(parents=True, exist_ok=False)
+		logs = self._last_logs
+		try:
+			self._write_json(directory / "workflow.json", graph)
+			self._write_json(directory / "generation_workflow.json", generation_config)
+			(directory / "requirement_analysis.md").write_text(requirement_text, encoding="utf-8")
+			raw_nodes = {node["name"]: node for node in graph["nodes"]}
+			artifacts: dict[str, dict[str, Path]] = {}
+			# Make all prior sources available for graph-aware ancestor inspection.
+			for name in order:
+				registry = manifest["nodes"].get(name)
+				targets = self._artifact_targets(directory, name)
+				artifacts[name] = targets
+				if registry:
+					self._copy_artifacts(self._node_version(registry["versions"][-1]).artifacts, targets)
+			run = _GenerationRun(
+				request=request, directory=directory, graph=graph,
+				order=tuple(order), version=version,
+				requirement_text=requirement_text, raw_nodes=raw_nodes,
+				artifacts=artifacts, registry=manifest["nodes"],
+				generation=generation, modifier=modifier,
+			)
+		except BaseException:
+			shutil.rmtree(directory, ignore_errors=True)
+			raise
+		if not business_nodes:
+			return self._publish_empty_graph(run, manifest), None
+		skipped: list[str] = []
+		if head_done:
+			skipped.extend(self.head_step_ids)
+		return None, _LiveRun(
+			request_id=f"flowx-node-{version:08d}-{uuid.uuid4().hex[:12]}",
+			directory=directory,
+			state={
+				"dynamic_workflow_run": run,
+				"dynamic_workflow_orchestrator": self,
+				"dynamic_workflow_logs": logs,
+				NAMESPACE_KEY: {},
+				"dynamic_workflow_namespace_lock": RLock(),
+				**state_extra,
+			},
+			skipped=skipped,
+		)
 
 	@staticmethod
 	def _load_business(graph_path: Path) -> tuple[dict[str, Any], list[str]]:
@@ -772,7 +925,9 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 			removed = self._trim_history(manifest)
 			self._write_json(self._manifest_path, manifest)
 		except BaseException:
-			shutil.rmtree(directory, ignore_errors=True)
+			# An atomic manifest replacement may have completed before an exception.
+			if not self._is_published(directory):
+				shutil.rmtree(directory, ignore_errors=True)
 			raise
 		for path in removed:
 			shutil.rmtree(path, ignore_errors=True)
@@ -864,9 +1019,11 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 				shutil.rmtree(path, ignore_errors=True)
 			return self._workflow_version(workflow_record)
 		except BaseException:
-			shutil.rmtree(directory, ignore_errors=True)
-			for node_dir in created_node_dirs:
-				shutil.rmtree(node_dir, ignore_errors=True)
+			# Never roll back artifacts already referenced by the committed manifest.
+			if not self._is_published(directory):
+				shutil.rmtree(directory, ignore_errors=True)
+				for node_dir in created_node_dirs:
+					shutil.rmtree(node_dir, ignore_errors=True)
 			raise
 
 	def _trim_history(self, manifest: dict[str, Any]) -> list[Path]:
@@ -895,23 +1052,34 @@ class DynamicWorkflowOrchestrator(ExpandedWorkflowEngine):
 				shutil.rmtree(path, ignore_errors=True)
 
 	def close(self, request_id: str | None = None) -> None:
-		"""Abandon one native run, or release the expanded engine.
+		"""Abandon one native run (and its pending candidate), or release the expanded engine.
 
 		``AgentBuilder`` closes the published child workflows. Safe before the first
 		run, when no pool exists yet; terminal and idempotent otherwise.
 		"""
-		if request_id is not None:
-			super().close(request_id)
-			return
 		with self._run_lock:
-			if self._closed:
+			if request_id is not None:
+				if self._closed and not self._close_complete:
+					self.close()
+					return
+				live = self._pending.get(request_id)
+				if live is not None:
+					self._abandon(live)
+				elif self._engine_ready:
+					super().close(request_id)
 				return
 			self._closed = True
-			if self._engine_ready:
-				close_workflow_engine(self)
+			if not self._close_complete:
+				if self._engine_ready:
+					close_workflow_engine(self)
+				self._close_complete = True
+			# A callback may have published while native cancellation was joining it.
+			for rid, live in list(self._pending.items()):
+				self._discard_unpublished(live)
+				self._pending.pop(rid, None)
 
 
 __all__ = [
 	"DynamicWorkflowError", "DynamicWorkflowOrchestrator", "DynamicWorkflowRequest",
-	"NODES_STAGE_EXIT_ID", "NodeRepairInput", "NodesStageOutcome", "NodeVersion", "WorkflowVersion",
+	"NODES_STAGE_EXIT_ID", "NodesStageOutcome", "NodeVersion", "OrchestratorRun", "WorkflowVersion",
 ]

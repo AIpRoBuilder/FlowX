@@ -1,4 +1,7 @@
 <a name="readme-top"></a>
+<!-- Modified 2026-11-03: document workflow-indexed background builds and review. -->
+<!-- Modified 2026-11-02: clarify SDK repair behavior and paused-result fields. -->
+<!-- Modified 2026-11-03: document the background-only MCP build interface. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -46,7 +49,7 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 - **[2026.10.24]** ⚙️ **原生 WorkflowEngine 生成。** 图、节点和入口生成工作流现在都是 `WorkflowEngine` 的子类。
 - **[2026.10.22]** 🚀 **交互式运行时。** `run_service` 返回可连接的 `base_url`；MCP 新增 `run_step` 与 `reset_session`。
 - **[2026.10.20]** 🛠️ **引导式节点修复。** 节点测试失败后，可以结合用户指导进行修正并重试。
-- **[2026.10.19]** 🔁 **演进 API。** `evolve` / `evolve_workflow` 可以作用于整个工作流、单个节点，或由引擎自行判断。
+- **[2026.10.19]** 🔁 **演进 API。** SDK 的 `evolve` 和 MCP 工作流演进能力可以作用于整个工作流、单个节点，或由引擎自行判断。
 
 <a name="why-flowx"></a>
 ## 🌟 为什么选择 FlowX？
@@ -263,7 +266,16 @@ Return the category, priority, and draft reply as structured output.
 
 ### 2. 构建并检查
 
-Agent 会调用 `build_workflow`（或分阶段调用 `build_workflow_json`、`build_nodes` 和 `build_main_entrypoint`）来创建工作流图、节点实现与后端。使用 `list_workflows`、`list_nodes` 和 `get_workflow` 检查工作流 ID、节点 ID 与产物位置。具体步骤 ID 来自生成的工作流，而不是固定的演示 schema。
+先调用 `create_workflow` 分配空工作流，再选择 `start_new_workflow(workflow_id, prompt)` 构建整个工作流，或使用 `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` 仅构建工作流图及需求分析；该图构建工具也可修改已有工作流。分阶段构建时，可按需继续调用 `start_build_nodes` 和 `start_build_main_entrypoint(workflow_id, amendment='', fastapi_port=8000, smoke_test=false)`。已有工作流还可通过 `start_build_workflow` 和 `start_evolve_workflow` 构建或演进多个阶段。使用 `list_workflows`、`list_nodes` 和 `get_workflow` 检查工作流 ID、节点 ID 与产物位置。具体步骤 ID 来自生成的工作流，而不是固定的演示 schema。
+
+所有 MCP 构建都在后台运行并立即返回。通过 `get_build_status(workflow_id)` 查询，直到构建完成、失败、需要输入或需要恢复；检查最终结果中的阶段错误。顶层 `ok` 表示状态查询成功，不代表构建成功：应检查 `status` 和 `result.ok`。状态为 `input_required` 时展示 `awaiting.prompt` 和 `awaiting.test_log`，等待用户回答，再调用 `submit_background_build_input`，传入当前的 `workflow_id`、`revision`、`request_id`、作为 `step_id` 的 `awaiting.stepId` 和用户 `input`，然后继续查询。普通指导修正节点，`test: <指导>` 修正测试，`skip` 跳过本次修正，空回答仅使用测试日志。使用当前的 `workflow_id`、`revision` 和 `request_id` 调用 `abort_background_build` 可放弃暂停的构建。若状态为 `recovery_required`，先用当前的 `workflow_id` 和 `revision` 调用 `recover_background_build`，不要直接重建。
+
+状态只保存在当前 MCP 服务进程中，按工作流显示最新构建；服务进程重启后无法恢复原内存中的构建。引擎在所有工作流之间只允许一个活动构建，暂停时仍占用该名额。支持 `interactive` 的后台工具默认开启交互；传 `interactive=false` 则直接按测试日志修正。`list_pending_builds` 只适用于暂停的后台构建，只能在原服务进程存活时于超时或客户端重启后找回等待问题。是否轮询和如何显示由客户端决定。
+
+> [!IMPORTANT]
+> **MCP 客户端接口破坏性变更：**同步 MCP 工具 `build_workflow_json`、`build_nodes`、`build_main_entrypoint`、`build_workflow`、`evolve_workflow`、`submit_build_input` 和 `abort_build` 已移除。请迁移到对应的 `start_*` 和后台输入/取消工具，并轮询结果。新建工作流须先调用 `create_workflow`，再启动构建。Python SDK 的同步构建方法仍可使用。升级前请用旧服务完成或取消旧同步暂停任务；不要仅为升级而重启正在进行的构建。
+
+若 `recover_background_build` 持续报告底层候选清理未完成，它不会自动删除文件或释放写入名额。停止原服务后，确认没有其他写入者，再按 [动态工作流文档](docs/DYNAMIC_WORKFLOW.md) 检查未发布候选。若单独构建图后只有需求或图文件之一存在，`start_build_workflow_json` 会拒绝覆盖：请先检查产物，再选择适当的已有工作流修复方式，不要盲目重试创建。若两个文件均未写出，确认没有写入者或残留候选后，可重试原创建请求。
 
 ### 3. 运行、演进与复用
 
@@ -274,7 +286,7 @@ Update the draft_reply node: for urgent tickets, include an escalation note.
 Then rerun the service.
 ```
 
-`run_service` 启动或重启生成的服务。`run_step` 向运行中的服务输入某个步骤的参数，并在工作流暂停等待更多输入时返回状态；`reset_session` 取消暂停的运行。`evolve_workflow` 可以修改整个工作流（`target="workflow"`）、某个节点（`list_nodes` 返回的 step id 或 node id），或由引擎自行判断。
+`run_service` 启动或重启生成的服务。`run_step` 向运行中的服务输入某个步骤的参数，并在工作流暂停等待更多输入时返回状态；`reset_session` 取消暂停的运行。`start_evolve_workflow` 可以修改整个工作流（`target="workflow"`）、某个节点（`list_nodes` 返回的 step id 或 node id），或由引擎自行判断；按上述方式轮询后台构建。
 
 这正是区别所在：Agent 不只是回答当前工单，而是构建并演进处理下一张工单的流程。
 
@@ -285,17 +297,23 @@ Then rerun the service.
 
 | 类别 | 工具 | 用途 |
 | --- | --- | --- |
-| 构建 | `build_workflow_json` | 创建（不传 `workflow_id`）或修改 `workflow.json` 及其需求分析。 |
-| 构建 | `build_nodes` | 构建工作流节点，或按 step id 修改指定节点；未变化的节点会被复用。 |
-| 构建 | `build_main_entrypoint` | 基于最新节点创建或重新生成主入口。 |
-| 构建 | `build_workflow` | 从请求和/或运行日志创建或修改整个工作流；后续阶段会跟随前面的变更。 |
-| 构建 | `evolve_workflow` | 演进现有工作流（`target="workflow"`）或单个节点（step id 或 node id）；不传 `target` 时由引擎判断。 |
+| 后台构建 | `create_workflow` | 创建空工作流并返回 `workflow_id`。 |
+| 后台构建 | `start_new_workflow` | 开始构建已创建的空工作流并立即返回。 |
+| 后台构建 | `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` | 为已分配的空工作流创建图和需求分析，或修改已有工作流的图和需求分析；不构建节点或主入口。 |
+| 后台构建 | `start_build_nodes` | 构建节点或按 step id 修改指定节点；未变化的节点会被复用。 |
+| 后台构建 | `start_build_main_entrypoint(workflow_id, amendment='', fastapi_port=8000, smoke_test=false)` | 基于最新节点创建或重新生成主入口，可选冒烟测试。 |
+| 后台构建 | `start_build_workflow` | 从请求和/或运行日志修改已有工作流；后续阶段可跟随前面的变更。 |
+| 后台构建 | `start_evolve_workflow` | 演进现有工作流（`target="workflow"`）或单个节点（step id 或 node id）；不传 `target` 时由引擎判断。 |
+| 后台构建 | `get_build_status` | 按 `workflow_id` 查询当前进程中最新的构建状态和审核问题。 |
+| 后台构建 | `submit_background_build_input` | 校验并接受暂停构建的审核回答，后台继续构建并立即返回。 |
+| 后台构建 | `abort_background_build`、`recover_background_build` | 放弃暂停的构建或重新检查不确定的引擎状态。 |
+| 后台构建 | `list_pending_builds` | 列出暂停的后台构建及其等待的问题；原服务进程存活时可在超时或客户端重启后恢复 `request_id` 和 `revision`。 |
 | 运行时 | `run_service` | 将构建好的工作流作为服务运行并返回 `base_url`；再次调用会使用最新文件重启服务。 |
 | 运行时 | `run_step` | 向运行中的服务输入某个步骤的参数；工作流暂停等待更多输入时返回 `awaiting`。 |
 | 运行时 | `reset_session` | 取消暂停的会话，使下一次 `run_step` 开始全新运行。 |
 | 运行时 | `stop_service` | 停止工作流正在运行的服务。 |
 | 检查 | `list_workflows` | 列出工作流 ID、节点 ID、版本和未解决的错误。 |
-| 检查 | `list_nodes` | 列出工作流的节点（step id、node id、版本）；可作为 `evolve_workflow` 的目标。 |
+| 检查 | `list_nodes` | 列出工作流的节点（step id、node id、版本）；可作为 `start_evolve_workflow` 的目标。 |
 | 检查 | `get_workflow` | 定位工作流的需求、`workflow.json`、节点版本和主入口。 |
 
 <a name="python-sdk"></a>
@@ -311,15 +329,15 @@ with FlowXClient(workspace="./workflows") as flowx:
         "Build a workflow that categorizes and prioritizes support tickets.",
     ).raise_for_failure()                                  # workflow.json + requirements
     workflow_id = created.workflow_id
-    flowx.build_nodes(workflow_id).raise_for_failure()     # all nodes, or {step_id: amendment}
+    flowx.build_nodes(workflow_id, await_repair_input=False).raise_for_failure()  # all nodes, or {step_id: amendment}
     flowx.build_main_entrypoint(workflow_id).raise_for_failure()
-    flowx.build_workflow("Also return a summary.", workflow_id=workflow_id)  # whole engine
+    flowx.build_workflow("Also return a summary.", workflow_id=workflow_id, await_repair_input=False)  # whole engine
     print(flowx.run_service(workflow_id))                  # run / rerun as a service
 ```
 
 每次构建调用都会返回 `AgentResult`，其中包含各阶段结果、未解决的错误、日志与产物路径；阶段失败会记录在结果中，而不是直接抛出。
 
-向 `build_nodes`、`build_workflow` 或 `evolve` 传入 `repair_input_callback=...`，可以在节点测试失败后引导修正。回调会收到包含节点 step id、尝试次数、pytest 日志与测试结果的 `NodeRepairInput`，并返回要与日志结合的指导、`"skip"`（跳过本次修正）或 `""`（仅使用日志）。可运行示例见 [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py)。
+`build_nodes`、`build_workflow` 与 `evolve` 在节点测试失败时默认暂停在该节点自己的 gate 处（`await_repair_input` 默认为 `True`）。结果包含 `status="input_required"`、`request_id` 与 `awaiting`；后者包含步骤元数据、`stepId`、`node`、`workflow_id`、`test_log`（最多保留末尾 6,000 个字符）和 `test_log_chars`（完整日志字符数）。用 `flowx.answer(request_id, input, awaiting["stepId"])` 继续。暂停时 `ok` 也可能为 `True`，因此不能仅凭 `raise_for_failure()` 判断构建已完成。普通文本修正节点（默认目标），`input="test: <指导>"` 改为修正生成的测试，`input="skip"` 跳过本次修正，`""` 仅按日志修正节点。传 `await_repair_input=False` 则节点自动按测试日志修正。可运行示例见 [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py)。
 
 要修改现有工作流，可使用 `evolve(workflow_id, command, target=...)` 选择演进目标。`list_nodes` 会返回每个节点的 step id 与 node id；不传 `target` 时由引擎判断命令指向哪一部分。可运行示例见 [examples/sdk_evolve.py](examples/sdk_evolve.py)。
 

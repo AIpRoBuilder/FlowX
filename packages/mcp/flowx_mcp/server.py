@@ -8,6 +8,12 @@
 # Modified 2026-10-16: rewrite the tool surface on the AgentBuilder engine (build_*, run_service).
 # Modified 2026-10-19: add evolve_workflow and list_nodes.
 # Modified 2026-10-22: proxy the generated service's run-step and reset-session endpoints.
+# Modified 2026-11-01: interactive repair gating is the default for every build tool.
+# Modified 2026-11-02: paused builds expose action_required and list_pending_builds for recovery.
+# Modified 2026-11-02: reuse shared build result handling for submitted build input.
+# Modified 2026-11-02: capture pending-build probe errors and describe the actual pause metadata.
+# Modified 2026-11-03: add workflow-indexed background builds and guarded repair recovery.
+# Modified 2026-11-03: expose background-only MCP build tools and guard orphaned pauses.
 """FastMCP server exposing the FlowX workflow engine."""
 
 from __future__ import annotations
@@ -15,8 +21,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import copy
 import importlib
-import io
 import json
 import logging
 import os
@@ -35,6 +41,10 @@ load_env_from_runtime_context(__file__)
 bootstrap_import_paths(__file__)
 
 logger = logging.getLogger("flowx.server")
+
+_OUTPUT_LOCK = threading.RLock()
+_OUTPUT_DEPTH = 0
+_OUTPUT_ORIGINAL: Any = None
 
 _MCP_SERVER_AVAILABLE = False
 _MCP_SERVER_IMPORT_ERROR = ""
@@ -69,13 +79,26 @@ def _error(tool: str, message: str, **extra: Any) -> str:
 
 @contextlib.contextmanager
 def _capture_builder_output(label: str) -> Iterator[None]:
-    """Capture noisy builder stdout/stderr so MCP stdio stays clean."""
-    buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+    """Route builder output to stderr while the stdio transport owns its original stream.
+
+    The transport binds stdout before tools run. Nested and concurrent calls must share
+    one redirect; a logger initialized during a build may retain the stderr stream.
+    """
+    del label
+    global _OUTPUT_DEPTH, _OUTPUT_ORIGINAL
+    with _OUTPUT_LOCK:
+        if _OUTPUT_DEPTH == 0:
+            _OUTPUT_ORIGINAL = sys.stdout
+            sys.stdout = sys.stderr
+        _OUTPUT_DEPTH += 1
+    try:
         yield
-    output = buffer.getvalue().strip()
-    if output:
-        logger.info("%s output:\n%s", label, output)
+    finally:
+        with _OUTPUT_LOCK:
+            _OUTPUT_DEPTH -= 1
+            if _OUTPUT_DEPTH == 0:
+                sys.stdout = _OUTPUT_ORIGINAL
+                _OUTPUT_ORIGINAL = None
 
 
 def _tool_call(tool: str, func: Callable[[], Any]) -> str:
@@ -86,6 +109,14 @@ def _tool_call(tool: str, func: Callable[[], Any]) -> str:
     except Exception as exc:
         logger.exception("%s failed", tool)
         return _error(tool, str(exc), traceback=traceback.format_exc().splitlines()[-20:])
+
+
+def _status_call(tool: str, func: Callable[[], Any]) -> str:
+    """Registry-only tools must not touch the process-wide output stream."""
+    try:
+        return _json(func())
+    except Exception as exc:
+        return _error(tool, str(exc))
 
 
 def _http(url: str, payload: dict[str, Any], timeout: float) -> str:
@@ -140,6 +171,155 @@ _SERVICES: dict[str, str] = {}
 _SESSIONS: dict[str, str] = {}
 _HTTP_LOCK = threading.Lock()
 
+# The engine serializes all builds, including different workflows. This registry
+# has its own lock so polling never waits for the engine's long-running lock.
+_BUILD_LOCK = threading.RLock()
+_BUILD_JOBS: dict[str, dict[str, Any]] = {}
+_BUILD_ACTIVE: str | None = None
+
+
+def _reserve_build(owner: str) -> None:
+    global _BUILD_ACTIVE
+    with _BUILD_LOCK:
+        if _BUILD_ACTIVE is not None:
+            raise RuntimeError(f"another build is active ({_BUILD_ACTIVE}); query or finish it first")
+        _BUILD_ACTIVE = owner
+
+
+def _release_build(owner: str) -> None:
+    global _BUILD_ACTIVE
+    with _BUILD_LOCK:
+        if _BUILD_ACTIVE == owner:
+            _BUILD_ACTIVE = None
+
+
+def _job_snapshot(job: dict[str, Any]) -> dict[str, Any]:
+    """Copy the last observation without exposing mutable registry state."""
+    return copy.deepcopy(job)
+
+
+def _job_action(job: dict[str, Any]) -> None:
+    job["action_required"] = (
+        "submit_background_build_input" if job["status"] == "input_required"
+        else "recover_background_build" if job["status"] == "recovery_required"
+        else "get_build_status" if job["status"] == "running" else None
+    )
+
+
+def _check_build_recovery(workflow_id: str) -> dict[str, Any]:
+    return dict(_get_client().build_recovery_state(workflow_id))
+
+
+def _run_background(workflow_id: str, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+    """Run to the next native pause/completion, then publish an immutable snapshot."""
+    global _BUILD_ACTIVE
+    payload: dict[str, Any] | None = None
+    error = ""
+    recovery: dict[str, Any] | None = None
+    recovery_unknown = False
+    cleanup_required = False
+    invoked = False
+    try:
+        with _capture_builder_output(method):
+            if method != "answer":
+                busy = _pending_payload(method)
+                if busy is not None:
+                    raise RuntimeError(busy["error"])
+            invoked = True
+            result = getattr(_get_client(), method)(*args, **kwargs)
+            payload = dict(_sdk().result_to_dict(result))
+            # Validate serializability before publishing the result to pollers.
+            _json(payload)
+            service = payload.get("service")
+            if isinstance(service, dict) and service.get("base_url"):
+                with _HTTP_LOCK:
+                    _SERVICES[workflow_id] = service["base_url"]
+    except BaseException as exc:
+        logger.exception("background %s failed", method)
+        error = f"{type(exc).__name__}: {exc}"
+        if invoked:
+            try:
+                state = _check_build_recovery(workflow_id)
+                recovery = state if state.get("status") == "input_required" else None
+                cleanup_required = state.get("status") == "cleanup_required"
+            except Exception:
+                recovery_unknown = True
+                logger.exception("could not inspect the failed build")
+    with _BUILD_LOCK:
+        job = _BUILD_JOBS[workflow_id]
+        job["revision"] += 1
+        if recovery is not None:
+            job.update(status="input_required", request_id=recovery["request_id"],
+                       awaiting=recovery["awaiting"], error=error, result=None)
+        elif recovery_unknown or cleanup_required:
+            job.update(status="recovery_required", request_id=None, awaiting=None, error=error, result=None)
+        elif error:
+            job.update(status="failed", request_id=None, awaiting=None, error=error, result=None)
+        elif payload is not None and payload.get("status") == "input_required":
+            job.update(status="input_required", request_id=payload.get("request_id"),
+                       awaiting=payload.get("awaiting"), error=None, result=payload)
+        else:
+            job.update(status="completed" if payload and payload.get("ok") else "failed",
+                       request_id=None, awaiting=None, error=None, result=payload)
+        _job_action(job)
+        if job["status"] not in ("input_required", "recovery_required") and _BUILD_ACTIVE == workflow_id:
+            _BUILD_ACTIVE = None
+
+
+def _start_background(_workflow_id: str, method: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+    """Reserve the single writer before launching; return the running observation."""
+    global _BUILD_ACTIVE
+    workflow_id = _workflow_id
+    if not workflow_id.strip():
+        raise ValueError("workflow_id must be a non-empty string")
+    with _BUILD_LOCK:
+        _reserve_build(workflow_id)
+        previous = _BUILD_JOBS.get(workflow_id)
+        revision = (previous["revision"] if previous else 0) + 1
+        job = {"ok": True, "workflow_id": workflow_id, "revision": revision,
+               "status": "running", "request_id": None, "awaiting": None,
+               "result": None, "error": None}
+        _job_action(job)
+        _BUILD_JOBS[workflow_id] = job
+        initial = _job_snapshot(job)
+        try:
+            threading.Thread(target=_run_background, args=(workflow_id, method, args, kwargs),
+                             name=f"flowx-build-{workflow_id}", daemon=True).start()
+        except Exception:
+            if previous is None:
+                _BUILD_JOBS.pop(workflow_id, None)
+            else:
+                _BUILD_JOBS[workflow_id] = previous
+            _BUILD_ACTIVE = None
+            raise
+        return initial
+
+
+def _resume_background(workflow_id: str, revision: int, request_id: str, step_id: str, value: str) -> dict[str, Any]:
+    with _BUILD_LOCK:
+        job = _BUILD_JOBS.get(workflow_id)
+        if job is None:
+            raise LookupError(f"no background build for workflow {workflow_id}")
+        if (job["status"] != "input_required" or job["revision"] != revision
+                or job["request_id"] != request_id or _BUILD_ACTIVE != workflow_id):
+            raise ValueError("stale or already answered build; call get_build_status again")
+        awaiting = job.get("awaiting") or {}
+        if not step_id or step_id != awaiting.get("stepId"):
+            raise ValueError("step_id does not match the current question")
+        old = _job_snapshot(job)
+        job.update(status="running", revision=revision + 1, request_id=None,
+                   awaiting=None, result=None, error=None)
+        _job_action(job)
+        initial = _job_snapshot(job)
+        try:
+            threading.Thread(target=_run_background,
+                             args=(workflow_id, "answer", (request_id, value, step_id), {}),
+                             name=f"flowx-answer-{workflow_id}", daemon=True).start()
+        except Exception:
+            _BUILD_JOBS[workflow_id] = old
+            raise
+        return initial
+
 
 def _session_for(workflow_id: str) -> str:
     with _HTTP_LOCK:
@@ -175,14 +355,23 @@ def _close_client() -> None:
         client.close()
 
 
-def _build(tool: str, method: str, *args: Any, **kwargs: Any) -> str:
-    """Run one engine build method and return its result as JSON."""
-
-    def _impl() -> dict[str, Any]:
-        result = getattr(_get_client(), method)(*args, **kwargs)
-        return _sdk().result_to_dict(result)
-
-    return _tool_call(tool, _impl)
+def _pending_payload(tool: str) -> dict[str, Any] | None:
+    """Refuse a new build while one waits at a node gate (it owns its candidate revision)."""
+    pending = _get_client().pending_requests()
+    if not pending:
+        return None
+    first = pending[0]
+    return {
+        "ok": False, "tool": tool, "status": "blocked",
+        "request_id": first["request_id"],
+        "workflow_id": first["workflow_id"],
+        "error": (
+            f"unregistered paused build request_id={first['request_id']} "
+            f"workflow_id={first['workflow_id']} owns a candidate; resolve it outside "
+            "this MCP server before starting another build"
+        ),
+        "awaiting": first["awaiting"],
+    }
 
 
 def create_server() -> Any:
@@ -200,139 +389,237 @@ def create_server() -> Any:
         instructions=(
             "FlowX workflow builder. Create or modify a workflow's workflow.json and requirements, "
             "its nodes (all of them, or specific ones by step id), its main entrypoint, or the whole "
-            "workflow from one request; then run or rerun it as a service. Workflows are identified "
-            "by the workflow_id returned when they are created. Stage failures come back as "
-            "ok=false with the per-stage errors; pass them to build_workflow(fix_errors=true) to repair. "
-            "To change an existing workflow, use evolve_workflow (target the workflow or one node from "
-            "list_nodes, or omit target to let the engine decide)."
+            "workflow from one request; then run or rerun it as a service. Use create_workflow "
+            "to allocate a workflow_id, then start_new_workflow for the whole workflow or "
+            "start_build_workflow_json for its graph and requirements. For existing workflows use "
+            "start_build_workflow_json, start_build_nodes, start_build_main_entrypoint, "
+            "start_build_workflow or start_evolve_workflow. To target a node with "
+            "start_evolve_workflow, obtain its step_id or node_id from list_nodes; omit target "
+            "to let the engine decide. Stage failures include per-stage errors; use "
+            "start_build_workflow with fix_errors=true to repair them. Start tools return "
+            "immediately: poll get_build_status with workflow_id until input_required, completed, "
+            "failed or recovery_required. The top-level ok indicates a successful status query, "
+            "not a successful build: inspect status and result.ok. Interactive builds pause on a node test failure. Show "
+            "awaiting.prompt and awaiting.test_log to the user, then call "
+            "submit_background_build_input with the exact revision, request_id and awaiting.stepId, "
+            "or abort_background_build with the exact revision and request_id. Use "
+            "list_pending_builds to rediscover an active or paused background build. Do not retry "
+            "a build while it is active or paused; if status=recovery_required call "
+            "recover_background_build. Background status and paused runs exist only in this "
+            "server process."
         ),
     )
 
     @flowx_mcp.tool()
-    def build_workflow_json(
-        prompt: str,
-        workflow_id: Optional[str] = None,
-        temperature: float = 0.35,
-    ) -> str:
-        """Create (no workflow_id) or modify (with workflow_id) workflow.json and its requirement analysis.
+    def create_workflow() -> str:
+        """Allocate an empty workflow id for start_new_workflow or start_build_workflow_json."""
+        def _impl() -> dict[str, Any]:
+            owner = f"create:{uuid.uuid4().hex}"
+            _reserve_build(owner)
+            try:
+                busy = _pending_payload("create_workflow")
+                if busy is not None:
+                    return busy
+                return {"ok": True, "workflow_id": _get_client().create_workflow(),
+                    "action_required": None,
+                    "next_actions": ["start_new_workflow", "start_build_workflow_json"]}
+            finally:
+                _release_build(owner)
+        return _tool_call("create_workflow", _impl)
 
-        Nodes and the main entrypoint are not rebuilt; call build_nodes and build_main_entrypoint
-        (or build_workflow) afterwards.
+    @flowx_mcp.tool()
+    def start_new_workflow(workflow_id: str, prompt: str, cascade: bool = True,
+                           fastapi_port: int = 8000, smoke_test: bool = False,
+                           serve: bool = False, interactive: bool = True) -> str:
+        """Start building an empty workflow allocated by create_workflow; poll get_build_status.
 
-        Args:
-            prompt: The requirement for a new workflow, or the change to apply to an existing one.
-            workflow_id: Id of the workflow to modify; omit to create a new workflow.
-            temperature: LLM temperature for graph planning.
+        An interactive test failure is exposed as input_required only after the engine pauses.
+        """
+        if not str(prompt or "").strip():
+            return _error("start_new_workflow", "prompt must be a non-empty string")
+        return _tool_call("start_new_workflow", lambda: _start_background(
+            workflow_id, "build_new_workflow", workflow_id, prompt, cascade=cascade,
+            fastapi_port=fastapi_port, smoke_test_main=smoke_test, serve=serve,
+            await_repair_input=interactive,
+        ))
+
+    @flowx_mcp.tool()
+    def start_build_workflow_json(workflow_id: str, prompt: str, temperature: float = 0.35) -> str:
+        """Start creating or modifying a workflow graph and requirements; poll get_build_status.
+
+        Use an empty workflow allocated by create_workflow, or an existing complete workflow.
+        Nodes and the main entrypoint are not rebuilt; use start_build_nodes and
+        start_build_main_entrypoint afterwards when needed. Partial records cannot be overwritten.
         """
         text = str(prompt or "").strip()
         if not text:
-            return _error("build_workflow_json", "prompt must be a non-empty string")
-        return _build(
-            "build_workflow_json", "build_workflow_json", text,
-            workflow_id=workflow_id or None, temperature=temperature,
-        )
+            return _error("start_build_workflow_json", "prompt must be a non-empty string")
+        return _tool_call("start_build_workflow_json", lambda: _start_background(
+            workflow_id, "build_allocated_workflow_json", workflow_id, text, temperature=temperature,
+        ))
 
     @flowx_mcp.tool()
-    def build_nodes(
-        workflow_id: str,
-        amendments: Optional[dict[str, str]] = None,
-        cascade: bool = False,
-    ) -> str:
-        """Build a workflow's nodes, or amend specific nodes; unchanged nodes are reused.
+    def start_build_main_entrypoint(workflow_id: str, amendment: str = "", fastapi_port: int = 8000,
+                                    smoke_test: bool = False) -> str:
+        """Start creating or regenerating the main entrypoint; poll get_build_status.
 
-        Args:
-            workflow_id: Id of an existing workflow that has a workflow.json.
-            amendments: Optional {step_id: change description}; only those nodes are modified.
-            cascade: Also regenerate the main entrypoint when the nodes changed.
+        The workflow must have built nodes. Amendment describes optional changes,
+        fastapi_port selects the service port, and smoke_test audits a run before acceptance.
         """
-        return _build(
-            "build_nodes", "build_nodes", workflow_id,
-            dict(amendments) if amendments else None, cascade=cascade,
-        )
-
-    @flowx_mcp.tool()
-    def build_main_entrypoint(
-        workflow_id: str,
-        amendment: str = "",
-        fastapi_port: int = 8000,
-        smoke_test: bool = False,
-    ) -> str:
-        """Create or regenerate a workflow's main entrypoint from its latest nodes.
-
-        Args:
-            workflow_id: Id of a workflow whose nodes are built.
-            amendment: Optional change request for the entrypoint.
-            fastapi_port: Port the generated service listens on.
-            smoke_test: Run the entrypoint once and audit its log before accepting it.
-        """
-        return _build(
-            "build_main_entrypoint", "build_main_entrypoint", workflow_id, amendment,
+        return _tool_call("start_build_main_entrypoint", lambda: _start_background(
+            workflow_id, "build_main_entrypoint", workflow_id, amendment,
             fastapi_port=fastapi_port, smoke_test_main=smoke_test,
-        )
+        ))
 
     @flowx_mcp.tool()
-    def build_workflow(
-        prompt: str = "",
-        workflow_id: Optional[str] = None,
-        logs: Optional[list[str]] = None,
-        fix_errors: bool = False,
-        cascade: bool = True,
-        fastapi_port: int = 8000,
-        smoke_test: bool = False,
-        serve: bool = False,
-    ) -> str:
-        """Create or modify a whole workflow from a free-text request and/or run logs.
+    def start_build_nodes(workflow_id: str, amendments: Optional[dict[str, str]] = None,
+                          cascade: bool = False, interactive: bool = True) -> str:
+        """Start building existing nodes without waiting; poll get_build_status(workflow_id)."""
+        return _tool_call("start_build_nodes", lambda: _start_background(
+            workflow_id, "build_nodes", workflow_id, dict(amendments) if amendments else None,
+            cascade=cascade, await_repair_input=interactive,
+        ))
 
-        The request is classified into the stages it affects (workflow.json, nodes, main
-        entrypoint); with cascade, later stages follow earlier changes.
-
-        Args:
-            prompt: What to create or change.
-            workflow_id: Id of the workflow to modify; omit to create a new one.
-            logs: Output/test logs of a run; failures in them are traced to a node or the entrypoint and fixed.
-            fix_errors: Also repair the errors left unresolved by earlier runs of this workflow.
-            cascade: Rebuild later stages when an earlier one changed.
-            fastapi_port: Port the generated service listens on.
-            smoke_test: Run the entrypoint once and audit its log before accepting it.
-            serve: Start the workflow as a service when everything succeeded.
-        """
+    @flowx_mcp.tool()
+    def start_build_workflow(workflow_id: str, prompt: str = "", logs: Optional[list[str]] = None,
+                             fix_errors: bool = False, cascade: bool = True,
+                             fastapi_port: int = 8000, smoke_test: bool = False,
+                             serve: bool = False, interactive: bool = True) -> str:
+        """Start changing an existing workflow in the background; poll get_build_status."""
         if not (str(prompt or "").strip() or logs or fix_errors):
-            return _error("build_workflow", "provide a prompt, logs, or fix_errors=true")
-        return _build(
-            "build_workflow", "build_workflow", prompt or "",
-            workflow_id=workflow_id or None, logs=tuple(logs or ()), fix_errors=fix_errors,
-            cascade=cascade, fastapi_port=fastapi_port, smoke_test_main=smoke_test, serve=serve,
-        )
+            return _error("start_build_workflow", "provide a prompt, logs, or fix_errors=true")
+        return _tool_call("start_build_workflow", lambda: _start_background(
+            workflow_id, "build_workflow", prompt or "", workflow_id=workflow_id,
+            logs=tuple(logs or ()), fix_errors=fix_errors, cascade=cascade,
+            fastapi_port=fastapi_port, smoke_test_main=smoke_test, serve=serve,
+            await_repair_input=interactive,
+        ))
 
     @flowx_mcp.tool()
-    def evolve_workflow(
-        workflow_id: str,
-        command: str,
-        target: Optional[str] = None,
-        cascade: bool = True,
-        fastapi_port: int = 8000,
-        smoke_test: bool = False,
-        serve: bool = False,
-    ) -> str:
-        """Evolve an existing workflow, or one of its nodes, with a change command.
-
-        Args:
-            workflow_id: Id of the workflow to evolve.
-            command: The change to make.
-            target: "workflow" to change the workflow itself, or a node step id / node id
-                (see list_nodes) to change only that node; omit to let the engine decide.
-            cascade: Rebuild later stages (nodes, main entrypoint) when an earlier one changed.
-            fastapi_port: Port the generated service listens on.
-            smoke_test: Run the entrypoint once and audit its log before accepting it.
-            serve: Start the workflow as a service when everything succeeded.
-        """
+    def start_evolve_workflow(workflow_id: str, command: str, target: Optional[str] = None,
+                              cascade: bool = True, fastapi_port: int = 8000,
+                              smoke_test: bool = False, serve: bool = False,
+                              interactive: bool = True) -> str:
+        """Start evolving an existing workflow in the background; poll get_build_status."""
         if not str(command or "").strip():
-            return _error("evolve_workflow", "command must be a non-empty string")
-        return _build(
-            "evolve_workflow", "evolve", workflow_id, command,
-            target=target or None, cascade=cascade, fastapi_port=fastapi_port,
-            smoke_test_main=smoke_test, serve=serve,
-        )
+            return _error("start_evolve_workflow", "command must be a non-empty string")
+        return _tool_call("start_evolve_workflow", lambda: _start_background(
+            workflow_id, "evolve", workflow_id, command, target=target or None,
+            cascade=cascade, fastapi_port=fastapi_port, smoke_test_main=smoke_test,
+            serve=serve, await_repair_input=interactive,
+        ))
+
+    @flowx_mcp.tool()
+    def get_build_status(workflow_id: str) -> str:
+        """Get the latest background build observation without waiting for the engine.
+
+        If input_required, show awaiting.prompt and awaiting.test_log to the user and
+        submit their answer with the exact revision, request_id and awaiting.stepId.
+        State is in memory and is lost when the MCP server process exits.
+        """
+        def _impl() -> dict[str, Any]:
+            with _BUILD_LOCK:
+                job = _BUILD_JOBS.get(workflow_id)
+                if job is None:
+                    raise LookupError(f"no background build for workflow {workflow_id} in this server process")
+                return _job_snapshot(job)
+        return _status_call("get_build_status", _impl)
+
+    @flowx_mcp.tool()
+    def submit_background_build_input(workflow_id: str, revision: int, request_id: str,
+                                      step_id: str, input: str = "") -> str:
+        """Accept a user answer and resume in the background; poll get_build_status again.
+
+        Supply the exact revision, request_id and awaiting.stepId from the latest observation.
+        'test: guidance' amends the test; 'skip' skips this amendment; other text amends the node.
+        """
+        return _status_call("submit_background_build_input", lambda: _resume_background(
+            workflow_id, revision, request_id, step_id, input,
+        ))
+
+    @flowx_mcp.tool()
+    def recover_background_build(workflow_id: str, revision: int) -> str:
+        """Recheck an uncertain build against the engine; never start a replacement build first."""
+        def _impl() -> dict[str, Any]:
+            with _BUILD_LOCK:
+                job = _BUILD_JOBS.get(workflow_id)
+                if (job is None or job["status"] != "recovery_required"
+                        or job["revision"] != revision or _BUILD_ACTIVE != workflow_id):
+                    raise ValueError("stale or non-recoverable build; call get_build_status again")
+                job["status"] = "recovering"
+                _job_action(job)
+            try:
+                state = _check_build_recovery(workflow_id)
+                pending = state if state.get("status") == "input_required" else None
+            except Exception:
+                with _BUILD_LOCK:
+                    job["status"] = "recovery_required"
+                    _job_action(job)
+                raise
+            with _BUILD_LOCK:
+                job["revision"] += 1
+                if state.get("status") == "cleanup_required":
+                    job.update(status="recovery_required", error="native candidate cleanup is still required")
+                elif pending is None:
+                    job.update(status="failed", request_id=None, awaiting=None)
+                    _release_build(workflow_id)
+                else:
+                    job.update(status="input_required", request_id=pending["request_id"],
+                               awaiting=pending["awaiting"])
+                _job_action(job)
+                return _job_snapshot(job)
+        return _tool_call("recover_background_build", _impl)
+
+    @flowx_mcp.tool()
+    def abort_background_build(workflow_id: str, revision: int, request_id: str) -> str:
+        """Abort an awaiting background build using its exact revision and request_id."""
+        def _impl() -> dict[str, Any]:
+            with _BUILD_LOCK:
+                job = _BUILD_JOBS.get(workflow_id)
+                if (job is None or job["status"] != "input_required" or job["revision"] != revision
+                        or job["request_id"] != request_id or _BUILD_ACTIVE != workflow_id):
+                    raise ValueError("stale or non-paused build; call get_build_status again")
+                job["status"] = "aborting"
+                _job_action(job)
+            try:
+                _get_client().abort(request_id)
+            except Exception:
+                with _BUILD_LOCK:
+                    job["status"] = "recovery_required"
+                    job["revision"] += 1
+                    _job_action(job)
+                raise
+            with _BUILD_LOCK:
+                job.update(status="aborted", revision=revision + 1, request_id=None,
+                           awaiting=None, result=None, error=None)
+                _job_action(job)
+                _release_build(workflow_id)
+                return _job_snapshot(job)
+        return _tool_call("abort_background_build", _impl)
+
+    @flowx_mcp.tool()
+    def list_pending_builds() -> str:
+        """List the active background build and any question it waits on.
+
+        This only reports jobs registered in this server process without waiting for the
+        engine. Use get_build_status for details, submit_background_build_input to answer,
+        or abort_background_build to abort a paused build. State is lost on server exit.
+        """
+
+        def _impl() -> dict[str, Any]:
+            with _BUILD_LOCK:
+                job = _BUILD_JOBS.get(_BUILD_ACTIVE) if _BUILD_ACTIVE is not None else None
+                if job is not None:
+                    pending = ([{"request_id": job["request_id"], "workflow_id": job["workflow_id"],
+                                 "awaiting": copy.deepcopy(job["awaiting"]), "revision": job["revision"]}]
+                               if job["status"] == "input_required" else [])
+                    return {"ok": True, "count": len(pending), "pending": pending,
+                            "action_required": job["action_required"], "status": job["status"],
+                            "revision": job["revision"], "active_workflow_id": job["workflow_id"]}
+                return {"ok": True, "count": 0, "pending": [], "action_required": None,
+                        "active_workflow_id": None}
+
+        return _status_call("list_pending_builds", _impl)
 
     @flowx_mcp.tool()
     def run_service(workflow_id: str) -> str:
@@ -376,7 +663,7 @@ def create_server() -> Any:
         input: Any = None,
         session_id: str = "",
         file_path: Optional[str] = None,
-        timeout: float = 300.0,
+        timeout: float = 1200.0,
     ) -> str:
         """Send one step's input to a running workflow; report whether it needs more input.
 
@@ -447,7 +734,7 @@ def create_server() -> Any:
     def list_nodes(workflow_id: str) -> str:
         """List a workflow's nodes as step_id, node_id and version (node_id is null until built).
 
-        Use a step_id or node_id as the target of evolve_workflow.
+        Use a step_id or node_id as the target of start_evolve_workflow.
 
         Args:
             workflow_id: Id of the workflow.
@@ -514,8 +801,24 @@ def run_server(
     except KeyboardInterrupt:
         logger.info("FlowX MCP server interrupted")
     finally:
-        # Stops the services this process started.
-        _close_client()
+        # Closing the engine while a worker holds its run lock can hang indefinitely.
+        # An active daemon is abandoned at process exit; never close its pools underneath it.
+        with _BUILD_LOCK:
+            active_job = _BUILD_JOBS.get(_BUILD_ACTIVE) if _BUILD_ACTIVE else None
+            worker_running = _BUILD_ACTIVE is not None and (
+                active_job is None or active_job["status"] not in ("input_required", "recovery_required")
+            )
+        if worker_running:
+            logger.warning("MCP server stopped while a build is running; its outcome is unknown")
+            with _client_lock:
+                client = _client
+            if client is not None:
+                try:
+                    client.stop_all_services()
+                except Exception:
+                    logger.exception("could not stop workflow services during shutdown")
+        else:
+            _close_client()
 
 
 def main(argv: Optional[list[str]] = None) -> None:

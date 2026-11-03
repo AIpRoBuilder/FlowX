@@ -7,6 +7,7 @@ Modified 2026-10-15: verify cleaned request APIs, builder-local routing and dete
 Modified 2026-10-15: migrate generation coverage to complete per-node requests without batch/callback state.
 Modified 2026-10-15: replace removed batch coverage with immediate rejection and direct graph refresh tests.
 Modified 2026-10-16: drop the removed workflow service wrappers; AgentBuilder owns its four workflows.
+Modified 2026-11-03: verify managed services do not inherit protocol stdout.
 """
 
 from __future__ import annotations
@@ -226,7 +227,7 @@ def test_merged_node_requests_have_flat_keyword_only_inputs(request_class, requi
         assert parameters["node_name"].default == ""
         outputs = {
             "test_file_path", "log_file_path", "test_log", "test_result",
-            "amended_node_file_path",
+            "amended_node_file_path", "amended_test_file_path", "amendment_target",
         }
         assert {field.name for field in request_fields if not field.init} == outputs
         assert outputs.isdisjoint(parameters)
@@ -353,8 +354,10 @@ def test_runtime_service_returns_explicit_process_data_without_retaining_it(
     first.poll.assert_not_called()
     first.terminate.assert_not_called()
     assert dependencies["popen_subprocess"].call_args_list == [
-        call(["/custom/python", str(tmp_path / "main.py")], cwd=str(tmp_path), env=environment),
-        call(["/custom/python", second_path], cwd=str(tmp_path / "another"), env=environment),
+           call(["/custom/python", str(tmp_path / "main.py")], cwd=str(tmp_path), env=environment,
+               stdout=builder_services.subprocess.DEVNULL),
+           call(["/custom/python", second_path], cwd=str(tmp_path / "another"), env=environment,
+               stdout=builder_services.subprocess.DEVNULL),
     ]
     assert all(
         actual.kwargs["env"] is not environment

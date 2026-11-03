@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Modified 2026-11-02: remove a hardcoded credential and clarify interactive repair.
 """Build, modify and run a FlowX workflow with the Python SDK.
 
 Setup (from the repository root):
@@ -19,14 +20,12 @@ from flowx_sdk import FlowXClient
 
 PORT = 8765
 REQUIREMENT = (
-    "Build a workflow that accepts a support ticket, classifies its category, assigns a priority, "
-    "and drafts a reply. Return the category, priority and draft reply as structured output."
+    "生成一个上传文字生成表格让人工审核，最后生成pdf的工作流"
 )
 
 
 def main() -> None:
     with FlowXClient() as flowx:  # stops any service it started on exit
-        flowx.api_key = "sk-c01ec39cd593406fb069c82dcaf4f526"
         if not flowx.api_key:
             sys.exit("Set FLOWX_LLM_API_KEY (or pass api_key=...) before running this example.")
 
@@ -35,8 +34,16 @@ def main() -> None:
         workflow_id = created.workflow_id
         print(f"workflow {workflow_id}: {created.artifacts['graph']}")
 
-        # 2. Generate every node of the graph.
-        built = flowx.build_nodes(workflow_id).raise_for_failure()
+        # 2. Generate every node. A failing node test pauses for repair guidance;
+        # an empty answer amends the node from its own log.
+        built = flowx.build_nodes(workflow_id, await_repair_input=True)
+        while built.status == "input_required":
+            awaiting = dict(built.awaiting or {})
+            print(f"=== {awaiting.get('node')} 测试失败 ===")
+            print((awaiting.get("test_log") or "")[-4000:])
+            answer = input("修复指引（回车=按日志自动修 / skip / test: 修测试）> ").strip()
+            built = flowx.answer(built.request_id, answer, awaiting["stepId"])
+        built.raise_for_failure()
         node_names = list(built.artifacts["nodes"])
         print(f"nodes: {', '.join(node_names)}")
 
@@ -54,10 +61,11 @@ def main() -> None:
         # ).raise_for_failure()
 
         # 5. Evolve the whole workflow from one request; the engine decides which stages to rerun.
-        evolved = flowx.build_workflow(
-            "Also return a one-line summary of the ticket.", workflow_id=workflow_id, fastapi_port=PORT,
-        ).raise_for_failure()
-        print({name: stage.status for name, stage in evolved.stages.items()})
+        # evolved = flowx.build_workflow(
+        #     "Also return a one-line summary of the ticket.", workflow_id=workflow_id,
+        #     fastapi_port=PORT, await_repair_input=False,
+        # ).raise_for_failure()
+        # print({name: stage.status for name, stage in evolved.stages.items()})
 
         # 6. Run it as a service; calling run_service again restarts it with the latest files.
         service = flowx.run_service(workflow_id)

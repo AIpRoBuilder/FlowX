@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified 2026-10-16: build or modify workflows through FlowXClient.build_workflow.
+# Modified 2026-11-01: A2A has no answer channel, so its builds stay non-interactive.
 """A2A JSON-RPC adapter for FlowX workflow building."""
 
 from __future__ import annotations
@@ -167,7 +168,12 @@ def _dispatch(payload: Mapping[str, Any], client: FlowXClient, tasks: _TaskStore
     context_id = str(params.get("contextId") or message.get("contextId") or uuid.uuid4().hex)
     task = tasks.create(context_id)
     try:
-        result = client.build_workflow(requirement, workflow_id=str(workflow_id) if workflow_id else None)
+        result = client.build_workflow(
+            requirement,
+            workflow_id=str(workflow_id) if workflow_id else None,
+            # This adapter cannot answer a paused repair gate, so amend from the test log.
+            await_repair_input=False,
+        )
         task.artifacts = [
             {
                 "artifactId": "workflow-artifacts",

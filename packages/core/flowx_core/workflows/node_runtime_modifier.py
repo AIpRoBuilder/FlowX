@@ -8,11 +8,16 @@ Modified 2026-10-15: remove unused workflow name and write-only stage bookkeepin
 Modified 2026-10-20: gate the amendment on user input that guides it or skips it.
 Modified 2026-10-20: interactive runs ask for guidance after the node test result.
 Modified 2026-10-24: be the WorkflowEngine instead of wrapping one.
+Modified 2026-11-01: gate answers can target the generated test; the node stays the default target.
+Modified 2026-11-02: a test-targeted gate answer creates the test when it is missing.
+Modified 2026-11-02: a skip answer skips only the current amendment pass, not every later pass.
+Modified 2026-11-02: share target aliases and preserve first-present guidance precedence.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import uuid
@@ -37,15 +42,48 @@ from flowx_core.worker.node_writer import PromptNodeFileCoderBase
 
 # Exact, case-insensitive inputs that skip the amendment instead of guiding it.
 _SKIP_AMENDMENT_INPUTS = frozenset({
-	"skip", "/skip", "skip amendment", "skip_amendment", "skip-amendment",
+	"skip", "/skip", "skip amendment", "skip_amendment", "skip-amendment", "跳过", "跳过修改",
 })
 
+# A gate answer may name the artifact to amend; the node remains the default target.
+_AMENDMENT_TARGETS = {
+	"node": "node", "节点": "node",
+	"test": "test", "tests": "test", "pytest": "test", "测试": "test", "用例": "test",
+}
+_TARGET_PREFIX = re.compile(
+	r"^(node|tests?|pytest|节点|测试|用例)\s*[:：=]\s*(.*)$", re.IGNORECASE | re.DOTALL,
+)
+_BARE_TARGET_INPUTS = {
+	**_AMENDMENT_TARGETS,
+	"fix test": "test", "fix the test": "test",
+	"amend test": "test", "amend the test": "test",
+	"修测试": "test", "改测试": "test", "修复测试": "test",
+}
 
-def _amendment_input_parts(user_input: Any) -> tuple[bool, str]:
-	"""Split user input into (skip amendment, guidance), accepting text or JSON.
 
-	The workflow engine normalizes object inputs to JSON text, so ``{"skip": true}``
-	and ``{"guidance": "..."}`` are accepted alongside the plain-text forms.
+@dataclass(frozen=True)
+class AmendmentAnswer:
+	"""One gate answer: whether to skip, which artifact to amend, and the guidance."""
+
+	skip: bool = False
+	target: str = "node"
+	guidance: str = ""
+
+	@property
+	def amends_test(self) -> bool:
+		"""Whether this answer amends the generated pytest module instead of the node."""
+		return self.target == "test"
+
+
+def parse_amendment_answer(user_input: Any) -> AmendmentAnswer:
+	"""Parse a gate answer into skip, target and guidance, accepting text or JSON.
+
+	The workflow engine normalizes object inputs to JSON text, so ``{"skip": true}``,
+	``{"target": "test", "guidance": "..."}`` and ``{"fix_test": true}`` are accepted
+	alongside the plain-text forms. Plain guidance -- and any payload that names no
+	target -- amends the node, because that stays the default target. A ``test:`` or
+	``tests:`` prefix targets the generated pytest module; bare words such as ``test``
+	or ``fix the test`` do the same without guidance.
 	"""
 	if isinstance(user_input, Mapping):
 		payload: Mapping[str, Any] | None = user_input
@@ -61,18 +99,42 @@ def _amendment_input_parts(user_input: Any) -> tuple[bool, str]:
 			if isinstance(parsed, Mapping):
 				payload = parsed
 	if payload is None:
-		skip = text.lower() in _SKIP_AMENDMENT_INPUTS
-		return skip, "" if skip else text
+		if text.lower() in _SKIP_AMENDMENT_INPUTS:
+			return AmendmentAnswer(skip=True)
+		bare = _BARE_TARGET_INPUTS.get(text.lower())
+		if bare is not None:
+			return AmendmentAnswer(target=bare)
+		prefixed = _TARGET_PREFIX.match(text)
+		if prefixed is not None:
+			return AmendmentAnswer(
+				target=_AMENDMENT_TARGETS[prefixed.group(1).lower()],
+				guidance=prefixed.group(2).strip(),
+			)
+		return AmendmentAnswer(guidance=text)
 	skip = bool(payload.get("skip", payload.get("skip_amendment", False)))
 	recognized = "skip" in payload or "skip_amendment" in payload
+	target = "test" if payload.get("fix_test") or payload.get("amend_test") else "node"
+	recognized = recognized or target == "test"
+	for key in ("target", "artifact", "amend"):
+		named = str(payload.get(key) or "").strip().lower()
+		if named:
+			recognized = True
+			target = _AMENDMENT_TARGETS.get(named, target)
+			break
 	for key in ("guidance", "amendment", "input", "text"):
 		if key in payload:
-			recognized = True
-			guidance = str(payload.get(key) or "").strip()
-			if guidance:
-				return skip, guidance
-			break
-	return skip, "" if recognized or not payload else json.dumps(dict(payload), ensure_ascii=False)
+			return AmendmentAnswer(skip=skip, target=target, guidance=str(payload.get(key) or "").strip())
+	return AmendmentAnswer(
+		skip=skip,
+		target=target,
+		guidance="" if recognized or not payload else json.dumps(dict(payload), ensure_ascii=False),
+	)
+
+
+def _amendment_input_parts(user_input: Any) -> tuple[bool, str]:
+	"""Backwards-compatible view of a gate answer: (skip amendment, guidance)."""
+	answer = parse_amendment_answer(user_input)
+	return answer.skip, answer.guidance
 
 
 def _compose_amendment(test_log: str, guidance: str) -> str:
@@ -103,6 +165,8 @@ class NodeRuntimeModifierRequest:
 	skip_generate_node_test: bool = False
 	skip_run_node_test: bool = False
 	skip_amend_node: bool = False
+	# Pause at the node's own gate (amend_node) instead of amending silently.
+	await_input: bool = False
 	node_name: str = ""
 	test_temperature: float = 0.2
 	amendment_temperature: float = 0.3
@@ -112,6 +176,9 @@ class NodeRuntimeModifierRequest:
 	test_log: str = field(default="", init=False)
 	test_result: dict[str, Any] | None = field(default=None, init=False)
 	amended_node_file_path: str = field(default="", init=False)
+	amended_test_file_path: str = field(default="", init=False)
+	# "node", "test" or "skipped": what the last amendment gate answer changed.
+	amendment_target: str = field(default="", init=False)
 
 
 def _request_from_state(session_state: Mapping[str, Any]) -> NodeRuntimeModifierRequest:
@@ -282,7 +349,15 @@ class ExecuteNodeTest(RunNodeTest):
 
 
 class AmendNodeFromTestLog(PromptNodeFileCoderBase):
-	"""Apply the pytest log and optional user guidance, or skip the amendment on request."""
+	"""Apply the pytest log and optional user guidance, or skip this amendment pass.
+
+	The node source is the default amendment target. An answer that targets the test
+	(``test: ...``, ``tests=...``, ``fix the test`` or a JSON ``target``/``fix_test``)
+	repairs the generated pytest module instead, which is the fix when the node is
+	right and its test asserts the wrong contract. When that module is missing (for
+	example after a dirty retry deleted it and test generation failed), the answer
+	creates it from the current node instead of failing the gate.
+	"""
 
 	STEP_ID = "amend_node"
 	DEPENDENCIES = ["run_node_test"]
@@ -296,7 +371,7 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 		self.setWaitFunc(self.wait_function)
 
 	def wait_function(self) -> bool:
-		"""Pause until the caller supplies guidance, a skip instruction, or a blank proceed."""
+		"""Pause until the caller supplies guidance, a target, a skip instruction, or a blank proceed."""
 		param = self.get_workflow_param()
 		with param.condition:
 			if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
@@ -305,7 +380,11 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 			if not isinstance(request, NodeRuntimeModifierRequest):
 				param.set_state(self.STEP_ID, "running")
 				return True
-			if request.skip_amend_node or (request.test_result is not None and request.test_result["ok"]):
+			if (
+				request.skip_amend_node
+				or (request.test_result is not None and request.test_result["ok"])
+				or not request.await_input
+			):
 				param.set_state(self.STEP_ID, "running")
 				return True
 			ready = self.STEP_ID in param.inputs
@@ -318,6 +397,22 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 	def get_feedback_contract_text(self) -> str:
 		return "Preserve the existing AG-UI workflow node contract while applying the test feedback.\n"
 
+	def _test_writer(self) -> PromptNodeTestFileCoder:
+		"""The generated-test coder used when the answer targets the test module."""
+		writer = self.__dict__.get("test_amender")
+		if writer is None:
+			# Reuse this coder's client and model instead of opening another provider connection.
+			writer = PromptNodeTestFileCoder(
+				api_key=self.api_key,
+				model=self.model,
+				provider=self.provider,
+				timeout=self.timeout,
+				session_marking_prompt=self.session_marking_prompt,
+				client=self.client,
+			)
+			self.test_amender = writer
+		return writer
+
 	def process_input(
 		self,
 		user_input: str,
@@ -329,12 +424,43 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 		working_directory = Path(request.working_directory).expanduser().resolve()
 		node_path = _resolve_path(request.node_file_name, working_directory)
 		node_name = request.node_name or node_path.stem
-		skip_input, guidance = _amendment_input_parts(user_input)
-		if skip_input:
-			request.skip_amend_node = True
-		if request.skip_amend_node or (request.test_result is not None and request.test_result["ok"]):
+		answer = parse_amendment_answer(user_input)
+		if answer.skip or request.skip_amend_node or (
+			request.test_result is not None and request.test_result["ok"]
+		):
 			request.amended_node_file_path = str(node_path.resolve())
+			request.amendment_target = "skipped"
+		elif answer.amends_test:
+			# The node is presumed correct, so its generated test is repaired instead.
+			if not request.test_log:
+				raise RuntimeError("node test output log is missing")
+			test_path = _resolve_path(
+				request.test_file_path or request.test_file_name,
+				working_directory,
+			)
+			test_writer = self._test_writer()
+			if test_path.is_file():
+				amended_test_path = test_writer.amend_test_with_feedback(
+					str(node_path),
+					str(test_path),
+					_compose_amendment(request.test_log, answer.guidance),
+					temperature=request.test_temperature,
+				)
+			else:
+				# A dirty retry deletes the old test and test generation can fail, so
+				# create the missing module from the current node instead of failing.
+				amended_test_path = test_writer.write_test_from_node_file(
+					str(node_path),
+					str(test_path),
+					temperature=request.test_temperature,
+				)
+			request.amended_test_file_path = str(Path(amended_test_path).resolve())
+			request.test_file_path = request.amended_test_file_path
+			request.amendment_target = "test"
+			# Verify must run the amended module; regenerating it would discard the fix.
+			request.skip_generate_node_test = True
 		else:
+			request.amendment_target = "node"
 			if not request.test_log:
 				raise RuntimeError("node test output log is missing")
 			graph_path = _resolve_path(request.workflow_graph, working_directory)
@@ -342,7 +468,7 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 				raise FileNotFoundError(f"Workflow graph not found: {graph_path}")
 			amended_path = self.amend_code_with_feedback(
 				str(node_path),
-				_compose_amendment(request.test_log, guidance),
+				_compose_amendment(request.test_log, answer.guidance),
 				graph_plan_path=str(graph_path),
 				current_node_name=node_name,
 				temperature=request.amendment_temperature,
@@ -350,7 +476,11 @@ class AmendNodeFromTestLog(PromptNodeFileCoderBase):
 			request.amended_node_file_path = str(Path(amended_path).resolve())
 		return StepRunOutput(
 			card={"kind": "node-amendment", "status": "completed"},
-			derived={"amended_node_file_path": request.amended_node_file_path},
+			derived={
+				"amended_node_file_path": request.amended_node_file_path,
+				"amended_test_file_path": request.amended_test_file_path,
+				"amendment_target": request.amendment_target,
+			},
 		)
 
 
@@ -409,10 +539,11 @@ class NodeRuntimeModifierPipeline(FlowXWorkflowEngine):
 	) -> NodeRuntimeModifierRequest:
 		"""Return a fresh repair request with outputs; leave caller inputs unchanged.
 
-		``user_input`` is fed to the gated amendment step: non-empty text guides the
-		amendment alongside the test log, exact skip values (``skip``, ``/skip``,
-		``skip amendment``, ``skip_amendment`` or ``skip-amendment``) skip it, and
-		an empty value proceeds from the test log alone.
+		``user_input`` is fed to the gated amendment step: non-empty text guides the node
+		amendment alongside the test log, a ``test: ...`` answer (or ``fix the test``, or a
+		JSON ``{"target": "test"}``) amends the generated test instead, exact skip values
+		(``skip``, ``/skip``, ``skip amendment``, ``skip_amendment`` or ``skip-amendment``)
+		skip it, and an empty value proceeds from the test log alone.
 		"""
 
 		request = self._prepare_request(request)
@@ -437,13 +568,15 @@ class NodeRuntimeModifierPipeline(FlowXWorkflowEngine):
 		"""Run the repair pipeline, pausing for input after a failing node test.
 
 		The callback receives the run-local request after ``run_node_test`` has set
-		``test_result`` and ``test_log``. Return guidance, ``"skip"`` to skip the
-		amendment, or an empty string to amend from the test log alone.
+		``test_result`` and ``test_log``. Return guidance to amend the node, ``test: ...``
+		to amend the generated test instead, ``"skip"`` to skip the amendment, or an
+		empty string to amend the node from the test log alone.
 		"""
 
 		if self.closed:
 			raise RuntimeError(self.CLOSED_MESSAGE)
 		request = self._prepare_request(request)
+		request.await_input = True
 		request_id = f"flowx-request-{uuid.uuid4().hex}"
 		state = {**request.state, "node_runtime_modifier": request}
 		token = _RUN_REQUEST.set((state, frozenset()))

@@ -4,6 +4,7 @@
 # Modified 2026-10-15: merged repair request model and same-input per-run isolation.
 # Modified 2026-10-15: verify repair outputs and native execution without stage bookkeeping.
 # Modified 2026-10-20: cover the interactive amendment gate, guidance and skip.
+# Modified 2026-11-02: cover amendment answer alias precedence and per-pass skips.
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
@@ -11,7 +12,7 @@ import inspect
 import json
 from pathlib import Path
 from threading import Barrier
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -103,7 +104,7 @@ def test_repair_request_is_the_only_model_with_required_keyword_inputs_and_fresh
     required = {"node_file_name", "workflow_graph", "working_directory"}
     output_defaults = {
         "test_file_path": "", "log_file_path": "", "test_log": "", "test_result": None,
-        "amended_node_file_path": "",
+        "amended_node_file_path": "", "amended_test_file_path": "", "amendment_target": "",
     }
     removed_fields = {"workflow_name", "skipped_stages", "completed_stages"}
     assert is_dataclass(NodeRuntimeModifierRequest)
@@ -253,6 +254,7 @@ def test_repair_repeated_or_concurrent_same_input_uses_fresh_native_requests(
             assert result.outputs["run_node_test"].derived == {"log_file_path": ""}
             assert result.outputs["amend_node"].derived == {
                 "amended_node_file_path": str(tmp_path / "ExampleNode.py"),
+                "amended_test_file_path": "", "amendment_target": "skipped",
             }
         assert len({request.workflow_graph for request in requests}) == 2
         for request in requests:
@@ -356,7 +358,11 @@ def test_repair_repeated_same_input_isolates_results_commands_and_log_snapshots(
                 **request.test_result, "log_file_path": request.log_file_path,
             }
             assert result.outputs["run_node_test"].derived is not request.test_result
-            assert result.outputs["amend_node"].derived == {"amended_node_file_path": str(node_file)}
+            assert result.outputs["amend_node"].derived == {
+                "amended_node_file_path": str(node_file),
+                "amended_test_file_path": "",
+                "amendment_target": "node" if request.test_result["ok"] is False else "skipped",
+            }
             assert json.loads(Path(request.workflow_graph).read_text(encoding="utf-8")) == graph
         assert first.workflow_graph != second.workflow_graph
         assert first.test_result["ok"] is False
@@ -525,6 +531,7 @@ def test_amend_node_gates_on_user_input_only_when_amendment_is_needed(tmp_path: 
     amender = AmendNodeFromTestLog(client=object())
     request = NodeRuntimeModifierRequest(
         node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+        await_input=True,
     )
     request.test_result = {"ok": False}
     param = WorkflowParam()
@@ -549,6 +556,157 @@ def test_amend_node_gates_on_user_input_only_when_amendment_is_needed(tmp_path: 
     request.test_result, request.skip_amend_node = {"ok": False}, True
     assert amender.wait_function() is True
     assert param.states[amender.STEP_ID] == "running"
+
+
+def test_amend_node_never_pauses_without_await_input(tmp_path: Path) -> None:
+    amender = AmendNodeFromTestLog(client=object())
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+    )
+    request.test_result = {"ok": False}
+    param = WorkflowParam()
+    param.state = {"node_runtime_modifier": request}
+    param.outputs = {"run_node_test": StepRunOutput(derived=request.test_result)}
+    amender.get_workflow_param = lambda: param  # type: ignore[method-assign]
+
+    assert amender.wait_function() is True
+    assert param.states[amender.STEP_ID] == "running"
+
+
+def test_skip_answer_only_skips_the_current_amendment_pass(tmp_path: Path) -> None:
+    amender = AmendNodeFromTestLog(client=object())
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+        await_input=True,
+    )
+    request.test_result = {"ok": False}
+    request.test_log = "AssertionError: expected 2, got 1"
+    param = WorkflowParam()
+    param.state = {"node_runtime_modifier": request}
+    param.outputs = {"run_node_test": StepRunOutput(derived=request.test_result)}
+    amender.get_workflow_param = lambda: param  # type: ignore[method-assign]
+
+    output = amender.process_input("skip", {}, {"node_runtime_modifier": request})
+
+    assert output.derived["amendment_target"] == "skipped"
+    assert request.skip_amend_node is False
+    assert request.amended_node_file_path == str((tmp_path / "ExampleNode.py").resolve())
+
+    # The next pass with a still-failing test asks again.
+    param.inputs.pop(amender.STEP_ID, None)
+    assert amender.wait_function() is False
+    assert param.states[amender.STEP_ID] == "awaiting_input"
+
+
+@pytest.mark.parametrize("answer", [
+    "skip", "  /SKIP  ", "skip amendment", "skip_amendment", "skip-amendment",
+    "跳过", "跳过修改",
+    '{"skip": true, "target": "test", "guidance": ""}',
+    '{"skip_amendment": true, "fix_test": true}',
+    {"skip": True, "target": "test", "text": ""},
+])
+def test_skip_gate_answers_allow_the_next_pass_to_amend(tmp_path: Path, answer) -> None:
+    node_file = tmp_path / "ExampleNode.py"
+    node_file.write_text("# original node\n", encoding="utf-8")
+    graph_file = tmp_path / "workflow.json"
+    graph_file.write_text("{}", encoding="utf-8")
+    amender = _NodeWriter(client=object())
+    request = NodeRuntimeModifierRequest(
+        node_file_name=node_file.name, workflow_graph=graph_file.name,
+        working_directory=str(tmp_path), await_input=True,
+    )
+    request.test_result = {"ok": False}
+    request.test_log = "AssertionError: expected 2, got 1"
+    state = {"node_runtime_modifier": request}
+    param = WorkflowParam()
+    param.state = state
+    param.outputs = {"run_node_test": StepRunOutput(derived=request.test_result)}
+    param.inputs[amender.STEP_ID] = answer
+    amender.get_workflow_param = lambda: param  # type: ignore[method-assign]
+
+    assert amender.wait_function() is True
+    skipped = amender.process_input(answer, {}, state)
+
+    assert skipped.derived["amendment_target"] == "skipped"
+    assert request.skip_amend_node is False
+    assert amender.calls == []
+    assert node_file.read_text(encoding="utf-8") == "# original node\n"
+
+    # A still-failing later pass must pause again and accept a real amendment.
+    param.inputs.pop(amender.STEP_ID)
+    assert amender.wait_function() is False
+    assert param.states[amender.STEP_ID] == "awaiting_input"
+    param.inputs[amender.STEP_ID] = "node: keep the existing interface"
+    assert amender.wait_function() is True
+    amended = amender.process_input(param.inputs[amender.STEP_ID], {}, state)
+
+    assert amended.derived["amendment_target"] == "node"
+    assert request.skip_amend_node is False
+    assert len(amender.calls) == 1
+    assert request.test_log in amender.calls[0]["amendment"]
+    assert "keep the existing interface" in amender.calls[0]["amendment"]
+    assert node_file.read_text(encoding="utf-8") == "# amended node\n"
+
+
+def test_expanded_amend_gate_reads_the_node_namespace(tmp_path: Path) -> None:
+    from flowx_core.architect.graph import NodeMeta
+    from flowx_core.tools.node_state import NAMESPACE_KEY
+    from flowx_core.workflows.dynamic_node_graph import NodeBuildNamespace, _amend_scoped_class
+
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+        await_input=True,
+    )
+    request.test_result = {"ok": False}
+    namespace = NodeBuildNamespace(
+        node_name="Reply", raw_node={}, node_meta=NodeMeta(name="Reply", type="", desc=""),
+        targets={}, upstream={}, repair_state={"node_runtime_modifier": request},
+    )
+    cls = _amend_scoped_class(
+        AmendNodeFromTestLog, node_name="Reply", step_id="Reply__amend_node",
+        dependencies=["Reply__run_node_test"],
+    )
+    amender = cls(client=object())
+    param = WorkflowParam()
+    param.state = {NAMESPACE_KEY: {"Reply": namespace}}
+    param.outputs = {"Reply__run_node_test": StepRunOutput(derived=request.test_result)}
+    amender.get_workflow_param = lambda: param  # type: ignore[method-assign]
+
+    assert amender.wait_function() is False
+    assert param.states[amender.STEP_ID] == "awaiting_input"
+
+    param.inputs[amender.STEP_ID] = "keep the existing schema"
+    assert amender.wait_function() is True
+    assert param.states[amender.STEP_ID] == "running"
+
+
+def test_initial_audit_failure_keeps_the_repair_loop_enabled(tmp_path: Path) -> None:
+    from flowx_core.architect.graph import NodeMeta
+    from flowx_core.tools.node_state import NAMESPACE_KEY
+    from flowx_core.workflows.dynamic_node_graph import NodeBuildNamespace, _guard_class
+
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+    )
+    namespace = NodeBuildNamespace(
+        node_name="Reply", raw_node={}, node_meta=NodeMeta(name="Reply", type="", desc=""),
+        targets={}, upstream={}, dirty=True, repair_state={"node_runtime_modifier": request},
+    )
+    namespace.repair_enabled = True
+    guard = _guard_class("Reply")()
+    audit = StepRunOutput(
+        derived={"ok": False, "violations": [{"rule": "session_state_ancestor_key_invalid"}]}
+    )
+
+    output = guard.process_input(
+        "", {"Reply__node_audit": audit}, {NAMESPACE_KEY: {"Reply": namespace}},
+    )
+
+    assert namespace.repair_enabled is True
+    assert request.skip_generate_node_test is False
+    assert request.skip_run_node_test is False
+    assert request.skip_amend_node is False
+    assert output.derived == {"audit_ok": False, "repair_enabled": True}
 
 
 def _interactive_modifier(tmp_path: Path, returncode: int):
@@ -603,7 +761,8 @@ def test_modifier_run_interactive_skip_leaves_the_node_unchanged(tmp_path: Path)
             request, lambda current: "skip" if "AssertionError" in current.test_log else "",
         )
         assert amender.calls == []
-        assert result.skip_amend_node is True
+        assert result.skip_amend_node is False
+        assert result.amendment_target == "skipped"
         assert result.test_result is not None and result.test_result["ok"] is False
         assert result.amended_node_file_path == str(node_file)
         assert node_file.read_text(encoding="utf-8") == "# original node\n"
@@ -661,6 +820,333 @@ def test_modifier_forwards_user_guidance_and_skip_to_amend_step(tmp_path: Path) 
         assert skipped_without_log.test_log == skipped_without_log.log_file_path == ""
         assert skipped_without_log.amended_node_file_path == str(node_file)
         assert len(amender.calls) == 1
+    finally:
+        modifier.close()
+
+
+@pytest.mark.parametrize(("answer", "expected"), [
+    ("", ("node", "", False)),
+    ("focus on the failing assertion", ("node", "focus on the failing assertion", False)),
+    ("node: keep the existing schema", ("node", "keep the existing schema", False)),
+    ("test: assert the dict contract", ("test", "assert the dict contract", False)),
+    ("tests=assert the dict contract", ("test", "assert the dict contract", False)),
+    ("测试：用字典访问", ("test", "用字典访问", False)),
+    ("fix the test", ("test", "", False)),
+    ("node", ("node", "", False)),
+    ("skip", ("node", "", True)),
+    ("跳过", ("node", "", True)),
+    ('{"skip": true}', ("node", "", True)),
+    ('{"target": "test"}', ("test", "", False)),
+    ('{"target": "test", "guidance": "assert mapping access"}', ("test", "assert mapping access", False)),
+    ('{"fix_test": true}', ("test", "", False)),
+    ('{"guidance": "keep the api"}', ("node", "keep the api", False)),
+    ('{"unrelated": 1}', ("node", '{"unrelated": 1}', False)),
+])
+def test_parse_amendment_answer_defaults_to_the_node_target(answer, expected) -> None:
+    parsed = modifier_module.parse_amendment_answer(answer)
+
+    assert (parsed.target, parsed.guidance, parsed.skip) == expected
+    assert parsed.amends_test is (parsed.target == "test")
+    assert modifier_module._amendment_input_parts(answer) == (parsed.skip, parsed.guidance)
+
+
+def _encoded_amendment_mapping(payload, as_json):
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":")) if as_json else payload
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["mapping", "json"])
+@pytest.mark.parametrize(("guidance_fields", "expected"), [
+    ({"guidance": " first ", "amendment": "second", "input": "third", "text": "fourth"}, "first"),
+    ({"amendment": " second ", "input": "third", "text": "fourth"}, "second"),
+    ({"input": " third ", "text": "fourth"}, "third"),
+    ({"text": " fourth "}, "fourth"),
+    ({"guidance": "", "amendment": "ignored"}, ""),
+    ({"guidance": None, "amendment": "ignored"}, ""),
+    ({"guidance": False, "input": "ignored"}, ""),
+    ({"guidance": 0, "text": "ignored"}, ""),
+    ({"guidance": [], "amendment": "ignored"}, ""),
+    ({"guidance": {}, "amendment": "ignored"}, ""),
+    ({"guidance": " \n\t ", "amendment": "ignored"}, ""),
+    ({"amendment": None, "input": "ignored"}, ""),
+    ({"input": "", "text": "ignored"}, ""),
+    ({"guidance": 42}, "42"),
+    ({"guidance": True}, "True"),
+    ({"guidance": ["first", "second"]}, "['first', 'second']"),
+])
+def test_parse_amendment_answer_prefers_first_present_guidance_alias(
+    as_json, guidance_fields, expected,
+) -> None:
+    payload = {"skip": True, "target": "test", **guidance_fields, "unrelated": "ignored"}
+
+    answer = modifier_module.parse_amendment_answer(_encoded_amendment_mapping(payload, as_json))
+
+    assert answer == modifier_module.AmendmentAnswer(skip=True, target="test", guidance=expected)
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["mapping", "json"])
+@pytest.mark.parametrize("key", ["guidance", "amendment", "input", "text"])
+@pytest.mark.parametrize("value", [None, False, 0, "", " \n\t ", [], {}])
+def test_empty_guidance_alias_is_recognized_and_suppresses_unknown_fallback(as_json, key, value) -> None:
+    payload = {key: value, "unrelated": "must not leak into guidance"}
+
+    answer = modifier_module.parse_amendment_answer(_encoded_amendment_mapping(payload, as_json))
+
+    assert answer == modifier_module.AmendmentAnswer()
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["mapping", "json"])
+@pytest.mark.parametrize(("payload", "target", "skip"), [
+    ({"target": " NODE ", "artifact": "test", "amend": "test", "fix_test": True}, "node", False),
+    ({"target": "test", "artifact": "node", "amend": "node"}, "test", False),
+    ({"target": "", "artifact": "tests", "amend": "node"}, "test", False),
+    ({"target": " \n", "artifact": "", "amend": "pytest"}, "test", False),
+    ({"target": None, "artifact": None, "amend": "用例"}, "test", False),
+    ({"target": 0, "artifact": "tests"}, "test", False),
+    ({"target": "unknown", "artifact": "test"}, "node", False),
+    ({"target": "unknown", "artifact": "node", "fix_test": True}, "test", False),
+    ({"target": None, "artifact": "unknown", "amend": "test"}, "node", False),
+    ({"target": "", "artifact": "node", "fix_test": True, "amend_test": True}, "node", False),
+    ({"target": True, "unrelated": 1}, "node", False),
+    ({"fix_test": True}, "test", False),
+    ({"amend_test": True}, "test", False),
+    ({"fix_test": False, "amend_test": "yes"}, "test", False),
+    ({"skip": False, "skip_amendment": True, "target": "test"}, "test", False),
+    ({"skip": None, "skip_amendment": True, "target": "test"}, "test", False),
+    ({"skip_amendment": True, "target": "node"}, "node", True),
+    ({"skip": "false", "target": "test"}, "test", True),
+    ({"skip": False, "unrelated": 1}, "node", False),
+    ({"skip_amendment": 0, "unrelated": 1}, "node", False),
+])
+def test_parse_amendment_answer_target_and_skip_alias_priority(as_json, payload, target, skip) -> None:
+    answer = modifier_module.parse_amendment_answer(_encoded_amendment_mapping(payload, as_json))
+
+    assert answer == modifier_module.AmendmentAnswer(skip=skip, target=target)
+
+
+@pytest.mark.parametrize("as_json", [False, True], ids=["mapping", "json"])
+@pytest.mark.parametrize(("payload", "guidance"), [
+    ({}, ""),
+    ({"unknown": 1}, '{"unknown": 1}'),
+    ({"未知": "值", "nested": {"a": [1, None]}}, '{"未知": "值", "nested": {"a": [1, null]}}'),
+    ({"target": "  ", "fix_test": False}, '{"target": "  ", "fix_test": false}'),
+    ({"target": None, "artifact": False, "amend": 0}, '{"target": null, "artifact": false, "amend": 0}'),
+    ({"fix_test": False, "amend_test": 0}, '{"fix_test": false, "amend_test": 0}'),
+    ({"skip_candidate": True}, '{"skip_candidate": true}'),
+])
+def test_parse_amendment_answer_unknown_mapping_fallback(as_json, payload, guidance) -> None:
+    answer = modifier_module.parse_amendment_answer(_encoded_amendment_mapping(payload, as_json))
+
+    assert answer == modifier_module.AmendmentAnswer(guidance=guidance)
+
+
+@pytest.mark.parametrize("text", ["{unclosed", '{"target":', " [1, 2] ", "null", " fix tests "])
+def test_non_mapping_or_invalid_json_remains_plain_guidance(text) -> None:
+    assert modifier_module.parse_amendment_answer(text) == modifier_module.AmendmentAnswer(guidance=text.strip())
+
+
+@pytest.mark.parametrize(("payload", "target"), [
+    ({"guidance": None, "unrelated": object()}, "node"),
+    ({"text": "", "unrelated": object()}, "node"),
+    ({"skip": False, "unrelated": object()}, "node"),
+    ({"target": "unknown", "unrelated": object()}, "node"),
+    ({"fix_test": True, "unrelated": object()}, "test"),
+])
+def test_recognized_mapping_does_not_serialize_unrelated_values(payload, target) -> None:
+    assert modifier_module.parse_amendment_answer(payload) == modifier_module.AmendmentAnswer(target=target)
+
+
+def test_unknown_non_dict_mapping_uses_json_fallback_and_rejects_unserializable_values() -> None:
+    payload = MappingProxyType({"unrelated": "中文"})
+    assert modifier_module.parse_amendment_answer(payload) == modifier_module.AmendmentAnswer(
+        guidance='{"unrelated": "中文"}',
+    )
+    with pytest.raises(TypeError):
+        modifier_module.parse_amendment_answer(MappingProxyType({"unrelated": object()}))
+
+
+@pytest.mark.parametrize("padded_uppercase", [False, True], ids=["exact", "case-and-whitespace"])
+@pytest.mark.parametrize(("alias", "target"), [
+    ("node", "node"), ("节点", "node"),
+    ("test", "test"), ("tests", "test"), ("pytest", "test"), ("测试", "test"), ("用例", "test"),
+    ("fix test", "test"), ("fix the test", "test"),
+    ("amend test", "test"), ("amend the test", "test"),
+    ("修测试", "test"), ("改测试", "test"), ("修复测试", "test"),
+])
+def test_all_bare_amendment_target_aliases(alias, target, padded_uppercase) -> None:
+    text = f" \n{alias.upper()}\t" if padded_uppercase else alias
+
+    answer = modifier_module.parse_amendment_answer(text)
+
+    assert answer == modifier_module.AmendmentAnswer(target=target)
+
+
+@dataclass
+class _RecordingTestAmender:
+    calls: list[dict[str, object]] = field(default_factory=list)
+    created: list[dict[str, object]] = field(default_factory=list)
+
+    def amend_test_with_feedback(
+        self,
+        node_file_path: str,
+        output_path: str,
+        amendment: str,
+        **kwargs: object,
+    ) -> Path:
+        self.calls.append({
+            "node_file_path": node_file_path,
+            "output_path": output_path,
+            "amendment": amendment,
+            **kwargs,
+        })
+        target = Path(output_path)
+        target.write_text("def test_amended():\n    assert True\n", encoding="utf-8")
+        return target
+
+    def write_test_from_node_file(
+        self,
+        node_file_path: str,
+        output_path: str,
+        **kwargs: object,
+    ) -> Path:
+        self.created.append({
+            "node_file_path": node_file_path,
+            "output_path": output_path,
+            **kwargs,
+        })
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("def test_created():\n    assert True\n", encoding="utf-8")
+        return target
+
+
+def test_amend_step_routes_a_test_answer_to_the_generated_test(tmp_path: Path) -> None:
+    node_file = tmp_path / "ExampleNode.py"
+    node_file.write_text("# original node\n", encoding="utf-8")
+    test_file = tmp_path / "tests" / "test_ExampleNode.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_wrong():\n    assert False\n", encoding="utf-8")
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+        test_file_name="tests/test_ExampleNode.py", await_input=True,
+    )
+    request.test_result = {"ok": False}
+    request.test_log = "E   AttributeError: 'dict' object has no attribute 'id'"
+    amender = AmendNodeFromTestLog(client=object())
+    test_amender = _RecordingTestAmender()
+    amender.test_amender = test_amender
+
+    output = amender.process_input(
+        "test: assert on the mapping contract", {}, {"node_runtime_modifier": request},
+    )
+
+    assert output.derived == {
+        "amended_node_file_path": "",
+        "amended_test_file_path": str(test_file.resolve()),
+        "amendment_target": "test",
+    }
+    assert request.amendment_target == "test"
+    assert request.skip_generate_node_test is True
+    assert request.test_file_path == str(test_file.resolve())
+    assert node_file.read_text(encoding="utf-8") == "# original node\n"
+    assert len(test_amender.calls) == 1
+    call = test_amender.calls[0]
+    assert call["node_file_path"] == str(node_file)
+    assert Path(str(call["output_path"])).resolve() == test_file.resolve()
+    assert request.test_log in str(call["amendment"])
+    assert "assert on the mapping contract" in str(call["amendment"])
+
+
+def test_amend_step_creates_the_test_when_a_test_answer_finds_it_missing(tmp_path: Path) -> None:
+    node_file = tmp_path / "ExampleNode.py"
+    node_file.write_text("# original node\n", encoding="utf-8")
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph={}, working_directory=str(tmp_path),
+        test_file_name="tests/test_ExampleNode.py", await_input=True,
+    )
+    request.test_result = {"ok": False}
+    request.test_log = "ERROR: file or directory not found: tests/test_ExampleNode.py"
+    amender = AmendNodeFromTestLog(client=object())
+    test_amender = _RecordingTestAmender()
+    amender.test_amender = test_amender
+
+    output = amender.process_input("test", {}, {"node_runtime_modifier": request})
+
+    test_file = tmp_path / "tests" / "test_ExampleNode.py"
+    assert output.derived == {
+        "amended_node_file_path": "",
+        "amended_test_file_path": str(test_file.resolve()),
+        "amendment_target": "test",
+    }
+    assert request.amendment_target == "test"
+    assert request.skip_generate_node_test is True
+    assert request.test_file_path == str(test_file.resolve())
+    assert test_file.is_file()
+    assert test_amender.calls == []
+    assert len(test_amender.created) == 1
+    assert test_amender.created[0]["node_file_path"] == str(node_file)
+    assert Path(str(test_amender.created[0]["output_path"])).resolve() == test_file.resolve()
+
+
+def test_amend_step_keeps_the_node_as_the_default_target(tmp_path: Path) -> None:
+    node_file = tmp_path / "ExampleNode.py"
+    node_file.write_text("# original node\n", encoding="utf-8")
+    test_file = tmp_path / "tests" / "test_ExampleNode.py"
+    test_file.parent.mkdir()
+    test_file.write_text("def test_wrong():\n    assert False\n", encoding="utf-8")
+    graph_file = tmp_path / "workflow.json"
+    graph_file.write_text(json.dumps({"nodes": [{"name": "ExampleNode", "depends": []}]}), encoding="utf-8")
+    request = NodeRuntimeModifierRequest(
+        node_file_name="ExampleNode.py", workflow_graph=str(graph_file), working_directory=str(tmp_path),
+        test_file_name="tests/test_ExampleNode.py", await_input=True,
+    )
+    request.test_result = {"ok": False}
+    request.test_log = "AssertionError: boom"
+    amender = _NodeWriter(client=object())
+    test_amender = _RecordingTestAmender()
+    amender.test_amender = test_amender
+
+    output = amender.process_input("focus on the assertion", {}, {"node_runtime_modifier": request})
+
+    assert output.derived["amendment_target"] == "node"
+    assert test_amender.calls == []
+    assert len(amender.calls) == 1
+    assert "focus on the assertion" in amender.calls[0]["amendment"]
+    assert request.test_file_path == ""
+
+
+def test_modifier_run_interactive_amends_the_test_when_asked(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _FakeTestCoder:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def amend_test_with_feedback(self, node_file_path, output_path, amendment, **kwargs):
+            calls.append({
+                "node_file_path": node_file_path, "output_path": output_path,
+                "amendment": amendment, **kwargs,
+            })
+            target = Path(output_path)
+            target.write_text("def test_amended():\n    assert True\n", encoding="utf-8")
+            return target
+
+    monkeypatch.setattr(modifier_module, "PromptNodeTestFileCoder", _FakeTestCoder)
+    modifier, amender, request, node_file = _interactive_modifier(tmp_path, returncode=1)
+    test_file = tmp_path / "tests" / "test_ExampleNode.py"
+
+    try:
+        result = modifier.run_interactive(
+            request, lambda current: "test: assert on the node's real contract",
+        )
+        assert amender.calls == []
+        assert result.amendment_target == "test"
+        assert result.amended_node_file_path == ""
+        assert Path(result.amended_test_file_path) == test_file.resolve()
+        assert node_file.read_text(encoding="utf-8") == "# original node\n"
+        assert test_file.read_text(encoding="utf-8") == "def test_amended():\n    assert True\n"
+        assert len(calls) == 1
+        assert "assert on the node's real contract" in calls[0]["amendment"]
+        assert result.test_temperature == calls[0]["temperature"]
     finally:
         modifier.close()
 
@@ -739,7 +1225,8 @@ def test_modifier_reuses_pool_without_reusing_previous_request(monkeypatch, tmp_
             assert result.outputs["run_node_test"].derived == {
                 **request.test_result, "log_file_path": request.log_file_path,
             }
-            assert result.outputs["amend_node"].derived == {"amended_node_file_path": str(node_file)}
+            assert result.outputs["amend_node"].derived["amended_node_file_path"] == str(node_file)
+            assert result.outputs["amend_node"].derived["amendment_target"] in {"node", "skipped"}
         assert len(writer.calls) == len(amender.calls) == 1
         assert commands[1][0][0] == "/another/python"
         assert commands[1][1] == 7
@@ -829,7 +1316,8 @@ def test_modifier_never_allocates_native_test_runners_after_eager_construction(m
             result = next(result for result in run_results if result.outputs["run_node_test"].derived["node_name"] == item.node_name)
             assert result.outputs["generate_node_test"].derived == {"test_file_path": item.test_file_path}
             assert result.outputs["run_node_test"].derived == {**item.test_result, "log_file_path": item.log_file_path}
-            assert result.outputs["amend_node"].derived == {"amended_node_file_path": item.amended_node_file_path}
+            assert result.outputs["amend_node"].derived["amended_node_file_path"] == item.amended_node_file_path
+            assert result.outputs["amend_node"].derived["amendment_target"] == "skipped"
         assert allocations == [], f"request-time native RunNodeTest allocations: {allocations}"
     finally:
         modifier.close()
@@ -1144,7 +1632,8 @@ def test_modifier_constructs_operational_nodes_and_isolates_concurrent_requests(
             result = next(result for result in run_results if result.outputs["run_node_test"].derived["node_name"] == item.node_name)
             assert result.outputs["generate_node_test"].derived == {"test_file_path": item.test_file_path}
             assert result.outputs["run_node_test"].derived == {**item.test_result, "log_file_path": item.log_file_path}
-            assert result.outputs["amend_node"].derived == {"amended_node_file_path": item.amended_node_file_path}
+            assert result.outputs["amend_node"].derived["amended_node_file_path"] == item.amended_node_file_path
+            assert result.outputs["amend_node"].derived["amendment_target"] == "node"
         assert len({item.workflow_graph for item in [*requests, third]}) == 3
         assert {call["current_node_name"]: call["amendment"] for call in amender.calls} == {
             item.node_name: item.test_log for item in [*requests, third]

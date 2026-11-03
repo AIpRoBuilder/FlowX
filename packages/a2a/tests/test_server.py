@@ -11,7 +11,7 @@ class FakeFlowXClient:
         self.ok = ok
         self.calls: list[tuple[str, str | None]] = []
 
-    def build_workflow(self, prompt: str, *, workflow_id: str | None = None) -> AgentResult:
+    def build_workflow(self, prompt: str, *, workflow_id: str | None = None, **_options) -> AgentResult:
         self.calls.append((prompt, workflow_id))
         return AgentResult(
             workflow_id="wf1",

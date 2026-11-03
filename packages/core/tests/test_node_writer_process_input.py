@@ -2,6 +2,7 @@
 
 Modified: verify the explicit input-gate contract in generation and repair prompts.
 Modified: verify bytes file hooks, explicit persistence, and optional legacy node helpers.
+Modified: verify the generated node prompt describes runtime variable types and access.
 """
 
 import json
@@ -95,6 +96,29 @@ def test_coder_includes_pooled_runtime_input_policy(coder_type) -> None:
     assert "param.condition" in coder.system_prompt
     assert "param.can_run(self.STEP_ID, self.DEPENDENCIES)" in coder.system_prompt
     assert "INPUT_REQUIRED is UI metadata only" in coder.system_prompt
+
+
+@pytest.mark.parametrize("coder_type", [WorkflowStepNodeCoder, WorkflowFileNodeCoder])
+def test_node_generation_system_prompt_describes_runtime_variable_types(coder_type) -> None:
+    prompt = coder_type(client=object()).system_prompt
+
+    assert "`StepMeta` is a `TypedDict` and a `dict` at runtime" in prompt
+    assert '`meta["id"]`' in prompt
+    assert '`meta["dependencies"]`' in prompt
+    assert "`meta.id`" in prompt
+    assert "`STEP_ID`, `TITLE`, and `PROMPT` are `str`" in prompt
+    assert "`DEPENDENCIES` is `list[str]`" in prompt
+    assert "`INPUT_REQUIRED` is `bool`" in prompt
+    assert "`user_input: str`" in prompt
+    assert "`file_bytes: bytes`" in prompt
+    assert "`dependency_results: dict[str, StepRunOutput]`" in prompt
+    assert "`StepRunOutput` is an object" in prompt
+    assert "`.card` and `.derived` are `dict[str, Any]`" in prompt
+    assert "`session_state: dict[str, Any]`" in prompt
+    assert "`param.inputs` is `dict[str, StepRunInput]`" in prompt
+    assert "`param.outputs` is `dict[str, StepRunOutput]`" in prompt
+    assert "`param.state` is `dict[str, Any]`" in prompt
+    assert "not necessarily `str`" in prompt
 
 
 def test_process_input_can_resolve_node_meta_from_graph(tmp_path, monkeypatch) -> None:
@@ -211,3 +235,45 @@ def test_node_prompts_do_not_require_global_registration_or_cloning(coder_type) 
     assert "Decorate each step class" not in coder.system_prompt
     assert "from pydaograph import register_class" not in coder.system_prompt
     assert "and still define" not in coder.system_prompt
+
+
+def test_audit_remediation_is_rule_specific() -> None:
+    ancestor_rule = WorkflowStepNodeCoder._audit_remediation_text(
+        "Line 121: session_state_ancestor_key_invalid - key is not declared in ancestor nodes"
+    )
+    assert "remove the reported session_state read" in ancestor_rule
+    assert "Do not add DEFAULT_CONFIG" in ancestor_rule
+    assert "Add/ensure class-level DEFAULT_CONFIG" not in ancestor_rule
+
+    dependency_rule = WorkflowStepNodeCoder._audit_remediation_text(
+        "Line 10: dependency_results_missing_dependency_keys - missing derived key"
+    )
+    assert "dependency_results_missing_dependency_keys" in dependency_rule
+    assert "use DEFAULT_CONFIG only when the missing value is a genuine configuration default" in dependency_rule
+    assert WorkflowStepNodeCoder._audit_remediation_text("no audit rule here") == ""
+
+
+def test_amendment_prompt_never_asks_for_default_config_on_ancestor_keys(tmp_path, monkeypatch) -> None:
+    coder = WorkflowStepNodeCoder(client=object())
+    output = tmp_path / "Target.py"
+    output.write_text("class Target:\n    pass\n", encoding="utf-8")
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        coder, "code_to_file", lambda prompt, path, **kwargs: prompts.append(prompt) or Path(path)
+    )
+
+    coder.process_input("", {}, {
+        "WorkflowStepNodeCoder::action": "amend",
+        "node_writer": {
+            "code_path": str(output),
+            "amendment": (
+                "Line 121: session_state_ancestor_key_invalid - Method 'process_input' reads "
+                "session_state['reject_reason'], but this key is not declared in ancestor nodes."
+            ),
+        },
+    })
+
+    prompt = prompts[0]
+    assert "session_state_ancestor_key_invalid: remove the reported session_state read" in prompt
+    assert "Do not add DEFAULT_CONFIG" in prompt
+    assert "treat missing variables as potential config variables" not in prompt

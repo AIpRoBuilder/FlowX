@@ -264,6 +264,7 @@ def test_generation_and_modifier_requests_are_flat_keyword_only_models(tmp_path:
         node_generation.NodeGenerationRequest(generation.graph_plan_path)
     assert {setting.name for setting in fields(repair) if not setting.init} == {
         "test_file_path", "log_file_path", "test_log", "test_result", "amended_node_file_path",
+        "amended_test_file_path", "amendment_target",
     }
 
 
@@ -316,6 +317,7 @@ def test_modifier_request_replacement_preserves_inputs_and_resets_outputs(tmp_pa
 
 @pytest.mark.parametrize("output_name", [
     "test_file_path", "log_file_path", "test_log", "test_result", "amended_node_file_path",
+    "amended_test_file_path", "amendment_target",
 ])
 def test_modifier_request_outputs_reject_constructor_and_replace_keywords(tmp_path: Path, output_name: str) -> None:
     inputs = {
@@ -331,6 +333,27 @@ def test_modifier_request_outputs_reject_constructor_and_replace_keywords(tmp_pa
     assert request.test_file_path == request.log_file_path == request.test_log == ""
     assert request.test_result is None
     assert request.amended_node_file_path == ""
+
+
+def test_repair_gating_defaults_to_paused_and_the_pipeline_stays_opt_in(tmp_path: Path) -> None:
+    import flowx_core.agent_workflow_engine as engine_module
+    import flowx_core.dynamic_workflow_orchestrator as orchestrator_module
+
+    orchestrator_request = orchestrator_module.DynamicWorkflowRequest(
+        workflow_json_path=tmp_path / "workflow.json",
+        requirement_md_path=tmp_path / "requirement.md",
+    )
+    assert orchestrator_request.await_repair_input is True
+    assert orchestrator_module.DynamicWorkflowRequest(
+        workflow_json_path=tmp_path / "workflow.json",
+        requirement_md_path=tmp_path / "requirement.md",
+        await_repair_input=False,
+    ).await_repair_input is False
+    assert engine_module.AgentRequest().await_repair_input is True
+    # The pipeline request stays opt-in: a non-interactive run cannot answer its gate.
+    assert NodeRuntimeModifierRequest(
+        node_file_name="First.py", workflow_graph={}, working_directory=str(tmp_path),
+    ).await_input is False
 
 
 def test_generation_requests_have_independent_defaults_and_shallow_replacements(tmp_path: Path) -> None:

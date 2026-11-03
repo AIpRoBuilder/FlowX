@@ -305,6 +305,31 @@ class FlowXWorkflowEngine(WorkflowEngine):
             raise RuntimeError(f"workflow execution did not produce output for step(s): {sorted(missing)}")
         return result
 
+    def start_steps(
+        self,
+        *,
+        request_id: str | None = None,
+        state: Mapping[str, Any] | None = None,
+        skipped_steps: Iterable[str] = (),
+    ) -> RunResult:
+        """Seed request state and start the graph, keeping a reported pause alive.
+
+        Unlike ``run_steps``, a pause does not close the run: the caller resumes it
+        with ``resume_steps(request_id, step_id, value)``.
+        """
+        token = _RUN_REQUEST.set((state if state is not None else {}, frozenset(skipped_steps)))
+        try:
+            # Bypass request-model dispatch: a native run starts from a request id.
+            return super().run(
+                request_id or f"flowx-request-{uuid.uuid4().hex}", {},
+            )
+        finally:
+            _RUN_REQUEST.reset(token)
+
+    def resume_steps(self, request_id: str, step_id: str, value: StepRunInput) -> RunResult:
+        """Post one waiting step's answer by id and observe the run again."""
+        return super().run(request_id, {step_id: value}, resume=True)
+
     def close(self, request_id: str | None = None) -> None:
         """Abandon one waiting run, or release the pool when called without an id."""
         if request_id is not None:

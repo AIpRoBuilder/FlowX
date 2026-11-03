@@ -1,3 +1,5 @@
+# Modified 2026-11-03: cover allocated workflow graph delegation to the engine.
+
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -7,7 +9,6 @@ import flowx_sdk
 import flowx_sdk.client as client_module
 from flowx_core.agent_intent import AgentIntent, StagePlan
 from flowx_core.agent_workflow_engine import AgentResult, StageOutcome
-from flowx_core.dynamic_workflow_orchestrator import NodeRepairInput
 
 
 @pytest.fixture
@@ -63,45 +64,43 @@ def test_build_methods_delegate_to_the_engine_api(sdk):
     builder.build_workflow.assert_called_once_with("Add a node", workflow_id="wf1", logs=("trace",))
 
 
-def test_guided_repair_callback_is_merged_into_node_options(sdk):
-    builder, client = sdk.builder, sdk.client
-    callback = lambda context: f"guide {context.node_name}"
-    previous = lambda context: ""
+def test_build_allocated_workflow_json_delegates_to_the_engine(sdk):
+    result = object()
+    sdk.builder.engine.build_allocated_workflow_json.return_value = result
 
-    client.build_nodes("wf1", repair_input_callback=callback)
-    assert builder.build_nodes.call_args.kwargs == {
-        "node_options": {"repair_input_callback": callback},
-    }
-
-    builder.reset_mock()
-    client.build_workflow(
-        "Add a node", workflow_id="wf1", repair_input_callback=callback,
-        node_options={"max_repair_retries": 0, "repair_input_callback": previous},
+    returned = sdk.client.build_allocated_workflow_json(
+        "wf1", "Collect tickets", temperature=0.17, max_retries=2,
     )
-    assert builder.build_workflow.call_args.kwargs == {
-        "workflow_id": "wf1",
-        "node_options": {"max_repair_retries": 0, "repair_input_callback": callback},
-    }
 
-    builder.reset_mock()
-    client.evolve("wf1", "Fix the node", repair_input_callback=callback)
-    assert builder.evolve.call_args.kwargs == {
-        "target": None,
-        "node_options": {"repair_input_callback": callback},
-    }
-
-    builder.reset_mock()
-    client.build_nodes("wf1", node_options={"max_repair_retries": 1})
-    assert builder.build_nodes.call_args.kwargs == {
-        "node_options": {"max_repair_retries": 1},
-    }
+    assert returned is result
+    sdk.builder.engine.build_allocated_workflow_json.assert_called_once_with(
+        "wf1", "Collect tickets", temperature=0.17, max_retries=2,
+    )
+    sdk.builder.build_workflow_json.assert_not_called()
 
 
-def test_sdk_exports_the_repair_input_context():
-    assert flowx_sdk.NodeRepairInput is NodeRepairInput
-    assert NodeRepairInput(
-        node_name="Collect", attempt=0, test_log="failed", test_result={"ok": False},
-    ).node_name == "Collect"
+def test_build_nodes_forwards_await_repair_input(sdk):
+    builder, client = sdk.builder, sdk.client
+
+    client.build_nodes("wf1", await_repair_input=True)
+
+    assert builder.build_nodes.call_args.kwargs == {"await_repair_input": True}
+
+
+def test_answer_abort_and_pending_requests_delegate_to_the_engine(sdk):
+    builder, client = sdk.builder, sdk.client
+    builder.engine.pending_requests.return_value = [
+        {"request_id": "r1", "workflow_id": "wf1", "awaiting": {"stepId": "Reply__amend_node"}},
+    ]
+
+    client.answer("r1", "use a fallback", "Reply__amend_node")
+    client.answer("r1")
+    client.abort("r1")
+
+    assert builder.engine.answer.call_args_list[0].args == ("r1", "use a fallback", "Reply__amend_node")
+    assert builder.engine.answer.call_args_list[1].args == ("r1", "", "")
+    builder.engine.abort.assert_called_once_with("r1")
+    assert client.pending_requests() == builder.engine.pending_requests.return_value
 
 
 def test_evolve_and_list_nodes_delegate_to_the_engine(sdk):
