@@ -4,6 +4,7 @@
 <!-- Modified 2026-11-03: document the background-only MCP build interface. -->
 <!-- Modified 2026-11-03: document installation of the FlowX agent skill. -->
 <!-- Modified 2026-11-03: add Hermes Agent skill installation instructions. -->
+<!-- Modified 2026-11-04: update skill installation for its move to the repository root. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -255,32 +256,31 @@ For interactive terminal use, prefix with `poetry run` or `uv run` if the enviro
 <a name="install-the-flowx-agent-skill"></a>
 ### Install the FlowX agent skill
 
-The [FlowX workflow skill](.github/skills/flowx-workflows/SKILL.md) guides a
-compatible coding agent through building, inspecting, repairing, running, and
-evolving workflows. In a VS Code workspace opened at this repository, the skill
-is already in the project skill directory; no copy is needed.
+The [FlowX workflow skill](SKILL.md) guides a compatible coding agent through
+building, inspecting, repairing, running, and evolving workflows. The source
+file lives at the repository root, which is not a standard VS Code skill
+discovery location; install it in a skill directory before using it.
 
-To make it available in **another project**, run the following from the root of
-a FlowX source checkout, replacing the example path with the destination
-project's absolute path:
+To make it available in **a project** (including this one), run the following
+from the root of a FlowX source checkout, replacing the example path with the
+destination project's absolute path:
 
 ```bash
 TARGET_PROJECT=/absolute/path/to/your/project
-mkdir -p "$TARGET_PROJECT/.github/skills"
-cp -R .github/skills/flowx-workflows "$TARGET_PROJECT/.github/skills/"
+mkdir -p "$TARGET_PROJECT/.github/skills/flowx-workflows"
+cp SKILL.md "$TARGET_PROJECT/.github/skills/flowx-workflows/SKILL.md"
 ```
 
 Alternatively, install it for your user account in VS Code from the FlowX
 source checkout:
 
 ```bash
-mkdir -p ~/.copilot/skills
-cp -R .github/skills/flowx-workflows ~/.copilot/skills/
+mkdir -p ~/.copilot/skills/flowx-workflows
+cp SKILL.md ~/.copilot/skills/flowx-workflows/SKILL.md
 ```
 
-These commands assume the destination `flowx-workflows` directory does not yet
-exist. To update an existing copy, review and replace or merge it instead of
-running `cp -R` over it. Other agent hosts may use different skill directories;
+These commands overwrite any existing destination `SKILL.md`; review or back
+up local changes first. Other agent hosts may use different skill directories;
 check their documentation. When redistributing the skill, retain its attribution
 and the applicable FlowX [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
@@ -299,24 +299,24 @@ With [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/featur
 installed, install this skill from the public GitHub repository:
 
 ```bash
-hermes skills install AIpRoBuilder/FlowX/.github/skills/flowx-workflows
+hermes skills install https://raw.githubusercontent.com/AIpRoBuilder/FlowX/main/SKILL.md
 hermes skills list
 ```
 
 In a Hermes chat, the equivalent is
-`/skills install AIpRoBuilder/FlowX/.github/skills/flowx-workflows`. Review the
+`/skills install https://raw.githubusercontent.com/AIpRoBuilder/FlowX/main/SKILL.md`. Review the
 skill and approve the installation when prompted; then start a new session or
-refresh the skills and invoke `/flowx-workflows`. The GitHub command requires
-the skill to have been committed and pushed to the repository's default branch;
+refresh the skills and invoke `/flowx-workflows`. The URL command requires
+the skill to have been committed and pushed to the repository's `main` branch;
 it cannot install unpublished local changes.
 
 To install the current local checkout into the default Hermes profile instead,
-run this from the FlowX repository root (provided the destination does not
-already exist):
+run this from the FlowX repository root (back up any existing destination file
+first):
 
 ```bash
-mkdir -p ~/.hermes/skills
-cp -R .github/skills/flowx-workflows ~/.hermes/skills/
+mkdir -p ~/.hermes/skills/flowx-workflows
+cp SKILL.md ~/.hermes/skills/flowx-workflows/SKILL.md
 ```
 
 For a named profile or a custom Hermes home, use that profile's skills directory
