@@ -2,6 +2,8 @@
 <!-- Modified 2026-11-02: clarify SDK repair behavior and paused-result fields. -->
 <!-- Modified 2026-11-03: document workflow-indexed background builds and review. -->
 <!-- Modified 2026-11-03: document the background-only MCP build interface. -->
+<!-- Modified 2026-11-03: document installation of the FlowX agent skill. -->
+<!-- Modified 2026-11-03: add Hermes Agent skill installation instructions. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -106,6 +108,7 @@ FlowX is model- and UI-agnostic. Connect an MCP-capable agent client, call the P
   - [Configure the environment](#configure-the-environment)
   - [Start the MCP server](#start-the-mcp-server)
   - [Register FlowX in an MCP client](#register-flowx-in-an-mcp-client)
+  - [Install the FlowX agent skill](#install-the-flowx-agent-skill)
 - [⚡ Quick Start](#quickstart)
 - [🧰 MCP Tool Surface](#tool-surface)
 - [🐍 Python SDK](#python-sdk)
@@ -248,6 +251,77 @@ For interactive terminal use, prefix with `poetry run` or `uv run` if the enviro
   }
 }
 ```
+
+<a name="install-the-flowx-agent-skill"></a>
+### Install the FlowX agent skill
+
+The [FlowX workflow skill](.github/skills/flowx-workflows/SKILL.md) guides a
+compatible coding agent through building, inspecting, repairing, running, and
+evolving workflows. In a VS Code workspace opened at this repository, the skill
+is already in the project skill directory; no copy is needed.
+
+To make it available in **another project**, run the following from the root of
+a FlowX source checkout, replacing the example path with the destination
+project's absolute path:
+
+```bash
+TARGET_PROJECT=/absolute/path/to/your/project
+mkdir -p "$TARGET_PROJECT/.github/skills"
+cp -R .github/skills/flowx-workflows "$TARGET_PROJECT/.github/skills/"
+```
+
+Alternatively, install it for your user account in VS Code from the FlowX
+source checkout:
+
+```bash
+mkdir -p ~/.copilot/skills
+cp -R .github/skills/flowx-workflows ~/.copilot/skills/
+```
+
+These commands assume the destination `flowx-workflows` directory does not yet
+exist. To update an existing copy, review and replace or merge it instead of
+running `cp -R` over it. Other agent hosts may use different skill directories;
+check their documentation. When redistributing the skill, retain its attribution
+and the applicable FlowX [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Open the target workspace in a skill-capable agent and ask it to use FlowX, or
+invoke `/flowx-workflows` in a host that supports skill slash commands. Reload
+the workspace if the skill is not discovered. Installing the skill only adds
+instructions: it does **not** install FlowX, configure an LLM, or register the
+MCP server. Follow the [installation](#installation),
+[environment](#configure-the-environment), and
+[MCP registration](#register-flowx-in-an-mcp-client) steps separately. A pip
+install does not automatically install the agent skill.
+
+#### Hermes Agent
+
+With [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)
+installed, install this skill from the public GitHub repository:
+
+```bash
+hermes skills install AIpRoBuilder/FlowX/.github/skills/flowx-workflows
+hermes skills list
+```
+
+In a Hermes chat, the equivalent is
+`/skills install AIpRoBuilder/FlowX/.github/skills/flowx-workflows`. Review the
+skill and approve the installation when prompted; then start a new session or
+refresh the skills and invoke `/flowx-workflows`. The GitHub command requires
+the skill to have been committed and pushed to the repository's default branch;
+it cannot install unpublished local changes.
+
+To install the current local checkout into the default Hermes profile instead,
+run this from the FlowX repository root (provided the destination does not
+already exist):
+
+```bash
+mkdir -p ~/.hermes/skills
+cp -R .github/skills/flowx-workflows ~/.hermes/skills/
+```
+
+For a named profile or a custom Hermes home, use that profile's skills directory
+instead. Copying manually does not use Hermes's hub installation or update
+tracking. The skill is separate from the FlowX MCP server and its configuration.
 
 <a name="quickstart"></a>
 ## ⚡ Quick Start

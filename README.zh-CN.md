@@ -2,6 +2,8 @@
 <!-- Modified 2026-11-03: document workflow-indexed background builds and review. -->
 <!-- Modified 2026-11-02: clarify SDK repair behavior and paused-result fields. -->
 <!-- Modified 2026-11-03: document the background-only MCP build interface. -->
+<!-- Modified 2026-11-03: document installation of the FlowX agent skill. -->
+<!-- Modified 2026-11-03: add Hermes Agent skill installation instructions. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -106,6 +108,7 @@ FlowX 与模型和 UI 无关。你可以连接支持 MCP 的 Agent 客户端、�
   - [配置环境](#configure-the-environment)
   - [启动 MCP 服务器](#start-the-mcp-server)
   - [在 MCP 客户端中注册 FlowX](#register-flowx-in-an-mcp-client)
+  - [安装 FlowX Agent Skill](#install-the-flowx-agent-skill)
 - [⚡ 快速开始](#quickstart)
 - [🧰 MCP 工具列表](#tool-surface)
 - [🐍 Python SDK](#python-sdk)
@@ -248,6 +251,67 @@ python3.10 run_server.py
   }
 }
 ```
+
+<a name="install-the-flowx-agent-skill"></a>
+### 安装 FlowX Agent Skill
+
+[FlowX 工作流技能](.github/skills/flowx-workflows/SKILL.md)可以指导兼容的
+编程 Agent 构建、检查、修复、运行和演进工作流。在 VS Code 中以本仓库为工作区
+打开时，该技能已位于项目技能目录中，无需复制。
+
+如需在**其他项目**中使用，请在 FlowX 源码仓库根目录执行以下命令，并将示例路径
+替换为目标项目的绝对路径：
+
+```bash
+TARGET_PROJECT=/absolute/path/to/your/project
+mkdir -p "$TARGET_PROJECT/.github/skills"
+cp -R .github/skills/flowx-workflows "$TARGET_PROJECT/.github/skills/"
+```
+
+也可以在 FlowX 源码仓库中执行以下命令，为当前 VS Code 用户安装：
+
+```bash
+mkdir -p ~/.copilot/skills
+cp -R .github/skills/flowx-workflows ~/.copilot/skills/
+```
+
+以上命令假设目标位置尚不存在 `flowx-workflows` 目录。更新已有副本时，请先检查并
+替换或合并，不要直接对已有目录执行 `cp -R`。其他 Agent 宿主可能使用不同的技能
+目录，请参阅其文档。重新分发该技能时，请保留署名及适用的 FlowX
+[LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
+
+在支持技能的 Agent 中打开目标工作区，然后请求它使用 FlowX；支持技能斜杠命令的
+宿主也可以调用 `/flowx-workflows`。如果未发现技能，请重新加载工作区。安装技能
+只会添加指导说明，**不会**安装 FlowX、配置 LLM 或注册 MCP 服务器。请另行完成
+[安装](#installation)、[环境配置](#configure-the-environment)和
+[MCP 注册](#register-flowx-in-an-mcp-client)。通过 pip 安装 FlowX 不会自动安装
+Agent Skill。
+
+#### Hermes Agent
+
+安装 [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)
+后，可以从公开 GitHub 仓库安装该技能：
+
+```bash
+hermes skills install AIpRoBuilder/FlowX/.github/skills/flowx-workflows
+hermes skills list
+```
+
+在 Hermes 对话中也可以输入
+`/skills install AIpRoBuilder/FlowX/.github/skills/flowx-workflows`。请先检查技能，
+并在提示时确认安装；然后开始新会话或刷新技能，调用 `/flowx-workflows`。GitHub
+安装命令要求该技能已提交并推送到仓库默认分支，无法安装尚未发布的本地修改。
+
+如需将当前本地检出安装到默认 Hermes 配置，在 FlowX 仓库根目录执行以下命令
+（目标目录尚不存在时）：
+
+```bash
+mkdir -p ~/.hermes/skills
+cp -R .github/skills/flowx-workflows ~/.hermes/skills/
+```
+
+对于命名配置或自定义 Hermes 主目录，请改用对应配置的技能目录。手动复制不会使用
+Hermes Hub 安装或更新跟踪。该技能与 FlowX MCP 服务器及其配置是独立的。
 
 <a name="quickstart"></a>
 ## ⚡ 快速开始
