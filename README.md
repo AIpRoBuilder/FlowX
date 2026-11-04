@@ -6,6 +6,7 @@
 <!-- Modified 2026-11-03: add Hermes Agent skill installation instructions. -->
 <!-- Modified 2026-11-04: update skill installation for its move to the repository root. -->
 <!-- Modified 2026-11-04: document first-use setup and combined Hermes installation. -->
+<!-- Modified 2026-11-04: streamline setup and quick-start guidance. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -28,6 +29,7 @@
 </p>
 
 <p align="center">
+  <a href="#setup">⚙️ Setup</a> ·
   <a href="#quickstart">🚀 Quick Start</a> ·
   <a href="#key-features">✨ Key Features</a> ·
   <a href="#tool-surface">🧰 MCP Tools</a> ·
@@ -38,7 +40,7 @@
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-FlowX is an **MCP server, Python SDK, and A2A adapter that let AI agents build, run, and evolve workflows**. Describe a process in plain language; FlowX compiles it into a workflow graph (`workflow.json`), audited and tested per-node Python implementations, and a runnable FastAPI backend. The agent can then inspect the artifacts, start the service, feed step inputs, and evolve the workflow in the same conversation, so it becomes a reusable process instead of a one-off answer.
+FlowX lets AI agents **build, run, and evolve workflows** through MCP, a Python SDK, or A2A. Describe a process and FlowX generates a workflow graph, audited and tested Python nodes, and a FastAPI backend.
 
 <p align="center"><strong>Describe → Generate → Inspect → Run → Evolve → Reuse</strong></p>
 
@@ -47,7 +49,8 @@ FlowX is an **MCP server, Python SDK, and A2A adapter that let AI agents build, 
 FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 
 <a name="news"></a>
-## 📣 News
+<details>
+<summary>📣 News</summary>
 
 - **[2026.10.28]** 🧩 **Expanded node engine.** Each business node now runs a generation → audit → test → bounded repair chain before it is published.
 - **[2026.10.24]** ⚙️ **WorkflowEngine-native generation.** Graph, node, and entrypoint workflows are now `WorkflowEngine` subclasses.
@@ -55,76 +58,29 @@ FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 - **[2026.10.20]** 🛠️ **Guided node repair.** A failed node test can be amended with user guidance before it is retried.
 - **[2026.10.19]** 🔁 **Evolve API.** SDK `evolve` and MCP workflow evolution can target the whole workflow, a single node, or let the engine decide.
 
+</details>
+
 <a name="why-flowx"></a>
 ## 🌟 Why FlowX?
 
-FlowX is a **Generative Workflow layer** for AI agents: it turns intent into an executable process instead of a one-off chat answer. The process is stored as an explicit graph and code, so an agent can inspect it, run it, and change only the parts that need to change.
-
-| Instead of… | FlowX gives you… |
-| --- | --- |
-| A one-off chat answer | A reusable workflow stored on disk under `workspace/workflows/<workflow_id>` |
-| A hand-drawn, static flow | A graph and node code generated from intent, audited, tested, and editable |
-| Re-prompting from scratch | Follow-up changes that rebuild only the affected nodes |
-| A hosted black box | A local, Apache-2.0 engine usable from any MCP-capable client, the Python SDK, or A2A |
+Turn an intent into an editable, reusable process instead of a one-off answer. Change the workflow later without rebuilding unchanged nodes.
 
 <p align="center">
   <img src="assets/generative-workflow-demo.gif" alt="45-second illustrative FlowX walkthrough in a Codex-style desktop interface: project and thread navigation on the left, a continuous conversation with per-node result cards and a bottom composer, and a narrow workflow inspector on the right." width="90%" />
 </p>
 
-*Illustrative walkthrough, not a live recording. Your existing agent remains the assistant; FlowX provides its workflow capability behind the conversation. Messages and per-node cards illustrate what the host UI can render, independent of transport. FlowX does not bundle this interface or automatically generate these card layouts. Generation and execution times are illustrative. See the [storyboard and rendering instructions](assets/README-demo.md).*
-
-### Where FlowX fits
-
-**Generative UI shapes the interaction. Generative Workflow shapes the execution.** FlowX focuses on the latter: the explicit process an agent can build, run, and change behind a chat, a task panel, or another intelligent interface.
-
-| Layer | Responsibility |
-| --- | --- |
-| Intelligent UI / agent client | Capture intent and present progress, inputs, and results. The host application owns the interface. |
-| **FlowX: Generative Workflow** | Turn intent into workflow artifacts; expose tools to inspect, execute, and evolve them. |
-| Workflow runtime | Execute generated nodes in a FastAPI backend using [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow); expose step events over AG-UI SSE. |
-
-FlowX is model- and UI-agnostic. Connect an MCP-capable agent client, call the Python SDK, or delegate workflow generation over A2A. A custom frontend can consume the generated backend's events; rendering those events remains the frontend's responsibility. No dedicated integration with a particular model or intelligent UI is implied.
-
-> [!NOTE]
-> The primary interactive path is local stdio MCP. MCP and the Python SDK expose the same engine: build or modify `workflow.json` and requirements, nodes, the main entrypoint, or the whole workflow; then run it as a service and feed step inputs. The A2A adapter currently exposes non-streaming workflow building. FlowX is a workflow layer, not a hosted UI product.
+*Illustrative walkthrough, not a live recording. The UI, cards, and timings are illustrative; FlowX does not bundle this interface. See the [storyboard](assets/README-demo.md).*
 
 <a name="key-features"></a>
 ## 🚀 Key Features
 
-- 🧩 **Intent → executable workflow** — Generate a workflow graph, node documentation, Python node code, and a backend entry point.
-- 🛡️ **Audited, tested, self-repairing nodes** — Each business node runs through generation, audit, test, and bounded repair; a node that still fails is not published.
-- 🔁 **Conversational evolution** — Change the whole workflow or specific nodes; unchanged nodes are reused. SDK callers can guide a failed node's repair.
-- 🚀 **Local execution loop** — Start and stop a built workflow through MCP or the SDK; feed step inputs and reset sessions through MCP.
-- 🔌 **Three interfaces** — Local stdio MCP, Python SDK, and a non-streaming A2A adapter share the same core.
-- 📦 **Reusable, versioned artifacts** — Workflows live on disk under `workspace/workflows/<workflow_id>` and can be reopened and evolved later.
-- 🧠 **Model- and UI-agnostic** — Connect any MCP-capable client or your own frontend; FlowX does not bundle a UI.
-
-<a name="table-of-contents"></a>
-## 📑 Table of Contents
-
-- [📣 News](#news)
-- [🌟 Why FlowX?](#why-flowx)
-- [🚀 Key Features](#key-features)
-- [⚙️ Setup](#setup)
-  - [Installation](#installation)
-  - [Configure the environment](#configure-the-environment)
-  - [Start the MCP server](#start-the-mcp-server)
-  - [Register FlowX in an MCP client](#register-flowx-in-an-mcp-client)
-  - [Install the FlowX agent skill](#install-the-flowx-agent-skill)
-- [⚡ Quick Start](#quickstart)
-- [🧰 MCP Tool Surface](#tool-surface)
-- [🐍 Python SDK](#python-sdk)
-- [🤝 A2A Server](#a2a-server)
-- [🏗️ Architecture](#architecture)
-  - [Runtime topology](#runtime-topology)
-  - [Repository layout](#repository-layout)
-  - [Artifact flow](#artifact-flow)
-- [🧪 Runtime Compatibility](#runtime-compatibility)
-- [🙏 Acknowledgements](#acknowledgements)
-- [🤝 Contributing](#contributing)
-- [💬 Contact](#contact)
-- [📜 License & Provenance](#license-provenance)
-- [⭐ Star History](#star-history)
+- 🧩 **Generate** a graph, node documentation, Python code, and a backend.
+- 🛡️ **Audit and test** each node, with bounded repair; failing nodes are not published.
+- 🔁 **Evolve** the workflow or individual nodes, reusing unchanged nodes.
+- 🚀 **Run locally** through MCP or the SDK; MCP also supports step inputs and session resets.
+- 🔌 **Choose an interface:** local stdio MCP, Python SDK, or non-streaming A2A.
+- 📦 **Reuse artifacts** stored under `workspace/workflows/<workflow_id>`.
+- 🧠 **Bring your own model and UI:** FlowX does not bundle a frontend.
 
 <a name="setup"></a>
 ## ⚙️ Setup
@@ -132,17 +88,21 @@ FlowX is model- and UI-agnostic. Connect an MCP-capable agent client, call the P
 ### Prerequisites
 
 - **Python 3.10 or later.**
+- Git, to obtain FlowX and its workflow runtime dependency.
 - An MCP-capable agent client for the local stdio path.
 - An OpenAI-compatible LLM provider (DeepSeek is the default).
 
 <a name="installation"></a>
 ### Installation
 
-One installation includes the shared core, MCP adapter, Python SDK, and A2A adapter.
+Clone FlowX and install the core, MCP server, SDK, and A2A adapter:
 
 #### pip
 
 ```bash
+git clone https://github.com/AIpRoBuilder/FlowX.git
+cd FlowX
+
 # Create and activate a virtual environment
 python3.10 -m venv .venv
 source .venv/bin/activate
@@ -173,14 +133,14 @@ conda activate flowx
 <details>
 <summary>Install with a local ag_ui_workflow checkout</summary>
 
-The FlowX agent is vendored under `packages/core/flowx_core`. Only [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) remains an external workflow-runtime dependency. To use a local checkout instead of its Git dependency, install it first and then install FlowX without dependencies.
+To replace the Git-installed [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) runtime with a local checkout, install FlowX and its dependencies first, then install the local runtime without dependencies:
 
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
+python -m pip install -e .
 python -m pip install -e ../ag_ui_worflow --no-deps
-python -m pip install -e . --no-deps
 ```
 
 With Poetry or uv:
@@ -192,9 +152,8 @@ poetry install
 poetry run pip install -e ../ag_ui_worflow --no-deps
 
 # uv
-uv venv --python 3.10
+uv sync
 uv pip install --python .venv/bin/python -e ../ag_ui_worflow --no-deps
-uv pip install --python .venv/bin/python -e . --no-deps
 ```
 
 </details>
@@ -208,7 +167,7 @@ For source-checkout execution, FlowX automatically discovers each `packages/*` c
 cp .env.example .env
 ```
 
-Set at least `FLOWX_LLM_PROVIDER`, `FLOWX_LLM_MODEL`, `FLOWX_LLM_API_KEY`, and `FLOWX_DEFAULT_WORKSPACE`.
+Edit `.env` and set your provider, model, API key, and workspace:
 
 ```dotenv
 FLOWX_LLM_PROVIDER=deepseek
@@ -218,6 +177,12 @@ FLOWX_DEFAULT_WORKSPACE=./.flowx_workspaces
 ```
 
 `FLOWX_CONFIG_ROOT` lets an installed `flowx-mcp` resolve a `.env` file outside the repository checkout. `FLOWX_EXTRA_PATHS` can point at a local [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) source when it is not installed into the current environment.
+
+The SDK and A2A server read process environment variables; they do not automatically load this `.env` file. Export the settings or load the file in your application before creating a client. For example, from the checkout root in macOS/Linux:
+
+```bash
+set -a; source .env; set +a
+```
 
 <a name="start-the-mcp-server"></a>
 ### Start the MCP server
@@ -233,29 +198,36 @@ flowx-mcp --verbose
 python3.10 run_server.py
 ```
 
-For interactive terminal use, prefix with `poetry run` or `uv run` if the environment is not activated. For MCP client configuration, use the absolute executable path and arguments described below; an MCP host may not inherit your shell's `PATH`.
+Use `poetry run` or `uv run` if the environment is not activated. An MCP host normally starts the server itself; the command above is for checking the entry point.
 
 <a name="register-flowx-in-an-mcp-client"></a>
 ### Register FlowX in an MCP client
+
+Replace the executable with the absolute path to your virtual environment's `flowx-mcp`, and set your credentials and workspace. MCP hosts may not inherit your shell's `PATH`.
 
 ```jsonc
 {
   "mcpServers": {
     "flowx": {
-      "command": "flowx-mcp",
+      "command": "/absolute/path/to/your/venv/bin/flowx-mcp",
       "env": {
         "FLOWX_LLM_PROVIDER": "deepseek",
         "FLOWX_LLM_MODEL": "deepseek-flash",
         "FLOWX_LLM_API_KEY": "<your key>",
-        "FLOWX_DEFAULT_WORKSPACE": "/Users/user/Desktop/codes/flowx_workspaces"
+        "FLOWX_DEFAULT_WORKSPACE": "/absolute/path/to/flowx_workspaces"
       }
     }
   }
 }
 ```
 
+Store credentials according to your MCP client's security guidance; avoid committing them to a repository.
+
 <a name="install-the-flowx-agent-skill"></a>
 ### Install the FlowX agent skill
+
+<details>
+<summary>Optional: install the skill for VS Code or Hermes Agent</summary>
 
 The [FlowX workflow skill](skills/flowx-workflows/SKILL.md) guides a compatible
 coding agent through building, inspecting, repairing, running, and evolving
@@ -343,10 +315,12 @@ For a named profile or a custom Hermes home, use that profile's skills directory
 instead. Copying manually does not use Hermes's hub installation or update
 tracking. The skill is separate from the FlowX MCP server and its configuration.
 
+</details>
+
 <a name="quickstart"></a>
 ## ⚡ Quick Start
 
-The describe → generate → inspect → run → evolve loop works through any local MCP-capable agent client.
+After [setup](#setup), ask your MCP-capable agent:
 
 ### 1. Describe a workflow
 
@@ -360,16 +334,23 @@ Return the category, priority, and draft reply as structured output.
 
 ### 2. Build and inspect
 
-Call `create_workflow` to allocate an empty workflow, then choose `start_new_workflow(workflow_id, prompt)` to build the whole workflow, or `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` to build only its graph and requirement analysis. The graph tool also modifies an existing workflow. For a staged build, follow it with `start_build_nodes` and `start_build_main_entrypoint(workflow_id, amendment='', fastapi_port=8000, smoke_test=false)` as needed. For an existing workflow, `start_build_workflow` and `start_evolve_workflow` can build or evolve multiple stages. Use `list_workflows`, `list_nodes`, and `get_workflow` to inspect workflow ids, node ids, and artifact locations. Exact step IDs come from the generated workflow—not from a fixed demo schema.
+1. Call `create_workflow`, then `start_new_workflow(workflow_id, prompt)`.
+2. Poll `get_build_status(workflow_id)`. Check `status` and `result.ok`: the response's top-level `ok` only confirms that the status query succeeded.
+3. If `input_required`, show `awaiting.prompt` and `awaiting.test_log`, then resume with `submit_background_build_input` using the exact `workflow_id`, `revision`, `request_id`, `awaiting.stepId` as `step_id`, and the user's `input`. Poll again.
+4. Inspect the result with `get_workflow` and `list_nodes`. Use the generated step IDs, not fixed demo IDs.
 
-All MCP builds run in the background and return immediately. Poll `get_build_status(workflow_id)` until the build completes, fails, requires input, or needs recovery; inspect the final result for stage errors. Top-level `ok` means the status query succeeded, not that the build succeeded: check `status` and `result.ok`. When it returns `input_required`, show `awaiting.prompt` and `awaiting.test_log` and ask the user. Resume with `submit_background_build_input`, supplying the exact `workflow_id`, `revision`, `request_id`, `awaiting.stepId` as `step_id`, and the user's `input`; then poll again. Guidance amends the node, `test: <guidance>` amends its test, `skip` skips the amendment, and an empty answer uses the test log alone. Use `abort_background_build` with the exact `workflow_id`, `revision`, and `request_id` to abandon a paused build. For `recovery_required`, call `recover_background_build` with the exact `workflow_id` and `revision` before attempting another build.
+MCP builds run in the background; the Python SDK retains synchronous methods. Older synchronous MCP build tools were removed: finish or abort an old paused build with the old server before upgrading. Generation sends requirements and possibly logs to your LLM provider and can run generated tests; review generated code before running its service.
 
-Status represents the latest build for a workflow and is stored only in the MCP server process; after a server restart the prior in-memory build cannot be resumed. The engine allows one active build across workflows; a paused build holds that slot. For background tools that support `interactive`, it defaults to `true`; `interactive=false` amends from the test log without asking. `list_pending_builds` only reports paused background builds and can recover a question after a timeout or client restart only while the original server process remains alive. The host decides whether to poll and how to display results.
+<details>
+<summary>Background build options and recovery</summary>
 
-> [!IMPORTANT]
-> **Breaking change for MCP clients:** synchronous MCP tools `build_workflow_json`, `build_nodes`, `build_main_entrypoint`, `build_workflow`, `evolve_workflow`, `submit_build_input`, and `abort_build` are removed. Migrate to the corresponding `start_*` and background input/abort tools and poll for results. Creating a workflow now requires `create_workflow` before starting a build. The Python SDK's synchronous build methods remain available. Finish or abort any old synchronous paused build using the old server before upgrading; do not restart an active build just to upgrade.
+- For a staged build, use `start_build_workflow_json`, `start_build_nodes`, and `start_build_main_entrypoint`. The graph tool also modifies existing plans; `start_build_workflow` and `start_evolve_workflow` modify existing workflows.
+- Repair input amends the node; `test: <guidance>` amends the test, `skip` skips the amendment, and an empty answer uses the test log. Supported start tools accept `interactive=false` to repair from the log without prompting.
+- Abort a paused build with `abort_background_build` and its exact `workflow_id`, `revision`, and `request_id`. For `recovery_required`, call `recover_background_build` with the exact `workflow_id` and `revision` before starting another build.
+- Only one build can be active across workflows; a paused build holds that slot. Status and paused builds live in the MCP server process and cannot be resumed after it exits. `list_pending_builds` recovers pending questions only while the original process is alive.
+- If recovery still requires native candidate cleanup, stop the original server, confirm no other writer is active, and inspect unpublished candidates as described in [dynamic workflow documentation](docs/DYNAMIC_WORKFLOW.md). A partial graph-only plan is not overwritten: inspect it and repair the existing workflow. If neither plan file exists, retry creation only after confirming no writer or retained candidate remains.
 
-If `recover_background_build` continues to report native candidate cleanup is required, it does not delete files or release the writer slot automatically. Stop the original server, confirm that no other writer is active, and inspect unpublished candidates as described in the [dynamic workflow documentation](docs/DYNAMIC_WORKFLOW.md). If a graph-only build leaves just one of the requirement or graph files, `start_build_workflow_json` refuses to overwrite the partial plan; inspect the artifacts and use an appropriate existing-workflow repair rather than retrying creation blindly. If neither file was written, the original create request can be retried after confirming no writer or retained candidate remains.
+</details>
 
 ### 3. Run, evolve, and reuse
 
@@ -381,8 +362,6 @@ Then rerun the service.
 ```
 
 `run_service` starts or restarts the generated service. `run_step` feeds one step's input to the running service and reports when the workflow pauses for more input; `reset_session` cancels a paused run. `start_evolve_workflow` changes the whole workflow (`target="workflow"`), one node (a step id or node id from `list_nodes`), or lets the engine decide; poll its background build as above.
-
-This is the distinction: the agent does not only answer the ticket. It builds and evolves the process for handling the next one.
 
 <a name="tool-surface"></a>
 ## 🧰 MCP Tool Surface
@@ -425,25 +404,26 @@ with FlowXClient(workspace="./workflows") as flowx:
     workflow_id = created.workflow_id
     flowx.build_nodes(workflow_id, await_repair_input=False).raise_for_failure()  # all nodes, or {step_id: amendment}
     flowx.build_main_entrypoint(workflow_id).raise_for_failure()
-    flowx.build_workflow("Also return a summary.", workflow_id=workflow_id, await_repair_input=False)  # whole engine
-    print(flowx.run_service(workflow_id))                  # run / rerun as a service
+    print(flowx.run_service(workflow_id))                  # run as a service
+    input("Press Enter to stop the service... ")
 ```
 
-Each build call returns an `AgentResult` with per-stage outcomes, unresolved errors, logs and artifact paths; stage failures are reported there rather than raised.
+  Each build call returns an `AgentResult` with per-stage outcomes, errors, logs, and artifact paths. `raise_for_failure()` raises for failed stages. Keep the client open while using the service; exiting the `with` block stops services it started.
 
-`build_nodes`, `build_workflow` and `evolve` pause at a node's own gate when its test fails (`await_repair_input` defaults to `True`). The result then has `status="input_required"`, a `request_id`, and `awaiting` with step metadata, `stepId`, `node`, `workflow_id`, `test_log` (up to its last 6,000 characters) and `test_log_chars` (the full log length). Answer it with `flowx.answer(request_id, input, awaiting["stepId"])`. A paused result can have `ok=True`, so `raise_for_failure()` alone does not establish completion. Guidance amends the node (the default), `input="test: <guidance>"` fixes the generated test instead, `input="skip"` skips the amendment, and `""` amends the node from the log alone. Pass `await_repair_input=False` to amend from the test log automatically. A runnable walkthrough is in [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py).
+`build_nodes`, `build_workflow`, and `evolve` default to pausing on a failed node test. If `status="input_required"`, inspect `awaiting` and resume with `flowx.answer(request_id, input, awaiting["stepId"])`. A paused result can have `ok=True`, so `raise_for_failure()` alone does not confirm completion. Pass `await_repair_input=False` to repair from the test log automatically. For guidance and input options, see [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py).
 
 To change an existing workflow, choose what to evolve with `evolve(workflow_id, command, target=...)`. `list_nodes` returns each node's step id and node id to use as a target; without a `target` the engine decides what the command refers to. A runnable walkthrough is in [examples/sdk_evolve.py](examples/sdk_evolve.py).
 
 For a direct, LLM-free smoke test of the expanded `DynamicWorkflowOrchestrator` engine, see [examples/dynamic_workflow_orchestrator.py](examples/dynamic_workflow_orchestrator.py). It exercises per-node generation/repair chains, finalizer IDs and an incremental business-graph update.
 
 ```python
-from flowx_sdk import WORKFLOW_TARGET
+from flowx_sdk import FlowXClient, WORKFLOW_TARGET
 
-nodes = flowx.list_nodes(workflow_id)   # [{"step_id": ..., "node_id": ..., "version": ...}]
-flowx.evolve(workflow_id, "Add a language-detection step.", target=WORKFLOW_TARGET)  # the workflow
-flowx.evolve(workflow_id, "Validate empty input.", target=nodes[0]["step_id"])       # one node (step id or node id)
-flowx.evolve(workflow_id, "Also return a one-line summary.")                         # engine judges
+workflow_id = "<existing workflow ID>"
+with FlowXClient(workspace="./workflows") as flowx:
+  flowx.evolve(workflow_id, "Add a language-detection step.", target=WORKFLOW_TARGET, await_repair_input=False).raise_for_failure()
+  nodes = flowx.list_nodes(workflow_id)
+  flowx.evolve(workflow_id, "Validate empty input.", target=nodes[0]["step_id"], await_repair_input=False).raise_for_failure()
 ```
 
 <a name="a2a-server"></a>
@@ -476,20 +456,6 @@ flowchart TB
   RUNTIME -.->|"AG-UI SSE to a custom frontend"| UI
   MCP -->|"follow-up changes"| CORE
 ```
-
-<a name="runtime-topology"></a>
-### Runtime topology
-
-<div align="center">
-  <img src="assets/architecture.png" alt="Local MCP topology connecting the FlowX generation core and generated workflow backend" width="460" height="400" />
-</div>
-
-- `flowx_mcp.server` exposes the tool surface over stdio through FastMCP.
-- `flowx_core.AgentBuilder` owns the LLM-backed generation workflows; `AgentWorkflowEngine` drives each request through the reformat, graph, node, and main-entrypoint stages.
-- `flowx_core.DynamicWorkflowOrchestrator` expands each business node into generation, audit, test, and bounded repair steps, then publishes versioned artifacts.
-- `flowx_sdk.FlowXClient` and `flowx_a2a` call the same agent core without routing through MCP.
-- The generated `main.py` runs as a managed FastAPI subprocess per workflow.
-- `run_service` starts or restarts the generated `main.py`; `run_step` and `reset_session` drive an interactive run over HTTP and AG-UI SSE.
 
 <a name="repository-layout"></a>
 ### Repository layout
