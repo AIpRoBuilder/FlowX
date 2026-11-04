@@ -7,11 +7,51 @@ description: 'Use when building, inspecting, running, repairing, or evolving Flo
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <!-- FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466 -->
 <!-- Modified 2026-11-04: move the skill to the repository root. -->
+<!-- Modified 2026-11-04: add first-use FlowX installation and verification. -->
 
 # FlowX Workflows
 
 Turn a user's process description into a reusable workflow; inspect its artifacts,
 and run or evolve it when requested.
+
+## Install FlowX when needed
+
+Skill installation only copies instructions; it does not execute this section.
+When this skill is first used, check whether FlowX is available before working:
+
+1. If suitable FlowX MCP tools are already connected, use them without installing
+   another copy. For Python SDK work, check `from flowx_sdk import FlowXClient`
+   in the Python environment that will run the user's code.
+2. If a local installation is needed, use the user's existing project virtual
+   environment or create a dedicated virtual environment with Python 3.10+.
+   For a new environment, choose an unused path and run
+   `/path/to/python3 -m venv /path/to/venv`. Never install into system Python
+   or overwrite an existing environment. Install from a trusted local FlowX
+   checkout, if available:
+
+   ```bash
+   /path/to/venv/bin/python -m pip install -e /path/to/FlowX
+   ```
+
+   Otherwise, install from the upstream Git repository (requires Git and network
+   access):
+
+   ```bash
+   /path/to/venv/bin/python -m pip install 'git+https://github.com/AIpRoBuilder/FlowX.git'
+   ```
+
+   Replace the paths with the actual environment and checkout. On Windows, use
+   the virtual environment's `Scripts/python.exe` instead. Do not silently
+   upgrade or replace an existing FlowX installation.
+3. Verify the SDK in that same environment with
+   `/path/to/venv/bin/python -c "from flowx_sdk import FlowXClient"`, and check
+   that its `bin/flowx-mcp` executable exists (`Scripts/flowx-mcp.exe` on
+   Windows). Report installation or verification failures and stop instead of
+   claiming FlowX is ready.
+4. Installing the package does not connect MCP tools or configure an LLM.
+   If MCP is needed, register the environment's `flowx-mcp` executable with the
+   host and reconnect as required; otherwise use the installed SDK. Configure
+   credentials securely as described below, without exposing their values.
 
 ## Before starting
 

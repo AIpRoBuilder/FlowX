@@ -5,6 +5,7 @@
 <!-- Modified 2026-11-03: document installation of the FlowX agent skill. -->
 <!-- Modified 2026-11-03: add Hermes Agent skill installation instructions. -->
 <!-- Modified 2026-11-04: update skill installation for its move to the repository root. -->
+<!-- Modified 2026-11-04: document first-use setup and combined Hermes installation. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -256,10 +257,9 @@ For interactive terminal use, prefix with `poetry run` or `uv run` if the enviro
 <a name="install-the-flowx-agent-skill"></a>
 ### Install the FlowX agent skill
 
-The [FlowX workflow skill](SKILL.md) guides a compatible coding agent through
-building, inspecting, repairing, running, and evolving workflows. The source
-file lives at the repository root, which is not a standard VS Code skill
-discovery location; install it in a skill directory before using it.
+The [FlowX workflow skill](skills/flowx-workflows/SKILL.md) guides a compatible
+coding agent through building, inspecting, repairing, running, and evolving
+workflows. Install it in a skill directory before using it.
 
 To make it available in **a project** (including this one), run the following
 from the root of a FlowX source checkout, replacing the example path with the
@@ -268,7 +268,7 @@ destination project's absolute path:
 ```bash
 TARGET_PROJECT=/absolute/path/to/your/project
 mkdir -p "$TARGET_PROJECT/.github/skills/flowx-workflows"
-cp SKILL.md "$TARGET_PROJECT/.github/skills/flowx-workflows/SKILL.md"
+cp skills/flowx-workflows/SKILL.md "$TARGET_PROJECT/.github/skills/flowx-workflows/SKILL.md"
 ```
 
 Alternatively, install it for your user account in VS Code from the FlowX
@@ -276,7 +276,7 @@ source checkout:
 
 ```bash
 mkdir -p ~/.copilot/skills/flowx-workflows
-cp SKILL.md ~/.copilot/skills/flowx-workflows/SKILL.md
+cp skills/flowx-workflows/SKILL.md ~/.copilot/skills/flowx-workflows/SKILL.md
 ```
 
 These commands overwrite any existing destination `SKILL.md`; review or back
@@ -286,12 +286,13 @@ and the applicable FlowX [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Open the target workspace in a skill-capable agent and ask it to use FlowX, or
 invoke `/flowx-workflows` in a host that supports skill slash commands. Reload
-the workspace if the skill is not discovered. Installing the skill only adds
-instructions: it does **not** install FlowX, configure an LLM, or register the
-MCP server. Follow the [installation](#installation),
+the workspace if the skill is not discovered. Installing the skill alone only
+adds instructions; on first use, the agent can install FlowX in an appropriate
+Python environment if it is missing. Configuring an LLM and registering the
+MCP server are separate steps. See [installation](#installation),
 [environment](#configure-the-environment), and
-[MCP registration](#register-flowx-in-an-mcp-client) steps separately. A pip
-install does not automatically install the agent skill.
+[MCP registration](#register-flowx-in-an-mcp-client). A pip install does not
+automatically install the agent skill.
 
 #### Hermes Agent
 
@@ -299,16 +300,35 @@ With [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/featur
 installed, install this skill from the public GitHub repository:
 
 ```bash
-hermes skills install https://raw.githubusercontent.com/AIpRoBuilder/FlowX/main/SKILL.md
+hermes skills install AIpRoBuilder/FlowX/skills/flowx-workflows
 hermes skills list
 ```
 
 In a Hermes chat, the equivalent is
-`/skills install https://raw.githubusercontent.com/AIpRoBuilder/FlowX/main/SKILL.md`. Review the
-skill and approve the installation when prompted; then start a new session or
-refresh the skills and invoke `/flowx-workflows`. The URL command requires
-the skill to have been committed and pushed to the repository's `main` branch;
+`/skills install AIpRoBuilder/FlowX/skills/flowx-workflows`. Review the skill
+and approve the installation when prompted; then start a new session or
+refresh the skills and invoke `/flowx-workflows`. GitHub installation requires
+the skill to have been committed and pushed to the repository's default branch;
 it cannot install unpublished local changes.
+
+To install both FlowX and the skill in one explicit operation on macOS or Linux,
+run the following with Git, Hermes, and Python 3.10+ available. It creates a
+dedicated virtual environment and refuses to reuse an existing path:
+
+```bash
+python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ required"' && \
+  test ! -e "$HOME/.flowx/venv" && \
+  test ! -L "$HOME/.flowx/venv" && \
+  python3 -m venv "$HOME/.flowx/venv" && \
+  "$HOME/.flowx/venv/bin/python" -m pip install 'git+https://github.com/AIpRoBuilder/FlowX.git' && \
+  hermes skills install AIpRoBuilder/FlowX/skills/flowx-workflows
+```
+
+Review and approve the Hermes prompt, then check its output. If a step fails or
+the installation is declined, the environment may remain; inspect it before
+retrying. The command does not register MCP or configure credentials. For MCP
+registration use `$HOME/.flowx/venv/bin/flowx-mcp` as the executable; for SDK
+code use `$HOME/.flowx/venv/bin/python`.
 
 To install the current local checkout into the default Hermes profile instead,
 run this from the FlowX repository root (back up any existing destination file
@@ -316,7 +336,7 @@ first):
 
 ```bash
 mkdir -p ~/.hermes/skills/flowx-workflows
-cp SKILL.md ~/.hermes/skills/flowx-workflows/SKILL.md
+cp skills/flowx-workflows/SKILL.md ~/.hermes/skills/flowx-workflows/SKILL.md
 ```
 
 For a named profile or a custom Hermes home, use that profile's skills directory
