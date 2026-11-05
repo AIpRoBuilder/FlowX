@@ -7,6 +7,7 @@
 <!-- Modified 2026-11-04: update skill installation for its move to the repository root. -->
 <!-- Modified 2026-11-04: document first-use setup and combined Hermes installation. -->
 <!-- Modified 2026-11-04: streamline setup and quick-start guidance. -->
+<!-- Modified 2026-11-05: install the complete skill including SDK scripts. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -238,23 +239,23 @@ python3.10 run_server.py
 ```bash
 TARGET_PROJECT=/absolute/path/to/your/project
 mkdir -p "$TARGET_PROJECT/.github/skills/flowx-workflows"
-cp skills/flowx-workflows/SKILL.md "$TARGET_PROJECT/.github/skills/flowx-workflows/SKILL.md"
+cp -R skills/flowx-workflows/. "$TARGET_PROJECT/.github/skills/flowx-workflows/"
 ```
 
 也可以在 FlowX 源码仓库中执行以下命令，为当前 VS Code 用户安装：
 
 ```bash
 mkdir -p ~/.copilot/skills/flowx-workflows
-cp skills/flowx-workflows/SKILL.md ~/.copilot/skills/flowx-workflows/SKILL.md
+cp -R skills/flowx-workflows/. ~/.copilot/skills/flowx-workflows/
 ```
 
-以上命令会覆盖目标位置已有的 `SKILL.md`，请先检查或备份本地修改。其他 Agent 宿主可能使用不同的技能
+以上命令会覆盖目标位置已有的同名文件，请先检查或备份本地修改。其他 Agent 宿主可能使用不同的技能
 目录，请参阅其文档。重新分发该技能时，请保留署名及适用的 FlowX
 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
 
 在支持技能的 Agent 中打开目标工作区，然后请求它使用 FlowX；支持技能斜杠命令的
 宿主也可以调用 `/flowx-workflows`。如果未发现技能，请重新加载工作区。安装技能
-本身只会添加指导说明；首次使用时，如果缺少 FlowX，Agent 可以将其安装到合适的
+会复制指导说明和脚本，但不会安装 SDK；首次使用时，如果缺少 FlowX，Agent 可以将其安装到合适的
 Python 环境中。LLM 配置和 MCP 服务器注册仍需单独完成。请参阅
 [安装](#installation)、[环境配置](#configure-the-environment)和
 [MCP 注册](#register-flowx-in-an-mcp-client)。通过 pip 安装 FlowX 不会自动安装 Agent Skill。
@@ -296,7 +297,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ requir
 
 ```bash
 mkdir -p ~/.hermes/skills/flowx-workflows
-cp skills/flowx-workflows/SKILL.md ~/.hermes/skills/flowx-workflows/SKILL.md
+cp -R skills/flowx-workflows/. ~/.hermes/skills/flowx-workflows/
 ```
 
 对于命名配置或自定义 Hermes 主目录，请改用对应配置的技能目录。手动复制不会使用

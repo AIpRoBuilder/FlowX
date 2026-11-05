@@ -7,6 +7,7 @@
 <!-- Modified 2026-11-04: update skill installation for its move to the repository root. -->
 <!-- Modified 2026-11-04: document first-use setup and combined Hermes installation. -->
 <!-- Modified 2026-11-04: streamline setup and quick-start guidance. -->
+<!-- Modified 2026-11-05: install the complete skill including SDK scripts. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -240,7 +241,7 @@ destination project's absolute path:
 ```bash
 TARGET_PROJECT=/absolute/path/to/your/project
 mkdir -p "$TARGET_PROJECT/.github/skills/flowx-workflows"
-cp skills/flowx-workflows/SKILL.md "$TARGET_PROJECT/.github/skills/flowx-workflows/SKILL.md"
+cp -R skills/flowx-workflows/. "$TARGET_PROJECT/.github/skills/flowx-workflows/"
 ```
 
 Alternatively, install it for your user account in VS Code from the FlowX
@@ -248,18 +249,18 @@ source checkout:
 
 ```bash
 mkdir -p ~/.copilot/skills/flowx-workflows
-cp skills/flowx-workflows/SKILL.md ~/.copilot/skills/flowx-workflows/SKILL.md
+cp -R skills/flowx-workflows/. ~/.copilot/skills/flowx-workflows/
 ```
 
-These commands overwrite any existing destination `SKILL.md`; review or back
+These commands overwrite matching files in the destination; review or back
 up local changes first. Other agent hosts may use different skill directories;
 check their documentation. When redistributing the skill, retain its attribution
 and the applicable FlowX [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Open the target workspace in a skill-capable agent and ask it to use FlowX, or
 invoke `/flowx-workflows` in a host that supports skill slash commands. Reload
-the workspace if the skill is not discovered. Installing the skill alone only
-adds instructions; on first use, the agent can install FlowX in an appropriate
+the workspace if the skill is not discovered. Installing the skill copies its
+instructions and scripts, not the SDK; on first use, the agent can install FlowX in an appropriate
 Python environment if it is missing. Configuring an LLM and registering the
 MCP server are separate steps. See [installation](#installation),
 [environment](#configure-the-environment), and
@@ -308,7 +309,7 @@ first):
 
 ```bash
 mkdir -p ~/.hermes/skills/flowx-workflows
-cp skills/flowx-workflows/SKILL.md ~/.hermes/skills/flowx-workflows/SKILL.md
+cp -R skills/flowx-workflows/. ~/.hermes/skills/flowx-workflows/
 ```
 
 For a named profile or a custom Hermes home, use that profile's skills directory
