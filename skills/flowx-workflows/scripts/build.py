@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Added 2026-11-05: provide a JSON-lines SDK build and repair interface.
+# Modified 2026-11-06: document the node-test pause and answer protocol in CLI help.
 """Build and evolve FlowX workflows; exchange repair answers over stdin as JSON lines."""
 
 from __future__ import annotations
@@ -16,6 +17,21 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from flowx_sdk import FlowXClient, result_to_dict
+
+
+REPAIR_HELP = """\
+Node-test repair pauses:
+    When an input_required event appears, inspect awaiting.prompt and
+    awaiting.test_log. Keep this process running and send one JSON line to stdin:
+        {"action":"answer","input":"Handle empty input"}
+        {"action":"answer","input":"test: correct the fixture"}
+        {"action":"answer","input":"skip"}
+        {"action":"answer","input":""}
+        {"action":"abort"}
+    Send one answer per pause; test: targets the test, skip skips this attempt,
+    and empty input uses the test log alone. EOF aborts the paused build.
+    Audit violations are repaired automatically; they do not have a separate pause.
+"""
 
 
 def emit(event: str, **fields: Any) -> None:
@@ -45,7 +61,8 @@ def build_options(parser: argparse.ArgumentParser, *, cascade: bool = False, def
 
 
 def make_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=REPAIR_HELP,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workspace", help="FlowX workspace; defaults to FLOWX_DEFAULT_WORKSPACE")
     commands = parser.add_subparsers(dest="operation", required=True)
 
@@ -63,7 +80,8 @@ def make_parser() -> argparse.ArgumentParser:
     text_options(graph)
     build_options(graph)
 
-    nodes = commands.add_parser("nodes", help="Build nodes or amend selected step ids")
+    nodes = commands.add_parser("nodes", help="Build nodes or amend selected step ids", epilog=REPAIR_HELP,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     nodes.add_argument("--workflow-id", required=True)
     nodes.add_argument("--amend", nargs=2, action="append", metavar=("STEP_ID", "GUIDANCE"), default=[])
     build_options(nodes, cascade=True, default_cascade=False)

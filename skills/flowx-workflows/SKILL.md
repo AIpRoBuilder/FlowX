@@ -9,6 +9,7 @@ description: 'Use when building, auditing, inspecting, repairing, evolving, or r
 <!-- Modified 2026-11-04: move the skill to the repository root. -->
 <!-- Modified 2026-11-04: add first-use FlowX installation and verification. -->
 <!-- Modified 2026-11-05: use bundled SDK command scripts and JSON-lines interaction. -->
+<!-- Modified 2026-11-06: distinguish node-test pauses from automatic audit repair. -->
 
 # FlowX workflows
 
@@ -102,7 +103,9 @@ gates and repairs failing node tests from their logs.
 
 Graph, node, and main generation include their respective audits; node generation
 also runs generated tests and bounded repair. There is no separate SDK standalone
-audit command in these scripts. Inspect the final JSON `result.stages`,
+audit command in these scripts. Audit violations are repaired automatically from
+their reports and do not pause for user input; the interactive gate below is for
+failed node tests. Inspect the final JSON `result.stages`,
 `result.errors`, `result.logs` (including node audit and test logs when present),
 and `result.artifacts`. A successful stage audit is not proof of security or
 correctness; skipped stages and reused nodes do not imply fresh tests ran. Report

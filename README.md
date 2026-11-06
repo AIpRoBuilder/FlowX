@@ -8,6 +8,7 @@
 <!-- Modified 2026-11-04: document first-use setup and combined Hermes installation. -->
 <!-- Modified 2026-11-04: streamline setup and quick-start guidance. -->
 <!-- Modified 2026-11-05: install the complete skill including SDK scripts. -->
+<!-- Modified 2026-11-06: document CLI answers for paused node-test repairs. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -412,6 +413,36 @@ with FlowXClient(workspace="./workflows") as flowx:
   Each build call returns an `AgentResult` with per-stage outcomes, errors, logs, and artifact paths. `raise_for_failure()` raises for failed stages. Keep the client open while using the service; exiting the `with` block stops services it started.
 
 `build_nodes`, `build_workflow`, and `evolve` default to pausing on a failed node test. If `status="input_required"`, inspect `awaiting` and resume with `flowx.answer(request_id, input, awaiting["stepId"])`. A paused result can have `ok=True`, so `raise_for_failure()` alone does not confirm completion. Pass `await_repair_input=False` to repair from the test log automatically. For guidance and input options, see [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py).
+
+### Answer a node-build pause from the terminal
+
+With the SDK installed, LLM settings exported, and a workflow graph already built,
+run the skill's build script from the repository root, replacing the workspace and
+workflow ID with your own:
+
+```bash
+python skills/flowx-workflows/scripts/build.py --workspace "$WS" nodes --workflow-id "$WF"
+```
+
+If the script emits an `input_required` JSON event, review `awaiting.prompt` and
+`awaiting.test_log`. Keep the **same process** running and enter one JSON line in
+its stdin, followed by Enter:
+
+```json
+{"action":"answer","input":"Handle empty input before calling the API."}
+```
+
+Send one answer per pause; repeat if another node needs input. Use
+`test: <guidance>` as the input to amend the generated test, `skip` to skip this
+amendment attempt, or an empty string to repair from the test log alone. Send
+`{"action":"abort"}` to cancel; closing stdin also aborts. The optional `step_id`
+must match `awaiting.stepId`. `--auto-repair` disables these test-repair pauses.
+Check the final `result.status`, `result.ok`, stages, errors, and logs rather than
+assuming a pause or answer means success.
+
+Node audit violations are repaired automatically from their audit reports; they do
+not have a separate user-input pause. See the [skill instructions](skills/flowx-workflows/SKILL.md)
+and [dynamic workflow documentation](docs/DYNAMIC_WORKFLOW.md) for details.
 
 To change an existing workflow, choose what to evolve with `evolve(workflow_id, command, target=...)`. `list_nodes` returns each node's step id and node id to use as a target; without a `target` the engine decides what the command refers to. A runnable walkthrough is in [examples/sdk_evolve.py](examples/sdk_evolve.py).
 

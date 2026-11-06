@@ -8,6 +8,7 @@
 <!-- Modified 2026-11-04: document first-use setup and combined Hermes installation. -->
 <!-- Modified 2026-11-04: streamline setup and quick-start guidance. -->
 <!-- Modified 2026-11-05: install the complete skill including SDK scripts. -->
+<!-- Modified 2026-11-06: document CLI answers for paused node-test repairs. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -399,6 +400,31 @@ with FlowXClient(workspace="./workflows") as flowx:
   每次构建调用都会返回包含各阶段结果、错误、日志和产物路径的 `AgentResult`；`raise_for_failure()` 会在阶段失败时抛出异常。使用服务时请保持客户端打开；退出 `with` 代码块会停止该客户端启动的服务。
 
 `build_nodes`、`build_workflow` 和 `evolve` 默认在节点测试失败时暂停。若 `status="input_required"`，检查 `awaiting`，然后用 `flowx.answer(request_id, input, awaiting["stepId"])` 继续。暂停时 `ok` 也可能为 `True`，不能仅凭 `raise_for_failure()` 判断构建完成。传入 `await_repair_input=False` 可自动根据测试日志修复。指导和输入选项参见 [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py)。
+
+### 在终端回答节点构建暂停
+
+安装 SDK、导出 LLM 配置并构建工作流图后，在仓库根目录运行技能的构建脚本，
+将工作区和工作流 ID 替换为实际值：
+
+```bash
+python skills/flowx-workflows/scripts/build.py --workspace "$WS" nodes --workflow-id "$WF"
+```
+
+如果脚本输出 `input_required` JSON 事件，查看 `awaiting.prompt` 和
+`awaiting.test_log`。保持**同一个进程**运行，在其标准输入中输入一行 JSON 并回车：
+
+```json
+{"action":"answer","input":"调用 API 前先处理空输入。"}
+```
+
+每次暂停只发送一个回答；后续节点再次暂停时重复此操作。输入
+`test: <指导>` 可修改生成的测试，`skip` 可跳过本次修改，空字符串根据测试日志修复。
+发送 `{"action":"abort"}` 可取消构建；关闭标准输入也会取消。可选的 `step_id`
+必须与 `awaiting.stepId` 一致。`--auto-repair` 会关闭这些测试修复暂停。请检查最终的
+`result.status`、`result.ok`、阶段、错误和日志，不要仅凭暂停或回答判断成功。
+
+节点审计违规会根据审计报告自动修复，不会单独暂停等待用户输入。详情参见
+[技能说明](skills/flowx-workflows/SKILL.md)和[动态工作流文档](docs/DYNAMIC_WORKFLOW.md)。
 
 要修改现有工作流，可使用 `evolve(workflow_id, command, target=...)` 选择演进目标。`list_nodes` 会返回每个节点的 step id 与 node id；不传 `target` 时由引擎判断命令指向哪一部分。可运行示例见 [examples/sdk_evolve.py](examples/sdk_evolve.py)。
 

@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Added 2026-11-05: offline coverage for the SDK-backed workflow skill scripts.
+# Modified 2026-11-06: cover node-pause answer help.
 from __future__ import annotations
 
 import importlib.util
@@ -38,6 +39,18 @@ def result(*, status="completed", ok=True, request_id="", awaiting=None):
 
 def events(capsys):
     return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+
+
+@pytest.mark.parametrize("arguments", [["--help"], ["nodes", "--help"]])
+def test_help_explains_node_pause_answers(arguments, capsys):
+    with pytest.raises(SystemExit) as exc:
+        build.make_parser().parse_args(arguments)
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    assert '"action":"answer"' in output
+    assert '"action":"abort"' in output
+    assert "awaiting.test_log" in output
+    assert "Audit violations are repaired automatically" in output
 
 
 @pytest.mark.parametrize("arguments,method,expected", [
