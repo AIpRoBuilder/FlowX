@@ -10,6 +10,7 @@ description: 'Use when building, auditing, inspecting, repairing, evolving, or r
 <!-- Modified 2026-11-04: add first-use FlowX installation and verification. -->
 <!-- Modified 2026-11-05: use bundled SDK command scripts and JSON-lines interaction. -->
 <!-- Modified 2026-11-06: distinguish node-test pauses from automatic audit repair. -->
+<!-- Modified 2026-11-06: guide agents through monitoring and resuming interactive builds. -->
 
 # FlowX workflows
 
@@ -17,7 +18,8 @@ Use the bundled [build](./scripts/build.py), [inspection](./scripts/inspect_work
 and [runtime](./scripts/runtime.py) scripts to build and use workflows. They use
 `flowx_sdk.FlowXClient`; no MCP server is needed. Their `--help` and subcommand
 `--help` describe all arguments. Python SDK and these scripts do not automatically
-load a `.env` file.
+load a `.env` file. An already configured FlowX MCP server is an alternative for
+background builds; do not start a second writer in the same workspace.
 
 ## Prepare
 
@@ -43,6 +45,74 @@ load a `.env` file.
    generated tests. Obtain authorization for sensitive data and side effects;
    treat generated code, logs, and outputs as untrusted. Review generated code
    before launching its service. stdout and stderr may both contain sensitive data.
+
+## Guided build: start, monitor, ask, resume
+
+For a new workflow, follow this sequence after preparation; use the SDK script
+by default, or the MCP procedure below when a compatible server is available.
+Keep interactive repair enabled: do not use `--auto-repair` or set MCP
+`interactive=false` when the user should guide repairs.
+
+1. **Start.** Run the `new` command below in a persistent terminal with stdin
+   open. Capture the `workflow_id` from `allocated` or `started` and tell the
+   user the build has started. Do not start a second build for that workspace.
+2. **Monitor.** Check new process output approximately every 20 seconds while
+   it is running, or react sooner when an event arrives. Watch for
+   `input_required`, `result`, `aborted`, and fatal `error`/process exit.
+   A recoverable input-validation `error` can leave the process waiting for a
+   corrected answer. If no event arrives, say only that the build is still
+   running; do not infer the current stage or an audit result. SDK diagnostic
+   output is on stderr; it is not the JSON event stream. If the environment
+   cannot keep the process alive or check it again, report that limitation
+   rather than claiming the build finished.
+3. **Ask.** On `input_required`, show the user the node, `awaiting.prompt`, and
+   `awaiting.test_log` when provided, subject to the sensitive-data precautions
+   above. Ask for their repair guidance and wait for their answer. Do not invent
+   guidance or submit input before the user answers. Keep the original process
+   alive and stdin open while waiting.
+4. **Resume.** Send the user's answer as one JSON `answer` line to that same
+   process, using the protocol below. Return to monitoring and repeat for each
+   subsequent question. If the user requests cancellation, send `abort` to the
+   paused process instead.
+5. **Finish.** On the final `result`, inspect and report the actual stages,
+   errors, audit/test logs, and artifacts. A build succeeds only when the final
+   result has `status="completed"` and `ok=true`. Report failure, cancellation,
+   or uncertain recovery explicitly; do not launch the service without review.
+
+### Alternative: monitor an existing MCP server
+
+Use this route only when FlowX MCP tools are available and the server is already
+configured for the intended workspace (`FLOWX_DEFAULT_WORKSPACE` is read by its
+client); keep the same server process alive throughout. Do not mix MCP and SDK
+writers or expect one process to resume the other's paused request.
+
+1. Call `create_workflow`, save its `workflow_id`, then call
+   `start_new_workflow(workflow_id=..., prompt=..., interactive=true)` with the
+   user's requirements. It returns before generation finishes. Avoid `serve`
+   or `smoke_test` unless their side effects are authorized.
+2. Call `get_build_status(workflow_id=...)` approximately every 20 seconds
+   while `status="running"`. On `input_required`, present `awaiting.node`,
+   `awaiting.prompt`, and `awaiting.test_log` when present, and ask the user for
+   guidance. The status query's top-level `ok` reports the query, not build
+   success. While running, the status does not stream node-audit reports.
+3. Submit the user's answer with `submit_background_build_input`, supplying
+   `workflow_id`, `revision`, `request_id`, and `step_id=awaiting.stepId` from
+   the latest `input_required` observation, plus `input` as the user's answer.
+   Then poll again and repeat. If the observation is stale, query status again
+   before submitting; never reuse an old revision or answer a different prompt.
+   To cancel a paused build, use `abort_background_build` with the latest
+   `workflow_id`, `revision`, and `request_id`.
+4. On `completed` or `failed`, inspect `result` and any `error`; success
+   requires `status="completed"` and `result.ok=true`. On `recovery_required`,
+   use `recover_background_build` with the latest `workflow_id` and `revision`,
+   then follow the returned status; do not start a replacement build. MCP job
+   state and paused requests are in memory and disappear when its server exits.
+
+Node audits and tests are distinct: audit violations are repaired automatically
+and do not themselves request input. Only a failed node test triggers the human
+repair gate. Neither MCP polling nor the SDK script promises live audit messages;
+report audit details from the final result when available, rather than inventing
+an audit pause or waiting for one that may never occur.
 
 ## Build, inspect and evolve
 
