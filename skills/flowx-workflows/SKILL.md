@@ -11,6 +11,7 @@ description: 'Use when building, auditing, inspecting, repairing, evolving, or r
 <!-- Modified 2026-11-05: use bundled SDK command scripts and JSON-lines interaction. -->
 <!-- Modified 2026-11-06: distinguish node-test pauses from automatic audit repair. -->
 <!-- Modified 2026-11-06: guide agents through monitoring and resuming interactive builds. -->
+<!-- Modified 2026-11-08: start and retain the reviewed service after complete builds. -->
 
 # FlowX workflows
 
@@ -78,6 +79,12 @@ Keep interactive repair enabled: do not use `--auto-repair` or set MCP
    errors, audit/test logs, and artifacts. A build succeeds only when the final
    result has `status="completed"` and `ok=true`. Report failure, cancellation,
    or uncertain recovery explicitly; do not launch the service without review.
+6. **Start the service.** After a successful complete build, review the generated
+   code and start the runtime as described below. Wait for `service_ready`,
+   report its `base_url`, and keep the runtime process and stdin open. Build
+   completion alone does not mean the service is running. If review, startup,
+   readiness, or process persistence fails, report that the service is not
+   confirmed running. Do not start a service for a failed or partial build.
 
 ### Alternative: monitor an existing MCP server
 
@@ -107,6 +114,13 @@ writers or expect one process to resume the other's paused request.
    use `recover_background_build` with the latest `workflow_id` and `revision`,
    then follow the returned status; do not start a replacement build. MCP job
    state and paused requests are in memory and disappear when its server exits.
+5. After a successful complete build, review the generated code and start the
+   runtime below in the same workspace. Start with `serve=false` so the code
+   can be reviewed before launch and the runtime owns the service. The MCP
+   `start_new_workflow` tool does not expose a host option and uses the SDK's
+   `0.0.0.0` default; inspect the stored binding and do not launch a publicly
+   bound service without authorization. For local-only binding, prefer the SDK
+   `new` command with `--host 127.0.0.1` from the start.
 
 Node audits and tests are distinct: audit violations are repaired automatically
 and do not themselves request input. Only a failed node test triggers the human
@@ -124,7 +138,7 @@ UTF-8 file. The examples below are alternatives, not a single mandatory sequence
 ```bash
 # Allocate an ID, or create and build a complete workflow in one command.
 "$PY" "$SKILL/scripts/build.py" --workspace "$WS" allocate
-"$PY" "$SKILL/scripts/build.py" --workspace "$WS" new --prompt 'Classify support tickets and draft replies.'
+"$PY" "$SKILL/scripts/build.py" --workspace "$WS" new --host 127.0.0.1 --prompt 'Classify support tickets and draft replies.'
 
 # Staged creation; capture the allocated workflow_id from stdout first.
 "$PY" "$SKILL/scripts/build.py" --workspace "$WS" graph --workflow-id "$WF" --prompt-file /path/to/requirements.txt
@@ -207,18 +221,28 @@ cannot answer or abort them. The inspection `recovery` command only reports the
 new process's state, not another process's active pause. Do not run competing
 writers against a workspace.
 
-## Run a generated workflow with user interaction
+## Start and manage the workflow service
 
-After review, start one runtime process and leave stdin open:
+After a successful complete build and code review, start one runtime process
+in a persistent terminal using the same workspace and actual workflow ID. Leave
+stdin open, including after reporting back to the user; otherwise EOF stops the
+service. Do not start another runtime for an already-running service, or stop an
+unknown process occupying its port. A graph-only or nodes-only build may need
+the remaining stages rebuilt before a service can be started.
 
 ```bash
 "$PY" "$SKILL/scripts/runtime.py" --workspace "$WS" --workflow-id "$WF" --session-id my-session
 ```
 
 Wait for `service_ready` (the script checks the bind address is free before
-launch, verifies the child is alive, and probes the returned `base_url`). The
-free-port check is not atomic; avoid competing launches on the same address. Send JSON
-lines to the **same process**, using a real step ID from inspection:
+launch, verifies the child is alive, and probes the returned `base_url`). Report
+the URL, session ID, and that the service is running only after this event;
+readiness does not prove a workflow run succeeded. If startup fails, the port is
+occupied, or the environment cannot keep the terminal and stdin open, report the
+service as not confirmed running and explain the limitation. The free-port check
+is not atomic; avoid competing launches on the same address. When the user wants
+to run a workflow step, send JSON lines to the **same process**, using a real step
+ID from inspection:
 
 ```json
 {"action":"step","step_id":"actual-step-id","input":"first input"}
@@ -242,5 +266,7 @@ a different process.
 ## Report
 
 Provide workflow ID, build status, audit/test outcomes, important artifact paths,
-unresolved errors, any user action needed, and whether the service is still
-running. Do not claim a build, audit, test, or runtime succeeded without evidence.
+unresolved errors, any user action needed, and service status. If ready, include
+the actual `base_url`, session ID, and how its owner process keeps it running;
+otherwise report why it is not confirmed running. Do not claim a build, audit,
+test, or runtime succeeded without evidence.
