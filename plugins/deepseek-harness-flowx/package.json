@@ -1,0 +1,34 @@
+{
+  "name": "dsh-flowx-plugin",
+  "version": "0.1.0",
+  "description": "Build and inspect FlowX workflows in the DeepSeek Harness web interface.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "dsh": "0.2.2-rc.1",
+    "node": ">=24.9.0"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "host/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
+}
