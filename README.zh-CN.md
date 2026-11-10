@@ -56,6 +56,7 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 <details>
 <summary>📣 更新动态</summary>
 
+- **[2026.11.10]** 🔑 **技能与插件更新。** DeepSeek Harness 插件设置现在可填写 `FLOWX_LLM_API_KEY`，且不再需要填写技能目录；FlowX 技能脚本会复用插件保存的 Python、工作区和 API Key。
 - **[2026.10.28]** 🧩 **扩展节点引擎。** 每个业务节点在发布前都会执行“生成 → 审计 → 测试 → 有界修复”链路。
 - **[2026.10.24]** ⚙️ **原生 WorkflowEngine 生成。** 图、节点和入口生成工作流现在都是 `WorkflowEngine` 的子类。
 - **[2026.10.22]** 🚀 **交互式运行时。** `run_service` 返回可连接的 `base_url`；MCP 新增 `run_step` 与 `reset_session`。

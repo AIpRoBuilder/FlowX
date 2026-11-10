@@ -56,6 +56,7 @@ FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 <details>
 <summary>📣 News</summary>
 
+- **[2026.11.10]** 🔑 **Skill and plugin update.** The DeepSeek Harness plugin settings now accept `FLOWX_LLM_API_KEY` and no longer ask for a skill directory. The FlowX skill scripts reuse the plugin's saved Python, workspace, and API key.
 - **[2026.10.28]** 🧩 **Expanded node engine.** Each business node now runs a generation → audit → test → bounded repair chain before it is published.
 - **[2026.10.24]** ⚙️ **WorkflowEngine-native generation.** Graph, node, and entrypoint workflows are now `WorkflowEngine` subclasses.
 - **[2026.10.22]** 🚀 **Interactive runtime.** `run_service` returns a connectable `base_url`; MCP adds `run_step` and `reset_session`.
