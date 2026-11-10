@@ -71,7 +71,7 @@ function fakeSpawn(inspection = () => ({ ok: false })) {
   const spawn = (command, args, options) => {
     const child = new FakeChild();
     calls.push({ command, args, options, child });
-    if (args[0].endsWith('inspect_workflow.py')) {
+    if (args[0] === '-c') {
       setImmediate(() => {
         const output = inspection(args);
         if (output === null) return;

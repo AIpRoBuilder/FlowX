@@ -29,9 +29,9 @@ compatibility, but the browser interface does not surface them.
 - Python **3.10 or newer** with the FlowX SDK and its dependencies installed in
   the interpreter used by the plugin. Installing this npm package does not
   install Python, the SDK, or the FlowX skill.
-- A complete installation of the FlowX skill, **including its scripts**. The
-  host invokes `inspect_workflow.py` and retains compatibility endpoints that
-  invoke `build.py`; copying only the skill instructions is insufficient.
+- The viewer and its settings need only the Python SDK. The FlowX skill is
+  needed only by the retained build compatibility endpoints, which invoke its
+  `build.py`.
 - A provider and model with authorized API access. Export
   `FLOWX_LLM_API_KEY`, `FLOWX_LLM_PROVIDER`, and `FLOWX_LLM_MODEL` into the
   Harness host process environment before launch. Credentials are not entered
@@ -83,9 +83,10 @@ process. For other installation methods, see the
 ### Viewer settings
 
 Select **Settings** in the overlay to edit two existing absolute paths and the
-API key. The skill directory is not configured: it is located automatically
-(`FLOWX_SKILL_DIR`, the source checkout, then `$DSH_HOME/skills/flowx-workflows`
-or `~/.dsh/skills/flowx-workflows`, then `./.dsh/skills/flowx-workflows`). The
+API key. No skill directory is needed to save settings or view workflows; build
+endpoints locate the skill on demand (`FLOWX_SKILL_DIR`, the source checkout,
+then `$DSH_HOME/skills/flowx-workflows` or `~/.dsh/skills/flowx-workflows`,
+then `./.dsh/skills/flowx-workflows`). The
 dialog reloads the workflow list immediately after a successful save; changing
 saved values does not require a host restart.
 

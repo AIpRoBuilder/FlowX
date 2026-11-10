@@ -27,6 +27,21 @@ const FOLDER_PROBE_LIMIT = 4 * LIMIT;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const TEXT_TYPES = new Set(['.json', '.md', '.py', '.txt', '.log']);
 const DEFAULT_SKILL = fileURLToPath(new URL('../../../skills/flowx-workflows/', import.meta.url));
+// Read-only inspection runs through the installed SDK; argv: workspace, operation[, workflow id].
+const INSPECT_CODE = `import contextlib, json, sys
+from flowx_sdk import FlowXClient
+workspace, operation, *rest = sys.argv[1:]
+try:
+    with contextlib.redirect_stdout(sys.stderr), FlowXClient(workspace=workspace) as client:
+        if operation == 'list': data = client.workflows()
+        elif operation == 'nodes': data = client.list_nodes(rest[0])
+        elif operation == 'artifacts': data = client.artifacts(rest[0])
+        else: data = client.build_recovery_state(rest[0])
+    print(json.dumps({'ok': True, 'operation': operation, 'data': data}, ensure_ascii=False, default=str))
+except Exception as exc:
+    print(json.dumps({'ok': False, 'error': type(exc).__name__}))
+    sys.exit(1)
+`;
 const SETTINGS_KEYS = ['python', 'workspace'];
 const SAVE_KEYS = ['python', 'workspace', 'apiKey'];
 const SETTINGS_LIMIT = 16384;
@@ -195,6 +210,16 @@ export class FlowXHostService {
       } catch { /* try the next location */ }
     }
     throw new Error();
+  }
+
+  // Only the build endpoints need the skill's build.py.
+  async buildScript() {
+    try {
+      const root = await this.skillRoot();
+      const script = await fs.realpath(path.join(root, 'scripts', 'build.py'));
+      if (!inside(root, script) || !(await fs.stat(script)).isFile()) throw new Error();
+      return script;
+    } catch { throw problem('configuration', 'Building requires the FlowX skill (set FLOWX_SKILL_DIR or install it under ~/.dsh/skills/flowx-workflows).'); }
   }
 
   validSettings(settings) {
@@ -371,23 +396,20 @@ export class FlowXHostService {
     if (![workspace, python].every(p => typeof p === 'string' && path.isAbsolute(p))) {
       throw problem('configuration', 'FLOWX_WORKSPACE and FLOWX_PYTHON must be absolute paths.');
     }
+    let stage = 'workspace directory';
     try {
       // Execute the configured Python path, not its realpath: a venv's symlink
       // must remain argv[0] so Python discovers pyvenv.cfg and its packages.
-      const [root, skillRoot] = await Promise.all([fs.realpath(workspace), this.skillRoot()]);
+      const root = await fs.realpath(workspace);
+      if (!(await fs.stat(root)).isDirectory()) throw new Error();
+      stage = 'executable Python interpreter (FLOWX_PYTHON)';
       const interpreter = path.normalize(python);
-      const [rootStat, pythonStat] = await Promise.all([fs.stat(root), fs.stat(interpreter)]);
-      if (!rootStat.isDirectory() || !pythonStat.isFile()) throw new Error();
+      if (!(await fs.stat(interpreter)).isFile()) throw new Error();
       await fs.access(interpreter, constants.X_OK);
-      const scripts = {};
-      for (const name of ['build.py', 'inspect_workflow.py']) {
-        const script = await fs.realpath(path.join(skillRoot, 'scripts', name));
-        if (!inside(skillRoot, script) || !(await fs.stat(script)).isFile()) throw new Error();
-        scripts[name] = script;
-      }
+      stage = 'workspace storage (workflows/ must be a real directory without symlinks)';
       await this.checkStorage(root, createStorage);
-      return { root, interpreter, scripts };
-    } catch { throw problem('configuration', 'FlowX paths must refer to an existing workspace, executable interpreter and skill scripts.'); }
+      return { root, interpreter };
+    } catch { throw problem('configuration', `FlowX configuration is invalid: cannot use ${stage}.`); }
   }
 
   async checkStorage(root, create = true) {
@@ -466,7 +488,8 @@ export class FlowXHostService {
       await fs.writeFile(promptFile, prompt, { mode: 0o600, flag: 'wx' });
       if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
       run.config = config;
-      const child = this.spawnChild(config.interpreter, [config.scripts['build.py'], '--workspace', config.root, 'new', '--host', '127.0.0.1', '--prompt-file', promptFile], config.savedSettings);
+      const buildScript = await this.buildScript();
+      const child = this.spawnChild(config.interpreter, [buildScript, '--workspace', config.root, 'new', '--host', '127.0.0.1', '--prompt-file', promptFile], config.savedSettings);
       run.child = child;
       run.done = this.watchBuild(run);
       this.update({ status: 'running' });
@@ -687,8 +710,8 @@ export class FlowXHostService {
 
   async runInspection(config, operation, id) {
     if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-    const args = [config.scripts['inspect_workflow.py'], '--workspace', config.root, operation];
-    if (id) args.push('--workflow-id', id);
+    const args = ['-c', INSPECT_CODE, config.root, operation];
+    if (id) args.push(id);
     const child = this.spawnChild(config.interpreter, args, config.savedSettings);
     child.stdin.end();
     return new Promise((resolve, reject) => {
