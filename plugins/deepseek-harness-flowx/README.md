@@ -3,31 +3,42 @@
 <!-- FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466 -->
 <!-- Upstream: https://github.com/AIpRoBuilder/FlowX -->
 <!-- Added 2026-11-09: document packaging, setup, operation, and safety. -->
+<!-- Modified 2026-11-10: document the implemented read-only viewer, settings, and folder browsing. -->
 
 # FlowX for DeepSeek Harness
 
-This web-profile plugin adds an owner-only FlowX panel for building new
-workflows, answering node-test repair prompts, and inspecting a workspace's
-workflow graphs and artifacts. It is a UI and host integration, **not an agent
-tool**. The separately installed [FlowX workflow skill](https://github.com/AIpRoBuilder/FlowX/tree/main/skills/flowx-workflows)
-can guide an agent through additional build, inspection, and runtime operations.
+The web-profile interface is an owner-only, **read-only workflow viewer**. The
+**FlowX** sidebar footer action opens a left-side overlay without replacing the
+conversation; it overlays part of the window instead of adding a native,
+resizable sidebar column. The overlay lists workflows, renders the current
+plan graph with node descriptions, and browses the workflow directory. It is a
+UI and host integration, **not an agent tool**. Use the separately installed
+[FlowX workflow skill](https://github.com/AIpRoBuilder/FlowX/tree/main/skills/flowx-workflows)
+to create, evolve, and run workflows.
+
+The viewer intentionally has no **Start a build**, repair, or evolve controls.
+The authenticated host API retains build endpoints for existing host
+compatibility, but the browser interface does not surface them.
 
 ## Prerequisites
 
 - DeepSeek Harness `dsh` **0.2.2-rc.1**, Node.js **24.9.0 or newer**, and
   `pnpm` on `PATH` for the CLI plugin installer. This package declares an
-  exact Harness version, not compatibility with other releases.
+  exact Harness version, not compatibility with other releases. Only the web
+  profile is supported; installing it does not install a Desktop plugin.
 - Python **3.10 or newer** with the FlowX SDK and its dependencies installed in
   the interpreter used by the plugin. Installing this npm package does not
   install Python, the SDK, or the FlowX skill.
 - A complete installation of the FlowX skill, **including its scripts**. The
-  plugin invokes its `build.py` and `inspect_workflow.py`; copying only the
-  skill instructions is insufficient.
+  host invokes `inspect_workflow.py` and retains compatibility endpoints that
+  invoke `build.py`; copying only the skill instructions is insufficient.
 - A provider and model with authorized API access. Export
   `FLOWX_LLM_API_KEY`, `FLOWX_LLM_PROVIDER`, and `FLOWX_LLM_MODEL` into the
-  Harness host process environment before launch. The SDK and skill scripts do
-  not automatically load a FlowX `.env` file; even inspection can require a
-  provider key. Harness model settings do not automatically configure FlowX.
+  Harness host process environment before launch. Credentials are not entered
+  in the viewer or saved in its settings; they may be inherited by spawned skill
+  processes. The SDK and skill scripts do not automatically load a FlowX
+  `.env` file; even inspection can require a provider key. Harness model
+  settings do not automatically configure FlowX.
 
 ## Install and configure
 
@@ -64,84 +75,120 @@ dsh web
 
 The installer resolves the local path from the invoking directory and adds the
 bundle to the web profile. Restart an already-running profile after installation
-if necessary. The last command starts the web profile; open its reported URL
-and select **FlowX** in the sidebar. `dsh plugin` manages a profile: it does
-not start Harness or globally launch a process. For other installation methods,
-see the [Harness CLI guide](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md).
+if necessary. The last command starts the web profile; open its reported URL.
+`dsh plugin` manages a profile: it does not start Harness or globally launch a
+process. For other installation methods, see the
+[Harness CLI guide](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/README.md).
 
-`FLOWX_PYTHON` must be an absolute path to the executable interpreter with the
-SDK installed; preserve the virtual-environment executable path rather than
-resolving it to the base interpreter. Activating that environment also puts
-its Python on `PATH` for the separate skill's runtime and smoke tests; check
-that `dsh` and `pnpm` remain available after activation. `FLOWX_WORKSPACE`
-must be an absolute path to an **existing directory**, used for FlowX artifacts
-independently of the workspace selected in Harness. `FLOWX_SKILL_DIR` must be an absolute path
-to the skill directory containing both scripts. The source-checkout layout
-provides a default skill path when the plugin is loaded from that layout, but
-an installed, copied, packed, or otherwise relocated distribution must set
-`FLOWX_SKILL_DIR` explicitly to a separately installed skill. Set it explicitly
-for linked installations too, so both linked and packed packages use the
-intended skill. A local `add` and an explicit `link:` can have different
-package-manager storage behavior; neither bundles the skill. Reinstall or
-restart as appropriate after updating the plugin or skill.
+### Viewer settings
+
+Select **Settings** in the overlay to edit two existing absolute paths and the
+API key. The skill directory is not configured: it is located automatically
+(`FLOWX_SKILL_DIR`, the source checkout, then `$DSH_HOME/skills/flowx-workflows`
+or `~/.dsh/skills/flowx-workflows`, then `./.dsh/skills/flowx-workflows`). The
+dialog reloads the workflow list immediately after a successful save; changing
+saved values does not require a host restart.
+
+| Field | Environment fallback | Requirement |
+| --- | --- | --- |
+| `python` | `FLOWX_PYTHON` | Executable Python interpreter with the FlowX SDK installed. Preserve the virtual-environment executable path rather than resolving it to the base interpreter. |
+| `workspace` | `FLOWX_WORKSPACE` | Existing directory for FlowX artifacts, independent of the workspace selected in Harness. |
+| `apiKey` | `FLOWX_LLM_API_KEY` | Optional provider key. It is stored in the owner-only settings file, never returned to the browser, and an empty value keeps the saved key. |
+
+The separately installed skill's scripts read this same settings file, so they
+use the saved `python`, `workspace` and API key by default (explicit
+`--workspace` still wins).
+
+The host persists these paths in
+`$DSH_HOME/plugins/deepseek-harness-flowx/settings.json`, or
+`~/.dsh/plugins/deepseek-harness-flowx/settings.json` when `DSH_HOME` is unset.
+The file is owner-only, mode `0600`; the plugin settings directory is mode
+`0700`. `DSH_HOME`, when set, must be an absolute path; a symlinked `DSH_HOME`
+base is resolved once, while links inside the plugin-managed paths remain
+rejected. Saved settings override the corresponding environment fallbacks and
+persist across restarts. Invalid or unsafe paths and storage are rejected
+without overwriting the previous file, and the dialog shows the failure so it
+can be corrected.
+
+The host snapshots environment variables at initialization, so restart it after
+changing environment fallbacks or provider credentials. The source-checkout
+layout supplies a default skill path when available; for linked, installed,
+copied, or packed plugins, explicitly configure the separately installed skill
+path. Neither local `add` nor `link:` bundles the skill. Reinstall or restart as
+appropriate after updating the plugin or skill. Activating the environment also
+puts its Python on `PATH` for the separate skill's runtime and smoke tests;
+check that `dsh` and `pnpm` remain available after activation.
 
 The example's skill copy is separate from the plugin package. For another
 project or user skill root, follow the
 [FlowX skill installation instructions](https://github.com/AIpRoBuilder/FlowX#install-the-flowx-agent-skill)
-and the Harness skill provider's discovery rules, then point
-`FLOWX_SKILL_DIR` at that installed directory. Use the same absolute FlowX
-workspace for the skill and the plugin. When redistributing the separate skill,
-retain its attribution and applicable FlowX [LICENSE](LICENSE) and [NOTICE](NOTICE).
-The plugin snapshots its environment at host initialization: restart the host
-after changing settings. Desktop has a
-separate plugin profile and may not inherit temporary exports from an unrelated
-terminal; GUI launch environment and login-shell discovery vary by platform and
-configuration. Arrange for the Desktop host to receive the same variables
-securely before it starts; installing into the web profile alone does not
-install into Desktop.
+and the Harness skill provider's discovery rules, then point `skillDir` or
+`FLOWX_SKILL_DIR` at that installed directory. Configure the skill separately to
+use the same absolute FlowX workspace; viewer settings do not configure the
+agent's skill process. When redistributing the separate skill, retain its
+attribution and applicable FlowX [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Use
 
-1. In **FlowX**, enter a workflow prompt, review the risk notice, give explicit
-   consent, and select **Build workflow**. The plugin builds a new workflow;
-   it does not automatically start its generated service.
-2. The panel displays overall build status, but does **not** provide live
-   per-stage progress or audit results. If a node test fails, review the repair
-   prompt and optional test log, then provide guidance and select **Continue
-   repair**. Empty guidance uses the test log; `test: ...` targets the test,
-   and `skip` skips that amendment attempt. **Abort build** is available only
-   while a repair prompt is paused, not throughout an active build.
-3. After the build ends, select a workflow to inspect its current plan graph,
-   dependencies, requirements, main entrypoint, and available node artifacts.
-   The displayed graph is the **current plan**; the published workflow and node
-   revisions or artifacts can differ after a graph-only update. Rebuild
-   affected stages before relying on them as a consistent published workflow.
-4. A skill build in the same workspace can be inspected here after it finishes:
-   select **Refresh** under **Your workflows**, then select the workflow.
-   There is no automatic synchronization with the skill or another process, and
-   the plugin cannot answer or abort another process's paused build. Do not
-   run two writers against the same workspace. The plugin's build/inspection
-   coordination is local to this Node process; it does not lock other Harness,
-   SDK, MCP, skill, or external processes.
+1. Select the **FlowX** sidebar footer action to open the left overlay. In
+   narrow windows this dismisses Harness's navigation drawer first; the current
+   conversation and its selection are preserved. Press **Escape**, select
+   **Close**, or use the footer action again to close the overlay. Select
+   **Settings** to configure `skillDir`, `python`, and `workspace`.
+2. Select a workflow to inspect its graph, dependencies, requirements, main
+   entrypoint, and available node artifacts. The graph is the **current plan**,
+   not necessarily the published revision: published workflow and node
+   revisions or artifacts can differ after a graph-only update. Rebuild affected
+   stages before relying on a consistent published workflow.
+3. Expand the **Workflow folder** tree to browse the actual directory under
+   `workspace/workflows/<workflow_id>` and open eligible files. Select
+   **Refresh** after a separate skill operation finishes; there is no automatic
+   synchronization with other processes.
 
-The plugin has no workflow-runtime controls or automatic service launch. Review
-generated code before running it. If the separately installed skill starts a
-service, its own runtime process owns that service; this plugin neither manages
-nor stops it. Follow the skill's runtime instructions and keep its process
-alive as required.
+The viewer has no build, repair, evolve, or runtime controls. Use the separate
+skill for those operations, review generated code before running it, and follow
+the skill's runtime instructions. A service started by the skill is owned by
+its runtime process, not by the viewer.
+
+### Folder browsing limits
+
+Folder browsing omits hidden and credential-named paths, symlinks, and special
+files; requests traversing symlinks are denied. Only regular, single-link
+`.json`, `.md`, `.py`, `.txt`, and `.log`
+files of at most 1 MiB that pass UTF-8 and safety checks are readable; other
+files may appear but cannot be opened. Invalid JSON, JSON-shaped text that
+cannot be safely parsed, and disallowed control characters are rejected. JSON
+is structurally sanitized, and manifest error details and absolute entrypoint
+paths are withheld.
+
+Each folder listing returns at most 200 entries, scans at most 1,000 entries,
+and is limited to 256 KiB of entry metadata and 4 MiB of text probes. A listing
+can therefore be truncated or contain files that are not marked readable when
+the probe budget is exhausted; it is not an exhaustive filesystem listing.
+
+Host coordination of builds, inspections, and settings is local to this Node
+process. It does **not** lock other Harness, SDK, MCP, skill, or external
+processes, or prevent external workspace edits. Avoid concurrent writers to
+the same workspace and inspect only after the other operation finishes.
 
 ## Security and privacy
 
-Builds send prompts and potentially repair context to the configured model
-provider. Generated tests and code run **without a sandbox** under the host
-user's privileges and may access secrets, local files, and the network. Obtain
-explicit consent for each build and its side effects; use only authorized
-inputs and trusted environments. Auditing and tests do not establish safety.
-The host filters some inherited environment variables and performs best-effort
-redaction of displayed configuration and output; neither is a security boundary
-or a guarantee that secrets are removed. Prompts, repair details, logs, and
-artifacts can be sensitive even after redaction. Restrict workspace access and
-review content before sharing it.
+Read-only describes the viewer UI, **not** the host's full capabilities: for
+compatibility, its authenticated owner-only API still exposes build endpoints
+even though the viewer has no build form. Do not expose the host route outside
+Harness's authenticated owner-only boundary. Inspection can also create the
+workspace's `workflows` storage directory if it is absent.
+
+Builds through those endpoints or the separate skill send prompts and potentially
+repair context to the configured model provider. Generated tests and code run
+**without a sandbox** under the host user's privileges and may access secrets,
+local files, and the network. Obtain explicit consent for each build and its
+side effects; use only authorized inputs and trusted environments. Auditing and
+tests do not establish safety. The host filters some inherited environment
+variables and performs best-effort redaction of displayed configuration and
+output; neither is a security boundary or a guarantee that secrets are removed.
+Prompts, repair details, logs, and artifacts can be sensitive even after
+redaction. Restrict workspace access and review content before sharing it.
 
 ## Tests and source
 

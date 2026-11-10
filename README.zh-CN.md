@@ -10,6 +10,7 @@
 <!-- Modified 2026-11-05: install the complete skill including SDK scripts. -->
 <!-- Modified 2026-11-06: document CLI answers for paused node-test repairs. -->
 <!-- Modified 2026-11-09: link to the optional DeepSeek Harness plugin. -->
+<!-- Modified 2026-11-10: clarify the requested read-only Harness viewer. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -83,7 +84,7 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 - 🚀 **本地运行**工作流；MCP 还支持步骤输入和会话重置。
 - 🔌 **选择接口：**本地 stdio MCP、Python SDK 或非流式 A2A。
 - 📦 **复用产物：**工作流保存在 `workspace/workflows/<workflow_id>` 下。
-- 🧠 **自选模型和 UI：**也可安装可选的 [DeepSeek Harness 插件](plugins/deepseek-harness-flowx/README.md)，可视化创建和查看工作流。
+- 🧠 **自选模型和 UI：**可选的 [DeepSeek Harness 插件](plugins/deepseek-harness-flowx/README.md)计划提供只读工作流查看器；创建、演进和运行工作流请使用独立的 FlowX 技能。
 
 <a name="setup"></a>
 ## ⚙️ 安装与配置

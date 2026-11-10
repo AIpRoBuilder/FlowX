@@ -27,10 +27,14 @@ background builds; do not start a second writer in the same workspace.
 1. Establish whether the user wants a new workflow or an existing workflow ID,
    and clarify essential inputs, outputs, review steps, and constraints. Use the
    same workspace for all operations on a workflow.
-2. Set `SKILL` to the **absolute path of this installed skill directory**,
-   `PY` to the Python executable for the chosen environment, and `WS` to the
-   desired absolute workspace path. Examples below use macOS/Linux shell syntax;
-   substitute actual paths. All scripts must be copied with this skill.
+2. Set `SKILL` to the **absolute path of this installed skill directory**.
+   If the FlowX Harness plugin has saved settings, run
+   `python3 "$SKILL/scripts/plugin_settings.py"` and use its `python` as `PY` and
+   `workspace` as `WS`; the scripts also default to these and re-run themselves
+   under the saved Python. Otherwise set `PY` to the Python executable for the
+   chosen environment and `WS` to the desired absolute workspace path. Examples
+   below use macOS/Linux shell syntax; substitute actual paths. All scripts
+   must be copied with this skill.
 3. Use Python 3.10+ and verify `"$PY" -c 'from flowx_sdk import FlowXClient'`.
    If missing, use an existing suitable virtual environment or create a dedicated
    environment at an unused path (`python3 -m venv /path/to/venv`), then install
@@ -38,7 +42,9 @@ background builds; do not start a second writer in the same workspace.
    checkout is available, `"$PY" -m pip install 'git+https://github.com/AIpRoBuilder/FlowX.git'`.
    Do not overwrite an existing environment or silently upgrade a working install.
 4. Configure `FLOWX_LLM_API_KEY` (or `OPENAI_API_KEY`), `FLOWX_LLM_PROVIDER`,
-   and `FLOWX_LLM_MODEL` in the process environment. Never pass keys as CLI
+   and `FLOWX_LLM_MODEL` in the process environment. The scripts also load an
+   API key saved in the plugin settings (`api_key_set` in `plugin_settings.py`
+   output) and export it as `FLOWX_LLM_API_KEY`. Never pass keys as CLI
    arguments, paste them in chat, or commit them. Ask the user to configure
    secrets directly if needed. The SDK defaults to DeepSeek/`deepseek-flash`.
    Even inspection and allocation initialize SDK components and may need a key.

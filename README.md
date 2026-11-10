@@ -10,6 +10,7 @@
 <!-- Modified 2026-11-05: install the complete skill including SDK scripts. -->
 <!-- Modified 2026-11-06: document CLI answers for paused node-test repairs. -->
 <!-- Modified 2026-11-09: link to the optional DeepSeek Harness plugin. -->
+<!-- Modified 2026-11-10: clarify the requested read-only Harness viewer. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -83,7 +84,7 @@ Turn an intent into an editable, reusable process instead of a one-off answer. C
 - 🚀 **Run locally** through MCP or the SDK; MCP also supports step inputs and session resets.
 - 🔌 **Choose an interface:** local stdio MCP, Python SDK, or non-streaming A2A.
 - 📦 **Reuse artifacts** stored under `workspace/workflows/<workflow_id>`.
-- 🧠 **Bring your own model and UI:** or install the optional [DeepSeek Harness plugin](plugins/deepseek-harness-flowx/README.md) to create and inspect workflows visually.
+- 🧠 **Bring your own model and UI:** the optional [DeepSeek Harness plugin](plugins/deepseek-harness-flowx/README.md) is planned to provide a read-only workflow viewer; use the separate FlowX skill to create, evolve, and run workflows.
 
 <a name="setup"></a>
 ## ⚙️ Setup

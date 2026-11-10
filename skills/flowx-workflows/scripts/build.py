@@ -16,7 +16,14 @@ import sys
 from pathlib import Path
 from typing import Any, Sequence
 
-from flowx_sdk import FlowXClient, result_to_dict
+if __name__ == "__main__":
+    import plugin_settings
+
+    _PLUGIN_WORKSPACE = plugin_settings.apply(None)  # may re-exec under the plugin's Python
+else:
+    _PLUGIN_WORKSPACE = None
+
+from flowx_sdk import FlowXClient, result_to_dict  # noqa: E402
 
 
 REPAIR_HELP = """\
@@ -63,7 +70,7 @@ def build_options(parser: argparse.ArgumentParser, *, cascade: bool = False, def
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, epilog=REPAIR_HELP,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--workspace", help="FlowX workspace; defaults to FLOWX_DEFAULT_WORKSPACE")
+    parser.add_argument("--workspace", help="FlowX workspace; defaults to the plugin's saved workspace, then FLOWX_DEFAULT_WORKSPACE")
     commands = parser.add_subparsers(dest="operation", required=True)
 
     commands.add_parser("allocate", help="Allocate an empty workflow id")
@@ -212,7 +219,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         # Native generation may print: reserve stdout for the JSON-lines protocol.
         with contextlib.redirect_stdout(sys.stderr):
-            client = FlowXClient(workspace=args.workspace)
+            client = FlowXClient(workspace=args.workspace or _PLUGIN_WORKSPACE)
         try:
             result = run_operation(client, args)
             return 0 if result is None else finish(client, result)

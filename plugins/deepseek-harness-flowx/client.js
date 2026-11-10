@@ -6,71 +6,54 @@
 // Modified 2026-11-09: distinguish host instances and plans from published revisions; require build-risk consent.
 // Modified 2026-11-09: call the authenticated shared Fetch route with stable injection.
 // Modified 2026-11-09: give the graph explorer and repair prompt the full panel width.
+// Modified 2026-11-10: replace the build page with a read-only left overlay, path settings, and folder browser.
+// Modified 2026-11-10: dismiss the narrow navigation drawer before opening the overlay.
 
 window.__ModuleLoader__.load({
   id: 'dsh-flowx-plugin',
   factory(require) {
     const React = require('react');
     const { createElement: h, useCallback, useEffect, useRef, useState } = React;
-    const activeStatuses = new Set(['starting', 'running', 'input_required', 'stopping', 'finishing', 'aborting']);
-    const isActive = state => !!state && activeStatuses.has(state.status);
     const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
     const styles = {
-      page: { color: '#192a44', background: '#f5f8fc', minHeight: '100%', padding: 'clamp(16px, 3vw, 36px)', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', boxSizing: 'border-box' },
-      shell: { maxWidth: 1440, margin: '0 auto', display: 'grid', gap: 20 },
-      hero: { display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: 16 },
-      eyebrow: { color: '#4d60cd', fontSize: 12, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase', margin: '0 0 6px' },
-      title: { fontSize: 'clamp(26px, 3vw, 36px)', lineHeight: 1.15, margin: '0 0 8px', letterSpacing: '-.04em' },
-      muted: { color: '#5d6e87', lineHeight: 1.5, fontSize: 14, margin: 0 },
-      badge: { borderRadius: 999, background: '#e8edff', color: '#4051bd', padding: '8px 13px', fontSize: 13, fontWeight: 700 },
-      card: { background: '#fff', border: '1px solid #e1e8f2', borderRadius: 16, padding: 20, boxShadow: '0 8px 28px rgba(37, 58, 95, .045)', minWidth: 0 },
-      heading: { margin: '0 0 8px', fontSize: 17, letterSpacing: '-.02em' },
-      sectionHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 14 },
-      button: { border: '1px solid #d5dff0', background: '#fff', color: '#324864', borderRadius: 9, padding: '9px 13px', font: 'inherit', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
-      primary: { border: '1px solid #5366db', background: '#5366db', color: '#fff', borderRadius: 9, padding: '10px 16px', font: 'inherit', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
-      danger: { border: '1px solid #ecc8cd', background: '#fff7f7', color: '#b33d4b', borderRadius: 9, padding: '10px 16px', font: 'inherit', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
-      input: { width: '100%', boxSizing: 'border-box', border: '1px solid #cfd9e8', borderRadius: 10, padding: 12, color: '#192a44', font: 'inherit', lineHeight: 1.5, resize: 'vertical', background: '#fbfcff' },
+      panel: { pointerEvents: 'auto', position: 'absolute', top: 8, bottom: 8, left: 8, width: 'min(600px, calc(100vw - 16px))', boxSizing: 'border-box', overflowY: 'auto', background: '#f5f8fc', color: '#192a44', border: '1px solid #dce5f3', borderRadius: 16, boxShadow: '0 20px 70px rgba(17, 33, 61, .25)', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', fontSize: 14 },
+      content: { padding: 18, display: 'grid', gap: 14 },
+      header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 },
+      title: { margin: '0 0 4px', fontSize: 22, letterSpacing: '-.04em' },
+      eyebrow: { color: '#5366cc', fontSize: 11, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase', margin: '0 0 5px' },
+      muted: { color: '#5d6e87', lineHeight: 1.5, fontSize: 13, margin: 0 },
+      card: { background: '#fff', border: '1px solid #e1e8f2', borderRadius: 13, padding: 16, minWidth: 0 },
+      heading: { margin: '0 0 8px', fontSize: 16, letterSpacing: '-.02em' },
       row: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 },
-      grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 440px), 1fr))', gap: 20 },
-      notice: { border: '1px solid #f0cbd0', color: '#953d4a', background: '#fff5f5', borderRadius: 10, padding: '11px 14px', fontSize: 14, overflowWrap: 'anywhere' },
-      pre: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflow: 'auto', maxHeight: 420, background: '#15243a', color: '#e9f1ff', borderRadius: 10, padding: 14, fontSize: 12, lineHeight: 1.55 },
-      label: { display: 'block', fontWeight: 700, fontSize: 13, margin: '0 0 7px' },
-      divider: { border: 0, borderTop: '1px solid #e8edf5', margin: '18px 0' },
+      button: { border: '1px solid #d5dff0', background: '#fff', color: '#324864', borderRadius: 8, padding: '7px 10px', font: 'inherit', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
+      primary: { border: '1px solid #5366db', background: '#5366db', color: '#fff', borderRadius: 8, padding: '8px 12px', font: 'inherit', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
+      input: { width: '100%', boxSizing: 'border-box', border: '1px solid #cfd9e8', borderRadius: 8, padding: 10, color: '#192a44', font: 'inherit', background: '#fbfcff' },
+      label: { display: 'block', fontWeight: 700, fontSize: 12, margin: '14px 0 6px' },
+      notice: { border: '1px solid #f0cbd0', color: '#953d4a', background: '#fff5f5', borderRadius: 9, padding: '10px 12px', fontSize: 13, overflowWrap: 'anywhere' },
+      pre: { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', overflow: 'auto', maxHeight: 380, background: '#15243a', color: '#e9f1ff', borderRadius: 9, padding: 12, fontSize: 12, lineHeight: 1.5 },
     };
 
-    // Sort names rather than trusting graph order; longest-path layers are stable
-    // for a DAG. Keep malformed references and cycles visible instead of hanging.
     function graphModel(graph) {
       if (!graph || !Array.isArray(graph.nodes)) throw new Error('The graph must contain a nodes array.');
-      const byName = new Map();
-      const warnings = [];
+      const byName = new Map(), warnings = [];
       for (const node of graph.nodes) {
-        if (!node || typeof node.name !== 'string' || !node.name.trim()) {
-          warnings.push('A node without a name was omitted.');
-        } else if (byName.has(node.name)) {
-          warnings.push(`Duplicate node: ${node.name}.`);
-        } else {
-          byName.set(node.name, { name: node.name, desc: typeof node.desc === 'string' ? node.desc : '', enabled: node.enable !== false, depends: Array.isArray(node.depends) ? [...new Set(node.depends.filter(dep => typeof dep === 'string'))].sort(compare) : [] });
-        }
+        if (!node || typeof node.name !== 'string' || !node.name.trim()) warnings.push('A node without a name was omitted.');
+        else if (byName.has(node.name)) warnings.push(`Duplicate node: ${node.name}.`);
+        else byName.set(node.name, { name: node.name, desc: typeof node.desc === 'string' ? node.desc : '', enabled: node.enable !== false, depends: Array.isArray(node.depends) ? [...new Set(node.depends.filter(dep => typeof dep === 'string'))].sort(compare) : [] });
       }
       const names = [...byName.keys()].sort(compare);
       const outgoing = new Map(names.map(name => [name, []]));
       const degree = new Map(names.map(name => [name, 0]));
       const depth = new Map(names.map(name => [name, 0]));
       const edges = [];
-      for (const name of names) {
-        for (const dep of byName.get(name).depends) {
-          if (!byName.has(dep)) { warnings.push(`${name} depends on missing node ${dep}.`); continue; }
-          outgoing.get(dep).push(name);
-          degree.set(name, degree.get(name) + 1);
-          edges.push({ from: dep, to: name });
-        }
+      for (const name of names) for (const dep of byName.get(name).depends) {
+        if (!byName.has(dep)) { warnings.push(`${name} depends on missing node ${dep}.`); continue; }
+        outgoing.get(dep).push(name); degree.set(name, degree.get(name) + 1); edges.push({ from: dep, to: name });
       }
       const ready = names.filter(name => degree.get(name) === 0);
       let visited = 0;
       while (ready.length) {
-        const name = ready.shift();
-        visited++;
+        const name = ready.shift(); visited++;
         for (const next of outgoing.get(name)) {
           depth.set(next, Math.max(depth.get(next), depth.get(name) + 1));
           degree.set(next, degree.get(next) - 1);
@@ -78,17 +61,11 @@ window.__ModuleLoader__.load({
         }
       }
       if (visited !== names.length) warnings.push('The graph contains a cycle; affected nodes may not follow dependency order.');
-      const layers = new Map();
-      for (const name of names) {
-        const layer = depth.get(name);
-        if (!layers.has(layer)) layers.set(layer, []);
-        layers.get(layer).push(name);
-      }
-      const positions = new Map();
+      const layers = new Map(), positions = new Map();
+      for (const name of names) { const layer = depth.get(name); if (!layers.has(layer)) layers.set(layer, []); layers.get(layer).push(name); }
       let rows = 1, columns = 1;
       for (const [layer, members] of layers) {
-        columns = Math.max(columns, layer + 1);
-        rows = Math.max(rows, members.length);
+        columns = Math.max(columns, layer + 1); rows = Math.max(rows, members.length);
         members.forEach((name, row) => positions.set(name, { x: 24 + layer * 270, y: 24 + row * 104 }));
       }
       return { nodes: names.map(name => ({ ...byName.get(name), ...positions.get(name) })), edges, warnings, width: 48 + (columns - 1) * 270 + 208, height: 48 + (rows - 1) * 104 + 68 };
@@ -103,325 +80,202 @@ window.__ModuleLoader__.load({
     function Graph({ model, selected, onSelect }) {
       const positions = new Map(model.nodes.map(node => [node.name, node]));
       return h('div', null,
-        model.warnings.length > 0 && h('div', { role: 'status', style: { ...styles.notice, marginBottom: 12 } }, model.warnings.join(' ')),
+        model.warnings.length > 0 && h('div', { role: 'status', style: { ...styles.notice, marginBottom: 10 } }, model.warnings.join(' ')),
         model.nodes.length === 0 ? h('p', { style: styles.muted }, 'This graph has no nodes.') :
-          h('div', { style: { overflowX: 'auto', border: '1px solid #edf1f8', borderRadius: 12, background: '#f8faff' } },
+          h('div', { style: { overflow: 'auto', maxHeight: 450, border: '1px solid #edf1f8', borderRadius: 10, background: '#f8faff' } },
             h('svg', { viewBox: `0 0 ${model.width} ${model.height}`, width: model.width, height: model.height, role: 'group', 'aria-label': 'Current plan dependency graph. Select a node to inspect it.', style: { display: 'block', maxWidth: 'none' } },
               model.edges.map(edge => {
                 const from = positions.get(edge.from), to = positions.get(edge.to);
-                const x1 = from.x + 208, y1 = from.y + 34, x2 = to.x, y2 = to.y + 34;
-                const bend = Math.max(32, Math.abs(x2 - x1) / 2);
+                const x1 = from.x + 208, y1 = from.y + 34, x2 = to.x, y2 = to.y + 34, bend = Math.max(32, Math.abs(x2 - x1) / 2);
                 return h('g', { key: `${edge.from}\0${edge.to}`, 'aria-hidden': true, 'data-flowx-edge': `${edge.from} → ${edge.to}` },
                   h('path', { d: `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`, stroke: '#9eade3', strokeWidth: 2, fill: 'none' }),
                   h('path', { d: `M ${x2 - 7} ${y2 - 4} L ${x2} ${y2} L ${x2 - 7} ${y2 + 4}`, stroke: '#9eade3', strokeWidth: 2, fill: 'none' }));
               }),
-              model.nodes.map(node => h('g', {
-                key: node.name, role: 'button', tabIndex: 0, focusable: true, 'aria-label': `Inspect node ${node.name}${node.enabled ? '' : ' (disabled)'}`, 'aria-pressed': selected === node.name,
-                'data-flowx-node': node.name, onClick: () => onSelect(node.name),
-                onKeyDown: event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(node.name); } },
-                onFocus: event => { event.currentTarget.style.outline = '2px solid #5366db'; },
-                onBlur: event => { event.currentTarget.style.outline = ''; },
-                style: { cursor: 'pointer' },
-              },
-              h('title', null, `${node.name}${node.enabled ? '' : ' (disabled)'}`),
-              h('rect', { x: node.x, y: node.y, width: 208, height: 68, rx: 12, fill: selected === node.name ? '#eef0ff' : '#fff', stroke: selected === node.name ? '#6071df' : '#dce4f2', strokeWidth: selected === node.name ? 2 : 1 }),
-              h('circle', { cx: node.x + 19, cy: node.y + 22, r: 5, fill: node.enabled ? '#7181eb' : '#8a6470' }),
-              h('text', { x: node.x + 32, y: node.y + 27, fill: '#223451', fontSize: 13, fontWeight: 700 }, node.name.length > 23 ? `${node.name.slice(0, 22)}…` : node.name),
-              h('text', { x: node.x + 19, y: node.y + 49, fill: '#5d6e87', fontSize: 11 }, `${node.depends.length} ${node.depends.length === 1 ? 'dependency' : 'dependencies'}${node.enabled ? '' : ' · Disabled'}`))))));
+              model.nodes.map(node => h('g', { key: node.name, role: 'button', tabIndex: 0, focusable: true, 'aria-label': `Inspect node ${node.name}${node.enabled ? '' : ' (disabled)'}`, 'aria-pressed': selected === node.name, 'data-flowx-node': node.name, onClick: () => onSelect(node.name), onKeyDown: event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(node.name); } }, style: { cursor: 'pointer' } },
+                h('title', null, `${node.name}${node.enabled ? '' : ' (disabled)'}`),
+                h('rect', { x: node.x, y: node.y, width: 208, height: 68, rx: 12, fill: selected === node.name ? '#eef0ff' : '#fff', stroke: selected === node.name ? '#6071df' : '#dce4f2', strokeWidth: selected === node.name ? 2 : 1 }),
+                h('circle', { cx: node.x + 19, cy: node.y + 22, r: 5, fill: node.enabled ? '#7181eb' : '#8a6470' }),
+                h('text', { x: node.x + 32, y: node.y + 27, fill: '#223451', fontSize: 13, fontWeight: 700 }, node.name.length > 23 ? `${node.name.slice(0, 22)}…` : node.name),
+                h('text', { x: node.x + 19, y: node.y + 49, fill: '#5d6e87', fontSize: 11 }, `${node.depends.length} ${node.depends.length === 1 ? 'dependency' : 'dependencies'}${node.enabled ? '' : ' · Disabled'}`))))));
     }
 
     async function callFlowX(endpoint, payload) {
       let response;
-      try {
-        response = await fetch('api/flowx', {
-          method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ endpoint, payload }), credentials: 'same-origin',
-        });
-      } catch {
-        throw new Error('Unable to reach FlowX.');
-      }
+      try { response = await fetch('api/flowx', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ endpoint, payload }), credentials: 'same-origin' }); }
+      catch { throw new Error('Unable to reach FlowX.'); }
       let result;
       try { result = await response.json(); } catch { /* Harness errors can be plain text. */ }
       if (!response.ok || !result || result.ok !== true || !Object.hasOwn(result, 'value')) {
-        const message = typeof result?.error?.message === 'string' && result.error.message
-          ? result.error.message : !response.ok ? `The FlowX request failed (HTTP ${response.status}).` : 'The FlowX response is invalid.';
-        const failure = new Error(message);
+        const failure = new Error(typeof result?.error?.message === 'string' && result.error.message ? result.error.message : !response.ok ? `The FlowX request failed (HTTP ${response.status}).` : 'The FlowX response is invalid.');
         if (typeof result?.error?.code === 'string') failure.code = result.error.code;
         throw failure;
       }
       return result.value;
     }
 
-    function Page({ call }) {
-      const [state, setState] = useState(null);
-      const [error, setError] = useState('');
-      const [prompt, setPrompt] = useState('');
-      const [consent, setConsent] = useState(false);
-      const [answer, setAnswer] = useState('');
-      const [operation, setOperation] = useState('');
-      const [catalog, setCatalog] = useState(null);
-      const [catalogVersion, setCatalogVersion] = useState(0);
-      const [workflow, setWorkflow] = useState(null);
-      const [artifacts, setArtifacts] = useState(null);
-      const [graph, setGraph] = useState(null);
-      const [graphError, setGraphError] = useState('');
-      const [selectedNode, setSelectedNode] = useState(null);
-      const [viewer, setViewer] = useState(null);
-      const mounted = useRef(false);
-      const current = useRef(null);
-      const stateRequests = useRef(0);
-      const acceptedRequest = useRef(0);
-      const stateEpoch = useRef(0);
-      const retiredInstances = useRef(new Set());
-      const operationRef = useRef('');
-      const selection = useRef(0);
-      const pendingList = useRef(false);
-      const busy = !!operation;
-      const active = isActive(state);
+    function Folder({ path, folders, onToggle, onRead }) {
+      const folder = folders[path];
+      if (!folder) return null;
+      if (folder.loading) return h('p', { role: 'status', style: styles.muted }, 'Loading folder…');
+      if (folder.error) return h('div', null, h('p', { role: 'alert', style: styles.notice }, folder.error), h('button', { type: 'button', style: styles.button, onClick: () => onToggle(path, true) }, 'Retry folder'));
+      return h('div', { style: { display: 'grid', gap: 3 } },
+        folder.entries.length === 0 && h('p', { style: styles.muted }, 'No visible files.'),
+        folder.entries.map(entry => h('div', { key: entry.path },
+          h('button', { type: 'button', disabled: !entry.readable, 'aria-expanded': entry.type === 'directory' ? !!folders[entry.path] : undefined, 'data-flowx-path': entry.path, onClick: () => entry.type === 'directory' ? onToggle(entry.path) : onRead(entry.path), style: { ...styles.button, width: '100%', border: 0, textAlign: 'left', overflowWrap: 'anywhere', opacity: entry.readable ? 1 : .55, background: '#f8faff' } }, `${entry.type === 'directory' ? folders[entry.path] ? '▾' : '▸' : '·'} ${entry.name}${entry.readable ? '' : ' (unavailable)'}`),
+          entry.type === 'directory' && folders[entry.path] && h('div', { style: { marginLeft: 14, borderLeft: '1px solid #e2e8f1', paddingLeft: 8 } }, h(Folder, { path: entry.path, folders, onToggle, onRead })))),
+        folder.truncated && h('p', { role: 'status', style: styles.muted }, 'Folder listing is limited; some entries or readable files may be omitted.'));
+    }
 
-      const applyState = useCallback((snapshot, ticket, epoch) => {
-        if (!mounted.current) return;
-        if (!snapshot || !Number.isSafeInteger(snapshot.revision) || typeof snapshot.status !== 'string' || (snapshot.instanceId != null && (typeof snapshot.instanceId !== 'string' || !snapshot.instanceId.trim()))) throw new Error('The build status response is invalid.');
-        // Older hosts omit instanceId; they remain usable but cannot detect restarts.
-        const instance = snapshot.instanceId ?? null;
-        const previous = current.current;
-        const previousInstance = previous?.instanceId ?? null;
-        // Never let an unidentifiable response replace an identified host.
-        if (previousInstance !== null && instance === null) return;
-        if (previous && instance === previousInstance) {
-          if (snapshot.revision < previous.revision || (snapshot.revision === previous.revision && ticket < acceptedRequest.current)) return;
-        } else {
-          // A request sent before the current instance was observed cannot switch
-          // instances, even if it happens to complete later than that response.
-          if (epoch !== stateEpoch.current || ticket < acceptedRequest.current || retiredInstances.current.has(instance)) return;
-          if (previous) {
-            stateEpoch.current++;
-            retiredInstances.current.add(previousInstance);
-            selection.current++;
-            setCatalog(null); setWorkflow(null); setArtifacts(null); setGraph(null); setGraphError(''); setSelectedNode(null); setViewer(null);
-            setCatalogVersion(value => value + 1);
-          }
-        }
-        acceptedRequest.current = Math.max(acceptedRequest.current, ticket);
-        current.current = snapshot;
-        setState(snapshot);
+    function Page({ call, close, subscribeSaved, notifySaved }) {
+      const [catalog, setCatalog] = useState(null), [error, setError] = useState(''), [busy, setBusy] = useState('');
+      const [workflow, setWorkflow] = useState(null), [artifacts, setArtifacts] = useState(null), [graph, setGraph] = useState(null), [graphError, setGraphError] = useState('');
+      const [selectedNode, setSelectedNode] = useState(null), [viewer, setViewer] = useState(null), [folders, setFolders] = useState({});
+      const [settings, setSettings] = useState(null), [settingsError, setSettingsError] = useState(''), [settingsBusy, setSettingsBusy] = useState(false);
+      const mounted = useRef(false), generation = useRef(0), listTicket = useRef(0), viewTicket = useRef(0), folderTickets = useRef({}), settingsTicket = useRef(0), operation = useRef(''), saving = useRef(false);
+      const closeRef = useRef(null), settingsRef = useRef(null), settingsButton = useRef(null);
+      const clearExplorer = useCallback(() => {
+        generation.current++; viewTicket.current++; folderTickets.current = {};
+        setWorkflow(null); setArtifacts(null); setGraph(null); setGraphError(''); setSelectedNode(null); setViewer(null); setFolders({});
       }, []);
-      const requestState = useCallback(async (endpoint, payload) => {
-        const ticket = ++stateRequests.current;
-        const epoch = stateEpoch.current;
-        try { applyState(await call(endpoint, payload), ticket, epoch); }
-        catch (failure) {
-          if (epoch === stateEpoch.current && (endpoint !== 'status' || ticket >= acceptedRequest.current)) throw failure;
-        }
-      }, [call, applyState]);
-      const refreshStatus = useCallback(async () => {
-        try { await requestState('status', null); }
-        catch (failure) { if (mounted.current) setError(failure.message || 'Unable to load status.'); }
-      }, [requestState]);
-      const begin = kind => {
-        if (operationRef.current) return false;
-        operationRef.current = kind;
-        setOperation(kind);
-        return true;
-      };
-      const end = kind => {
-        if (operationRef.current === kind) operationRef.current = '';
-        const reload = pendingList.current && !isActive(current.current);
-        if (reload) pendingList.current = false;
-        if (mounted.current) {
-          setOperation('');
-          if (reload) setCatalogVersion(value => value + 1);
-        }
-        // A StrictMode cleanup/setup can replay effects before an in-flight
-        // list settles. Retain the request to reload across that boundary.
-        else if (reload) pendingList.current = true;
-      };
+      const refresh = useCallback(async () => {
+        const ticket = ++listTicket.current;
+        clearExplorer(); setCatalog(null); setError(''); setBusy('list');
+        try {
+          const value = await call('list', null);
+          if (!value?.workflows || typeof value.workflows !== 'object' || Array.isArray(value.workflows)) throw new Error('The workflow catalog is invalid.');
+          if (mounted.current && ticket === listTicket.current) setCatalog(value.workflows);
+        } catch (failure) { if (mounted.current && ticket === listTicket.current) setError(failure.message || 'Unable to list workflows.'); }
+        finally { if (mounted.current && ticket === listTicket.current) setBusy(''); }
+      }, [call, clearExplorer]);
+      useEffect(() => {
+        mounted.current = true; closeRef.current?.focus();
+        const unsubscribe = subscribeSaved(refresh);
+        refresh();
+        return () => { mounted.current = false; unsubscribe(); generation.current++; listTicket.current++; viewTicket.current++; settingsTicket.current++; };
+      }, [refresh, subscribeSaved]);
+      useEffect(() => { if (settings && !settingsBusy) settingsRef.current?.focus(); }, [!!settings, settingsBusy]);
 
-      useEffect(() => {
-        mounted.current = true;
-        if (pendingList.current && !operationRef.current && !isActive(current.current)) {
-          pendingList.current = false;
-          setCatalogVersion(value => value + 1);
-        }
-        return () => { mounted.current = false; selection.current++; };
-      }, []);
-      useEffect(() => { refreshStatus(); }, [refreshStatus]);
-      useEffect(() => {
-        if (!active) return undefined;
-        let cancelled = false, timer;
-        const tick = async () => {
-          await refreshStatus();
-          if (!cancelled) timer = setTimeout(tick, 2000);
-        };
-        timer = setTimeout(tick, 2000);
-        return () => { cancelled = true; clearTimeout(timer); };
-      }, [active, refreshStatus]);
-      useEffect(() => { setAnswer(''); }, [state?.instanceId, state?.requestId, state?.awaiting?.stepId, state?.revision]);
-      useEffect(() => {
-        if (!active) return;
-        selection.current++;
-        setWorkflow(null); setArtifacts(null); setGraph(null); setGraphError(''); setSelectedNode(null); setViewer(null);
-      }, [active]);
-      useEffect(() => {
-        if (!state || active) return undefined;
-        if (!begin('list')) { pendingList.current = true; return undefined; }
-        pendingList.current = false;
-        const epoch = stateEpoch.current;
-        let cancelled = false, retry;
-        call('list', null).then(value => {
-          if (!cancelled && mounted.current && epoch === stateEpoch.current && !isActive(current.current)) setCatalog(value?.workflows || {});
-        }).catch(failure => {
-          if (cancelled || !mounted.current || epoch !== stateEpoch.current || isActive(current.current)) return;
-          if (failure.code === 'flowx/busy') retry = setTimeout(() => setCatalogVersion(value => value + 1), 2000);
-          else setError(failure.message || 'Unable to list workflows.');
-        }).finally(() => end('list'));
-        return () => { cancelled = true; clearTimeout(retry); };
-      }, [!!state, active, catalogVersion, call]);
-
-      const start = async event => {
-        event.preventDefault();
-        if (!current.current || isActive(current.current) || !prompt.trim() || !consent || !begin('start')) return;
-        setConsent(false);
-        setError('');
-        try { await requestState('start', { prompt }); }
-        catch (failure) {
-          if (mounted.current) setError(failure.message || 'Unable to start the build.');
-          await refreshStatus();
-        }
-        finally { end('start'); }
-      };
-      const respond = async (abort, event) => {
-        if (event) event.preventDefault();
-        const snapshot = current.current;
-        if (snapshot?.status !== 'input_required' || !snapshot.requestId || !snapshot.awaiting?.stepId || !begin(abort ? 'abort' : 'answer')) return;
-        const kind = abort ? 'abort' : 'answer';
-        const payload = { requestId: snapshot.requestId, stepId: snapshot.awaiting.stepId, revision: snapshot.revision };
-        if (!abort) payload.input = answer;
-        setError('');
-        try { await requestState(kind, payload); }
-        catch (failure) {
-          if (failure.code === 'flowx/stale-input') {
-            await refreshStatus();
-            if (mounted.current) setError('The repair request changed. Review the current request before trying again.');
-          } else {
-            if (mounted.current) setError(failure.message || 'Unable to submit the repair response.');
-            await refreshStatus();
-          }
-        } finally { end(kind); }
-      };
       const inspect = async id => {
-        if (isActive(current.current) || !begin('inspect')) return;
-        const ticket = ++selection.current;
-        setWorkflow(id); setArtifacts(null); setGraph(null); setGraphError(''); setSelectedNode(null); setViewer(null); setError('');
+        if (busy || operation.current) return;
+        clearExplorer(); const ticket = generation.current;
+        setWorkflow(id); setError(''); setBusy('inspect'); operation.current = 'inspect';
         try {
           const result = await call('inspect', { workflowId: id });
-          if (!mounted.current || ticket !== selection.current) return;
-          const map = result?.artifacts;
-          if (!map || typeof map !== 'object') throw new Error('The workflow artifact map is invalid.');
-          setArtifacts(map);
-          if (map.graph) {
+          if (!mounted.current || ticket !== generation.current) return;
+          if (!result?.artifacts || typeof result.artifacts !== 'object') throw new Error('The workflow artifact map is invalid.');
+          setArtifacts(result.artifacts);
+          if (result.artifacts.graph) {
             try {
-              const file = await call('readArtifact', { workflowId: id, path: map.graph });
+              const file = await call('readArtifact', { workflowId: id, path: result.artifacts.graph });
               const model = graphModel(JSON.parse(file.content));
-              if (mounted.current && ticket === selection.current) setGraph(model);
-            } catch (failure) {
-              if (mounted.current && ticket === selection.current) setGraphError(`Unable to load graph: ${failure.message || 'Invalid graph.'}`);
-            }
+              if (mounted.current && ticket === generation.current) setGraph(model);
+            } catch (failure) { if (mounted.current && ticket === generation.current) setGraphError(`Unable to load graph: ${failure.message || 'Invalid graph.'}`); }
           }
-        } catch (failure) { if (mounted.current && ticket === selection.current) setError(failure.message || 'Unable to inspect workflow.'); }
-        finally { end('inspect'); }
+        } catch (failure) { if (mounted.current && ticket === generation.current) setError(failure.message || 'Unable to inspect workflow.'); }
+        finally { operation.current = ''; if (mounted.current && ticket === generation.current) setBusy(''); }
+        if (mounted.current && ticket === generation.current) loadFolder(id, '', ticket);
       };
-      const readArtifact = async (path, label) => {
-        if (!path || !workflow || isActive(current.current) || !begin('artifact')) return;
-        const ticket = selection.current;
-        setViewer({ label, path, loading: true }); setError('');
+      const loadFolder = async (id, path, generationId) => {
+        const ticket = (folderTickets.current[path] || 0) + 1; folderTickets.current[path] = ticket;
+        setFolders(old => ({ ...old, [path]: { loading: true } }));
         try {
-          const file = await call('readArtifact', { workflowId: workflow, path });
-          if (mounted.current && ticket === selection.current) setViewer({ label, path, content: file.content, bytes: file.bytes });
-        } catch (failure) {
-          if (mounted.current && ticket === selection.current) setViewer({ label, path, error: failure.message || 'Unable to read artifact.' });
-        } finally { end('artifact'); }
+          const result = await call('listFolder', { workflowId: id, path });
+          if (!Array.isArray(result?.entries)) throw new Error('The folder listing is invalid.');
+          if (mounted.current && generationId === generation.current && folderTickets.current[path] === ticket) setFolders(old => ({ ...old, [path]: { entries: result.entries, truncated: result.truncated } }));
+        } catch (failure) { if (mounted.current && generationId === generation.current && folderTickets.current[path] === ticket) setFolders(old => ({ ...old, [path]: { error: failure.message || 'Unable to list folder.' } })); }
       };
-      const artifactButton = (label, path) => path
-        ? h('button', { type: 'button', key: label, style: styles.button, disabled: busy || active, onClick: () => readArtifact(path, label) }, label)
-        : h('span', { key: label, style: styles.muted }, `${label} unavailable`);
-      const node = graph?.nodes.find(item => item.name === selectedNode);
-      const nodeArtifacts = selectedNode && artifacts?.nodes?.[selectedNode];
-      const workflows = catalog && typeof catalog === 'object' ? Object.entries(catalog).sort(([a], [b]) => compare(a, b)) : [];
-
-      return h('main', { style: styles.page }, h('div', { style: styles.shell },
-        h('header', { style: styles.hero }, h('div', null,
-          h('p', { style: styles.eyebrow }, 'FlowX · workflow studio'),
-          h('h1', { style: styles.title }, 'Build what flows next.'),
-          h('p', { style: styles.muted }, 'Create workflows, resolve repairs, and explore every artifact in one place.')),
-          h('div', { style: styles.row }, h('span', { style: styles.badge, role: 'status' }, state ? `● ${state.status.replaceAll('_', ' ')}` : '● Connecting'),
-            h('button', { type: 'button', style: styles.button, onClick: () => { setError(''); refreshStatus(); } }, 'Refresh status'))),
-        error && h('div', { role: 'alert', style: styles.notice }, error),
-        state?.error?.message && h('div', { role: 'alert', style: styles.notice }, state.error.message),
-        state && state.instanceId == null && h('div', { role: 'status', style: styles.notice }, 'This host does not provide an instance ID; automatic restart detection is unavailable.'),
-        h('div', { style: styles.grid },
-          h('section', { style: styles.card, 'aria-labelledby': 'flowx-build-heading' },
-            h('h2', { id: 'flowx-build-heading', style: styles.heading }, 'Start a build'),
-            h('p', { style: styles.muted }, 'Describe the workflow you want to create.'),
-            h('form', { onSubmit: start, style: { marginTop: 16 } },
-              h('label', { htmlFor: 'flowx-prompt', style: styles.label }, 'Workflow prompt'),
-              h('textarea', { id: 'flowx-prompt', style: styles.input, rows: 4, value: prompt, onChange: event => setPrompt(event.target.value), placeholder: 'Describe your goal, inputs, and desired output…', disabled: active }),
-              h('p', { id: 'flowx-build-risk', style: { ...styles.notice, margin: '12px 0' } }, 'Builds run generated code and pytest without a sandbox, with host privileges. API credentials, local files, and network access may be exposed. Prompts, repair context, and artifacts may contain sensitive data.'),
-              h('div', { style: { display: 'flex', alignItems: 'flex-start', gap: 8 } },
-                h('input', { id: 'flowx-build-consent', type: 'checkbox', checked: consent, onChange: event => setConsent(event.target.checked), disabled: active || busy, required: true, 'aria-describedby': 'flowx-build-risk' }),
-                h('label', { htmlFor: 'flowx-build-consent', style: { ...styles.label, margin: 0 } }, 'I understand and accept these risks for this build.')),
-              h('div', { style: { ...styles.row, marginTop: 12 } },
-                h('button', { type: 'submit', style: styles.primary, disabled: !state || active || busy || !prompt.trim() || !consent }, operation === 'start' ? 'Starting…' : 'Build workflow'),
-                state?.workflowId && h('span', { style: styles.muted }, `Workflow: ${state.workflowId}`))),
-            active && state?.status !== 'input_required' && h('p', { style: { ...styles.muted, marginTop: 12 } }, 'Build in progress. Abort is available if a repair prompt appears.')),
+      const toggleFolder = (path, retry = false) => {
+        if (!workflow) return;
+        if (folders[path] && !retry) {
+          folderTickets.current[path] = (folderTickets.current[path] || 0) + 1;
+          setFolders(old => { const next = { ...old }; for (const key of Object.keys(next)) if (key === path || key.startsWith(`${path}/`)) { delete next[key]; folderTickets.current[key] = (folderTickets.current[key] || 0) + 1; } return next; });
+        } else loadFolder(workflow, path, generation.current);
+      };
+      const read = async (path, label, endpoint) => {
+        if (!workflow || !path) return;
+        const current = generation.current, ticket = ++viewTicket.current;
+        setViewer({ path, label, loading: true });
+        try {
+          const file = await call(endpoint, { workflowId: workflow, path });
+          if (typeof file?.content !== 'string') throw new Error('The file response is invalid.');
+          if (mounted.current && current === generation.current && ticket === viewTicket.current) setViewer({ path, label, content: file.content, bytes: file.bytes });
+        } catch (failure) { if (mounted.current && current === generation.current && ticket === viewTicket.current) setViewer({ path, label, error: failure.message || 'Unable to read file.' }); }
+      };
+      const openSettings = async () => {
+        const ticket = ++settingsTicket.current;
+        setSettings({ python: '', workspace: '', apiKey: '', apiKeySet: false }); setSettingsError(''); setSettingsBusy(true);
+        try {
+          const value = await call('getSettings', null);
+          if (mounted.current && ticket === settingsTicket.current) setSettings({ python: value?.python || '', workspace: value?.workspace || '', apiKey: '', apiKeySet: !!value?.apiKeySet });
+        } catch (failure) { if (mounted.current && ticket === settingsTicket.current) setSettingsError(failure.message || 'Unable to load settings.'); }
+        finally { if (mounted.current && ticket === settingsTicket.current) { setSettingsBusy(false); settingsRef.current?.focus(); } }
+      };
+      const cancelSettings = () => { if (saving.current) return; settingsTicket.current++; setSettings(null); setSettingsError(''); setSettingsBusy(false); settingsButton.current?.focus(); };
+      const saveSettings = async event => {
+        event.preventDefault(); if (!settings || settingsBusy || saving.current || operation.current || busy) return;
+        const ticket = ++settingsTicket.current; saving.current = true; setSettingsBusy(true); setSettingsError('');
+        try {
+          const { apiKeySet, ...payload } = settings;
+          await call('saveSettings', payload);
+          if (mounted.current && ticket === settingsTicket.current) { setSettings(null); settingsButton.current?.focus(); }
+          notifySaved();
+        } catch (failure) { if (mounted.current && ticket === settingsTicket.current) setSettingsError(failure.message || 'Unable to save settings.'); }
+        finally { saving.current = false; if (mounted.current && ticket === settingsTicket.current) setSettingsBusy(false); }
+      };
+      const artifactButton = (label, path) => path && h('button', { type: 'button', key: label, style: styles.button, onClick: () => read(path, label, 'readArtifact') }, label);
+      const node = graph?.nodes.find(item => item.name === selectedNode), nodeArtifacts = selectedNode && artifacts?.nodes?.[selectedNode];
+      const workflows = catalog ? Object.entries(catalog).sort(([a], [b]) => compare(a, b)) : [];
+      return h('aside', { id: 'flowx-overlay', role: 'region', 'aria-label': 'FlowX workflow explorer', style: styles.panel, onKeyDown: event => { if (event.key === 'Escape') { event.stopPropagation(); if (settings) cancelSettings(); else close(); } } },
+        h('div', { style: styles.content },
+          h('header', { style: styles.header }, h('div', null, h('p', { style: styles.eyebrow }, 'FlowX · read-only explorer'), h('h1', { style: styles.title }, 'Your workflows'), h('p', { style: styles.muted }, 'Explore plans and generated files without leaving your conversation.')),
+            h('div', { style: styles.row }, h('button', { type: 'button', ref: settingsButton, style: styles.button, onClick: openSettings }, 'Settings'), h('button', { type: 'button', ref: closeRef, style: styles.button, onClick: close, 'aria-label': 'Close FlowX' }, 'Close'))),
+          error && h('div', { role: 'alert', style: styles.notice }, error),
           h('section', { style: styles.card, 'aria-labelledby': 'flowx-workflows-heading' },
-            h('div', { style: styles.sectionHead }, h('div', null, h('h2', { id: 'flowx-workflows-heading', style: styles.heading }, 'Your workflows'), h('p', { style: styles.muted }, 'Select a workflow to explore its graph and files.')),
-              h('button', { type: 'button', style: styles.button, disabled: !state || active || busy, onClick: () => { setError(''); setCatalogVersion(value => value + 1); } }, 'Refresh')),
-            operation === 'list' ? h('p', { role: 'status', style: styles.muted }, 'Loading workflows…') :
-              active ? h('p', { style: styles.muted }, 'Workflow inspection is unavailable while a build is active.') :
-                catalog === null ? h('p', { style: styles.muted }, 'Workflows are not loaded yet.') : workflows.length === 0 ? h('p', { style: styles.muted }, 'No workflows yet. Start a build to create one.') :
-                  h('div', { style: { display: 'grid', gap: 8 } }, workflows.map(([id, info]) => h('button', { key: id, type: 'button', style: { ...styles.button, textAlign: 'left', background: workflow === id ? '#f0f3ff' : '#fff' }, disabled: busy, 'aria-pressed': workflow === id, onClick: () => inspect(id) },
-                    h('span', { style: { display: 'block', overflowWrap: 'anywhere' } }, id),
-                    h('span', { style: { ...styles.muted, display: 'block', fontWeight: 400, fontSize: 12, marginTop: 4 } }, `Published workflow revision ${info?.workflow_version ?? '—'} · ${Object.keys(info?.nodes || {}).length} listed nodes`))))),
-        state?.status === 'input_required' && state.awaiting && h('section', { style: { ...styles.card, gridColumn: '1 / -1', borderColor: '#f0d7a4', background: '#fffcf5' }, 'aria-labelledby': 'flowx-repair-heading' },
-          h('h2', { id: 'flowx-repair-heading', style: styles.heading }, 'Repair needs your input'),
-          h('p', { style: styles.muted }, `Step: ${state.awaiting.stepId}`),
-          state.awaiting.prompt && h('p', { style: { whiteSpace: 'pre-wrap', lineHeight: 1.5 } }, state.awaiting.prompt),
-          state.awaiting.test_log && h('details', null, h('summary', null, 'Test log'), h('pre', { style: styles.pre }, state.awaiting.test_log)),
-          h('form', { onSubmit: event => respond(false, event), style: { marginTop: 14 } },
-            h('label', { htmlFor: 'flowx-answer', style: styles.label }, 'Repair input'),
-            h('textarea', { id: 'flowx-answer', style: styles.input, rows: 3, value: answer, onChange: event => setAnswer(event.target.value), placeholder: 'Provide guidance, or leave empty to continue.' }),
-            h('div', { style: { ...styles.row, marginTop: 12 } },
-              h('button', { type: 'submit', style: styles.primary, disabled: busy }, operation === 'answer' ? 'Sending…' : 'Continue repair'),
-              h('button', { type: 'button', style: styles.danger, disabled: busy, onClick: () => respond(true) }, operation === 'abort' ? 'Aborting…' : 'Abort build')))),
-        workflow && h('section', { style: { ...styles.card, gridColumn: '1 / -1' }, 'aria-labelledby': 'flowx-explorer-heading' },
-          h('div', { style: styles.sectionHead }, h('div', null, h('p', { style: styles.eyebrow }, 'Workflow explorer'), h('h2', { id: 'flowx-explorer-heading', style: { ...styles.heading, overflowWrap: 'anywhere' } }, workflow)),
-            artifacts && h('span', { style: styles.badge }, `Published workflow revision ${artifacts.workflow_version ?? '—'}`)),
-          operation === 'inspect' && h('p', { role: 'status', style: styles.muted }, 'Loading workflow and graph…'),
-          artifacts && h(React.Fragment, null,
-            h('div', { style: styles.row }, artifactButton('Requirement', artifacts.requirement), artifactButton('Main entrypoint', artifacts.main_entrypoint?.path), artifactButton('Graph JSON', artifacts.graph)),
-            h('hr', { style: styles.divider }),
-            h('h3', { style: styles.heading }, 'Current plan dependency graph'),
-            h('p', { style: { ...styles.muted, marginBottom: 12 } }, 'This graph shows the current plan. Published workflow and node revisions and artifacts may differ after graph-only updates. Select a node to inspect it.'),
-            graphError ? h('div', { role: 'alert', style: styles.notice }, graphError) : graph ? h(Graph, { model: graph, selected: selectedNode, onSelect: setSelectedNode }) : !artifacts.graph ? h('p', { style: styles.muted }, 'No graph artifact is available.') : null,
-            node && h('div', { style: { marginTop: 16, padding: 16, border: '1px solid #e3e9f5', borderRadius: 12 } },
-              h('h3', { style: styles.heading }, node.name),
-              h('p', { style: { ...styles.muted, whiteSpace: 'pre-wrap' } }, node.desc || 'No description provided.'),
-              h('p', { style: { ...styles.muted, marginTop: 8 } }, `Status in current plan: ${node.enabled ? 'Enabled' : 'Disabled'}`),
-              h('p', { style: { ...styles.muted, marginTop: 8 } }, `Depends on: ${node.depends.length ? node.depends.join(', ') : 'None'}`),
-              nodeArtifacts && h('p', { style: { ...styles.muted, marginTop: 4 } }, `Node ID: ${nodeArtifacts.node_id} · Published node revision ${nodeArtifacts.version}`),
-              h('div', { style: { ...styles.row, marginTop: 12 } }, nodeArtifacts ? Object.entries(nodeArtifacts.artifacts || {}).sort(([a], [b]) => compare(a, b)).map(([label, path]) => artifactButton(label, path)) : h('span', { style: styles.muted }, 'No generated node artifacts.'))),
-            viewer && h('div', { style: { marginTop: 20 } },
-              h('h3', { style: styles.heading }, viewer.label),
-              h('p', { style: { ...styles.muted, overflowWrap: 'anywhere' } }, viewer.path, viewer.bytes != null ? ` · ${viewer.bytes} bytes` : ''),
-              viewer.loading ? h('p', { role: 'status', style: styles.muted }, 'Loading artifact…') : viewer.error ? h('div', { role: 'alert', style: styles.notice }, viewer.error) : h('pre', { style: styles.pre, tabIndex: 0 }, viewer.content)))))));
+            h('div', { style: { ...styles.row, justifyContent: 'space-between', marginBottom: 10 } }, h('h2', { id: 'flowx-workflows-heading', style: styles.heading }, 'Workflows'), h('button', { type: 'button', style: styles.button, disabled: !!busy, onClick: refresh }, 'Refresh')),
+            busy === 'list' ? h('p', { role: 'status', style: styles.muted }, 'Loading workflows…') : catalog && workflows.length === 0 ? h('p', { style: styles.muted }, 'No workflows found in this workspace.') :
+              h('div', { style: { display: 'grid', gap: 6 } }, workflows.map(([id, info]) => h('button', { key: id, type: 'button', style: { ...styles.button, textAlign: 'left', background: workflow === id ? '#f0f3ff' : '#fff', overflowWrap: 'anywhere' }, disabled: !!busy, 'aria-pressed': workflow === id, onClick: () => inspect(id) }, id, h('span', { style: { ...styles.muted, display: 'block', fontWeight: 400 } }, `Published revision ${info?.workflow_version ?? '—'} · ${Object.keys(info?.nodes || {}).length} listed nodes`))))),
+          workflow && h('section', { style: styles.card, 'aria-labelledby': 'flowx-explorer-heading' },
+            h('p', { style: styles.eyebrow }, 'Workflow explorer'), h('h2', { id: 'flowx-explorer-heading', style: { ...styles.heading, overflowWrap: 'anywhere' } }, workflow),
+            busy === 'inspect' && h('p', { role: 'status', style: styles.muted }, 'Loading workflow and graph…'),
+            artifacts && h(React.Fragment, null,
+              h('p', { style: { ...styles.muted, marginBottom: 10 } }, `Published workflow revision ${artifacts.workflow_version ?? '—'}`),
+              h('div', { style: styles.row }, artifactButton('Requirement', artifacts.requirement), artifactButton('Main entrypoint', artifacts.main_entrypoint?.path), artifactButton('Graph JSON', artifacts.graph)),
+              h('h3', { style: { ...styles.heading, marginTop: 16 } }, 'Current plan dependency graph'),
+              h('p', { style: { ...styles.muted, marginBottom: 10 } }, 'Published artifacts may differ after graph-only updates. Select a node for details.'),
+              graphError ? h('div', { role: 'alert', style: styles.notice }, graphError) : graph ? h(Graph, { model: graph, selected: selectedNode, onSelect: setSelectedNode }) : !artifacts.graph ? h('p', { style: styles.muted }, 'No graph artifact is available.') : null,
+              node && h('div', { style: { marginTop: 12, padding: 12, border: '1px solid #e3e9f5', borderRadius: 10 } }, h('h3', { style: styles.heading }, node.name), h('p', { style: { ...styles.muted, whiteSpace: 'pre-wrap' } }, node.desc || 'No description provided.'), h('p', { style: { ...styles.muted, marginTop: 8 } }, `Status: ${node.enabled ? 'Enabled' : 'Disabled'} · Depends on: ${node.depends.length ? node.depends.join(', ') : 'None'}`), nodeArtifacts && h('p', { style: styles.muted }, `Node ID: ${nodeArtifacts.node_id} · Published node revision ${nodeArtifacts.version}`), h('div', { style: { ...styles.row, marginTop: 8 } }, nodeArtifacts && Object.entries(nodeArtifacts.artifacts || {}).sort(([a], [b]) => compare(a, b)).map(([label, path]) => artifactButton(label, path)))),
+              h('h3', { style: { ...styles.heading, marginTop: 18 } }, 'Workflow folder'),
+              h('p', { style: { ...styles.muted, marginBottom: 8 } }, 'Expand folders and open supported text files.'),
+              h(Folder, { path: '', folders, onToggle: toggleFolder, onRead: path => read(path, 'File', 'readFolderFile') }),
+              viewer && h('div', { style: { marginTop: 18 } }, h('h3', { style: styles.heading }, viewer.label), h('p', { style: { ...styles.muted, overflowWrap: 'anywhere' } }, viewer.path, viewer.bytes != null ? ` · ${viewer.bytes} bytes` : ''), viewer.loading ? h('p', { role: 'status', style: styles.muted }, 'Loading file…') : viewer.error ? h('div', { role: 'alert', style: styles.notice }, viewer.error) : h('pre', { style: styles.pre, tabIndex: 0 }, viewer.content)))),
+          settings && h('div', { role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'flowx-settings-title', onKeyDown: event => { if (event.key !== 'Tab') return; const controls = [...event.currentTarget.querySelectorAll('input:not(:disabled), button:not(:disabled)')]; if (!controls.length) { event.preventDefault(); return; } const first = controls[0], last = controls[controls.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }, style: { position: 'fixed', inset: 0, background: 'rgba(24, 39, 62, .45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: 14, boxSizing: 'border-box', overflow: 'auto' } },
+            h('form', { onSubmit: saveSettings, style: { ...styles.card, width: '100%', maxWidth: 520, boxShadow: '0 16px 50px rgba(0,0,0,.2)' } },
+              h('h2', { id: 'flowx-settings-title', style: styles.heading }, 'FlowX settings'), h('p', { style: styles.muted }, 'Absolute paths on the Harness host. Saved values take precedence over environment variables. The API key is stored owner-only on the host and never shown again; leave it empty to keep the current one.'),
+              settingsError && h('p', { role: 'alert', style: styles.notice }, settingsError),
+              [['python', 'FLOWX_PYTHON'], ['workspace', 'FLOWX_WORKSPACE'], ['apiKey', 'FLOWX_LLM_API_KEY']].map(([key, label]) => h('div', { key }, h('label', { htmlFor: `flowx-${key}`, style: styles.label }, label), h('input', { id: `flowx-${key}`, ref: key === 'python' ? settingsRef : undefined, style: styles.input, type: key === 'apiKey' ? 'password' : 'text', autoComplete: key === 'apiKey' ? 'off' : undefined, placeholder: key === 'apiKey' && settings.apiKeySet ? 'Key is set' : undefined, value: settings[key], required: key !== 'apiKey', disabled: settingsBusy, onChange: event => setSettings(old => ({ ...old, [key]: event.target.value })) }))),
+              h('div', { style: { ...styles.row, marginTop: 16 } }, h('button', { type: 'submit', style: styles.primary, disabled: settingsBusy || !!busy }, settingsBusy ? 'Working…' : 'Save settings'), h('button', { type: 'button', style: styles.button, disabled: saving.current, onClick: cancelSettings }, 'Cancel'))))));
     }
 
     return {
-      inject: ['slots'],
+      inject: ['slots', 'layout'],
       apply(ctx) {
-        ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: 'flowx', inject: () => ({ call: callFlowX }) }, Page));
-        ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({ name: 'sidebar.panellist', id: 'flowx', order: 100, label: 'FlowX' }, Icon));
+        let open = false, listeners = new Set(), savedListeners = new Set(), trigger = null;
+        const publish = value => { open = value; for (const listener of listeners) listener(value); };
+        const close = () => { publish(false); trigger?.focus(); };
+        const subscribeSaved = listener => { savedListeners.add(listener); return () => savedListeners.delete(listener); };
+        const notifySaved = () => { for (const listener of savedListeners) listener(); };
+        function Launcher({ wide }) {
+          const [expanded, setExpanded] = useState(open);
+          useEffect(() => { listeners.add(setExpanded); return () => listeners.delete(setExpanded); }, []);
+          return h('button', { type: 'button', title: 'FlowX workflows', 'aria-label': 'FlowX workflows', 'aria-expanded': expanded, 'aria-controls': 'flowx-overlay', onClick: event => { trigger = event.currentTarget; if (!open && trigger.closest('[role="dialog"][aria-modal="true"]')) { trigger = trigger.ownerDocument.querySelector('[data-sidebar-opener]') || trigger; ctx.layout.toggleSidebar(); } publish(!open); }, style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 10px', border: 0, borderRadius: 8, background: expanded ? 'rgba(100, 115, 210, .16)' : 'transparent', color: 'inherit', cursor: 'pointer', font: 'inherit' } }, h(Icon), wide && h('span', null, 'FlowX'));
+        }
+        function Overlay() {
+          const [expanded, setExpanded] = useState(open);
+          useEffect(() => { listeners.add(setExpanded); return () => listeners.delete(setExpanded); }, []);
+          return expanded ? h(Page, { call: callFlowX, close, subscribeSaved, notifySaved }) : null;
+        }
+        ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'flowx', order: 100 }, Launcher));
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'flowx', order: 100 }, Overlay));
       },
     };
   },

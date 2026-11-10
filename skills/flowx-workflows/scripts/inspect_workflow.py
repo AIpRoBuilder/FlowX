@@ -13,12 +13,19 @@ import json
 import sys
 from typing import Sequence
 
-from flowx_sdk import FlowXClient
+if __name__ == "__main__":
+    import plugin_settings
+
+    _PLUGIN_WORKSPACE = plugin_settings.apply(None)  # may re-exec under the plugin's Python
+else:
+    _PLUGIN_WORKSPACE = None
+
+from flowx_sdk import FlowXClient  # noqa: E402
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workspace", help="FlowX workspace; defaults to FLOWX_DEFAULT_WORKSPACE")
+    parser.add_argument("--workspace", help="FlowX workspace; defaults to the plugin's saved workspace, then FLOWX_DEFAULT_WORKSPACE")
     commands = parser.add_subparsers(dest="operation", required=True)
     commands.add_parser("list", help="List workspace workflows")
     for name in ("nodes", "artifacts", "recovery"):
@@ -27,7 +34,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         with contextlib.redirect_stdout(sys.stderr):
-            with FlowXClient(workspace=args.workspace) as client:
+            with FlowXClient(workspace=args.workspace or _PLUGIN_WORKSPACE) as client:
                 if args.operation == "list":
                     data = client.workflows()
                 elif args.operation == "nodes":

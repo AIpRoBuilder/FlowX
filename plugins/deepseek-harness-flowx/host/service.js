@@ -4,6 +4,10 @@
 // Upstream: https://github.com/AIpRoBuilder/FlowX
 // Added 2026-11-09: owner-only, process-local workflow build and inspection host.
 // Modified 2026-11-09: bound and sanitize host responses and limit inherited credentials.
+// Modified 2026-11-10: persist owner-only path settings with private, serialized storage.
+// Modified 2026-11-10: resolve a symlinked DSH_HOME before confining settings storage.
+// Modified 2026-11-10: add bounded, owner-only workflow folder browsing.
+// Modified 2026-11-10: save the API key in settings and locate the skill automatically.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -16,14 +20,22 @@ import { fileURLToPath } from 'node:url';
 const LIMIT = 1024 * 1024;
 const BUILD_EVENT_LIMIT = 16 * LIMIT;
 const REPAIR_TEXT_LIMIT = 8192;
+const FOLDER_ENTRY_LIMIT = 200;
+const FOLDER_SCAN_LIMIT = 1000;
+const FOLDER_RESPONSE_LIMIT = 256 * 1024;
+const FOLDER_PROBE_LIMIT = 4 * LIMIT;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const TEXT_TYPES = new Set(['.json', '.md', '.py', '.txt', '.log']);
 const DEFAULT_SKILL = fileURLToPath(new URL('../../../skills/flowx-workflows/', import.meta.url));
+const SETTINGS_KEYS = ['python', 'workspace'];
+const SAVE_KEYS = ['python', 'workspace', 'apiKey'];
+const SETTINGS_LIMIT = 16384;
 const PROVIDER_CREDENTIALS = new Set(['FLOWX_LLM_API_KEY', 'OPENAI_API_KEY', 'ZHIPU_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'ONEONEONEAPI_API_KEY']);
 const CREDENTIAL_PATHS = new Set(['GOOGLE_APPLICATION_CREDENTIALS', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR']);
 const PROVIDER_URLS = new Set(['FLOWX_LLM_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
 const SECRET_ENV = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PRIVATE|COOKIE|JWT|(?:^|_)PAT(?:_|$))/i;
 const SECRET_FIELD = /(?:api[_-]?key|access[_-]?key|token|secret|password|passwd|credential|authorization|private[_-]?key)/i;
+const SECRET_PATH = /(?:api[_-]?key|access[_-]?key|token|secret|password|passwd|credential|authorization|private[_-]?key|(?:^|[._-])id[_-](?:rsa|dsa|ecdsa|ed25519)(?:[._-]|$)|\.(?:key|pem|p12|pfx)$)/i;
 const GRAPH_ID_FIELD = /^(?:id|ids|name|type|depends|dependenc(?:y|ies)|requires|source|target|from|to|node|step|parent|ref|reference|.*[_-](?:ids?|names?|refs?)|.*(?:Ids?|Names?|Refs?))$/i;
 const URL_CREDENTIALS = /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i;
 const STAGES = ['reformat', 'graph', 'nodes', 'main'];
@@ -31,13 +43,19 @@ const STAGE_STATUSES = new Set(['completed', 'skipped', 'failed', 'blocked', 'aw
 // This only coordinates service instances loaded from this module in this Node process.
 let buildOwner = null;
 let inspections = 0;
+let settingsWrites = 0;
+let settingsTail = Promise.resolve();
+const services = new Set();
+const serviceFinalizer = new FinalizationRegistry(reference => services.delete(reference));
 
 class HostError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
 const problem = (code, message) => new HostError(`flowx/${code}`, message);
 const invalid = () => problem('invalid-payload', 'Invalid endpoint payload.');
-const busy = () => problem('busy', 'A build or inspection is active in this plugin process.');
+const busy = () => problem('busy', 'A build, inspection or settings change is active in this plugin process.');
+const settingsError = () => problem('settings-invalid', 'The saved FlowX settings are invalid or unsafe.');
+const storageError = () => problem('settings-storage', 'The FlowX settings storage is unavailable or unsafe.');
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const exact = (value, keys) => object(value) && Object.keys(value).length === keys.length && keys.every(k => Object.hasOwn(value, k));
 const text = (value, max = LIMIT) => typeof value === 'string' && Buffer.byteLength(value) <= max;
@@ -58,6 +76,20 @@ function safeError(error) {
  * start takes {prompt}; answer takes {requestId,stepId,revision,input}; abort
  * takes {requestId,stepId,revision}; inspect takes {workflowId}; readArtifact
  * takes {workflowId,path}, where path is relative to that workflow's directory.
+ * listFolder takes {workflowId,path} ('' means root) and returns {workflowId,
+ * path,entries:[{name,path,type,readable}],truncated}. readFolderFile takes
+ * {workflowId,path} and returns the same bounded text shape as readArtifact.
+ * Folder listings omit hidden and credential-named paths, symlinks and special
+ * files; readable files have passed the text/size checks at listing time.
+ * The listing is capped at 200 entries, 1000 scanned entries, 256 KiB of entry
+ * metadata and 4 MiB of text probes; truncated also signals a probe budget cap.
+ * Folder reads are limited to 1 MiB, and JSON is structurally sanitized.
+ * Manifest error details and absolute entrypoint paths are withheld. Redaction
+ * is best-effort, and other workflow contents may still contain sensitive data.
+ * getSettings takes null; saveSettings takes {python,workspace,apiKey} (empty
+ * apiKey keeps the saved one) and both return {python,workspace,apiKeySet}
+ * (unset environment fallbacks are null); the key is never returned.
+ * The skill directory is not configurable: it is located automatically.
  * The owner must treat prompts, repair context, artifacts and logs as sensitive.
  * Nothing here locks other FlowX processes or prevents external workspace edits.
  * Revisions are scoped to instanceId; callers should compare both across reloads.
@@ -79,8 +111,8 @@ export class FlowXHostService {
         } catch { /* malformed URLs are not a source of separately known secrets */ }
       }
     }
-    const ordered = [...secrets].sort((a, b) => b.length - a.length);
-    this.secretPattern = ordered.length ? new RegExp(ordered.map(secret => secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g') : null;
+    this.secrets = secrets;
+    this.secretPattern = this.buildSecretPattern();
     this.spawn = spawn;
     this.inspectTimeoutMs = inspectTimeoutMs;
     this.abortTimeoutMs = abortTimeoutMs;
@@ -89,10 +121,14 @@ export class FlowXHostService {
     this.active = null;
     this.children = new Set();
     this.inspectionOps = new Set();
+    this.settingsOps = new Set();
     this.artifacts = new Map();
     this.graphSnapshot = null;
     this.closed = false;
     this.disposePromise = null;
+    this.serviceReference = new WeakRef(this);
+    services.add(this.serviceReference);
+    serviceFinalizer.register(this, this.serviceReference, this.serviceReference);
   }
 
   snapshot() { return structuredClone(this.state); }
@@ -105,6 +141,10 @@ export class FlowXHostService {
       let value;
       switch (endpoint) {
         case 'status': if (payload !== null) throw invalid(); value = this.snapshot(); break;
+        case 'getSettings': if (payload !== null) throw invalid(); value = await this.getSettings(); break;
+        case 'saveSettings':
+          if (!exact(payload, SAVE_KEYS) || !SAVE_KEYS.every(key => text(payload[key], 4096))) throw invalid();
+          value = await this.saveSettings({ python: payload.python, workspace: payload.workspace, apiKey: payload.apiKey }); break;
         case 'start':
           if (!exact(payload, ['prompt']) || !text(payload.prompt) || !payload.prompt.trim()) throw invalid();
           value = await this.start(payload.prompt); break;
@@ -122,26 +162,222 @@ export class FlowXHostService {
         case 'readArtifact':
           if (!exact(payload, ['workflowId', 'path']) || !workflowId(payload.workflowId) || !relativeArtifact(payload.path)) throw invalid();
           value = await this.readArtifact(payload.workflowId, payload.path); break;
+        case 'listFolder':
+          if (!exact(payload, ['workflowId', 'path']) || !workflowId(payload.workflowId) || !(payload.path === '' || relativeArtifact(payload.path))) throw invalid();
+          value = await this.listFolder(payload.workflowId, payload.path); break;
+        case 'readFolderFile':
+          if (!exact(payload, ['workflowId', 'path']) || !workflowId(payload.workflowId) || !relativeArtifact(payload.path)) throw invalid();
+          value = await this.readFolderFile(payload.workflowId, payload.path); break;
         default: throw problem('unknown-endpoint', 'Unknown endpoint.');
       }
       return { ok: true, value };
     } catch (error) { return { ok: false, error: safeError(error) }; }
   }
 
+  fallbackSettings() {
+    return { python: this.env.FLOWX_PYTHON ?? null, workspace: this.env.FLOWX_WORKSPACE ?? null, apiKeySet: Boolean(this.env.FLOWX_LLM_API_KEY) };
+  }
+
+  buildSecretPattern() {
+    const ordered = [...this.secrets].sort((a, b) => b.length - a.length);
+    return ordered.length ? new RegExp(ordered.map(secret => secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g') : null;
+  }
+
+  // Resolution order: FLOWX_SKILL_DIR, the source checkout, then Harness skill roots.
+  async skillRoot() {
+    const home = this.env.DSH_HOME !== undefined && path.isAbsolute(this.env.DSH_HOME) ? this.env.DSH_HOME : path.join(os.homedir(), '.dsh');
+    const candidates = this.env.FLOWX_SKILL_DIR ? [this.env.FLOWX_SKILL_DIR] : [DEFAULT_SKILL, path.join(home, 'skills', 'flowx-workflows'), path.join(process.cwd(), '.dsh', 'skills', 'flowx-workflows')];
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) continue;
+      try {
+        const root = await fs.realpath(candidate);
+        if ((await fs.stat(path.join(root, 'scripts', 'build.py'))).isFile()) return root;
+      } catch { /* try the next location */ }
+    }
+    throw new Error();
+  }
+
+  validSettings(settings) {
+    return object(settings) && Object.keys(settings).every(key => key === 'apiKey' || SETTINGS_KEYS.includes(key)) &&
+      SETTINGS_KEYS.every(key =>
+        text(settings[key], 4096) && path.isAbsolute(settings[key]) && !/[\x00-\x1f\x7f]/.test(settings[key]) && this.redact(settings[key]) === settings[key]) &&
+      (settings.apiKey === undefined || (text(settings.apiKey, 4096) && settings.apiKey.length > 0 && !/[\x00-\x1f\x7f]/.test(settings.apiKey))) &&
+      Buffer.byteLength(JSON.stringify(settings) + '\n') <= SETTINGS_LIMIT;
+  }
+
+  settingsDirectory() {
+    const home = this.env.DSH_HOME === undefined ? path.join(os.homedir(), '.dsh') : this.env.DSH_HOME;
+    if (!text(home, 4096) || !path.isAbsolute(home) || /[\x00-\x1f\x7f]/.test(home) ||
+        home.split(path.sep).some(part => part === '.' || part === '..')) throw storageError();
+    return path.join(home, 'plugins', 'deepseek-harness-flowx');
+  }
+
+  async settingsDirectoryAccess(create) {
+    const configured = this.settingsDirectory();
+    // DSH_HOME is operator configuration and may itself pass through a
+    // symlinked ancestor (for example /tmp -> /private/tmp on macOS). Resolve
+    // the base once, then confine and check every component below it.
+    const home = path.dirname(path.dirname(configured));
+    let base;
+    try { base = await fs.realpath(home); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw storageError();
+      if (!create) return null;
+      try { await fs.mkdir(home, { recursive: true, mode: 0o700 }); }
+      catch { throw storageError(); }
+      try { base = await fs.realpath(home); }
+      catch { throw storageError(); }
+    }
+    const plugins = path.join(base, 'plugins');
+    const directory = path.join(plugins, 'deepseek-harness-flowx');
+    const root = path.parse(directory).root;
+    let current = root;
+    try {
+      // Check every component rather than following an attacker-controlled link.
+      for (const component of path.relative(root, directory).split(path.sep).filter(Boolean)) {
+        current = path.join(current, component);
+        let stat;
+        try { stat = await fs.lstat(current); }
+        catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          if (!create) return null;
+          try { await fs.mkdir(current, { mode: 0o700 }); }
+          catch (mkdirError) { if (mkdirError.code !== 'EEXIST') throw mkdirError; }
+          stat = await fs.lstat(current);
+        }
+        if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error();
+        // A replaceable ancestor would defeat lstat/O_NOFOLLOW checks on children.
+        if (typeof process.getuid === 'function' && stat.uid !== 0 && stat.uid !== process.getuid()) throw new Error();
+        if ((stat.mode & 0o022) && !(stat.mode & 0o1000)) throw new Error();
+        if ((current === base || current === plugins || current === directory) && typeof process.getuid === 'function' && stat.uid !== process.getuid()) throw new Error();
+        if ((current === base || current === plugins) && (stat.mode & 0o022)) throw new Error();
+        if (current === directory && (stat.mode & 0o7777) !== 0o700) throw new Error();
+      }
+      if (await fs.realpath(directory) !== directory) throw new Error();
+      return directory;
+    } catch { throw storageError(); }
+  }
+
+  async readSettingsFile(directory) {
+    const filename = path.join(directory, 'settings.json');
+    let file;
+    try {
+      let before;
+      try { before = await fs.lstat(filename); }
+      catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || (before.mode & 0o7777) !== 0o600 ||
+          (typeof process.getuid === 'function' && before.uid !== process.getuid()) || before.size > SETTINGS_LIMIT) throw new Error();
+      file = await fs.open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+      const opened = await file.stat();
+      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.nlink !== 1 ||
+          (opened.mode & 0o7777) !== 0o600 || opened.size > SETTINGS_LIMIT) throw new Error();
+      const buffer = Buffer.alloc(SETTINGS_LIMIT + 1);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
+        if (!bytesRead) break;
+        offset += bytesRead;
+      }
+      const after = await fs.lstat(filename);
+      if (offset > SETTINGS_LIMIT || !after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino ||
+          after.nlink !== 1 || (after.mode & 0o7777) !== 0o600 ||
+          (typeof process.getuid === 'function' && after.uid !== process.getuid())) throw new Error();
+      const settings = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, offset)));
+      if (!this.validSettings(settings)) throw new Error();
+      return settings;
+    } catch { throw settingsError(); }
+    finally { await file?.close().catch(() => {}); }
+  }
+
+  async loadSettings() {
+    const directory = await this.settingsDirectoryAccess(false);
+    const settings = directory ? await this.readSettingsFile(directory) : null;
+    if (settings?.apiKey && !this.secrets.has(settings.apiKey)) {
+      this.secrets.add(settings.apiKey);
+      this.secretPattern = this.buildSecretPattern();
+    }
+    return settings;
+  }
+
+  async getSettings() {
+    return this.withSharedLease(async () => {
+      const saved = await this.loadSettings();
+      return saved ? { python: saved.python, workspace: saved.workspace, apiKeySet: Boolean(saved.apiKey) || Boolean(this.env.FLOWX_LLM_API_KEY) } : this.fallbackSettings();
+    });
+  }
+
+  saveSettings(submitted) {
+    if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+    if (buildOwner || inspections) throw busy();
+    // Reserve the lease synchronously, including while queued behind another save.
+    settingsWrites++;
+    const operation = settingsTail.then(async () => {
+      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+      const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
+      // An empty key keeps the previously saved one.
+      const apiKey = submitted.apiKey || previous?.apiKey;
+      const settings = { python: submitted.python, workspace: submitted.workspace, ...(apiKey ? { apiKey } : {}) };
+      if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
+      await this.validateConfig(settings, false);
+      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+      const directory = await this.settingsDirectoryAccess(true);
+      const filename = path.join(directory, 'settings.json');
+      await this.readSettingsFile(directory);
+      const temporary = path.join(directory, `.settings-${randomUUID()}.tmp`);
+      let file, created = false;
+      try {
+        file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+        created = true;
+        await file.chmod(0o600);
+        await file.writeFile(JSON.stringify(settings) + '\n', 'utf8');
+        await file.sync();
+        await file.close();
+        file = null;
+        // Recheck the directory and target immediately before atomic replacement.
+        await this.settingsDirectoryAccess(false);
+        await this.readSettingsFile(directory);
+        if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+        await fs.rename(temporary, filename);
+        created = false;
+      } catch (error) {
+        if (error instanceof HostError) throw error;
+        throw storageError();
+      } finally {
+        await file?.close().catch(() => {});
+        if (created) await fs.unlink(temporary).catch(() => {});
+      }
+      // Other service instances can share this settings file and cache the old root.
+      for (const reference of services) {
+        const service = reference.deref();
+        if (!service) { services.delete(reference); continue; }
+        service.artifacts.clear();
+        service.graphSnapshot = null;
+      }
+      return { python: settings.python, workspace: settings.workspace, apiKeySet: Boolean(settings.apiKey) || Boolean(this.env.FLOWX_LLM_API_KEY) };
+    });
+    const completion = operation.finally(() => { settingsWrites--; this.settingsOps.delete(completion); });
+    this.settingsOps.add(completion);
+    settingsTail = completion.catch(() => {});
+    return completion;
+  }
+
   async config() {
-    const workspace = this.env.FLOWX_WORKSPACE;
-    const python = this.env.FLOWX_PYTHON;
-    const skill = this.env.FLOWX_SKILL_DIR ?? DEFAULT_SKILL;
-    if (![workspace, python, skill].every(p => typeof p === 'string' && path.isAbsolute(p))) {
-      throw problem('configuration', 'FLOWX_WORKSPACE, FLOWX_PYTHON and FLOWX_SKILL_DIR must be absolute paths.');
+    const saved = await this.loadSettings();
+    return { ...await this.validateConfig(saved ?? this.fallbackSettings(), true), savedSettings: saved };
+  }
+
+  async validateConfig(settings, createStorage) {
+    const { workspace, python } = settings;
+    if (![workspace, python].every(p => typeof p === 'string' && path.isAbsolute(p))) {
+      throw problem('configuration', 'FLOWX_WORKSPACE and FLOWX_PYTHON must be absolute paths.');
     }
     try {
       // Execute the configured Python path, not its realpath: a venv's symlink
       // must remain argv[0] so Python discovers pyvenv.cfg and its packages.
-      const [root, skillRoot] = await Promise.all([fs.realpath(workspace), fs.realpath(skill)]);
+      const [root, skillRoot] = await Promise.all([fs.realpath(workspace), this.skillRoot()]);
       const interpreter = path.normalize(python);
-      const [rootStat, pythonStat, skillStat] = await Promise.all([fs.stat(root), fs.stat(interpreter), fs.stat(skillRoot)]);
-      if (!rootStat.isDirectory() || !pythonStat.isFile() || !skillStat.isDirectory()) throw new Error();
+      const [rootStat, pythonStat] = await Promise.all([fs.stat(root), fs.stat(interpreter)]);
+      if (!rootStat.isDirectory() || !pythonStat.isFile()) throw new Error();
       await fs.access(interpreter, constants.X_OK);
       const scripts = {};
       for (const name of ['build.py', 'inspect_workflow.py']) {
@@ -149,16 +385,20 @@ export class FlowXHostService {
         if (!inside(skillRoot, script) || !(await fs.stat(script)).isFile()) throw new Error();
         scripts[name] = script;
       }
-      await this.checkStorage(root);
+      await this.checkStorage(root, createStorage);
       return { root, interpreter, scripts };
     } catch { throw problem('configuration', 'FlowX paths must refer to an existing workspace, executable interpreter and skill scripts.'); }
   }
 
-  async checkStorage(root) {
+  async checkStorage(root, create = true) {
     // The SDK scans */agent.json even for list and before building a new workflow.
     // Refuse redirects there before handing the workspace to Python.
     const directory = path.join(root, 'workflows');
-    await fs.mkdir(directory, { recursive: false }).catch(error => { if (error.code !== 'EEXIST') throw error; });
+    if (create) await fs.mkdir(directory, { recursive: false }).catch(error => { if (error.code !== 'EEXIST') throw error; });
+    else {
+      try { await fs.lstat(directory); }
+      catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    }
     if (await fs.realpath(directory) !== directory || !(await fs.stat(directory)).isDirectory()) throw new Error();
     for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
       if (entry.isSymbolicLink()) throw new Error();
@@ -169,7 +409,7 @@ export class FlowXHostService {
     }
   }
 
-  spawnChild(command, args) {
+  spawnChild(command, args, settings) {
     // Keep Python, proxy and provider configuration, but drop unrelated secrets.
     // Credential paths and the explicitly supported FlowX/LLM keys are retained.
     const env = Object.fromEntries(Object.entries(this.env).filter(([key, value]) => {
@@ -177,6 +417,10 @@ export class FlowXHostService {
       if (PROVIDER_CREDENTIALS.has(upper) || CREDENTIAL_PATHS.has(upper) || PROVIDER_URLS.has(upper)) return true;
       return !SECRET_ENV.test(key) && !(typeof value === 'string' && URL_CREDENTIALS.test(value));
     }));
+    if (settings) {
+      Object.assign(env, { FLOWX_PYTHON: settings.python, FLOWX_WORKSPACE: settings.workspace });
+      if (settings.apiKey) env.FLOWX_LLM_API_KEY = settings.apiKey;
+    }
     const child = this.spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: process.platform !== 'win32' });
     this.children.add(child);
     // stderr can contain credentials and arbitrary test output: drain, never retain or log it.
@@ -209,7 +453,7 @@ export class FlowXHostService {
 
   async start(prompt) {
     if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-    if (buildOwner || inspections) throw busy();
+    if (buildOwner || inspections || settingsWrites) throw busy();
     buildOwner = this;
     const run = { child: null, temp: null, terminal: null, failure: null, abortRequested: false, done: null };
     run.startFinished = new Promise(resolve => { run.finishStart = resolve; });
@@ -222,7 +466,7 @@ export class FlowXHostService {
       await fs.writeFile(promptFile, prompt, { mode: 0o600, flag: 'wx' });
       if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
       run.config = config;
-      const child = this.spawnChild(config.interpreter, [config.scripts['build.py'], '--workspace', config.root, 'new', '--host', '127.0.0.1', '--prompt-file', promptFile]);
+      const child = this.spawnChild(config.interpreter, [config.scripts['build.py'], '--workspace', config.root, 'new', '--host', '127.0.0.1', '--prompt-file', promptFile], config.savedSettings);
       run.child = child;
       run.done = this.watchBuild(run);
       this.update({ status: 'running' });
@@ -419,27 +663,33 @@ export class FlowXHostService {
     if (buildOwner === this) buildOwner = null;
   }
 
-  async withInspection(operation) {
+  async withSharedLease(operation) {
     if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-    if (buildOwner) throw busy();
+    if (settingsWrites || buildOwner) throw busy();
     inspections++;
     let finish;
     const completion = new Promise(resolve => { finish = resolve; });
     this.inspectionOps.add(completion);
     try {
-      const config = await this.config();
-      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-      const result = await operation(config);
+      const result = await operation();
       if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
       return result;
     } finally { inspections--; this.inspectionOps.delete(completion); finish(); }
+  }
+
+  async withInspection(operation) {
+    return this.withSharedLease(async () => {
+      const config = await this.config();
+      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+      return operation(config);
+    });
   }
 
   async runInspection(config, operation, id) {
     if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
     const args = [config.scripts['inspect_workflow.py'], '--workspace', config.root, operation];
     if (id) args.push('--workflow-id', id);
-    const child = this.spawnChild(config.interpreter, args);
+    const child = this.spawnChild(config.interpreter, args, config.savedSettings);
     child.stdin.end();
     return new Promise((resolve, reject) => {
       let chunks = [], size = 0, failure = null;
@@ -463,25 +713,27 @@ export class FlowXHostService {
     });
   }
 
-  async list() {
-    return this.withInspection(async config => {
-      const data = await this.runInspection(config, 'list');
-      if (!object(data)) throw problem('inspection-failed', 'Workflow inspection returned invalid data.');
-      const workflows = {};
-      for (const [id, entry] of Object.entries(data)) {
-        if (!workflowId(id) || !this.safeIdentifier(id) || !object(entry) || !object(entry.nodes) || !Number.isSafeInteger(entry.workflow_version) || entry.workflow_version < 0 || !this.safeIdentifier(entry.main_entrypoint_id) || typeof entry.has_graph !== 'boolean' || typeof entry.has_main !== 'boolean' || !object(entry.errors)) throw problem('inspection-failed', 'Workflow inspection returned invalid data.');
-        const nodes = {};
-        for (const [node, nodeId] of Object.entries(entry.nodes)) {
-          if (!this.safeIdentifier(node) || (nodeId !== null && !this.safeIdentifier(nodeId))) throw problem('inspection-failed', 'Workflow inspection returned invalid data.');
-          Object.defineProperty(nodes, node, { value: nodeId, enumerable: true });
-        }
-        // Catalog errors can contain arbitrary logs, paths and credentials; reveal only their redacted keys.
-        const errors = {};
-        for (const key of Object.keys(entry.errors)) Object.defineProperty(errors, this.redact(key), { value: 'Details withheld.', enumerable: true, configurable: true });
-        workflows[id] = { nodes, workflow_version: entry.workflow_version, main_entrypoint_id: entry.main_entrypoint_id, has_graph: entry.has_graph, has_main: entry.has_main, errors };
+  async catalog(config) {
+    const data = await this.runInspection(config, 'list');
+    if (!object(data)) throw problem('inspection-failed', 'Workflow inspection returned invalid data.');
+    const workflows = {};
+    for (const [id, entry] of Object.entries(data)) {
+      if (!workflowId(id) || !this.safeIdentifier(id) || !object(entry) || !object(entry.nodes) || !Number.isSafeInteger(entry.workflow_version) || entry.workflow_version < 0 || !this.safeIdentifier(entry.main_entrypoint_id) || typeof entry.has_graph !== 'boolean' || typeof entry.has_main !== 'boolean' || !object(entry.errors)) throw problem('inspection-failed', 'Workflow inspection returned invalid data.');
+      const nodes = {};
+      for (const [node, nodeId] of Object.entries(entry.nodes)) {
+        if (!this.safeIdentifier(node) || (nodeId !== null && !this.safeIdentifier(nodeId))) throw problem('inspection-failed', 'Workflow inspection returned invalid data.');
+        Object.defineProperty(nodes, node, { value: nodeId, enumerable: true });
       }
-      return { workflows };
-    });
+      // Catalog errors can contain arbitrary logs, paths and credentials; reveal only their redacted keys.
+      const errors = {};
+      for (const key of Object.keys(entry.errors)) Object.defineProperty(errors, this.redact(key), { value: 'Details withheld.', enumerable: true, configurable: true });
+      workflows[id] = { nodes, workflow_version: entry.workflow_version, main_entrypoint_id: entry.main_entrypoint_id, has_graph: entry.has_graph, has_main: entry.has_main, errors };
+    }
+    return { workflows };
+  }
+
+  async list() {
+    return this.withInspection(config => this.catalog(config));
   }
 
   async workflowRoot(root, id) {
@@ -539,7 +791,7 @@ export class FlowXHostService {
     });
   }
 
-  async readMapped(root, id, relative, graph = false) {
+  async readMapped(root, id, relative, graph = false, { browse = false } = {}) {
     if (!relativeArtifact(relative) || !TEXT_TYPES.has(path.extname(relative).toLowerCase())) throw problem('artifact-unavailable', 'The artifact is unavailable or unsafe.');
     let file;
     try {
@@ -551,7 +803,7 @@ export class FlowXHostService {
       if (!before.isFile() || before.size > LIMIT) throw new Error();
       file = await fs.open(real, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
       const opened = await file.stat();
-      if (!opened.isFile() || opened.size > LIMIT || opened.dev !== before.dev || opened.ino !== before.ino || await fs.realpath(candidate) !== real) throw new Error();
+      if (!opened.isFile() || opened.size > LIMIT || (browse && opened.nlink !== 1) || opened.dev !== before.dev || opened.ino !== before.ino || await fs.realpath(candidate) !== real) throw new Error();
       const buffer = Buffer.alloc(LIMIT + 1);
       let offset = 0;
       while (offset < buffer.length) {
@@ -561,7 +813,18 @@ export class FlowXHostService {
       }
       if (offset > LIMIT) throw new Error();
       const source = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, offset));
-      const content = graph ? this.sanitizeGraph(source) : this.redact(source);
+      if (browse && /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(source)) throw new Error();
+      // All JSON and JSON-shaped text gets structural redaction, including graph
+      // aliases and escaped credentials. Invalid JSON fails closed.
+      const structured = graph || (browse && (path.extname(relative).toLowerCase() === '.json' || /^\s*[\[{]/.test(source)));
+      let content = structured ? this.sanitizeGraph(source) : this.redact(source);
+      if (browse && relative === 'agent.json') {
+        const manifest = JSON.parse(content);
+        if (!object(manifest)) throw new Error();
+        if (Object.hasOwn(manifest, 'errors')) manifest.errors = 'Details withheld.';
+        if (typeof manifest.main_entrypoint_path === 'string') manifest.main_entrypoint_path = '[withheld]';
+        content = JSON.stringify(manifest);
+      }
       if (!text(content)) throw new Error();
       return { workflowId: id, path: relative, content, bytes: offset, cached: false };
     } catch { throw problem('artifact-unavailable', 'The artifact is unavailable, unsafe, too large or not UTF-8 text.'); }
@@ -569,6 +832,7 @@ export class FlowXHostService {
   }
 
   async readArtifact(id, relative) {
+    if (settingsWrites) throw busy();
     if (buildOwner) {
       if (this.graphSnapshot?.workflowId === id && this.graphSnapshot.path === relative) return { ...this.graphSnapshot, cached: true };
       throw busy();
@@ -577,6 +841,97 @@ export class FlowXHostService {
       const entry = this.artifacts.get(id);
       if (!entry || entry.root !== config.root || !this.pathsIn(entry.map).has(relative)) throw problem('artifact-unavailable', 'Inspect the workflow before reading one of its listed artifacts.');
       return this.readMapped(config.root, id, relative, relative === entry.map.graph);
+    });
+  }
+
+  safeFolderPath(relative) {
+    return relative === '' || (relativeArtifact(relative) && relative.split('/').every(part =>
+      !part.startsWith('.') && !SECRET_PATH.test(part) && this.safeIdentifier(part)));
+  }
+
+  folderGraph(root, id, relative) {
+    const entry = this.artifacts.get(id);
+    return (entry?.root === root && entry.map.graph === relative) ||
+      (this.graphSnapshot?.workflowId === id && this.graphSnapshot.path === relative);
+  }
+
+  async folderWorkflow(config, id) {
+    if (!this.safeIdentifier(id)) throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.');
+    const directory = await this.workflowRoot(config.root, id);
+    // The SDK scans */agent.json; verify this exact directory's regular marker
+    // and its id before invoking it, then require actual catalog membership.
+    const marker = await this.readMapped(config.root, id, 'agent.json', true, { browse: true });
+    try { if (JSON.parse(marker.content).workflow_id !== id) throw new Error(); }
+    catch { throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.'); }
+    const { workflows } = await this.catalog(config);
+    if (!Object.hasOwn(workflows, id)) throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.');
+    return directory;
+  }
+
+  async folderDirectory(directory, relative) {
+    try {
+      const candidate = relative ? path.join(directory, ...relative.split('/')) : directory;
+      if ((relative && !inside(directory, candidate)) || await fs.realpath(candidate) !== candidate || !(await fs.lstat(candidate)).isDirectory()) throw new Error();
+      return candidate;
+    } catch { throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.'); }
+  }
+
+  async listFolder(id, relative) {
+    return this.withInspection(async config => {
+      if (!this.safeFolderPath(relative)) throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.');
+      const directory = await this.folderWorkflow(config, id);
+      const target = await this.folderDirectory(directory, relative);
+      const entries = [];
+      let scanned = 0, metadata = 0, probed = 0, truncated = false;
+      try {
+        const before = await fs.lstat(target);
+        const handle = await fs.opendir(target);
+        for await (const item of handle) {
+          if (++scanned > FOLDER_SCAN_LIMIT) { truncated = true; break; }
+          const itemPath = relative ? `${relative}/${item.name}` : item.name;
+          if (!this.safeFolderPath(itemPath) || item.isSymbolicLink()) continue;
+          const candidate = path.join(target, item.name);
+          let stat;
+          try {
+            stat = await fs.lstat(candidate);
+            if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile()) || await fs.realpath(candidate) !== candidate) continue;
+          } catch { continue; }
+          if (entries.length >= FOLDER_ENTRY_LIMIT) { truncated = true; break; }
+          const isDirectory = stat.isDirectory();
+          let readable = isDirectory;
+          if (!isDirectory && stat.nlink === 1 && stat.size <= LIMIT && TEXT_TYPES.has(path.extname(item.name).toLowerCase())) {
+            if (probed + stat.size > FOLDER_PROBE_LIMIT) truncated = true;
+            else {
+              probed += stat.size;
+              try { await this.readMapped(config.root, id, itemPath, this.folderGraph(config.root, id, itemPath), { browse: true }); readable = true; }
+              catch { /* Leave unsafe or invalid text disabled. */ }
+            }
+          }
+          const entry = { name: item.name, path: itemPath, type: isDirectory ? 'directory' : 'file', readable };
+          const bytes = Buffer.byteLength(JSON.stringify(entry)) + 1;
+          if (metadata + bytes > FOLDER_RESPONSE_LIMIT) { truncated = true; break; }
+          metadata += bytes;
+          entries.push(entry);
+        }
+        // Detect ordinary directory replacement while enumerating. This is not
+        // an OS sandbox or a lock against concurrent external workspace edits.
+        await this.folderDirectory(directory, relative);
+        const after = await fs.lstat(target);
+        if (!after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) throw new Error();
+      } catch (error) {
+        if (error instanceof HostError) throw error;
+        throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.');
+      }
+      entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      return { workflowId: id, path: relative, entries, truncated };
+    });
+  }
+
+  async readFolderFile(id, relative) {
+    return this.withInspection(async config => {
+      if (!this.safeFolderPath(relative)) throw problem('artifact-unavailable', 'The artifact is unavailable or unsafe.');
+      await this.folderWorkflow(config, id);
+      return this.readMapped(config.root, id, relative, this.folderGraph(config.root, id, relative), { browse: true });
     });
   }
 
@@ -590,8 +945,11 @@ export class FlowXHostService {
       if (run?.done) await run.done;
       await Promise.all([...this.children].map(child => new Promise(resolve => child.once('close', resolve))));
       await Promise.all([...this.inspectionOps]);
+      await Promise.allSettled([...this.settingsOps]);
       this.artifacts.clear();
       this.graphSnapshot = null;
+      services.delete(this.serviceReference);
+      serviceFinalizer.unregister(this.serviceReference);
       this.update({ status: 'disposed', requestId: null, awaiting: null, result: null, error: null });
     })();
     return this.disposePromise;

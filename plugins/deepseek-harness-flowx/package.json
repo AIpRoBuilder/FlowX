@@ -1,7 +1,8 @@
 {
   "name": "dsh-flowx-plugin",
   "version": "0.1.0",
-  "description": "Build and inspect FlowX workflows in the DeepSeek Harness web interface.",
+  "description": "FlowX workflow viewer for the DeepSeek Harness web profile (read-only interface planned).",
+  "//": "Modified 2026-11-10: describe the requested read-only workflow viewer.",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {

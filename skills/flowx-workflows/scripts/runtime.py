@@ -73,7 +73,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--workspace", required=True, type=_nonempty, help="FlowX workspace directory")
+    parser.add_argument("--workspace", required=True, type=_nonempty, help="FlowX workspace directory (defaults to the plugin's saved workspace)")
     parser.add_argument("--workflow-id", required=True, type=_nonempty, help="Generated workflow ID")
     parser.add_argument("--session-id", type=_nonempty, help="Session ID (default: a new UUID)")
     parser.add_argument("--timeout", type=_positive_float, default=1200.0,
@@ -296,4 +296,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import plugin_settings
+
+    _workspace = plugin_settings.apply(None)  # may re-exec under the plugin's Python
+    _argv = sys.argv[1:]
+    if _workspace and not any(a == "--workspace" or a.startswith("--workspace=") for a in _argv):
+        _argv += ["--workspace", _workspace]
+    raise SystemExit(main(_argv))
