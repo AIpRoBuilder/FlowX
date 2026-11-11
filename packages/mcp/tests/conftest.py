@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified 2026-11-03: add recovery-state support to the MCP test client.
 # Modified 2026-11-03: record allocated-graph and background workflow SDK calls.
+# Modified 2026-11-11: accept names in the allocation test double.
 """Load the MCP server in isolation: stubbed MCP SDK, bootstrap and FlowX SDK; no core, pools or network."""
 
 from __future__ import annotations
@@ -40,9 +41,9 @@ class FakeClient:
             raise outcome
         return outcome
 
-    def create_workflow(self):
-        self.calls.append(("create_workflow", (), {}))
-        outcome = self.results.get("create_workflow", "wf1")
+    def create_workflow(self, **kwargs):
+        self.calls.append(("create_workflow", (), kwargs))
+        outcome = self.results.get("create_workflow", kwargs.get("name", "wf1"))
         if isinstance(outcome, Exception):
             raise outcome
         return outcome

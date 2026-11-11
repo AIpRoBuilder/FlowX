@@ -4,6 +4,7 @@
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Added 2026-11-05: provide a JSON-lines SDK build and repair interface.
 # Modified 2026-11-06: document the node-test pause and answer protocol in CLI help.
+# Modified 2026-11-11: require a workflow folder name when allocating from the skill.
 """Build and evolve FlowX workflows; exchange repair answers over stdin as JSON lines."""
 
 from __future__ import annotations
@@ -73,9 +74,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", help="FlowX workspace; defaults to the plugin's saved workspace, then FLOWX_DEFAULT_WORKSPACE")
     commands = parser.add_subparsers(dest="operation", required=True)
 
-    commands.add_parser("allocate", help="Allocate an empty workflow id")
+    allocate = commands.add_parser("allocate", help="Allocate an empty named workflow")
+    allocate.add_argument("--name", required=True, help="New workflow folder name and id")
     new = commands.add_parser("new", help="Allocate and build a complete workflow")
-    new.add_argument("--workflow-id", help="Previously allocated empty workflow id")
+    new_target = new.add_mutually_exclusive_group(required=True)
+    new_target.add_argument("--name", help="New workflow folder name and id")
+    new_target.add_argument("--workflow-id", help="Previously allocated empty workflow id")
     text_options(new)
     build_options(new, cascade=True)
     new.add_argument("--host", default="0.0.0.0")
@@ -83,7 +87,9 @@ def make_parser() -> argparse.ArgumentParser:
     new.add_argument("--smoke-test", action="store_true")
 
     graph = commands.add_parser("graph", help="Create or modify only graph and requirements")
-    graph.add_argument("--workflow-id", help="Allocated or existing id; omit to allocate")
+    graph_target = graph.add_mutually_exclusive_group(required=True)
+    graph_target.add_argument("--name", help="New workflow folder name and id")
+    graph_target.add_argument("--workflow-id", help="Allocated or existing workflow id")
     text_options(graph)
     build_options(graph)
 
@@ -122,7 +128,7 @@ def prompt_text(args: argparse.Namespace) -> str:
 
 def run_operation(client: FlowXClient, args: argparse.Namespace) -> Any:
     if args.operation == "allocate":
-        workflow_id = sdk_call(client.create_workflow)
+        workflow_id = sdk_call(client.create_workflow, name=args.name)
         emit("allocated", workflow_id=workflow_id)
         return None
 
@@ -144,7 +150,7 @@ def run_operation(client: FlowXClient, args: argparse.Namespace) -> Any:
 
     workflow_id = args.workflow_id
     if args.operation in {"new", "graph"} and not workflow_id:
-        workflow_id = sdk_call(client.create_workflow)
+        workflow_id = sdk_call(client.create_workflow, name=args.name)
         emit("allocated", workflow_id=workflow_id)
     if args.operation in {"nodes", "evolve", "repair"} and args.cascade:
         # The SDK defaults would otherwise reset an existing local binding to 0.0.0.0.

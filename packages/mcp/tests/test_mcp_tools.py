@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified 2026-11-03: test background build polling and guarded repair recovery.
 # Modified 2026-11-03: migrate synchronous build coverage to background-only MCP tools.
+# Modified 2026-11-11: cover named and legacy allocation through MCP.
 """MCP tools delegate to the FlowX engine API and report results and failures as JSON."""
 
 import json
@@ -13,8 +14,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.shared.memory import create_connected_server_and_client_session
 
 
-def call(mcp_server, name, **kwargs):
-    return json.loads(mcp_server.tools[name](**kwargs))
+def call(mcp_server, tool_name, **kwargs):
+    return json.loads(mcp_server.tools[tool_name](**kwargs))
 
 
 def engine_calls(client):
@@ -69,6 +70,14 @@ def test_registers_one_tool_per_engine_function(mcp_server):
         "run_service", "stop_service", "list_workflows", "list_nodes", "get_workflow",
         "run_step", "reset_session",
     }
+
+
+def test_create_workflow_forwards_name_and_supports_legacy_calls(mcp_server):
+    assert call(mcp_server, "create_workflow", name="Ticket Triage")["workflow_id"] == "Ticket Triage"
+    assert call(mcp_server, "create_workflow")["workflow_id"] == "wf1"
+    assert engine_calls(mcp_server.client) == [
+        ("create_workflow", (), {"name": "Ticket Triage"}), ("create_workflow", (), {}),
+    ]
 
 
 START_CASES = [

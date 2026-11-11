@@ -4,6 +4,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Adapted the generated service HTTP and SSE protocol from flowx_mcp.server.
+# Modified 2026-11-11: describe workflow IDs without assuming they are generated.
 """Run one generated FlowX service and exchange JSON lines over stdin/stdout."""
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ def _parser() -> argparse.ArgumentParser:
         description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--workspace", required=True, type=_nonempty, help="FlowX workspace directory (defaults to the plugin's saved workspace)")
-    parser.add_argument("--workflow-id", required=True, type=_nonempty, help="Generated workflow ID")
+    parser.add_argument("--workflow-id", required=True, type=_nonempty, help="Allocated workflow ID")
     parser.add_argument("--session-id", type=_nonempty, help="Session ID (default: a new UUID)")
     parser.add_argument("--timeout", type=_positive_float, default=1200.0,
                         help="HTTP step/reset timeout in seconds (default: 1200)")

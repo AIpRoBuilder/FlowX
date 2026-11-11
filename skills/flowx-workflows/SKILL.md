@@ -13,6 +13,7 @@ description: 'Use when choosing, reusing, naming, building, auditing, inspecting
 <!-- Modified 2026-11-06: guide agents through monitoring and resuming interactive builds. -->
 <!-- Modified 2026-11-08: start and retain the reviewed service after complete builds. -->
 <!-- Modified 2026-11-10: select existing workflows before building and forward requested names. -->
+<!-- Modified 2026-11-11: use user-provided or description-derived names for new workflow folders. -->
 
 # FlowX workflows
 
@@ -37,8 +38,9 @@ background builds; do not start a second writer in the same workspace.
    chosen environment and `WS` to the desired absolute workspace path. Examples
    below use macOS/Linux shell syntax; substitute actual paths. All scripts
    must be copied with this skill.
-3. Use Python 3.10+ and verify `"$PY" -c 'from flowx_sdk import FlowXClient'`.
-   If missing, use an existing suitable virtual environment or create a dedicated
+3. Use Python 3.10+ and verify the SDK supports named allocation with
+   `"$PY" -c 'import inspect; from flowx_sdk import FlowXClient; assert "name" in inspect.signature(FlowXClient.create_workflow).parameters'`.
+   If missing or too old, use an existing suitable virtual environment or create a dedicated
    environment at an unused path (`python3 -m venv /path/to/venv`), then install
    a trusted checkout with `"$PY" -m pip install -e /path/to/FlowX` or, if no
    checkout is available, `"$PY" -m pip install 'git+https://github.com/AIpRoBuilder/FlowX.git'`.
@@ -70,8 +72,9 @@ effects, constraints, and available artifacts, not just a similar node or name:
 
 - An explicit workflow ID is the intended target; verify it exists and is
    suitable, and do not silently substitute another. For a requested workflow
-   name, compare it with available requirement/graph content and resolve it to
-   an actual catalog ID. Names are not unique or guaranteed to be recorded.
+   name, first check for an exact catalog ID match and inspect its contents.
+   Older workflows may have generated IDs and names recorded only in their
+   requirements; compare those contents and resolve them to the actual catalog ID.
 - Reuse a suitable existing workflow when it meets the request. Before running,
    check it has the necessary built artifacts and no relevant unresolved errors;
    review its code and service binding as below. A matching but incomplete,
@@ -86,12 +89,23 @@ effects, constraints, and available artifacts, not just a similar node or name:
    user requested or authorizes creation. A requested new workflow takes priority
    over reuse. Report the chosen ID and the reason for reuse, change, or creation.
 
-For a new workflow with a user-specified workflow name, include that exact name
-in the requirement passed to `new --prompt` or `--prompt-file` (and in the MCP
-`start_new_workflow` prompt). The SDK allocates the ID; `--workflow-id` accepts
-an already allocated ID, not a new name. The name in a requirement is not a
-guaranteed persistent alias or a unique lookup key; report the allocated ID so
-the user can select the workflow reliably later.
+For every new workflow, pass a folder name explicitly to `new --name`,
+`graph --name`, or `allocate --name`. Use the exact user-specified workflow
+name if provided; otherwise, as the LLM assistant, choose a short descriptive
+name based on the workflow's requirements and pass it yourself. Do not generate
+an opaque ID or ask the user for a name just because they omitted one. The name
+is both the folder name under `WS/workflows` and the `workflow_id`; it is not a
+runtime input. Preserve the full requirements in the prompt as well.
+
+Names must be a single nonempty folder name with no leading or trailing
+whitespace, trailing dot, path separators, control characters, or Windows
+reserved characters/names. If a user-specified name is invalid, explain and ask
+for a safe alternative instead of silently changing it. Allocation fails if a
+folder or file already exists at that name; never overwrite it. For a collision,
+ask the user to choose another name when they supplied it; for an assistant-chosen
+name, choose another descriptive name. Existing UUID-based workflows remain
+accessible by their original IDs. `--workflow-id` selects an already allocated
+workflow and cannot be combined with `--name`.
 
 If the user instead supplies a person's name or another value for a workflow
 run, preserve it as runtime input, not as the workflow ID or a build instruction.
@@ -144,10 +158,12 @@ Keep interactive repair enabled: do not use `--auto-repair` or set MCP
 
 Use this route only when FlowX MCP tools are available and the server is already
 configured for the intended workspace (`FLOWX_DEFAULT_WORKSPACE` is read by its
-client); keep the same server process alive throughout. Do not mix MCP and SDK
+client) and its `create_workflow` tool exposes `name`; otherwise use the SDK
+script or upgrade the server with authorization. Keep the same server process alive throughout. Do not mix MCP and SDK
 writers or expect one process to resume the other's paused request.
 
-1. Call `create_workflow`, save its `workflow_id`, then call
+1. Call `create_workflow(name=...)` with the user-provided or description-derived
+   folder name, save its `workflow_id`, then call
    `start_new_workflow(workflow_id=..., prompt=..., interactive=true)` with the
    user's requirements. It returns before generation finishes. Avoid `serve`
    or `smoke_test` unless their side effects are authorized.
@@ -190,11 +206,11 @@ as one quoted argument or use `--prompt-file /path/to/requirements.txt` for a
 UTF-8 file. The examples below are alternatives, not a single mandatory sequence.
 
 ```bash
-# Allocate an ID, or create and build a complete workflow in one command.
-"$PY" "$SKILL/scripts/build.py" --workspace "$WS" allocate
-"$PY" "$SKILL/scripts/build.py" --workspace "$WS" new --host 127.0.0.1 --prompt 'Classify support tickets and draft replies.'
-# A requested workflow name is part of the requirements, not its allocated ID.
-"$PY" "$SKILL/scripts/build.py" --workspace "$WS" new --host 127.0.0.1 --prompt 'Name this workflow Ticket Triage. Classify support tickets and draft replies.'
+# Alternatives: allocate for a staged build, or allocate and build in one command.
+"$PY" "$SKILL/scripts/build.py" --workspace "$WS" allocate --name 'Ticket Triage'
+"$PY" "$SKILL/scripts/build.py" --workspace "$WS" new --name 'Ticket Triage' --host 127.0.0.1 --prompt 'Classify support tickets and draft replies.'
+# Alternatively create only the graph in a newly named workflow.
+"$PY" "$SKILL/scripts/build.py" --workspace "$WS" graph --name 'Ticket Triage' --prompt 'Classify support tickets and draft replies.'
 
 # Staged creation; capture the allocated workflow_id from stdout first.
 "$PY" "$SKILL/scripts/build.py" --workspace "$WS" graph --workflow-id "$WF" --prompt-file /path/to/requirements.txt
@@ -215,9 +231,10 @@ UTF-8 file. The examples below are alternatives, not a single mandatory sequence
 
 Set `WF` from the actual `allocated` or `result` event, and `STEP` from `nodes`;
 never assume example IDs exist. `new --workflow-id "$WF"` builds an allocated
-**empty** workflow; without it `new` allocates first and immediately emits the ID.
-`graph` allocates if no ID is supplied and modifies a complete existing plan if
-one is supplied; it does not rebuild nodes or the entrypoint. A partial plan is
+**empty** workflow; `new --name` allocates first and immediately emits the ID.
+`graph --name` allocates a new workflow; `graph --workflow-id` creates an
+allocated plan or modifies a complete existing plan. It does not rebuild nodes
+or the entrypoint. A partial plan is
 not overwritten: inspect and recover it before retrying. `nodes --amend` may be
 repeated for distinct step IDs. `main` regenerates the entrypoint; arbitrary
 entrypoint amendments are not supported by this SDK version.

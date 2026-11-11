@@ -3,8 +3,10 @@ from __future__ import annotations
 # Modified 2026-11-02: cover iterative node retries and paused-run cleanup.
 # Modified 2026-11-03: cover allocated workflow creation and recovery-state reporting.
 # Modified 2026-11-03: cover allocated graph creation, modification, and overwrite safeguards.
+# Modified 2026-11-11: cover named workflow allocation and storage safety.
 
 import json
+import threading
 from dataclasses import replace
 from graphlib import TopologicalSorter
 from pathlib import Path
@@ -658,6 +660,83 @@ def test_allocated_workflow_builds_with_create_intent(native_world):
 		agent.build_new_workflow(workflow_id, "do not overwrite")
 
 
+def test_named_allocation_persists_and_legacy_ids_reload(tmp_path, monkeypatch):
+	monkeypatch.setattr(engine_module, "init_workflow_engine", lambda *args, **kwargs: None)
+	root = tmp_path / "workflows"
+	agent = AgentWorkflowEngine(storage_dir=root)
+	try:
+		record = agent.create_record("Ticket Triage")
+		legacy = agent.resolve_record(None)
+		assert record.workflow_id == "Ticket Triage"
+		assert record.storage_dir == root / "Ticket Triage"
+		assert json.loads((record.storage_dir / "agent.json").read_text())["workflow_id"] == "Ticket Triage"
+		assert legacy.workflow_id != record.workflow_id
+		assert agent.catalog()["Ticket Triage"]["has_graph"] is False
+	finally:
+		agent.close()
+	reloaded = AgentWorkflowEngine(storage_dir=root)
+	try:
+		assert set(reloaded.workflow_ids) == {record.workflow_id, legacy.workflow_id}
+		assert reloaded.record("Ticket Triage").storage_dir == root / "Ticket Triage"
+	finally:
+		reloaded.close()
+
+
+def test_worker_can_allocate_while_run_lock_is_held(tmp_path, monkeypatch):
+	monkeypatch.setattr(engine_module, "init_workflow_engine", lambda *args, **kwargs: None)
+	agent = AgentWorkflowEngine(storage_dir=tmp_path / "workflows")
+	created = []
+	try:
+		with agent._run_lock:
+			worker = threading.Thread(target=lambda: created.append(agent.resolve_record(None)))
+			worker.start()
+			worker.join(timeout=3)
+			assert not worker.is_alive(), "allocation must not wait on the caller's run lock"
+		assert len(created) == 1
+	finally:
+		agent.close()
+
+
+@pytest.mark.parametrize("name", ["", " ", ".", "..", "../escape", "/absolute", "a/b", "a\\b",
+	" trailing ", "trailing.", "bad\nname", "bad:name", "CON", "lpt1.txt"])
+def test_invalid_workflow_names_are_rejected_without_writing(tmp_path, monkeypatch, name):
+	monkeypatch.setattr(engine_module, "init_workflow_engine", lambda *args, **kwargs: None)
+	agent = AgentWorkflowEngine(storage_dir=tmp_path / "workflows")
+	try:
+		with pytest.raises(ValueError, match="safe single folder"):
+			agent.create_record(name)
+		assert list(agent.storage_dir.iterdir()) == []
+	finally:
+		agent.close()
+
+
+@pytest.mark.parametrize("kind", ["record", "directory", "file", "symlink"])
+def test_named_allocation_never_overwrites_existing_paths(tmp_path, monkeypatch, kind):
+	monkeypatch.setattr(engine_module, "init_workflow_engine", lambda *args, **kwargs: None)
+	agent = AgentWorkflowEngine(storage_dir=tmp_path / "workflows")
+	path = agent.storage_dir / "Ticket Triage"
+	try:
+		if kind == "record":
+			agent.create_record("Ticket Triage")
+		elif kind == "directory":
+			path.mkdir()
+			(path / "keep").write_text("original")
+		elif kind == "file":
+			path.write_text("original")
+		else:
+			path.symlink_to(tmp_path / "missing")
+		with pytest.raises(FileExistsError):
+			agent.create_record("Ticket Triage")
+		if kind == "directory":
+			assert (path / "keep").read_text() == "original"
+		elif kind == "file":
+			assert path.read_text() == "original"
+		elif kind == "symlink":
+			assert path.is_symlink()
+	finally:
+		agent.close()
+
+
 def test_allocated_graph_creates_and_modifies_without_building_nodes(native_world):
 	agent = native_world.agent()
 	workflow_id = agent.resolve_record(None).workflow_id
@@ -672,6 +751,24 @@ def test_allocated_graph_creates_and_modifies_without_building_nodes(native_worl
 	assert _statuses(modified) == ["completed", "completed", "skipped", "skipped"]
 	assert native_world.graph.requests[1].requirement_amendment == "add auditing"
 	assert not modified.artifacts["nodes"] and not native_world.main.requests
+
+
+def test_named_workflow_graph_build_uses_named_folder(native_world):
+	agent = native_world.agent()
+	workflow_id = agent.create_record("Ticket Triage").workflow_id
+	result = agent.build_allocated_workflow_json(workflow_id, "Classify support tickets")
+	assert result.ok, result.errors
+	assert result.workflow_id == "Ticket Triage"
+	assert Path(result.artifacts["graph"]) == native_world.root / "Ticket Triage" / "plan" / "workflow.json"
+	assert native_world.graph.requests[0].requirement_text == "Classify support tickets"
+
+
+def test_legacy_implicit_allocation_builds_graph_in_native_worker(native_world):
+	agent = native_world.agent()
+	result = agent.build_workflow_json("Classify support tickets")
+	assert result.ok, result.errors
+	assert len(result.workflow_id) == 32
+	assert Path(result.artifacts["graph"]) == native_world.root / result.workflow_id / "plan" / "workflow.json"
 
 
 @pytest.fixture

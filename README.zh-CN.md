@@ -11,6 +11,7 @@
 <!-- Modified 2026-11-06: document CLI answers for paused node-test repairs. -->
 <!-- Modified 2026-11-09: link to the optional DeepSeek Harness plugin. -->
 <!-- Modified 2026-11-10: clarify the requested read-only Harness viewer. -->
+<!-- Modified 2026-11-11: document optional named workflow allocation. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -326,7 +327,7 @@ Return the category, priority, and draft reply as structured output.
 
 ### 2. 构建并检查
 
-1. 调用 `create_workflow`，然后调用 `start_new_workflow(workflow_id, prompt)`。
+1. 调用 `create_workflow(name="Ticket Triage")`，然后调用 `start_new_workflow(workflow_id, prompt)`。可选名称同时是工作流文件夹名和 ID；省略时仍生成 ID。名称必须是安全的单个文件夹名，且不能覆盖已有路径。
 2. 轮询 `get_build_status(workflow_id)`，检查 `status` 和 `result.ok`；顶层 `ok` 只表示状态查询成功。
 3. 若状态为 `input_required`，展示 `awaiting.prompt` 和 `awaiting.test_log`，然后调用 `submit_background_build_input`，传入准确的 `workflow_id`、`revision`、`request_id`、作为 `step_id` 的 `awaiting.stepId` 和用户 `input`，再继续轮询。
 4. 使用 `get_workflow` 和 `list_nodes` 检查结果。步骤 ID 以生成的工作流为准。
@@ -362,7 +363,7 @@ Then rerun the service.
 
 | 类别 | 工具 | 用途 |
 | --- | --- | --- |
-| 后台构建 | `create_workflow` | 创建空工作流并返回 `workflow_id`。 |
+| 后台构建 | `create_workflow(name=None)` | 创建空工作流，可指定文件夹名和 `workflow_id`。 |
 | 后台构建 | `start_new_workflow` | 开始构建已创建的空工作流并立即返回。 |
 | 后台构建 | `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` | 为已分配的空工作流创建图和需求分析，或修改已有工作流的图和需求分析；不构建节点或主入口。 |
 | 后台构建 | `start_build_nodes` | 构建节点或按 step id 修改指定节点；未变化的节点会被复用。 |

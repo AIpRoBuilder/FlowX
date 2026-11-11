@@ -4,6 +4,7 @@
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Added 2026-11-05: offline coverage for the SDK-backed workflow skill scripts.
 # Modified 2026-11-06: cover node-pause answer help.
+# Modified 2026-11-11: cover named workflow allocation and existing IDs.
 from __future__ import annotations
 
 import importlib.util
@@ -54,8 +55,10 @@ def test_help_explains_node_pause_answers(arguments, capsys):
 
 
 @pytest.mark.parametrize("arguments,method,expected", [
-    (["new", "--prompt", "hi", "--host", "127.0.0.1", "--port", "8123"], "build_new_workflow", ("wf1", "hi")),
-    (["graph", "--prompt", "hi"], "build_allocated_workflow_json", ("wf1", "hi")),
+    (["new", "--name", "Ticket Triage", "--prompt", "hi", "--host", "127.0.0.1", "--port", "8123"], "build_new_workflow", ("wf1", "hi")),
+    (["graph", "--name", "Ticket Triage", "--prompt", "hi"], "build_allocated_workflow_json", ("wf1", "hi")),
+    (["new", "--workflow-id", "wf1", "--prompt", "hi"], "build_new_workflow", ("wf1", "hi")),
+    (["graph", "--workflow-id", "wf1", "--prompt", "hi"], "build_allocated_workflow_json", ("wf1", "hi")),
     (["nodes", "--workflow-id", "wf1", "--amend", "s1", "fix", "--amend", "s2", "change"], "build_nodes", ("wf1", {"s1": "fix", "s2": "change"})),
     (["main", "--workflow-id", "wf1"], "build_main_entrypoint", ("wf1",)),
     (["evolve", "--workflow-id", "wf1", "--target", "s1", "--prompt", "change"], "evolve", ("wf1", "change")),
@@ -67,6 +70,10 @@ def test_dispatch(arguments, method, expected, capsys):
     client.builder.engine.record.return_value = SimpleNamespace(fastapi_host="127.0.0.1", fastapi_port=9000)
     args = build.make_parser().parse_args(arguments)
     build.run_operation(client, args)
+    if "--name" in arguments:
+        client.create_workflow.assert_called_once_with(name="Ticket Triage")
+    else:
+        client.create_workflow.assert_not_called()
     call = getattr(client, method).call_args
     assert call.args == expected
     assert call.kwargs["await_repair_input"] is True
@@ -80,6 +87,16 @@ def test_dispatch(arguments, method, expected, capsys):
     if method == "build_workflow":
         assert call.kwargs["fix_errors"] is True and call.kwargs["workflow_id"] == "wf1"
     assert events(capsys)[-1]["event"] == "started"
+
+
+@pytest.mark.parametrize("arguments", [
+    ["allocate"], ["new", "--prompt", "hi"], ["graph", "--prompt", "hi"],
+    ["new", "--name", "Name", "--workflow-id", "wf1", "--prompt", "hi"],
+    ["graph", "--name", "Name", "--workflow-id", "wf1", "--prompt", "hi"],
+])
+def test_creation_requires_one_explicit_target(arguments):
+    with pytest.raises(SystemExit):
+        build.make_parser().parse_args(arguments)
 
 
 def test_files_options_and_no_cascade(tmp_path, capsys):
@@ -142,15 +159,15 @@ def test_main_keeps_sdk_output_off_json_stdout(monkeypatch, capsys):
     class Client:
         def __init__(self, *, workspace):
             print("constructor output")
-        def create_workflow(self):
+        def create_workflow(self, name):
             print("SDK output")
-            return "wf1"
+            return name
         def close(self):
             print("close output")
     monkeypatch.setattr(build, "FlowXClient", Client)
-    assert build.main(["allocate"]) == 0
+    assert build.main(["allocate", "--name", "Ticket Triage"]) == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"event": "allocated", "workflow_id": "wf1"}
+    assert json.loads(captured.out) == {"event": "allocated", "workflow_id": "Ticket Triage"}
     assert "SDK output" in captured.err and "close output" in captured.err
 
 

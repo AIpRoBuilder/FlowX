@@ -10,6 +10,7 @@
 # Modified 2026-11-01: repair gating is the default; answers can target the generated test.
 # Modified 2026-11-03: expose workflow allocation and building an allocated workflow.
 # Modified 2026-11-03: expose graph-only builds for allocated workflows.
+# Modified 2026-11-11: allow an explicit workflow folder name during allocation.
 """Python SDK for building, modifying and running FlowX workflows."""
 
 from __future__ import annotations
@@ -108,9 +109,13 @@ class FlowXClient:
         """Run the whole engine on a free-text request and/or ``logs=[...]``; later stages follow earlier changes."""
         return self.builder.build_workflow(prompt, workflow_id=workflow_id, **options)
 
-    def create_workflow(self) -> str:
-        """Allocate an empty workflow and return its identifier before building it."""
-        return self.builder.engine.resolve_record(None).workflow_id
+    def create_workflow(self, name: str | None = None) -> str:
+        """Allocate an empty workflow, optionally using ``name`` as its folder and ID.
+
+        Names must be safe single folder names and cannot overwrite existing paths.
+        Omitting the name retains the generated-ID behavior for existing callers.
+        """
+        return self.builder.engine.create_record(name).workflow_id
 
     def build_new_workflow(self, workflow_id: str, prompt: str, **options: Any) -> AgentResult:
         """Build a workflow previously allocated by :meth:`create_workflow`."""

@@ -11,6 +11,7 @@
 <!-- Modified 2026-11-06: document CLI answers for paused node-test repairs. -->
 <!-- Modified 2026-11-09: link to the optional DeepSeek Harness plugin. -->
 <!-- Modified 2026-11-10: clarify the requested read-only Harness viewer. -->
+<!-- Modified 2026-11-11: document optional named workflow allocation. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -339,7 +340,7 @@ Return the category, priority, and draft reply as structured output.
 
 ### 2. Build and inspect
 
-1. Call `create_workflow`, then `start_new_workflow(workflow_id, prompt)`.
+1. Call `create_workflow(name="Ticket Triage")`, then `start_new_workflow(workflow_id, prompt)`. The optional name is the workflow folder and ID; omitting it keeps the generated-ID behavior. A name must be a safe single folder name and cannot overwrite an existing path.
 2. Poll `get_build_status(workflow_id)`. Check `status` and `result.ok`: the response's top-level `ok` only confirms that the status query succeeded.
 3. If `input_required`, show `awaiting.prompt` and `awaiting.test_log`, then resume with `submit_background_build_input` using the exact `workflow_id`, `revision`, `request_id`, `awaiting.stepId` as `step_id`, and the user's `input`. Poll again.
 4. Inspect the result with `get_workflow` and `list_nodes`. Use the generated step IDs, not fixed demo IDs.
@@ -375,7 +376,7 @@ These MCP tools let the host agent operate the workflow layer from the same conv
 
 | Category | Tool | Purpose |
 | --- | --- | --- |
-| Background | `create_workflow` | Allocate an empty workflow and return its `workflow_id`. |
+| Background | `create_workflow(name=None)` | Allocate an empty workflow, optionally naming its folder and `workflow_id`. |
 | Background | `start_new_workflow` | Start building an allocated empty workflow and immediately return. |
 | Background | `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` | Create the graph and requirement analysis for an allocated empty workflow or modify them for an existing workflow; does not build nodes or the entrypoint. |
 | Background | `start_build_nodes` | Build nodes or amend specific nodes by step id; unchanged nodes are reused. |

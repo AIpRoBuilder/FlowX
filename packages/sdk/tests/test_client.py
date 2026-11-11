@@ -1,4 +1,5 @@
 # Modified 2026-11-03: cover allocated workflow graph delegation to the engine.
+# Modified 2026-11-11: cover named and legacy workflow allocation.
 
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -30,6 +31,14 @@ def test_builder_is_created_lazily_once_with_the_workspace_as_root(sdk):
     sdk.constructor.assert_called_once_with(
         api_key="key", model="m", provider="p", root_dir=str(sdk.workspace),
     )
+
+
+def test_create_workflow_forwards_optional_name(sdk):
+    sdk.builder.engine.create_record.return_value.workflow_id = "Ticket Triage"
+    assert sdk.client.create_workflow("Ticket Triage") == "Ticket Triage"
+    sdk.builder.engine.create_record.assert_called_once_with("Ticket Triage")
+    sdk.client.create_workflow()
+    assert sdk.builder.engine.create_record.call_args.args == (None,)
 
 
 def test_llm_settings_fall_back_to_the_environment(monkeypatch, tmp_path):

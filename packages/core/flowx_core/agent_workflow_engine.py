@@ -6,6 +6,7 @@
 # Modified 2026-11-02: retry failed node starts iteratively and derive the waiting step from its metadata.
 # Modified 2026-11-03: build explicitly allocated empty workflows for background clients.
 # Modified 2026-11-03: create or modify allocated workflow graphs without cascading.
+# Modified 2026-11-11: allocate workflows using a safe, caller-supplied folder name.
 """Request-driven workflow engine: reformat request -> graph plan -> nodes -> main entrypoint.
 
 The engine's own native graph runs ``reformat_request -> graph_plan``. The nodes stage and the
@@ -26,6 +27,7 @@ modify through it.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import uuid
 from contextlib import ExitStack
@@ -653,6 +655,8 @@ class AgentWorkflowEngine:
 		self._records: dict[str, WorkflowRecord] = {}
 		self._pending: dict[str, _PendingBuild] = {}
 		self._registry_lock, self._run_lock, self._service_lock = RLock(), RLock(), RLock()
+		# Reformat steps may allocate from a worker while the caller owns _run_lock.
+		self._allocation_lock = Lock()
 		self._services_closed = False
 		self._closed = False
 		self._engine: FlowXWorkflowEngine | None = init_workflow_engine(
@@ -700,11 +704,42 @@ class AgentWorkflowEngine:
 		"""The record to build into; ``None`` starts a new workflow."""
 		if workflow_id is not None:
 			return self.record(workflow_id)
-		new_id = uuid.uuid4().hex
-		record = WorkflowRecord(new_id, self.storage_dir / new_id, main_entrypoint_id=uuid.uuid4().hex)
-		self._register(record)
-		record.save()
-		return record
+		return self.create_record()
+
+	def create_record(self, name: str | None = None) -> WorkflowRecord:
+		"""Reserve a new folder and identifier; never reuse an existing path."""
+		if name is not None:
+			if (not isinstance(name, str) or not name or name != name.strip()
+					or name in {".", ".."} or name.endswith(".")
+					or re.search(r'[<>:"/\\|?*\x00-\x1f\x7f]', name)
+					or re.fullmatch(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", name)):
+				raise ValueError("workflow name must be a safe single folder name")
+		new_id = name if name is not None else uuid.uuid4().hex
+		with self._allocation_lock:
+			if self._closed:
+				raise RuntimeError("agent workflow engine is closed")
+			if new_id in self.workflow_ids:
+				raise FileExistsError(f"workflow already exists: {new_id}")
+			directory = self.storage_dir / new_id
+			# mkdir is exclusive, including for files and symlinks, and protects other data.
+			directory.mkdir()
+			record = WorkflowRecord(new_id, directory, main_entrypoint_id=uuid.uuid4().hex)
+			registered = False
+			try:
+				self._register(record)
+				registered = True
+				record.save()
+			except BaseException:
+				if registered:
+					with self._registry_lock:
+						self._records.pop(new_id, None)
+					with _ORCHESTRATORS_LOCK:
+						orchestrator = ORCHESTRATORS.pop(new_id, None)
+					if orchestrator is not None:
+						orchestrator.close()
+				shutil.rmtree(directory)
+				raise
+			return record
 
 	def catalog(self) -> dict[str, dict[str, Any]]:
 		"""Ids and unresolved errors of every workflow: what the judge matches a request against."""
@@ -1275,9 +1310,10 @@ class AgentWorkflowEngine:
 	def close(self) -> None:
 		"""Stop services started here, release the native engine and the orchestrators."""
 		with self._run_lock:
-			if self._closed:
-				return
-			self._closed = True
+			with self._allocation_lock:
+				if self._closed:
+					return
+				self._closed = True
 			self._pending.clear()
 			engine, self._engine = self._engine, None
 			with ExitStack() as cleanup:

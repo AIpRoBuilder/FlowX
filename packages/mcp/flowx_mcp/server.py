@@ -14,6 +14,7 @@
 # Modified 2026-11-02: capture pending-build probe errors and describe the actual pause metadata.
 # Modified 2026-11-03: add workflow-indexed background builds and guarded repair recovery.
 # Modified 2026-11-03: expose background-only MCP build tools and guard orphaned pauses.
+# Modified 2026-11-11: accept an optional workflow folder name at allocation.
 """FastMCP server exposing the FlowX workflow engine."""
 
 from __future__ import annotations
@@ -411,8 +412,8 @@ def create_server() -> Any:
     )
 
     @flowx_mcp.tool()
-    def create_workflow() -> str:
-        """Allocate an empty workflow id for start_new_workflow or start_build_workflow_json."""
+    def create_workflow(name: str | None = None) -> str:
+        """Allocate an empty workflow; name, if supplied, is its folder and workflow_id."""
         def _impl() -> dict[str, Any]:
             owner = f"create:{uuid.uuid4().hex}"
             _reserve_build(owner)
@@ -420,7 +421,9 @@ def create_server() -> Any:
                 busy = _pending_payload("create_workflow")
                 if busy is not None:
                     return busy
-                return {"ok": True, "workflow_id": _get_client().create_workflow(),
+                client = _get_client()
+                workflow_id = client.create_workflow() if name is None else client.create_workflow(name=name)
+                return {"ok": True, "workflow_id": workflow_id,
                     "action_required": None,
                     "next_actions": ["start_new_workflow", "start_build_workflow_json"]}
             finally:
