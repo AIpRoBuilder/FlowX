@@ -12,6 +12,7 @@
 <!-- Modified 2026-11-09: link to the optional DeepSeek Harness plugin. -->
 <!-- Modified 2026-11-10: clarify the requested read-only Harness viewer. -->
 <!-- Modified 2026-11-11: document optional named workflow allocation. -->
+<!-- Modified 2026-11-12: clarify Harness Web and Desktop plugin installation. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -86,7 +87,7 @@ Turn an intent into an editable, reusable process instead of a one-off answer. C
 - 🚀 **Run locally** through MCP or the SDK; MCP also supports step inputs and session resets.
 - 🔌 **Choose an interface:** local stdio MCP, Python SDK, or non-streaming A2A.
 - 📦 **Reuse artifacts** stored under `workspace/workflows/<workflow_id>`.
-- 🧠 **Bring your own model and UI:** the optional [DeepSeek Harness plugin](plugins/deepseek-harness-flowx/README.md) is planned to provide a read-only workflow viewer; use the separate FlowX skill to create, evolve, and run workflows.
+- 🧠 **Bring your own model and UI:** the optional [DeepSeek Harness plugin](plugins/deepseek-harness-flowx/README.md) provides a read-only workflow viewer for Web and Desktop, installed separately in each profile; use the separate FlowX skill to create, evolve, and run workflows.
 
 <a name="setup"></a>
 ## ⚙️ Setup
