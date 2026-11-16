@@ -13,6 +13,7 @@
 <!-- Modified 2026-11-10: clarify the requested read-only Harness viewer. -->
 <!-- Modified 2026-11-11: document optional named workflow allocation. -->
 <!-- Modified 2026-11-12: clarify Harness Web and Desktop plugin installation. -->
+<!-- Modified 2026-11-16: announce media workflow support and the Harness media canvas. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -58,6 +59,8 @@ FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 <details>
 <summary>📣 News</summary>
 
+- **[2026.11.16]** 🖼️ **Media workflow support.** Generated nodes can return `prompt`, `image`, and `video` cards in addition to structured text. The new `flowx_core.media` toolkit adds provider image/video helpers, Pillow resize and crop, FFmpeg trim and resize, optional headless Blender (`FLOWX_ENABLE_BLENDER=1`), and `FLOWX_MEDIA_DRY_RUN=1` for zero-cost node tests. Media outputs and step cards are journaled under `workflows/<workflow_id>/runs/`. Provider calls can be billable, and generated code and tests are not sandboxed.
+- **[2026.11.16]** 🎛️ **DeepSeek Harness plugin update.** The workflow canvas now previews each node's `prompt`, `image`, and `video` cards, with run history (**Sync outputs**), stale-revision badges, zoom/wide canvas, drag-to-arrange layout saved per workflow, and a lightbox for full-size previews. Media is delivered through an owner-only `/api/flowx/media` route using authenticated HTTP `Range` responses. See the [plugin README](plugins/deepseek-harness-flowx/README.md).
 - **[2026.11.10]** 🔑 **Skill and plugin update.** The DeepSeek Harness plugin settings now accept `FLOWX_LLM_API_KEY` and no longer ask for a skill directory. The FlowX skill scripts reuse the plugin's saved Python, workspace, and API key.
 - **[2026.10.28]** 🧩 **Expanded node engine.** Each business node now runs a generation → audit → test → bounded repair chain before it is published.
 - **[2026.10.24]** ⚙️ **WorkflowEngine-native generation.** Graph, node, and entrypoint workflows are now `WorkflowEngine` subclasses.

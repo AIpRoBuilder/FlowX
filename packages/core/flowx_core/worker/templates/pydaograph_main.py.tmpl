@@ -1,13 +1,15 @@
 # Modified 2026-10-13: explicit JSON class maps and bytes-only file-node transport.
 # Modified 2026-10-14: separate the NODES tuple from the reusable NODE_CLASSES map.
 # Modified 2026-10-23: type STEP_CHAIN with ag_ui_workflow.StepMeta.
+# Modified 2026-11-16: seed workflow root/request id on pool lease and tee SSE run journal.
 from __future__ import annotations
 
 import base64
 import binascii
 import json
+import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Lock
@@ -23,6 +25,7 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ag_ui_workflow import StepMeta, WorkflowEngine, WorkflowPipelinePool
+from flowx_core.media import RunJournal
 
 from __NODES_PACKAGE_NAME__ import (
 __NODE_IMPORTS__
@@ -33,7 +36,9 @@ import uvicorn
 
 _HERE = Path(__file__).resolve().parent
 _PROJECT_ROOT = __PROJECT_ROOT_EXPR__
-for _env_candidate in (_HERE / ".env", _PROJECT_ROOT / ".env"):
+_WORKFLOW_ROOT = _HERE.parent.parent if _HERE.parent.name == "service" else _PROJECT_ROOT
+os.environ.setdefault("FLOWX_WORKFLOW_ROOT", str(_WORKFLOW_ROOT))
+for _env_candidate in (_HERE / ".env", _PROJECT_ROOT / ".env", _WORKFLOW_ROOT / ".env"):
     if _env_candidate.is_file():
         load_dotenv(dotenv_path=_env_candidate, override=False)
 
@@ -44,6 +49,7 @@ PIPELINE_POOL: WorkflowPipelinePool | None = None
 ENGINE: WorkflowEngine | None = None
 SESSION_REQUESTS: dict[str, str] = {}
 _REQUEST_LOCK = Lock()
+RUN_JOURNAL = RunJournal(_WORKFLOW_ROOT)
 
 NODES = (
 __NODE_CLASS_ITEMS__
@@ -239,7 +245,11 @@ def run_step(payload: RunStepInput) -> StreamingResponse:
     request_id = _get_request_id(payload.sessionId)
     # Subclasses install their own setWaitFunc callbacks; the engine never does.
     return StreamingResponse(
-        engine.events(request_id, {step_id: normalized_input}),
+        RUN_JOURNAL.tee(
+            request_id,
+            payload.sessionId,
+            engine.events(request_id, {step_id: normalized_input}),
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -252,6 +262,7 @@ def reset_session(payload: ResetSessionInput) -> ResetSessionOutput:
         request_id = SESSION_REQUESTS.get(payload.sessionId)
         if request_id is not None:
             engine.close(request_id)
+            RUN_JOURNAL.mark_cancelled(request_id)
         new_request_id = str(uuid4())
         SESSION_REQUESTS[payload.sessionId] = new_request_id
     # Preserve HTTP field names, not removed engine attributes.

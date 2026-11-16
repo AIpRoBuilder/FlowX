@@ -21,6 +21,7 @@ Modified 2026-10-13: request-scoped nodes complete once; do not promise native r
     - 当 `meta_node_kind="WorkflowStepNode"` 时，交互节点 type 使用 "user_input"；无需用户输入的自动节点可使用 "none" 或领域外部源类型，如 "url"、"file"、"db"。
     - 当 `meta_node_kind="WorkflowFileNode"` 时，type 必须为 "user_file_input"。
     - 若 type 为 "none"，desc 必须为 "no need for ext data"。
+    - 禁止使用已废弃的 `ext_data.type="image"`；图像/视频上传节点统一使用 `meta_node_kind="WorkflowFileNode"` + `ext_data.type="user_file_input"`，远程图像/视频生成 API 节点使用 `ext_data.type="url"`，本地图像缩放/裁剪/FFmpeg/Blender 处理节点使用 `ext_data.type="none"`。
     - 示例：{"type":"user_input","desc":"user input income"}、{"type":"user_file_input","desc":"upload files for storage and downstream processing"}、{"type":"url","desc":"image generator api"}。
   - enable: 布尔值。
   - loop: 整数，只允许 1；可省略。当前运行时每个节点在一次请求中只完成一次。

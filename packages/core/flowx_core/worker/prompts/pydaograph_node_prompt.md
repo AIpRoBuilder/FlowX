@@ -53,6 +53,10 @@ Guidelines:
 - Return `StepRunOutput(card=..., derived=...)`.
 - Keep `card` JSON-serializable and practical for downstream consumers.
 - Keep `derived` as structured values for downstream step computation.
+- For prompt, image, video, FFmpeg, or Blender workflows, import `media_space` from `flowx_core.media` and obtain `space = media_space(self.STEP_ID, session_state)` (do not read private `session_state[...]` keys directly). Use `space.generate_image(...)`, `space.generate_video(...)`, `space.resize_image(...)`, `space.crop_image(...)`, `space.save_image(...)`, `space.save_bytes(...)`, `space.ffmpeg_trim_resize(...)`, `space.ffmpeg(...)`, or `space.blender_render(...)` to produce `asset` (`MediaAsset`), and return explicit dict literals for canvas rendering and static AST schema inspection:
+    - Prompt nodes: `card={"kind": "prompt", "prompt": prompt_text, "summary": prompt_text}` and `derived={"prompt": prompt_text}`.
+    - Image nodes: `card={"kind": "image", "media": asset.relpath, "mime": asset.mime, "width": asset.width, "height": asset.height}` and `derived={"image_path": str(asset.abspath), "width": asset.width, "height": asset.height}`.
+    - Video nodes: `card={"kind": "video", "media": asset.relpath, "poster": asset.poster_relpath, "mime": asset.mime, "duration": asset.duration}` and `derived={"video_path": str(asset.abspath), "duration": asset.duration}`.
 - Do not override `run` unless explicitly required; base class `run` orchestrates flow.
 - If the required behavior cannot be fully implemented from available context, keep valid runnable placeholder logic and add a concise TODO comment for the missing detail.
 - Never fabricate outputs (for example fake API responses, synthetic records, or simulated service success) when real execution paths are required.

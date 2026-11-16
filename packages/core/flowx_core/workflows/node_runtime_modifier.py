@@ -16,7 +16,10 @@ Modified 2026-11-02: share target aliases and preserve first-present guidance pr
 
 from __future__ import annotations
 
+from collections.abc import Generator
+from contextlib import contextmanager
 import json
+import os
 import re
 import subprocess
 import sys
@@ -277,6 +280,22 @@ class GenerateNodeTestFile(PromptNodeTestFileCoder):
 		)
 
 
+@contextmanager
+def _media_test_dry_run_env() -> Generator[None, None, None]:
+	"""Default FLOWX_MEDIA_DRY_RUN=1 during isolated pytest runs without changing subprocess kwargs."""
+	had = "FLOWX_MEDIA_DRY_RUN" in os.environ
+	prev = os.environ.get("FLOWX_MEDIA_DRY_RUN")
+	if not had:
+		os.environ["FLOWX_MEDIA_DRY_RUN"] = "1"
+	try:
+		yield
+	finally:
+		if not had:
+			os.environ.pop("FLOWX_MEDIA_DRY_RUN", None)
+		elif prev is not None:
+			os.environ["FLOWX_MEDIA_DRY_RUN"] = prev
+
+
 class ExecuteNodeTest(RunNodeTest):
 	"""Run the generated pytest module and retain its dedicated log."""
 
@@ -329,12 +348,13 @@ class ExecuteNodeTest(RunNodeTest):
 				request.log_file_path = str(log_path)
 				request.test_log = log_path.read_text(encoding="utf-8")
 		else:
-			result = _execute_node_test(
-				node_name=node_name, test_path=test_path, log_path=log_path,
-				command=[request.python_command or sys.executable, "-m", "pytest", str(test_path), "-q"],
-				cwd=str(working_directory), timeout=request.timeout,
-				run_subprocess=self.run_subprocess, timeout_expired=self.timeout_expired,
-			)
+			with _media_test_dry_run_env():
+				result = _execute_node_test(
+					node_name=node_name, test_path=test_path, log_path=log_path,
+					command=[request.python_command or sys.executable, "-m", "pytest", str(test_path), "-q"],
+					cwd=str(working_directory), timeout=request.timeout,
+					run_subprocess=self.run_subprocess, timeout_expired=self.timeout_expired,
+				)
 			if result is None:
 				raise RuntimeError("node test execution did not produce a result")
 			request.log_file_path = str(log_path)

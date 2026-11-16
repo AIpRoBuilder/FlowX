@@ -97,13 +97,18 @@ function pause(child, prompt = 'fix it', testLog = 'failed') {
 }
 
 function mountRoute() {
-  let route, cleanup;
+  const routes = [];
+  let cleanup;
   const ctx = {
-    connection: { fetch: { register(options) { assert.equal(route, undefined); route = options; } } },
+    connection: { fetch: { register(options) { routes.push(options); } } },
     effect(fn) { cleanup = fn(); },
   };
   apply(ctx);
-  return { route, cleanup };
+  const route = routes.find(item => item.path === '/api/flowx');
+  const mediaRoute = routes.find(item => item.path === '/api/flowx/media');
+  assert.ok(route);
+  assert.ok(mediaRoute);
+  return { route, mediaRoute, routes, cleanup };
 }
 
 const request = (body, headers = { 'content-type': 'application/json' }) =>
@@ -113,10 +118,13 @@ const jsonRequest = body => request(JSON.stringify(body));
 test('Cordis registers the exact buffered POST route and disposes its service', async () => {
   assert.equal(name, 'deepseek-harness-flowx');
   assert.deepEqual(inject, ['connection']);
-  const { route, cleanup } = mountRoute();
+  const { route, mediaRoute, cleanup } = mountRoute();
   assert.equal(route.path, '/api/flowx');
   assert.deepEqual(route.methods, ['POST']);
   assert.equal(route.requestBody, 'buffered');
+  assert.equal(mediaRoute.path, '/api/flowx/media');
+  assert.deepEqual(mediaRoute.methods, ['GET', 'HEAD']);
+  assert.equal(mediaRoute.requestBody, 'buffered');
   const response = await route.fetch(jsonRequest({ endpoint: 'status', payload: null }));
   assert.equal(response.status, 200);
   assert.match(response.headers.get('content-type'), /^application\/json\b/);
@@ -1393,4 +1401,100 @@ test('folder operations coordinate with builds, settings writes, and disposal', 
   resumeDispose();
   assert.equal((await browsing).error.code, 'flowx/disposed');
   await disposal;
+});
+
+test('listRuns, getRun, and layout persistence sanitize records and isolate canvas positions', async t => {
+  const { directory, service } = await folderFixture(t);
+  assert.deepEqual(await value(service, 'listRuns', { workflowId: 'wf1' }), { workflowId: 'wf1', latestRunId: null, runs: [] });
+  assert.deepEqual(await value(service, 'getLayout', { workflowId: 'wf1' }), { workflowId: 'wf1', positions: {} });
+
+  const runDir = path.join(directory, 'runs', 'run_01');
+  await fs.mkdir(runDir, { recursive: true });
+  await fs.writeFile(path.join(directory, 'runs', 'latest.json'), JSON.stringify({ schema_version: 1, run_id: 'run_01', workflow_version: 2, status: 'completed' }));
+  await fs.writeFile(path.join(runDir, 'run.json'), JSON.stringify({
+    schema_version: 1,
+    run_id: 'run_01',
+    session_id: 's1',
+    workflow_version: 2,
+    status: 'completed',
+    updated_at: '2026-11-16T12:00:00Z',
+    error: 'Bearer secret-leak',
+    nodes: {
+      Prompt: { status: 'completed', title: 'Prompt', card: { kind: 'prompt', prompt: 'hello test-secret-value', api_key: 'hidden' } },
+      Poster: { status: 'completed', title: 'Poster', card: { kind: 'image', media: 'runs/run_01/media/Poster/out.png', mime: 'image/png', width: 256, height: 256 } },
+    },
+  }));
+
+  const listed = await value(service, 'listRuns', { workflowId: 'wf1' });
+  assert.equal(listed.latestRunId, 'run_01');
+  assert.equal(listed.runs.length, 1);
+  assert.equal(listed.runs[0].node_count, 2);
+
+  const detail = (await value(service, 'getRun', { workflowId: 'wf1', runId: 'run_01' })).run;
+  assert.equal(detail.run_id, 'run_01');
+  assert.equal(detail.workflow_version, 2);
+  assert.equal(detail.has_error, true);
+  assert.equal(Object.hasOwn(detail, 'error'), false);
+  assert.equal(detail.nodes.Prompt.card.prompt, 'hello [REDACTED]');
+  assert.equal(detail.nodes.Prompt.card.api_key, '[REDACTED]');
+  assert.equal(detail.nodes.Poster.card.media, 'runs/run_01/media/Poster/out.png');
+
+  const saved = await value(service, 'saveLayout', { workflowId: 'wf1', positions: { Prompt: { x: 40.4, y: 80.7 } } });
+  assert.deepEqual(saved.positions, { Prompt: { x: 40, y: 81 } });
+  assert.deepEqual((await value(service, 'getLayout', { workflowId: 'wf1' })).positions, { Prompt: { x: 40, y: 81 } });
+  assert.equal((await call(service, 'saveLayout', { workflowId: 'wf1', positions: { Prompt: { x: 'NaN', y: 1 } } })).error.code, 'flowx/invalid-payload');
+});
+
+test('media route streams safe PNG/MP4 bytes with HTTP Range support and blocks unsafe files', async t => {
+  const { directory, root, env } = await folderFixture(t);
+  const mediaDir = path.join(directory, 'runs', 'r1', 'media', 'Step');
+  await fs.mkdir(mediaDir, { recursive: true });
+  const sampleBytes = Buffer.from('0123456789abcdef', 'utf8');
+  await fs.writeFile(path.join(mediaDir, 'clip.mp4'), sampleBytes);
+  await fs.writeFile(path.join(mediaDir, 'vector.svg'), '<svg onload="alert(1)"/>');
+  await fs.writeFile(path.join(root, 'outside.png'), 'secret-bytes');
+  await fs.symlink(path.join(root, 'outside.png'), path.join(mediaDir, 'escape.png'));
+
+  const service = new FlowXHostService({ env });
+  const readMedia = FlowXHostService.prototype.readMedia;
+  t.mock.method(FlowXHostService.prototype, 'readMedia', function (...args) {
+    return readMedia.apply(service, args);
+  });
+  const { mediaRoute, cleanup } = mountRoute();
+  t.after(async () => { await cleanup(); await service.dispose(); });
+
+  const full = await mediaRoute.fetch(new Request('http://localhost/api/flowx/media?workflowId=wf1&path=runs/r1/media/Step/clip.mp4'));
+  assert.equal(full.status, 200);
+  assert.equal(full.headers.get('content-type'), 'video/mp4');
+  assert.equal(full.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(full.headers.get('accept-ranges'), 'bytes');
+  assert.deepEqual(Buffer.from(await full.arrayBuffer()), sampleBytes);
+
+  const partial = await mediaRoute.fetch(new Request('http://localhost/api/flowx/media?workflowId=wf1&path=runs/r1/media/Step/clip.mp4', {
+    headers: { range: 'bytes=4-9' },
+  }));
+  assert.equal(partial.status, 206);
+  assert.equal(partial.headers.get('content-range'), 'bytes 4-9/16');
+  assert.equal(Buffer.from(await partial.arrayBuffer()).toString('utf8'), '456789');
+
+  const head = await mediaRoute.fetch(new Request('http://localhost/api/flowx/media?workflowId=wf1&path=runs/r1/media/Step/clip.mp4', { method: 'HEAD' }));
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get('content-length'), '16');
+  assert.equal((await head.arrayBuffer()).byteLength, 0);
+
+  const badRange = await mediaRoute.fetch(new Request('http://localhost/api/flowx/media?workflowId=wf1&path=runs/r1/media/Step/clip.mp4', {
+    headers: { range: 'bytes=99-100' },
+  }));
+  assert.equal(badRange.status, 416);
+
+  const svg = await mediaRoute.fetch(new Request('http://localhost/api/flowx/media?workflowId=wf1&path=runs/r1/media/Step/vector.svg'));
+  assert.equal(svg.status, 415);
+
+  const symlink = await mediaRoute.fetch(new Request('http://localhost/api/flowx/media?workflowId=wf1&path=runs/r1/media/Step/escape.png'));
+  assert.equal(symlink.status, 404);
+
+  const traversal = await mediaRoute.fetch(new Request('http://localhost/api/flowx/media?workflowId=wf1&path=../outside.png'));
+  assert.equal(traversal.status, 400);
+
+  assert.equal((await service.readMedia('wf1', 'runs/r1/media/Step/clip.mp4', {}, { principal: { kind: 'guest' } })).status, 403);
 });

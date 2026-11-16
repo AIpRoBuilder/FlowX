@@ -24,8 +24,21 @@ const FOLDER_ENTRY_LIMIT = 200;
 const FOLDER_SCAN_LIMIT = 1000;
 const FOLDER_RESPONSE_LIMIT = 256 * 1024;
 const FOLDER_PROBE_LIMIT = 4 * LIMIT;
+const MEDIA_LIMIT = 200 * LIMIT;
+const MEDIA_SLICE_LIMIT = 8 * LIMIT;
+const RUN_LIST_LIMIT = 50;
+const LAYOUT_NODE_LIMIT = 200;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const TEXT_TYPES = new Set(['.json', '.md', '.py', '.txt', '.log']);
+const MEDIA_TYPES = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.webp', 'image/webp'],
+  ['.gif', 'image/gif'],
+  ['.mp4', 'video/mp4'],
+  ['.webm', 'video/webm'],
+]);
 const DEFAULT_SKILL = fileURLToPath(new URL('../../../skills/flowx-workflows/', import.meta.url));
 // Read-only inspection runs through the installed SDK; argv: workspace, operation[, workflow id].
 const INSPECT_CODE = `import contextlib, json, sys
@@ -183,6 +196,18 @@ export class FlowXHostService {
         case 'readFolderFile':
           if (!exact(payload, ['workflowId', 'path']) || !workflowId(payload.workflowId) || !relativeArtifact(payload.path)) throw invalid();
           value = await this.readFolderFile(payload.workflowId, payload.path); break;
+        case 'listRuns':
+          if (!exact(payload, ['workflowId']) || !workflowId(payload.workflowId)) throw invalid();
+          value = await this.listRuns(payload.workflowId); break;
+        case 'getRun':
+          if (!exact(payload, ['workflowId', 'runId']) || !workflowId(payload.workflowId) || !workflowId(payload.runId)) throw invalid();
+          value = await this.getRun(payload.workflowId, payload.runId); break;
+        case 'getLayout':
+          if (!exact(payload, ['workflowId']) || !workflowId(payload.workflowId)) throw invalid();
+          value = await this.getLayout(payload.workflowId); break;
+        case 'saveLayout':
+          if (!exact(payload, ['workflowId', 'positions']) || !workflowId(payload.workflowId) || !object(payload.positions)) throw invalid();
+          value = await this.saveLayout(payload.workflowId, payload.positions); break;
         default: throw problem('unknown-endpoint', 'Unknown endpoint.');
       }
       return { ok: true, value };
@@ -956,6 +981,256 @@ export class FlowXHostService {
       await this.folderWorkflow(config, id);
       return this.readMapped(config.root, id, relative, this.folderGraph(config.root, id, relative), { browse: true });
     });
+  }
+
+  async verifiedWorkflowDirectory(config, id) {
+    if (!this.safeIdentifier(id)) throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.');
+    const directory = await this.workflowRoot(config.root, id);
+    const marker = await this.readMapped(config.root, id, 'agent.json', true, { browse: true });
+    try { if (JSON.parse(marker.content).workflow_id !== id) throw new Error(); }
+    catch { throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.'); }
+    return directory;
+  }
+
+  sanitizeRunRecord(raw, expectedRunId) {
+    const parsed = JSON.parse(this.sanitizeGraph(raw));
+    if (!object(parsed) || parsed.run_id !== expectedRunId || !workflowId(parsed.run_id)) throw new Error();
+    const version = Number.isSafeInteger(parsed.workflow_version) && parsed.workflow_version >= 0 ? parsed.workflow_version : 0;
+    const status = typeof parsed.status === 'string' && this.safeIdentifier(parsed.status) ? parsed.status : 'unknown';
+    const nodes = {};
+    if (object(parsed.nodes)) {
+      for (const [stepId, entry] of Object.entries(parsed.nodes)) {
+        if (!this.safeIdentifier(stepId) || !object(entry)) continue;
+        const card = object(entry.card) ? entry.card : {};
+        Object.defineProperty(nodes, stepId, {
+          value: {
+            status: typeof entry.status === 'string' ? entry.status : 'completed',
+            title: typeof entry.title === 'string' ? entry.title : stepId,
+            card,
+            updated_at: typeof entry.updated_at === 'string' ? entry.updated_at : null,
+          },
+          enumerable: true,
+        });
+      }
+    }
+    return {
+      run_id: parsed.run_id,
+      workflow_version: version,
+      status,
+      created_at: typeof parsed.created_at === 'string' ? parsed.created_at : null,
+      updated_at: typeof parsed.updated_at === 'string' ? parsed.updated_at : null,
+      awaiting: object(parsed.awaiting) ? parsed.awaiting : null,
+      has_error: Boolean(parsed.error),
+      nodes,
+    };
+  }
+
+  async listRuns(id) {
+    return this.withInspection(async config => {
+      const directory = await this.verifiedWorkflowDirectory(config, id);
+      const runsDir = path.join(directory, 'runs');
+      try {
+        const stat = await fs.lstat(runsDir);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || await fs.realpath(runsDir) !== runsDir) return { workflowId: id, latestRunId: null, runs: [] };
+      } catch (error) {
+        if (error.code === 'ENOENT') return { workflowId: id, latestRunId: null, runs: [] };
+        throw problem('artifact-unavailable', 'The workflow runs directory is unavailable or unsafe.');
+      }
+      let latestRunId = null;
+      try {
+        const latest = JSON.parse((await this.readMapped(config.root, id, 'runs/latest.json', true, { browse: true })).content);
+        if (object(latest) && workflowId(latest.run_id)) latestRunId = latest.run_id;
+      } catch { /* latest.json is optional */ }
+      const runs = [];
+      let scanned = 0;
+      const handle = await fs.opendir(runsDir);
+      for await (const item of handle) {
+        if (++scanned > FOLDER_SCAN_LIMIT) break;
+        if (!item.isDirectory() || item.isSymbolicLink() || !workflowId(item.name) || !this.safeIdentifier(item.name)) continue;
+        try {
+          const raw = await this.readMapped(config.root, id, `runs/${item.name}/run.json`, true, { browse: true });
+          const summary = this.sanitizeRunRecord(raw.content, item.name);
+          runs.push({
+            run_id: summary.run_id,
+            workflow_version: summary.workflow_version,
+            status: summary.status,
+            updated_at: summary.updated_at,
+            node_count: Object.keys(summary.nodes).length,
+          });
+        } catch { /* ignore incomplete or invalid run folders */ }
+      }
+      runs.sort((a, b) => {
+        const ta = a.updated_at || '', tb = b.updated_at || '';
+        if (ta !== tb) return tb < ta ? -1 : 1;
+        return a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0;
+      });
+      const bounded = runs.slice(0, RUN_LIST_LIMIT);
+      if (latestRunId && !bounded.some(item => item.run_id === latestRunId)) latestRunId = bounded[0]?.run_id ?? null;
+      return { workflowId: id, latestRunId: latestRunId ?? bounded[0]?.run_id ?? null, runs: bounded };
+    });
+  }
+
+  async getRun(id, runId) {
+    return this.withInspection(async config => {
+      if (!this.safeIdentifier(runId)) throw problem('artifact-unavailable', 'The workflow run is unavailable or unsafe.');
+      await this.verifiedWorkflowDirectory(config, id);
+      const raw = await this.readMapped(config.root, id, `runs/${runId}/run.json`, true, { browse: true });
+      try {
+        return { workflowId: id, run: this.sanitizeRunRecord(raw.content, runId) };
+      } catch {
+        throw problem('artifact-unavailable', 'The workflow run record is invalid or unsafe.');
+      }
+    });
+  }
+
+  validPositions(positions) {
+    if (!object(positions)) return null;
+    const entries = Object.entries(positions);
+    if (entries.length > LAYOUT_NODE_LIMIT) return null;
+    const clean = {};
+    for (const [name, coord] of entries) {
+      if (!this.safeIdentifier(name) || !object(coord) || !exact(coord, ['x', 'y'])) return null;
+      const x = Number(coord.x), y = Number(coord.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 100000 || Math.abs(y) > 100000) return null;
+      Object.defineProperty(clean, name, { value: { x: Math.round(x), y: Math.round(y) }, enumerable: true });
+    }
+    return clean;
+  }
+
+  async getLayout(id) {
+    return this.withInspection(async config => {
+      await this.verifiedWorkflowDirectory(config, id);
+      try {
+        const raw = await this.readMapped(config.root, id, 'canvas_layout.json', true, { browse: true });
+        const parsed = JSON.parse(raw.content);
+        const positions = object(parsed) ? this.validPositions(parsed.positions) : null;
+        return { workflowId: id, positions: positions || {} };
+      } catch {
+        return { workflowId: id, positions: {} };
+      }
+    });
+  }
+
+  async saveLayout(id, submittedPositions) {
+    const positions = this.validPositions(submittedPositions);
+    if (!positions) throw invalid();
+    return this.withInspection(async config => {
+      const directory = await this.verifiedWorkflowDirectory(config, id);
+      const target = path.join(directory, 'canvas_layout.json');
+      try {
+        const existing = await fs.lstat(target);
+        if (!existing.isFile() || existing.isSymbolicLink() || existing.nlink !== 1) throw new Error();
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw problem('artifact-unavailable', 'The canvas layout file is unsafe.');
+      }
+      const temporary = path.join(directory, `.canvas_layout-${randomUUID()}.tmp`);
+      let handle, created = false;
+      try {
+        handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+        created = true;
+        await handle.writeFile(JSON.stringify({ schema_version: 1, positions }, null, 2) + '\n', 'utf8');
+        await handle.sync();
+        await handle.close();
+        handle = null;
+        if (await fs.realpath(directory) !== directory) throw new Error();
+        await fs.rename(temporary, target);
+        created = false;
+      } catch {
+        throw problem('artifact-unavailable', 'Unable to save canvas layout.');
+      } finally {
+        await handle?.close().catch(() => {});
+        if (created) await fs.unlink(temporary).catch(() => {});
+      }
+      return { workflowId: id, positions };
+    });
+  }
+
+  parseByteRange(header, totalSize) {
+    if (!header) return null;
+    const match = /^bytes=(\d*)-(\d*)$/i.exec(header.trim());
+    if (!match || (match[1] === '' && match[2] === '') || totalSize === 0) return 'invalid';
+    let start, end;
+    if (match[1] === '') {
+      const suffix = Number(match[2]);
+      if (!Number.isSafeInteger(suffix) || suffix <= 0) return 'invalid';
+      start = Math.max(0, totalSize - suffix);
+      end = totalSize - 1;
+    } else {
+      start = Number(match[1]);
+      end = match[2] === '' ? totalSize - 1 : Number(match[2]);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end || start >= totalSize) return 'invalid';
+      end = Math.min(end, totalSize - 1);
+    }
+    return { start, end: Math.min(end, start + MEDIA_SLICE_LIMIT - 1) };
+  }
+
+  async readMedia(id, relative, { method = 'GET', rangeHeader = null } = {}, peer) {
+    if (peer?.principal?.kind !== 'owner') return { status: 403, headers: { 'cache-control': 'no-store' }, body: 'forbidden' };
+    if (!workflowId(id) || !this.safeFolderPath(relative)) {
+      return { status: 400, headers: { 'cache-control': 'no-store' }, body: 'invalid media path' };
+    }
+    const mime = MEDIA_TYPES.get(path.extname(relative).toLowerCase());
+    if (!mime) return { status: 415, headers: { 'cache-control': 'no-store' }, body: 'unsupported media type' };
+    try {
+      return await this.withInspection(async config => {
+        const directory = await this.verifiedWorkflowDirectory(config, id);
+        const candidate = path.join(directory, ...relative.split('/'));
+        let file;
+        try {
+          const real = await fs.realpath(candidate);
+          if (!inside(directory, real) || real !== candidate) throw new Error();
+          const before = await fs.lstat(real);
+          if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1) throw new Error();
+          if (before.size > MEDIA_LIMIT) return { status: 413, headers: { 'cache-control': 'no-store' }, body: 'media exceeds limit' };
+          file = await fs.open(real, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+          const opened = await file.stat();
+          if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > MEDIA_LIMIT || await fs.realpath(candidate) !== real) {
+            throw new Error();
+          }
+          const total = opened.size;
+          const baseHeaders = {
+            'content-type': mime,
+            'accept-ranges': 'bytes',
+            'cache-control': 'private, no-store',
+            'x-content-type-options': 'nosniff',
+          };
+          const parsedRange = this.parseByteRange(rangeHeader, total);
+          if (parsedRange === 'invalid') {
+            return { status: 416, headers: { ...baseHeaders, 'content-range': `bytes */${total}` }, body: null };
+          }
+          if (method === 'HEAD' && !parsedRange) {
+            return { status: 200, headers: { ...baseHeaders, 'content-length': String(total) }, body: null };
+          }
+          const start = parsedRange ? parsedRange.start : 0;
+          const end = parsedRange ? parsedRange.end : Math.min(total - 1, MEDIA_SLICE_LIMIT - 1);
+          const length = total === 0 ? 0 : end - start + 1;
+          const status = parsedRange || (total > length) ? 206 : 200;
+          const headers = {
+            ...baseHeaders,
+            'content-length': String(length),
+            ...(status === 206 ? { 'content-range': `bytes ${start}-${end}/${total}` } : {}),
+          };
+          if (method === 'HEAD') return { status, headers, body: null };
+          const buffer = Buffer.alloc(length);
+          let offset = 0;
+          while (offset < length) {
+            const { bytesRead } = await file.read(buffer, offset, length - offset, start + offset);
+            if (!bytesRead) break;
+            offset += bytesRead;
+          }
+          const after = await fs.lstat(real);
+          if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino || offset !== length) throw new Error();
+          return { status, headers, body: buffer };
+        } catch {
+          return { status: 404, headers: { 'cache-control': 'no-store' }, body: 'not found' };
+        } finally {
+          await file?.close().catch(() => {});
+        }
+      });
+    } catch (error) {
+      const status = error instanceof HostError && error.code === 'flowx/busy' ? 503 : 404;
+      return { status, headers: { 'cache-control': 'no-store' }, body: 'unavailable' };
+    }
   }
 
   dispose() {

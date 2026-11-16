@@ -5,6 +5,7 @@
 <!-- Added 2026-11-09: document packaging, setup, operation, and safety. -->
 <!-- Modified 2026-11-10: document the implemented read-only viewer, settings, and folder browsing. -->
 <!-- Modified 2026-11-12: document Web and Desktop installation and configuration. -->
+<!-- Modified 2026-11-16: document per-node media canvas previews, run journals, layout storage, and Range streaming. -->
 
 # FlowX for DeepSeek Harness
 
@@ -189,7 +190,12 @@ and [NOTICE](NOTICE).
    not necessarily the published revision: published workflow and node
    revisions or artifacts can differ after a graph-only update. Rebuild affected
    stages before relying on a consistent published workflow.
-3. Expand the **Workflow folder** tree to browse the actual directory under
+3. Select **Sync outputs** to load run journals recorded under
+   `workspace/workflows/<workflow_id>/runs` and render per-node prompt, image,
+   and video cards directly on the graph canvas (with zoom, **Expand canvas**,
+   lightbox preview, stale-revision badges, and drag-to-arrange layout saved to
+   `canvas_layout.json` without affecting build fingerprints).
+4. Expand the **Workflow folder** tree to browse the actual directory under
    `workspace/workflows/<workflow_id>` and open eligible files. Select
    **Refresh** after a separate skill operation finishes; there is no automatic
    synchronization with other processes.
@@ -198,6 +204,15 @@ The viewer has no build, repair, evolve, or runtime controls. Use the separate
 skill for those operations, review generated code before running it, and follow
 the skill's runtime instructions. A service started by the skill is owned by
 its runtime process, not by the viewer.
+
+### Media preview and folder browsing limits
+
+Media previews on the canvas are served through the owner-only `/api/flowx/media`
+route (`GET` and `HEAD` with HTTP `Range` support, capped at 200 MiB per file
+and 8 MiB per slice) with `X-Content-Type-Options: nosniff`. Only regular,
+single-link `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.mp4`, and `.webm` files
+inside the verified workflow directory are served; active vector/HTML types
+such as `.svg` and symlinks are rejected.
 
 ### Folder browsing limits
 

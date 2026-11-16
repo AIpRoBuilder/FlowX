@@ -830,3 +830,61 @@ test('a successful save still refreshes the catalog if Escape is pressed while s
   assert.ok(ui.workflow('fresh'));
   ui.unmount();
 });
+
+test('syncCanvas renders prompt, image, video cards, stale badges, lightbox and layout controls', async () => {
+  const graph = {
+    nodes: [
+      { name: 'Prompt', desc: 'Scene text' },
+      { name: 'Poster', desc: 'Generate poster', depends: ['Prompt'] },
+      { name: 'Clip', desc: 'Generate video', depends: ['Poster'] },
+    ],
+  };
+  const savedLayouts = [];
+  const runDetail = {
+    run_id: 'run_media_1',
+    workflow_version: 2, // older than published revision 3 -> stale badge
+    status: 'completed',
+    nodes: {
+      Prompt: { status: 'completed', title: 'Prompt', card: { kind: 'prompt', prompt: 'Neon dusk over Tokyo' } },
+      Poster: { status: 'completed', title: 'Poster', card: { kind: 'image', media: 'runs/run_media_1/media/Poster/out.png', mime: 'image/png', width: 512, height: 512 } },
+      Clip: { status: 'completed', title: 'Clip', card: { kind: 'video', media: 'runs/run_media_1/media/Clip/out.mp4', poster: 'runs/run_media_1/media/Clip/poster.png', mime: 'video/mp4', duration: 2.5 } },
+    },
+  };
+  const ui = harness((url, endpoint, payload) => {
+    if (endpoint === 'list') return ok(catalog('wf_media'));
+    if (endpoint === 'inspect') return ok({ artifacts: artifactMap({ graph: 'plan/workflow.json' }) });
+    if (endpoint === 'readArtifact') return ok({ content: JSON.stringify(graph), bytes: 80 });
+    if (endpoint === 'listFolder') return ok(entries());
+    if (endpoint === 'getLayout') return ok({ workflowId: 'wf_media', positions: { Poster: { x: 360, y: 40 } } });
+    if (endpoint === 'saveLayout') { savedLayouts.push(payload); return ok(payload); }
+    if (endpoint === 'listRuns') return ok({ workflowId: 'wf_media', latestRunId: 'run_media_1', runs: [{ run_id: 'run_media_1', workflow_version: 2, status: 'completed', node_count: 3 }] });
+    if (endpoint === 'getRun') return ok({ workflowId: 'wf_media', run: runDetail });
+    throw new Error(`unexpected ${endpoint}`);
+  });
+  await ui.mount();
+  await ui.toggle();
+  await ui.click(ui.workflow('wf_media'));
+  await ui.click(ui.button('Sync outputs'));
+
+  assert.match(ui.text(ui.page()), /Run rev 2 · stale/);
+  assert.match(ui.text(ui.page()), /Neon dusk over Tokyo/);
+  assert.match(ui.text(ui.page()), /512×512/);
+  assert.match(ui.text(ui.page()), /2\.5s/);
+
+  const img = ui.find(node => node.type === 'img');
+  assert.match(img.props.src, /api\/flowx\/media\?workflowId=wf_media&path=runs%2Frun_media_1%2Fmedia%2FPoster%2Fout\.png/);
+  const vid = ui.find(node => node.type === 'video');
+  assert.match(vid.props.src, /out\.mp4/);
+  assert.match(vid.props.poster, /poster\.png/);
+
+  await ui.click(ui.button('Expand'));
+  assert.ok(ui.find(node => node.props['aria-label'] === 'Media preview'));
+  await ui.key(ui.page(), 'Escape');
+  assert.equal(ui.all().some(node => node.props['aria-label'] === 'Media preview'), false);
+
+  await ui.click(ui.button('Expand canvas'));
+  assert.ok(ui.button('Compact view'));
+  await ui.click(ui.button('Reset layout'));
+  assert.deepEqual(savedLayouts.at(-1), { workflowId: 'wf_media', positions: {} });
+  ui.unmount();
+});

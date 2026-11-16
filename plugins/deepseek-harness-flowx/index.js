@@ -4,6 +4,7 @@
 // Upstream: https://github.com/AIpRoBuilder/FlowX
 // Added 2026-11-09: register the owner-only DeepSeek Harness host channel.
 // Modified 2026-11-09: use the authenticated shared Fetch route with bounded JSON.
+// Modified 2026-11-16: add owner-only byte-range media streaming on /api/flowx/media.
 
 import { FlowXHostService } from './host/service.js';
 
@@ -43,6 +44,28 @@ export function apply(ctx) {
         return json(await service.dispatch(body.endpoint, body.payload, OWNER));
       } catch {
         return json(failure('internal', 'The operation failed.'), 500);
+      }
+    },
+  });
+  ctx.connection.fetch.register({
+    path: '/api/flowx/media', methods: ['GET', 'HEAD'], requestBody: 'buffered',
+    async fetch(request) {
+      try {
+        const params = new URL(request.url).searchParams;
+        const result = await service.readMedia(
+          params.get('workflowId') || '',
+          params.get('path') || '',
+          { method: request.method, rangeHeader: request.headers.get('range') },
+          OWNER,
+        );
+        return new Response(request.method === 'HEAD' ? null : result.body, {
+          status: result.status,
+          headers: result.headers,
+        });
+      } catch {
+        return new Response(request.method === 'HEAD' ? null : 'internal error', {
+          status: 500, headers: { 'cache-control': 'no-store' },
+        });
       }
     },
   });
