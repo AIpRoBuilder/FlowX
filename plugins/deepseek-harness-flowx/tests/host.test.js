@@ -8,6 +8,7 @@
 // Modified 2026-11-10: cover private persistent settings and operation coordination.
 // Modified 2026-11-10: cover symlinked DSH_HOME resolution and retained confinement.
 // Modified 2026-11-10: exercise safe, catalog-bound workflow folder browsing.
+// Modified 2026-11-16: cover saved environment variables and their child-process application.
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -27,8 +28,13 @@ const call = (service, endpoint, payload = null, peer = OWNER) => service.dispat
 const value = async (...args) => {
   const result = await call(...args);
   assert.equal(result.ok, true, JSON.stringify(result));
-  // Settings results are compared against the submitted shape; the key itself is never returned.
-  if (['getSettings', 'saveSettings'].includes(args[1])) { const { apiKeySet, ...rest } = result.value; return { ...rest, apiKey: '' }; }
+  // Settings results are compared against the submitted shape; the key and
+  // environment values are never returned. Environment names are asserted
+  // separately where a test needs them.
+  if (['getSettings', 'saveSettings', 'saveEnvironment'].includes(args[1])) {
+    const { apiKeySet, envKeys, ...rest } = result.value;
+    return { ...rest, apiKey: '' };
+  }
   return result.value;
 };
 const waitFor = async (predicate, message = 'condition') => {
@@ -710,7 +716,7 @@ test('abort cannot race a late success result into completed', async t => {
 });
 
 const settingsFor = env => ({ python: env.FLOWX_PYTHON, workspace: env.FLOWX_WORKSPACE, apiKey: '' });
-const shown = (s, apiKeySet = true) => ({ python: s.python, workspace: s.workspace, apiKeySet });
+const shown = (s, apiKeySet = true, envKeys = []) => ({ python: s.python, workspace: s.workspace, apiKeySet, envKeys });
 const onDisk = s => ({ python: s.python, workspace: s.workspace });
 const settingsFile = env => path.join(env.DSH_HOME, 'plugins', 'deepseek-harness-flowx', 'settings.json');
 
@@ -785,6 +791,102 @@ test('settings endpoints are reachable through the existing owner-admitted route
   const save = await route.fetch(jsonRequest({ endpoint: 'saveSettings', payload: settingsFor(env) }));
   assert.deepEqual((await save.json()).value, shown(settingsFor(env)));
   assert.deepEqual(JSON.parse(await fs.readFile(settingsFile(env), 'utf8')), onDisk(settingsFor(env)));
+  const environment = await route.fetch(jsonRequest({ endpoint: 'saveEnvironment', payload: { set: { FLOWX_MEDIA_DRY_RUN: '1' }, remove: [] } }));
+  assert.deepEqual((await environment.json()).value.envKeys, ['FLOWX_MEDIA_DRY_RUN']);
+  assert.deepEqual(JSON.parse(await fs.readFile(settingsFile(env), 'utf8')), { ...onDisk(settingsFor(env)), env: { FLOWX_MEDIA_DRY_RUN: '1' } });
+});
+
+test('environment variables merge, persist, apply to children, and stay out of responses', async t => {
+  const { env } = await fixture(t);
+  const fake = fakeSpawn();
+  const service = new FlowXHostService({ env, spawn: fake.spawn });
+  t.after(() => service.dispose());
+  const first = await call(service, 'saveEnvironment', {
+    set: { FLOWX_MEDIA_DRY_RUN: '1', OPENAI_BASE_URL: 'https://gateway.test/v1', OPENAI_API_KEY: 'saved-env-secret' },
+    remove: [],
+  });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.deepEqual(first.value.envKeys, ['FLOWX_MEDIA_DRY_RUN', 'OPENAI_API_KEY', 'OPENAI_BASE_URL']);
+  const shownSettings = await call(service, 'getSettings');
+  assert.deepEqual(shownSettings.value.envKeys, first.value.envKeys);
+  assert.doesNotMatch(JSON.stringify(shownSettings), /saved-env-secret|gateway\.test/);
+  const filename = settingsFile(env);
+  assert.equal((await fs.stat(filename)).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(await fs.readFile(filename, 'utf8')).env, {
+    FLOWX_MEDIA_DRY_RUN: '1',
+    OPENAI_BASE_URL: 'https://gateway.test/v1',
+    OPENAI_API_KEY: 'saved-env-secret',
+  });
+
+  const child = await startFake(service, fake);
+  const inherited = fake.calls.at(-1).options.env;
+  assert.equal(inherited.FLOWX_MEDIA_DRY_RUN, '1');
+  assert.equal(inherited.OPENAI_BASE_URL, 'https://gateway.test/v1');
+  assert.equal(inherited.OPENAI_API_KEY, 'saved-env-secret');
+  assert.equal(inherited.FLOWX_WORKSPACE, env.FLOWX_WORKSPACE);
+  pause(child, 'saved-env-secret leaked', 'token=saved-env-secret');
+  const paused = await value(service, 'status');
+  assert.doesNotMatch(JSON.stringify(paused), /saved-env-secret/);
+  child.exit(1);
+  await waitFor(() => !service.active);
+
+  const merged = await call(service, 'saveEnvironment', { set: { FLOWX_LLM_MODEL: 'deepseek-flash' }, remove: ['OPENAI_BASE_URL'] });
+  assert.equal(merged.ok, true, JSON.stringify(merged));
+  assert.deepEqual(merged.value.envKeys, ['FLOWX_LLM_MODEL', 'FLOWX_MEDIA_DRY_RUN', 'OPENAI_API_KEY']);
+
+  // Saving paths preserves the saved environment, and saving environment
+  // variables preserves the saved API key.
+  await value(service, 'saveSettings', { ...settingsFor(env), apiKey: 'path-saved-key' });
+  const preserved = await call(service, 'getSettings');
+  assert.deepEqual(preserved.value.envKeys, merged.value.envKeys);
+  const finalEnv = await call(service, 'saveEnvironment', { set: { EXTRA_FLAG: 'true' }, remove: [] });
+  assert.equal(finalEnv.ok, true, JSON.stringify(finalEnv));
+  assert.deepEqual(finalEnv.value.envKeys, ['EXTRA_FLAG', 'FLOWX_LLM_MODEL', 'FLOWX_MEDIA_DRY_RUN', 'OPENAI_API_KEY']);
+  const disk = JSON.parse(await fs.readFile(filename, 'utf8'));
+  assert.equal(disk.apiKey, 'path-saved-key');
+  assert.deepEqual(disk.env, {
+    EXTRA_FLAG: 'true',
+    FLOWX_LLM_MODEL: 'deepseek-flash',
+    FLOWX_MEDIA_DRY_RUN: '1',
+    OPENAI_API_KEY: 'saved-env-secret',
+  });
+
+  // A restarted service reads and redacts the same saved variables.
+  const reopened = new FlowXHostService({ env });
+  t.after(() => reopened.dispose());
+  assert.deepEqual((await call(reopened, 'getSettings')).value.envKeys, finalEnv.value.envKeys);
+  assert.doesNotMatch(JSON.stringify(await value(reopened, 'status')), /saved-env-secret/);
+});
+
+test('environment settings require owner authorization, safe values, and configured paths', async t => {
+  const { env } = await fixture(t);
+  const service = new FlowXHostService({ env });
+  t.after(() => service.dispose());
+  for (const peer of [undefined, {}, { principal: { kind: 'guest' } }]) {
+    assert.equal((await service.dispatch('saveEnvironment', { set: { OK: '1' }, remove: [] }, peer)).error.code, 'flowx/forbidden');
+  }
+  const tooMany = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`VAR_${index}`, 'x']));
+  for (const payload of [
+    null, {}, { set: {}, remove: [], extra: true }, { set: null, remove: [] }, { set: [], remove: [] },
+    { set: { 'bad-name': 'x' }, remove: [] }, { set: { '9LEADING': 'x' }, remove: [] },
+    { set: JSON.parse('{"__proto__":"x"}'), remove: [] },
+    { set: { FLOWX_WORKSPACE: '/tmp' }, remove: [] },
+    { set: { FLOWX_LLM_API_KEY: 'x' }, remove: [] },
+    { set: { A: 'x'.repeat(4097) }, remove: [] },
+    { set: { A: 'line\nbreak' }, remove: [] },
+    { set: { A: 'tab\tvalue' }, remove: [] },
+    { set: tooMany, remove: [] },
+    { set: {}, remove: ['BAD-NAME'] },
+    { set: {}, remove: ['FLOWX_PYTHON'] },
+  ]) {
+    assert.equal((await service.dispatch('saveEnvironment', payload, OWNER)).error.code, 'flowx/invalid-payload', JSON.stringify(payload));
+  }
+  await assert.rejects(fs.lstat(env.DSH_HOME), { code: 'ENOENT' });
+
+  const unconfigured = new FlowXHostService({ env: { ...env, FLOWX_PYTHON: undefined, FLOWX_WORKSPACE: undefined } });
+  t.after(() => unconfigured.dispose());
+  assert.equal((await call(unconfigured, 'saveEnvironment', { set: { OK: '1' }, remove: [] })).error.code, 'flowx/configuration');
+  await assert.rejects(fs.lstat(env.DSH_HOME), { code: 'ENOENT' });
 });
 
 test('invalid paths, unsafe scripts and storage cannot mutate saved settings or create workflows', async t => {

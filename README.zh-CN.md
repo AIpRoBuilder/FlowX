@@ -14,6 +14,7 @@
 <!-- Modified 2026-11-11: document optional named workflow allocation. -->
 <!-- Modified 2026-11-12: clarify Harness Web and Desktop plugin installation. -->
 <!-- Modified 2026-11-16: announce media workflow support and the Harness media canvas. -->
+<!-- Modified 2026-11-16: announce plugin-saved environment variables. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -60,7 +61,7 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 <summary>📣 更新动态</summary>
 
 - **[2026.11.16]** 🖼️ **媒体工作流支持。** 生成的节点除了结构化文本外，还可以返回 `prompt`、`image` 和 `video` 卡片。新增的 `flowx_core.media` 工具包含图像/视频服务商调用封装、Pillow 缩放与裁剪、FFmpeg 裁剪与缩放、可选的 Blender 无界面渲染（需设置 `FLOWX_ENABLE_BLENDER=1`），以及用于零成本节点测试的 `FLOWX_MEDIA_DRY_RUN=1`。媒体产物与步骤卡片会记录到 `workflows/<workflow_id>/runs/`。服务商调用可能产生费用，生成的代码与测试也不在沙箱中运行。
-- **[2026.11.16]** 🎛️ **DeepSeek Harness 插件更新。** 工作流画布现在可以预览每个节点的 `prompt`、`image` 和 `video` 卡片，并支持运行历史（**Sync outputs**）、版本过期标记、缩放与宽画布、按工作流保存的拖拽布局，以及全尺寸灯箱预览。媒体通过仅限所有者的 `/api/flowx/media` 路由以带鉴权的 HTTP `Range` 响应提供。详见[插件 README](plugins/deepseek-harness-flowx/README.md)。
+- **[2026.11.16]** 🎛️ **DeepSeek Harness 插件更新。** 工作流画布现在可以预览每个节点的 `prompt`、`image` 和 `video` 卡片，并支持运行历史（**Sync outputs**）、版本过期标记、缩放与宽画布、按工作流保存的拖拽布局，以及全尺寸灯箱预览。媒体通过仅限所有者的 `/api/flowx/media` 路由以带鉴权的 HTTP `Range` 响应提供。设置中还新增了环境变量区域，可用于配置新建构建和技能进程所需的提供商、媒体与工具参数。详见[插件 README](plugins/deepseek-harness-flowx/README.md)。
 - **[2026.11.10]** 🔑 **技能与插件更新。** DeepSeek Harness 插件设置现在可填写 `FLOWX_LLM_API_KEY`，且不再需要填写技能目录；FlowX 技能脚本会复用插件保存的 Python、工作区和 API Key。
 - **[2026.10.28]** 🧩 **扩展节点引擎。** 每个业务节点在发布前都会执行“生成 → 审计 → 测试 → 有界修复”链路。
 - **[2026.10.24]** ⚙️ **原生 WorkflowEngine 生成。** 图、节点和入口生成工作流现在都是 `WorkflowEngine` 的子类。

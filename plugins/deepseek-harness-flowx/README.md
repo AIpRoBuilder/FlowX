@@ -6,6 +6,7 @@
 <!-- Modified 2026-11-10: document the implemented read-only viewer, settings, and folder browsing. -->
 <!-- Modified 2026-11-12: document Web and Desktop installation and configuration. -->
 <!-- Modified 2026-11-16: document per-node media canvas previews, run journals, layout storage, and Range streaming. -->
+<!-- Modified 2026-11-16: document saved environment variables for FlowX skill processes. -->
 
 # FlowX for DeepSeek Harness
 
@@ -130,23 +131,37 @@ by the offline tests below.
 
 ### Viewer settings
 
-Select **Settings** in the overlay to edit two existing absolute paths and the
-API key. No skill directory is needed to save settings or view workflows; build
-endpoints locate the skill on demand (`FLOWX_SKILL_DIR`, the source checkout,
-then `$DSH_HOME/skills/flowx-workflows` or `~/.dsh/skills/flowx-workflows`,
-then `./.dsh/skills/flowx-workflows`). The
-dialog reloads the workflow list immediately after a successful save; changing
-saved values does not require a host restart.
+Select **Settings** in the overlay to edit two existing absolute paths, the
+API key, and optional environment variables. No skill directory is needed to
+save settings or view workflows; build endpoints locate the skill on demand
+(`FLOWX_SKILL_DIR`, the source checkout, then
+`$DSH_HOME/skills/flowx-workflows` or `~/.dsh/skills/flowx-workflows`, then
+`./.dsh/skills/flowx-workflows`). The dialog reloads the workflow list
+immediately after a successful save; changing saved values does not require a
+host restart.
 
 | Field | Environment fallback | Requirement |
 | --- | --- | --- |
 | `python` | `FLOWX_PYTHON` | Executable Python interpreter with the FlowX SDK installed. Preserve the virtual-environment executable path rather than resolving it to the base interpreter. |
 | `workspace` | `FLOWX_WORKSPACE` | Existing directory for FlowX artifacts, independent of the workspace selected in Harness. |
 | `apiKey` | `FLOWX_LLM_API_KEY` | Optional provider key. It is stored in the owner-only settings file, never returned to the browser, and an empty value keeps the saved key. |
+| `env` | — | Optional `KEY=VALUE` lines saved as environment variables. They are applied to newly spawned build/inspection processes and exported by the skill's `plugin_settings.py`; values are stored owner-only and never returned to the browser. |
+
+Use **New or updated variables** to enter `KEY=VALUE` lines (comments and an
+optional `export` prefix are accepted), then select **Set environment
+variables**. The button merges new or changed names into the saved set; use the
+**×** control next to a saved name to remove it. `FLOWX_PYTHON`,
+`FLOWX_WORKSPACE`, `FLOWX_LLM_API_KEY`, and `FLOWX_PLUGIN_PYTHON_ACTIVE` are
+managed by dedicated settings and cannot be set here. Typical uses are
+`FLOWX_LLM_PROVIDER`, `FLOWX_LLM_MODEL`, `OPENAI_BASE_URL`, media provider
+URLs/models/keys, `FLOWX_MEDIA_DRY_RUN`, and `FLOWX_ENABLE_BLENDER` or
+`FLOWX_BLENDER_BIN`.
 
 The separately installed skill's scripts read this same settings file, so they
-use the saved `python`, `workspace` and API key by default (explicit
-`--workspace` still wins).
+use the saved `python`, `workspace`, API key, and environment variables by
+default (explicit `--workspace` still wins). Saved environment values override
+inherited values in skill processes; the saved API key still wins for
+`FLOWX_LLM_API_KEY`.
 
 The host persists these paths in
 `$DSH_HOME/plugins/deepseek-harness-flowx/settings.json`, or
@@ -159,8 +174,12 @@ persist across restarts. Invalid or unsafe paths and storage are rejected
 without overwriting the previous file, and the dialog shows the failure so it
 can be corrected.
 
-The host snapshots environment variables at initialization, so restart it after
-changing environment fallbacks or provider credentials. The source-checkout
+The host snapshots inherited environment variables at initialization, so
+restart it after changing host environment fallbacks or provider credentials.
+Variables saved in the viewer settings do not need a host restart: new
+build/inspection children and new skill processes read them. Start a new
+runtime process after changing saved variables because a running process keeps
+its original environment. The source-checkout
 layout supplies a default skill path when available; for linked, installed,
 copied, or packed plugins, explicitly configure the separately installed skill
 path. Neither local `add` nor `link:` bundles the skill. Reinstall or restart as
@@ -184,7 +203,8 @@ and [NOTICE](NOTICE).
    narrow windows this dismisses Harness's navigation drawer first; the current
    conversation and its selection are preserved. Press **Escape**, select
    **Close**, or use the footer action again to close the overlay. Select
-  **Settings** to configure `python`, `workspace`, and the API key.
+  **Settings** to configure `python`, `workspace`, the API key, and optional
+  environment variables.
 2. Select a workflow to inspect its graph, dependencies, requirements, main
    entrypoint, and available node artifacts. The graph is the **current plan**,
    not necessarily the published revision: published workflow and node

@@ -9,6 +9,7 @@
 // Modified 2026-11-10: replace the build page with a read-only left overlay, path settings, and folder browser.
 // Modified 2026-11-10: dismiss the narrow navigation drawer before opening the overlay.
 // Modified 2026-11-16: add HTML-over-SVG media canvas, per-node prompt/image/video previews, run selector, and layout persistence.
+// Modified 2026-11-16: add a saved environment-variable area to plugin settings.
 
 window.__ModuleLoader__.load({
   id: 'dsh-flowx-plugin',
@@ -18,6 +19,29 @@ window.__ModuleLoader__.load({
     const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
     const CARD_WIDTH = 236;
     const mediaHref = (workflowId, relPath) => `api/flowx/media?workflowId=${encodeURIComponent(workflowId)}&path=${encodeURIComponent(relPath)}`;
+    const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+    const ENV_RESERVED = new Set(['FLOWX_PYTHON', 'FLOWX_WORKSPACE', 'FLOWX_LLM_API_KEY', 'FLOWX_PLUGIN_PYTHON_ACTIVE', '__PROTO__', 'CONSTRUCTOR', 'PROTOTYPE']);
+    const parseEnvironment = text => {
+      const set = {};
+      for (const [index, raw] of String(text || '').split('\n').entries()) {
+        let line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        line = line.replace(/^export\s+/, '');
+        const equals = line.indexOf('=');
+        if (equals < 1) throw new Error(`Line ${index + 1}: expected KEY=VALUE.`);
+        const name = line.slice(0, equals).trim();
+        let value = line.slice(equals + 1).trim();
+        if (!ENV_NAME.test(name)) throw new Error(`Line ${index + 1}: invalid variable name.`);
+        if (ENV_RESERVED.has(name.toUpperCase())) throw new Error(`Line ${index + 1}: ${name} is managed by plugin settings.`);
+        if (Object.hasOwn(set, name)) throw new Error(`Line ${index + 1}: duplicate ${name}.`);
+        if (value.length >= 2 && (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+        if (/[\x00-\x1f\x7f]/.test(value)) throw new Error(`Line ${index + 1}: values must be printable text.`);
+        if (value.length > 4096) throw new Error(`Line ${index + 1}: value is too long.`);
+        set[name] = value;
+      }
+      if (Object.keys(set).length > 64) throw new Error('At most 64 environment variables can be set at once.');
+      return set;
+    };
     const statusTone = status => status === 'running' ? '#3b82f6' : status === 'completed' ? '#16a34a' : status === 'failed' ? '#dc2626' : status === 'awaiting_input' ? '#d97706' : '#7181eb';
     const styles = {
       panel: { pointerEvents: 'auto', position: 'absolute', top: 8, bottom: 8, left: 8, width: 'min(680px, calc(100vw - 16px))', boxSizing: 'border-box', overflowY: 'auto', background: '#f5f8fc', color: '#192a44', border: '1px solid #dce5f3', borderRadius: 16, boxShadow: '0 20px 70px rgba(17, 33, 61, .25)', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', fontSize: 14 },
@@ -370,10 +394,13 @@ window.__ModuleLoader__.load({
       };
       const openSettings = async () => {
         const ticket = ++settingsTicket.current;
-        setSettings({ python: '', workspace: '', apiKey: '', apiKeySet: false }); setSettingsError(''); setSettingsBusy(true);
+        setSettings({ python: '', workspace: '', apiKey: '', apiKeySet: false, envKeys: [], envDraft: '', envRemove: [], envNotice: '', envError: '' }); setSettingsError(''); setSettingsBusy(true);
         try {
           const value = await call('getSettings', null);
-          if (mounted.current && ticket === settingsTicket.current) setSettings({ python: value?.python || '', workspace: value?.workspace || '', apiKey: '', apiKeySet: !!value?.apiKeySet });
+          if (mounted.current && ticket === settingsTicket.current) {
+            const envKeys = Array.isArray(value?.envKeys) ? value.envKeys.filter(key => typeof key === 'string') : [];
+            setSettings({ python: value?.python || '', workspace: value?.workspace || '', apiKey: '', apiKeySet: !!value?.apiKeySet, envKeys, envDraft: '', envRemove: [], envNotice: '', envError: '' });
+          }
         } catch (failure) { if (mounted.current && ticket === settingsTicket.current) setSettingsError(failure.message || 'Unable to load settings.'); }
         finally { if (mounted.current && ticket === settingsTicket.current) { setSettingsBusy(false); settingsRef.current?.focus(); } }
       };
@@ -382,11 +409,36 @@ window.__ModuleLoader__.load({
         event.preventDefault(); if (!settings || settingsBusy || saving.current || operation.current || busy) return;
         const ticket = ++settingsTicket.current; saving.current = true; setSettingsBusy(true); setSettingsError('');
         try {
-          const { apiKeySet, ...payload } = settings;
-          await call('saveSettings', payload);
+          await call('saveSettings', { python: settings.python, workspace: settings.workspace, apiKey: settings.apiKey });
           if (mounted.current && ticket === settingsTicket.current) { setSettings(null); settingsButton.current?.focus(); }
           notifySaved();
         } catch (failure) { if (mounted.current && ticket === settingsTicket.current) setSettingsError(failure.message || 'Unable to save settings.'); }
+        finally { saving.current = false; if (mounted.current && ticket === settingsTicket.current) setSettingsBusy(false); }
+      };
+      const saveEnvironment = async () => {
+        if (!settings || settingsBusy || saving.current || operation.current || busy) return;
+        let set;
+        try { set = parseEnvironment(settings.envDraft); }
+        catch (failure) {
+          if (mounted.current) setSettings(old => old && ({ ...old, envError: failure.message, envNotice: '' }));
+          return;
+        }
+        const remove = settings.envRemove || [];
+        if (Object.keys(set).length === 0 && remove.length === 0) {
+          setSettings(old => old && ({ ...old, envError: 'Enter at least one KEY=VALUE line or remove a saved variable.', envNotice: '' }));
+          return;
+        }
+        const ticket = ++settingsTicket.current; saving.current = true; setSettingsBusy(true);
+        setSettings(old => old && ({ ...old, envError: '', envNotice: '' }));
+        try {
+          const value = await call('saveEnvironment', { set, remove });
+          if (mounted.current && ticket === settingsTicket.current) {
+            const envKeys = Array.isArray(value?.envKeys) ? value.envKeys.filter(key => typeof key === 'string') : [];
+            setSettings(old => old && ({ ...old, envKeys, envDraft: '', envRemove: [], envNotice: `Saved ${envKeys.length} environment ${envKeys.length === 1 ? 'variable' : 'variables'}. Restart running FlowX processes to apply changes.`, envError: '' }));
+          }
+        } catch (failure) {
+          if (mounted.current && ticket === settingsTicket.current) setSettings(old => old && ({ ...old, envError: failure.message || 'Unable to save environment variables.', envNotice: '' }));
+        }
         finally { saving.current = false; if (mounted.current && ticket === settingsTicket.current) setSettingsBusy(false); }
       };
       const graph = rawGraph ? graphModel(rawGraph, layout) : null;
@@ -395,6 +447,8 @@ window.__ModuleLoader__.load({
       const selectedRunNode = selectedNode && activeRun?.nodes?.[selectedNode];
       const staleRun = !!(activeRun && Number.isInteger(artifacts?.workflow_version) && artifacts.workflow_version > 0 && activeRun.workflow_version > 0 && activeRun.workflow_version !== artifacts.workflow_version);
       const workflows = catalog ? Object.entries(catalog).sort(([a], [b]) => compare(a, b)) : [];
+      const savedEnvKeys = settings?.envKeys || [], pendingEnvRemovals = settings?.envRemove || [];
+      const keptEnvKeys = savedEnvKeys.filter(key => !pendingEnvRemovals.includes(key));
       return h('aside', { id: 'flowx-overlay', role: 'region', 'aria-label': 'FlowX workflow explorer', style: wideCanvas ? styles.panelExpanded : styles.panel, onKeyDown: event => { if (event.key === 'Escape') { event.stopPropagation(); if (lightbox) setLightbox(null); else if (settings) cancelSettings(); else close(); } } },
         h('div', { style: styles.content },
           h('header', { style: styles.header }, h('div', null, h('p', { style: styles.eyebrow }, 'FlowX · workflow & media canvas'), h('h1', { style: styles.title }, 'Your workflows'), h('p', { style: styles.muted }, 'Explore plans, generated files, and per-node media outputs without leaving your conversation.')),
@@ -447,11 +501,24 @@ window.__ModuleLoader__.load({
               lightbox.kind === 'video'
                 ? h('video', { src: lightbox.src, poster: lightbox.poster, controls: true, autoPlay: true, style: { maxWidth: '100%', maxHeight: '74vh', borderRadius: 10, background: '#000' } })
                 : h('img', { src: lightbox.src, alt: lightbox.label, style: { maxWidth: '100%', maxHeight: '74vh', borderRadius: 10, display: 'block' } }))),
-          settings && h('div', { role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'flowx-settings-title', onKeyDown: event => { if (event.key !== 'Tab') return; const controls = [...event.currentTarget.querySelectorAll('input:not(:disabled), button:not(:disabled)')]; if (!controls.length) { event.preventDefault(); return; } const first = controls[0], last = controls[controls.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }, style: { position: 'fixed', inset: 0, background: 'rgba(24, 39, 62, .45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: 14, boxSizing: 'border-box', overflow: 'auto' } },
+          settings && h('div', { role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'flowx-settings-title', onKeyDown: event => { if (event.key !== 'Tab') return; const controls = [...event.currentTarget.querySelectorAll('input:not(:disabled), textarea:not(:disabled), button:not(:disabled)')]; if (!controls.length) { event.preventDefault(); return; } const first = controls[0], last = controls[controls.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }, style: { position: 'fixed', inset: 0, background: 'rgba(24, 39, 62, .45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: 14, boxSizing: 'border-box', overflow: 'auto' } },
             h('form', { onSubmit: saveSettings, style: { ...styles.card, width: '100%', maxWidth: 520, boxShadow: '0 16px 50px rgba(0,0,0,.2)' } },
               h('h2', { id: 'flowx-settings-title', style: styles.heading }, 'FlowX settings'), h('p', { style: styles.muted }, 'Absolute paths on the Harness host. Saved values take precedence over environment variables. The API key is stored owner-only on the host and never shown again; leave it empty to keep the current one.'),
               settingsError && h('p', { role: 'alert', style: styles.notice }, settingsError),
               [['python', 'FLOWX_PYTHON'], ['workspace', 'FLOWX_WORKSPACE'], ['apiKey', 'FLOWX_LLM_API_KEY']].map(([key, label]) => h('div', { key }, h('label', { htmlFor: `flowx-${key}`, style: styles.label }, label), h('input', { id: `flowx-${key}`, ref: key === 'python' ? settingsRef : undefined, style: styles.input, type: key === 'apiKey' ? 'password' : 'text', autoComplete: key === 'apiKey' ? 'off' : undefined, placeholder: key === 'apiKey' && settings.apiKeySet ? 'Key is set' : undefined, value: settings[key], required: key !== 'apiKey', disabled: settingsBusy, onChange: event => setSettings(old => ({ ...old, [key]: event.target.value })) }))),
+              h('div', { style: { marginTop: 18, paddingTop: 14, borderTop: '1px solid #e3e9f5' } },
+                h('h3', { style: styles.heading }, 'Environment variables'),
+                h('p', { style: styles.muted }, 'Optional KEY=VALUE lines applied to FlowX build, inspection, and runtime processes that start after saving. Values are stored owner-only on the host and never shown again. Use the API key field above for FLOWX_LLM_API_KEY.'),
+                savedEnvKeys.length > 0 && h('p', { style: styles.label }, 'Saved variables (values hidden)'),
+                savedEnvKeys.length > 0 && h('div', { style: { ...styles.row, marginTop: 8 } },
+                  keptEnvKeys.map(key => h('span', { key, style: { ...styles.badge, display: 'inline-flex', alignItems: 'center', gap: 6 } }, key,
+                    h('button', { type: 'button', 'aria-label': `Remove environment variable ${key}`, title: `Remove ${key}`, disabled: settingsBusy, onClick: () => setSettings(old => old && ({ ...old, envRemove: [...old.envRemove.filter(name => name !== key), key], envError: '', envNotice: '' })), style: { border: 0, background: 'transparent', color: '#953d4a', cursor: 'pointer', fontWeight: 800, padding: '0 0 0 2px', font: 'inherit' } }, '×'))),
+                  pendingEnvRemovals.length > 0 && h('button', { type: 'button', style: styles.button, disabled: settingsBusy, onClick: () => setSettings(old => old && ({ ...old, envRemove: [], envError: '', envNotice: '' })) }, `Undo ${pendingEnvRemovals.length} removal${pendingEnvRemovals.length === 1 ? '' : 's'}`)),
+                h('label', { htmlFor: 'flowx-env', style: styles.label }, 'New or updated variables'),
+                h('textarea', { id: 'flowx-env', rows: 4, spellCheck: false, placeholder: 'FLOWX_LLM_PROVIDER=deepseek\nFLOWX_MEDIA_DRY_RUN=1', value: settings.envDraft, disabled: settingsBusy, onChange: event => setSettings(old => old && ({ ...old, envDraft: event.target.value, envError: '', envNotice: '' })), style: { ...styles.input, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', resize: 'vertical' } }),
+                settings.envError && h('p', { role: 'alert', style: styles.notice }, settings.envError),
+                settings.envNotice && h('p', { role: 'status', style: { ...styles.muted, color: '#166534', marginTop: 8 } }, settings.envNotice),
+                h('button', { type: 'button', style: { ...styles.primary, marginTop: 10 }, disabled: settingsBusy || (settings.envDraft.trim() === '' && pendingEnvRemovals.length === 0), onClick: saveEnvironment }, 'Set environment variables')),
               h('div', { style: { ...styles.row, marginTop: 16 } }, h('button', { type: 'submit', style: styles.primary, disabled: settingsBusy || !!busy }, settingsBusy ? 'Working…' : 'Save settings'), h('button', { type: 'button', style: styles.button, disabled: saving.current, onClick: cancelSettings }, 'Cancel'))))));
     }
 

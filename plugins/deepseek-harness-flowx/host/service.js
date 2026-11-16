@@ -8,6 +8,7 @@
 // Modified 2026-11-10: resolve a symlinked DSH_HOME before confining settings storage.
 // Modified 2026-11-10: add bounded, owner-only workflow folder browsing.
 // Modified 2026-11-10: save the API key in settings and locate the skill automatically.
+// Modified 2026-11-16: save owner-configured environment variables for FlowX skill processes.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -57,6 +58,13 @@ except Exception as exc:
 `;
 const SETTINGS_KEYS = ['python', 'workspace'];
 const SAVE_KEYS = ['python', 'workspace', 'apiKey'];
+const ENV_SET_KEYS = ['set', 'remove'];
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const ENV_COUNT_LIMIT = 64;
+const ENV_VALUE_LIMIT = 4096;
+// These are managed by dedicated settings, the skill re-exec guard, or object
+// prototypes. Environment-variable names are case-insensitive on Windows.
+const ENV_RESERVED = new Set(['FLOWX_PYTHON', 'FLOWX_WORKSPACE', 'FLOWX_LLM_API_KEY', 'FLOWX_PLUGIN_PYTHON_ACTIVE', '__PROTO__', 'CONSTRUCTOR', 'PROTOTYPE']);
 const SETTINGS_LIMIT = 16384;
 const PROVIDER_CREDENTIALS = new Set(['FLOWX_LLM_API_KEY', 'OPENAI_API_KEY', 'ZHIPU_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'ONEONEONEAPI_API_KEY']);
 const CREDENTIAL_PATHS = new Set(['GOOGLE_APPLICATION_CREDENTIALS', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR']);
@@ -115,9 +123,14 @@ function safeError(error) {
  * Manifest error details and absolute entrypoint paths are withheld. Redaction
  * is best-effort, and other workflow contents may still contain sensitive data.
  * getSettings takes null; saveSettings takes {python,workspace,apiKey} (empty
- * apiKey keeps the saved one) and both return {python,workspace,apiKeySet}
- * (unset environment fallbacks are null); the key is never returned.
- * The skill directory is not configurable: it is located automatically.
+ * apiKey keeps the saved one); saveEnvironment takes {set,remove}, where set
+ * maps environment names to values and remove lists names to delete. They
+ * return {python,workspace,apiKeySet,envKeys} (unset environment fallbacks are
+ * null). The key and environment values are never returned. Saved environment
+ * variables are applied to spawned skill children and exported by the skill's
+ * plugin_settings.py; FLOWX_PYTHON, FLOWX_WORKSPACE, FLOWX_LLM_API_KEY and the
+ * skill re-exec guard are reserved. The skill directory is not configurable:
+ * it is located automatically.
  * The owner must treat prompts, repair context, artifacts and logs as sensitive.
  * Nothing here locks other FlowX processes or prevents external workspace edits.
  * Revisions are scoped to instanceId; callers should compare both across reloads.
@@ -128,19 +141,9 @@ function safeError(error) {
 export class FlowXHostService {
   constructor({ env = process.env, spawn = nodeSpawn, inspectTimeoutMs = 30000, abortTimeoutMs = 30000, shutdownMs = 2000 } = {}) {
     this.env = { ...env };
-    const secrets = new Set();
-    for (const [key, value] of Object.entries(this.env)) {
-      if (typeof value !== 'string' || !value) continue;
-      if (SECRET_ENV.test(key)) secrets.add(value);
-      if (URL_CREDENTIALS.test(value)) {
-        try {
-          const url = new URL(value);
-          for (const part of [url.username, url.password]) if (part) { secrets.add(part); secrets.add(decodeURIComponent(part)); }
-        } catch { /* malformed URLs are not a source of separately known secrets */ }
-      }
-    }
-    this.secrets = secrets;
-    this.secretPattern = this.buildSecretPattern();
+    this.secrets = new Set();
+    this.secretPattern = null;
+    this.collectSecrets(this.env);
     this.spawn = spawn;
     this.inspectTimeoutMs = inspectTimeoutMs;
     this.abortTimeoutMs = abortTimeoutMs;
@@ -173,6 +176,11 @@ export class FlowXHostService {
         case 'saveSettings':
           if (!exact(payload, SAVE_KEYS) || !SAVE_KEYS.every(key => text(payload[key], 4096))) throw invalid();
           value = await this.saveSettings({ python: payload.python, workspace: payload.workspace, apiKey: payload.apiKey }); break;
+        case 'saveEnvironment':
+          if (!exact(payload, ENV_SET_KEYS) || !object(payload.set) || !Array.isArray(payload.remove) ||
+              payload.remove.length > ENV_COUNT_LIMIT || !this.validEnvironment(payload.set) ||
+              !payload.remove.every(name => typeof name === 'string' && ENV_NAME.test(name) && !ENV_RESERVED.has(name.toUpperCase()))) throw invalid();
+          value = await this.saveEnvironment({ set: { ...payload.set }, remove: [...payload.remove] }); break;
         case 'start':
           if (!exact(payload, ['prompt']) || !text(payload.prompt) || !payload.prompt.trim()) throw invalid();
           value = await this.start(payload.prompt); break;
@@ -215,12 +223,47 @@ export class FlowXHostService {
   }
 
   fallbackSettings() {
-    return { python: this.env.FLOWX_PYTHON ?? null, workspace: this.env.FLOWX_WORKSPACE ?? null, apiKeySet: Boolean(this.env.FLOWX_LLM_API_KEY) };
+    return { python: this.env.FLOWX_PYTHON ?? null, workspace: this.env.FLOWX_WORKSPACE ?? null, apiKeySet: Boolean(this.env.FLOWX_LLM_API_KEY), envKeys: [] };
+  }
+
+  settingsView(settings) {
+    return {
+      python: settings.python,
+      workspace: settings.workspace,
+      apiKeySet: Boolean(settings.apiKey) || Boolean(this.env.FLOWX_LLM_API_KEY),
+      envKeys: Object.keys(settings.env || {}).sort(),
+    };
   }
 
   buildSecretPattern() {
     const ordered = [...this.secrets].sort((a, b) => b.length - a.length);
     return ordered.length ? new RegExp(ordered.map(secret => secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g') : null;
+  }
+
+  collectSecrets(entries) {
+    // Saved environment values can be credentials too, so redact secret-named
+    // values and URL credentials just like inherited host configuration.
+    let changed = false;
+    const add = value => {
+      if (!value || this.secrets.has(value)) return;
+      this.secrets.add(value);
+      changed = true;
+    };
+    for (const [key, value] of Object.entries(entries || {})) {
+      if (typeof key !== 'string' || typeof value !== 'string' || !value) continue;
+      if (SECRET_ENV.test(key)) add(value);
+      if (URL_CREDENTIALS.test(value)) {
+        try {
+          const url = new URL(value);
+          for (const part of [url.username, url.password]) {
+            if (!part) continue;
+            add(part);
+            try { add(decodeURIComponent(part)); } catch { /* keep the encoded form */ }
+          }
+        } catch { /* malformed URLs are not a source of separately known secrets */ }
+      }
+    }
+    if (changed) this.secretPattern = this.buildSecretPattern();
   }
 
   // Resolution order: FLOWX_SKILL_DIR, the source checkout, then Harness skill roots.
@@ -247,11 +290,20 @@ export class FlowXHostService {
     } catch { throw problem('configuration', 'Building requires the FlowX skill (set FLOWX_SKILL_DIR or install it under ~/.dsh/skills/flowx-workflows).'); }
   }
 
+  validEnvironment(env) {
+    if (!object(env)) return false;
+    const entries = Object.entries(env);
+    return entries.length <= ENV_COUNT_LIMIT && entries.every(([name, value]) =>
+      ENV_NAME.test(name) && !ENV_RESERVED.has(name.toUpperCase()) &&
+      text(value, ENV_VALUE_LIMIT) && !/[\x00-\x1f\x7f]/.test(value));
+  }
+
   validSettings(settings) {
-    return object(settings) && Object.keys(settings).every(key => key === 'apiKey' || SETTINGS_KEYS.includes(key)) &&
+    return object(settings) && Object.keys(settings).every(key => key === 'apiKey' || key === 'env' || SETTINGS_KEYS.includes(key)) &&
       SETTINGS_KEYS.every(key =>
         text(settings[key], 4096) && path.isAbsolute(settings[key]) && !/[\x00-\x1f\x7f]/.test(settings[key]) && this.redact(settings[key]) === settings[key]) &&
       (settings.apiKey === undefined || (text(settings.apiKey, 4096) && settings.apiKey.length > 0 && !/[\x00-\x1f\x7f]/.test(settings.apiKey))) &&
+      (settings.env === undefined || this.validEnvironment(settings.env)) &&
       Buffer.byteLength(JSON.stringify(settings) + '\n') <= SETTINGS_LIMIT;
   }
 
@@ -346,69 +398,112 @@ export class FlowXHostService {
       this.secrets.add(settings.apiKey);
       this.secretPattern = this.buildSecretPattern();
     }
+    if (settings?.env) this.collectSecrets(settings.env);
     return settings;
   }
 
   async getSettings() {
     return this.withSharedLease(async () => {
       const saved = await this.loadSettings();
-      return saved ? { python: saved.python, workspace: saved.workspace, apiKeySet: Boolean(saved.apiKey) || Boolean(this.env.FLOWX_LLM_API_KEY) } : this.fallbackSettings();
+      return saved ? this.settingsView(saved) : this.fallbackSettings();
     });
   }
 
-  saveSettings(submitted) {
+  async writeSettings(settings) {
+    if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
+    const directory = await this.settingsDirectoryAccess(true);
+    const filename = path.join(directory, 'settings.json');
+    await this.readSettingsFile(directory);
+    const temporary = path.join(directory, `.settings-${randomUUID()}.tmp`);
+    let file, created = false;
+    try {
+      file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+      created = true;
+      await file.chmod(0o600);
+      await file.writeFile(JSON.stringify(settings) + '\n', 'utf8');
+      await file.sync();
+      await file.close();
+      file = null;
+      // Recheck the directory and target immediately before atomic replacement.
+      await this.settingsDirectoryAccess(false);
+      await this.readSettingsFile(directory);
+      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+      await fs.rename(temporary, filename);
+      created = false;
+    } catch (error) {
+      if (error instanceof HostError) throw error;
+      throw storageError();
+    } finally {
+      await file?.close().catch(() => {});
+      if (created) await fs.unlink(temporary).catch(() => {});
+    }
+    // Other service instances can share this settings file and cache the old root.
+    for (const reference of services) {
+      const service = reference.deref();
+      if (!service) { services.delete(reference); continue; }
+      service.artifacts.clear();
+      service.graphSnapshot = null;
+    }
+    if (settings.env) this.collectSecrets(settings.env);
+  }
+
+  queueSettingsWrite(operation) {
     if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
     if (buildOwner || inspections) throw busy();
     // Reserve the lease synchronously, including while queued behind another save.
     settingsWrites++;
-    const operation = settingsTail.then(async () => {
+    const queued = settingsTail.then(async () => {
       if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-      const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
-      // An empty key keeps the previously saved one.
-      const apiKey = submitted.apiKey || previous?.apiKey;
-      const settings = { python: submitted.python, workspace: submitted.workspace, ...(apiKey ? { apiKey } : {}) };
-      if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
-      await this.validateConfig(settings, false);
-      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-      const directory = await this.settingsDirectoryAccess(true);
-      const filename = path.join(directory, 'settings.json');
-      await this.readSettingsFile(directory);
-      const temporary = path.join(directory, `.settings-${randomUUID()}.tmp`);
-      let file, created = false;
-      try {
-        file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
-        created = true;
-        await file.chmod(0o600);
-        await file.writeFile(JSON.stringify(settings) + '\n', 'utf8');
-        await file.sync();
-        await file.close();
-        file = null;
-        // Recheck the directory and target immediately before atomic replacement.
-        await this.settingsDirectoryAccess(false);
-        await this.readSettingsFile(directory);
-        if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-        await fs.rename(temporary, filename);
-        created = false;
-      } catch (error) {
-        if (error instanceof HostError) throw error;
-        throw storageError();
-      } finally {
-        await file?.close().catch(() => {});
-        if (created) await fs.unlink(temporary).catch(() => {});
-      }
-      // Other service instances can share this settings file and cache the old root.
-      for (const reference of services) {
-        const service = reference.deref();
-        if (!service) { services.delete(reference); continue; }
-        service.artifacts.clear();
-        service.graphSnapshot = null;
-      }
-      return { python: settings.python, workspace: settings.workspace, apiKeySet: Boolean(settings.apiKey) || Boolean(this.env.FLOWX_LLM_API_KEY) };
+      return operation();
     });
-    const completion = operation.finally(() => { settingsWrites--; this.settingsOps.delete(completion); });
+    const completion = queued.finally(() => { settingsWrites--; this.settingsOps.delete(completion); });
     this.settingsOps.add(completion);
     settingsTail = completion.catch(() => {});
     return completion;
+  }
+
+  saveSettings(submitted) {
+    return this.queueSettingsWrite(async () => {
+      const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
+      // An empty key keeps the previously saved one; saved environment variables are preserved.
+      const apiKey = submitted.apiKey || previous?.apiKey;
+      const settings = {
+        python: submitted.python,
+        workspace: submitted.workspace,
+        ...(apiKey ? { apiKey } : {}),
+        ...(previous?.env ? { env: previous.env } : {}),
+      };
+      if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
+      await this.validateConfig(settings, false);
+      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+      await this.writeSettings(settings);
+      return this.settingsView(settings);
+    });
+  }
+
+  saveEnvironment(submitted) {
+    if (!object(submitted) || !this.validEnvironment(submitted.set) || !Array.isArray(submitted.remove) || submitted.remove.length > ENV_COUNT_LIMIT ||
+        !submitted.remove.every(name => typeof name === 'string' && ENV_NAME.test(name) && !ENV_RESERVED.has(name.toUpperCase()))) throw invalid();
+    return this.queueSettingsWrite(async () => {
+      const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
+      const base = previous ?? this.fallbackSettings();
+      if (!base.python || !base.workspace) throw problem('configuration', 'Save the Python interpreter and workspace before setting environment variables.');
+      const env = { ...(previous?.env ?? {}) };
+      for (const name of submitted.remove) delete env[name];
+      for (const [name, value] of Object.entries(submitted.set)) env[name] = value;
+      if (!this.validEnvironment(env)) throw problem('configuration', 'Environment variables must use valid names and printable values within the size limits.');
+      const settings = {
+        python: base.python,
+        workspace: base.workspace,
+        ...(base.apiKey ? { apiKey: base.apiKey } : {}),
+        ...(Object.keys(env).length ? { env } : {}),
+      };
+      if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
+      await this.validateConfig(settings, false);
+      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+      await this.writeSettings(settings);
+      return this.settingsView(settings);
+    });
   }
 
   async config() {
@@ -465,6 +560,9 @@ export class FlowXHostService {
       return !SECRET_ENV.test(key) && !(typeof value === 'string' && URL_CREDENTIALS.test(value));
     }));
     if (settings) {
+      // Saved variables configure FlowX providers, media, and tools. Dedicated
+      // path and key settings are assigned last so they always win.
+      if (settings.env) Object.assign(env, settings.env);
       Object.assign(env, { FLOWX_PYTHON: settings.python, FLOWX_WORKSPACE: settings.workspace });
       if (settings.apiKey) env.FLOWX_LLM_API_KEY = settings.apiKey;
     }

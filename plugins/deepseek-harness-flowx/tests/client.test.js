@@ -7,6 +7,7 @@
 // Modified 2026-11-09: exercise shared Fetch requests and transport failures.
 // Modified 2026-11-10: test the read-only footer overlay, settings, folder browser and asynchronous races.
 // Modified 2026-11-10: verify navigation drawer handoff in narrow windows.
+// Modified 2026-11-16: cover the settings environment-variable area.
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -175,6 +176,8 @@ function harness(rpc, fetchOverride) {
   function workflow(id) { return find(node => node.type === 'button' && text(node).startsWith(`${id}Published revision `)); }
   function path(name) { return find(node => node.props['data-flowx-path'] === name); }
   function input(id) { return find(node => node.type === 'input' && node.props.id === `flowx-${id}`); }
+  function textarea(id) { return find(node => node.type === 'textarea' && node.props.id === `flowx-${id}`); }
+  function field(id) { return find(node => (node.type === 'input' || node.type === 'textarea') && node.props.id === `flowx-${id}`); }
   function fire(node) {
     assert.notEqual(node.props.disabled, true, 'control is disabled');
     assert.equal(typeof node.props.onClick, 'function');
@@ -183,7 +186,7 @@ function harness(rpc, fetchOverride) {
   const trigger = { focus() { focus.push('launcher'); }, closest() { return drawer ? {} : null; }, ownerDocument: { querySelector() { return { focus() { focus.push('sidebar opener'); } }; } } };
   async function click(node) { fire(node); await flush(); }
   async function toggle() { await click(launcher.tree); }
-  async function change(id, value) { input(id).props.onChange({ target: { value } }); await flush(); }
+  async function change(id, value) { field(id).props.onChange({ target: { value } }); await flush(); }
   async function submit() {
     let prevented = false;
     find(node => node.type === 'form').props.onSubmit({ preventDefault() { prevented = true; } });
@@ -200,7 +203,7 @@ function harness(rpc, fetchOverride) {
   return {
     registration, requires, plugin, injections, registrations, selections, focus, drawerToggles,
     setDrawer(value) { drawer = value; },
-    mount, flush, unmount, all, find, text, button, workflow, path, input, fire, click, toggle, change, submit, key,
+    mount, flush, unmount, all, find, text, button, workflow, path, input, textarea, fire, click, toggle, change, submit, key,
     launcher: () => launcher.tree, overlay: () => overlay.tree, page: () => page?.tree,
     call: (...args) => pageElement.props.call(...args),
   };
@@ -521,6 +524,42 @@ test('settings load, validate on the host, save paths and refresh the catalog', 
   assert.ok(ui.workflow('fresh'));
   assert.equal(lists, 2);
   assert.equal(ui.focus.at(-1), 'Settings');
+  ui.unmount();
+});
+
+test('settings save environment variables and remove saved names', async () => {
+  const calls = [];
+  let envKeys = ['FLOWX_MEDIA_DRY_RUN', 'OPENAI_BASE_URL'];
+  const ui = harness((url, endpoint, payload) => {
+    calls.push({ endpoint, payload });
+    if (endpoint === 'list') return ok(catalog('wf1'));
+    if (endpoint === 'getSettings') return ok({ ...settings, envKeys });
+    if (endpoint === 'saveEnvironment') {
+      if (payload.remove.includes('OPENAI_BASE_URL')) envKeys = ['FLOWX_MEDIA_DRY_RUN', 'OPENAI_API_KEY', 'FLOWX_LLM_MODEL'];
+      return ok({ ...settings, envKeys });
+    }
+    throw new Error(endpoint);
+  });
+  await ui.mount();
+  await ui.toggle();
+  await ui.click(ui.button('Settings'));
+  assert.match(ui.text(ui.page()), /FLOWX_MEDIA_DRY_RUN/);
+  assert.equal(ui.button('Set environment variables').props.disabled, true);
+  await ui.change('env', 'INVALID');
+  await ui.click(ui.button('Set environment variables'));
+  assert.match(ui.text(ui.find(node => node.props.role === 'alert')), /expected KEY=VALUE/);
+  assert.equal(calls.some(call => call.endpoint === 'saveEnvironment'), false);
+  await ui.click(ui.find(node => node.props['aria-label'] === 'Remove environment variable OPENAI_BASE_URL'));
+  assert.ok(ui.button('Undo 1 removal'));
+  await ui.change('env', 'export OPENAI_API_KEY="secret"\nFLOWX_LLM_MODEL=deepseek-flash\n# comment');
+  await ui.click(ui.button('Set environment variables'));
+  assert.deepEqual(calls.find(call => call.endpoint === 'saveEnvironment').payload, {
+    set: { OPENAI_API_KEY: 'secret', FLOWX_LLM_MODEL: 'deepseek-flash' },
+    remove: ['OPENAI_BASE_URL'],
+  });
+  assert.match(ui.text(ui.find(node => node.props.role === 'status' && /Saved/.test(ui.text(node)))), /Saved 3 environment variables/);
+  assert.equal(ui.textarea('env').props.value, '');
+  assert.equal(ui.all().some(node => node.props['aria-label'] === 'Remove environment variable OPENAI_BASE_URL'), false);
   ui.unmount();
 });
 
