@@ -133,8 +133,10 @@ by the offline tests below.
 ### Viewer settings
 
 Select **Settings** in the overlay to edit two existing absolute paths, the
-API key, and optional environment variables. No skill directory is needed to
-save settings or view workflows; build endpoints locate the skill on demand
+API key, and optional environment variables. Select **Environment variables** in
+the overlay header to open the same dialog focused directly on the custom
+environment editor. No skill directory is needed to save settings or view
+workflows; build endpoints locate the skill on demand
 (`FLOWX_SKILL_DIR`, the source checkout, then
 `$DSH_HOME/skills/flowx-workflows` or `~/.dsh/skills/flowx-workflows`, then
 `./.dsh/skills/flowx-workflows`). The dialog reloads the workflow list
@@ -180,7 +182,11 @@ restart it after changing host environment fallbacks or provider credentials.
 Variables saved in the viewer settings do not need a host restart: new
 build/inspection children and new skill processes read them. Start a new
 runtime process after changing saved variables because a running process keeps
-its original environment. The source-checkout
+its original environment. The Web and Desktop profiles run separate installed
+plugin copies: if the **Environment variables** action or section is missing,
+fully restart Harness and reinstall the current plugin in the active profile
+(`dsh plugin --profile web add ...` or `--profile desktop add ...`) before
+assuming the build is current. The source-checkout
 layout supplies a default skill path when available; for linked, installed,
 copied, or packed plugins, explicitly configure the separately installed skill
 path. Neither local `add` nor `link:` bundles the skill. Reinstall or restart as

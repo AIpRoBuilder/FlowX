@@ -275,7 +275,7 @@ window.__ModuleLoader__.load({
       const [workflowEnv, setWorkflowEnv] = useState(null);
       const [settings, setSettings] = useState(null), [settingsError, setSettingsError] = useState(''), [settingsBusy, setSettingsBusy] = useState(false);
       const mounted = useRef(false), generation = useRef(0), listTicket = useRef(0), viewTicket = useRef(0), runTicket = useRef(0), folderTickets = useRef({}), envTicket = useRef(0), settingsTicket = useRef(0), operation = useRef(''), saving = useRef(false), dragRef = useRef(null);
-      const closeRef = useRef(null), settingsRef = useRef(null), settingsButton = useRef(null);
+      const closeRef = useRef(null), settingsRef = useRef(null), settingsButton = useRef(null), envRef = useRef(null);
       const clearExplorer = useCallback(() => {
         generation.current++; viewTicket.current++; runTicket.current++; envTicket.current++; folderTickets.current = {};
         setWorkflow(null); setArtifacts(null); setRawGraph(null); setLayout({}); setGraphError('');
@@ -298,7 +298,12 @@ window.__ModuleLoader__.load({
         refresh();
         return () => { mounted.current = false; unsubscribe(); generation.current++; listTicket.current++; viewTicket.current++; runTicket.current++; envTicket.current++; settingsTicket.current++; };
       }, [refresh, subscribeSaved]);
-      useEffect(() => { if (settings && !settingsBusy) settingsRef.current?.focus(); }, [!!settings, settingsBusy]);
+      useEffect(() => {
+        if (!settings || settingsBusy) return;
+        const target = settings.focus === 'env' ? envRef.current : settingsRef.current;
+        target?.focus();
+        target?.scrollIntoView?.({ block: 'center' });
+      }, [!!settings, settingsBusy, settings?.focus]);
 
       const loadRunDetail = async (id, runId, generationId) => {
         if (!id || !runId) { setActiveRun(null); return; }
@@ -436,17 +441,17 @@ window.__ModuleLoader__.load({
           }
         }
       };
-      const openSettings = async () => {
+      const openSettings = async (focus = 'paths') => {
         const ticket = ++settingsTicket.current;
-        setSettings({ python: '', workspace: '', apiKey: '', apiKeySet: false, envKeys: [], envDraft: '', envRemove: [], envNotice: '', envError: '' }); setSettingsError(''); setSettingsBusy(true);
+        setSettings({ python: '', workspace: '', apiKey: '', apiKeySet: false, envKeys: [], envDraft: '', envRemove: [], envNotice: '', envError: '', focus }); setSettingsError(''); setSettingsBusy(true);
         try {
           const value = await call('getSettings', null);
           if (mounted.current && ticket === settingsTicket.current) {
             const envKeys = Array.isArray(value?.envKeys) ? value.envKeys.filter(key => typeof key === 'string') : [];
-            setSettings({ python: value?.python || '', workspace: value?.workspace || '', apiKey: '', apiKeySet: !!value?.apiKeySet, envKeys, envDraft: '', envRemove: [], envNotice: '', envError: '' });
+            setSettings({ python: value?.python || '', workspace: value?.workspace || '', apiKey: '', apiKeySet: !!value?.apiKeySet, envKeys, envDraft: '', envRemove: [], envNotice: '', envError: '', focus });
           }
         } catch (failure) { if (mounted.current && ticket === settingsTicket.current) setSettingsError(failure.message || 'Unable to load settings.'); }
-        finally { if (mounted.current && ticket === settingsTicket.current) { setSettingsBusy(false); settingsRef.current?.focus(); } }
+        finally { if (mounted.current && ticket === settingsTicket.current) setSettingsBusy(false); }
       };
       const cancelSettings = () => { if (saving.current) return; settingsTicket.current++; setSettings(null); setSettingsError(''); setSettingsBusy(false); settingsButton.current?.focus(); };
       const saveSettings = async event => {
@@ -498,7 +503,8 @@ window.__ModuleLoader__.load({
           h('header', { style: styles.header }, h('div', null, h('p', { style: styles.eyebrow }, 'FlowX · workflow & media canvas'), h('h1', { style: styles.title }, 'Your workflows'), h('p', { style: styles.muted }, 'Explore plans, generated files, and per-node media outputs without leaving your conversation.')),
             h('div', { style: styles.row },
               h('button', { type: 'button', style: styles.button, onClick: () => setWideCanvas(old => !old) }, wideCanvas ? 'Compact view' : 'Expand canvas'),
-              h('button', { type: 'button', ref: settingsButton, style: styles.button, onClick: openSettings }, 'Settings'),
+              h('button', { type: 'button', style: styles.button, onClick: () => openSettings('env') }, 'Environment variables'),
+              h('button', { type: 'button', ref: settingsButton, style: styles.button, onClick: () => openSettings('paths') }, 'Settings'),
               h('button', { type: 'button', ref: closeRef, style: styles.button, onClick: close, 'aria-label': 'Close FlowX' }, 'Close'))),
           error && h('div', { role: 'alert', style: styles.notice }, error),
           h('section', { style: styles.card, 'aria-labelledby': 'flowx-workflows-heading' },
@@ -567,11 +573,11 @@ window.__ModuleLoader__.load({
                 : h('img', { src: lightbox.src, alt: lightbox.label, style: { maxWidth: '100%', maxHeight: '74vh', borderRadius: 10, display: 'block' } }))),
           settings && h('div', { role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'flowx-settings-title', onKeyDown: event => { if (event.key !== 'Tab') return; const controls = [...event.currentTarget.querySelectorAll('input:not(:disabled), textarea:not(:disabled), button:not(:disabled)')]; if (!controls.length) { event.preventDefault(); return; } const first = controls[0], last = controls[controls.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }, style: { position: 'fixed', inset: 0, background: 'rgba(24, 39, 62, .45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: 14, boxSizing: 'border-box', overflow: 'auto' } },
             h('form', { onSubmit: saveSettings, style: { ...styles.card, width: '100%', maxWidth: 520, boxShadow: '0 16px 50px rgba(0,0,0,.2)' } },
-              h('h2', { id: 'flowx-settings-title', style: styles.heading }, 'FlowX settings'), h('p', { style: styles.muted }, 'Absolute paths on the Harness host. Saved values take precedence over environment variables. The API key is stored owner-only on the host and never shown again; leave it empty to keep the current one.'),
+              h('h2', { id: 'flowx-settings-title', style: styles.heading }, 'FlowX settings'), h('p', { style: styles.muted }, 'Absolute paths on the Harness host. Saved values take precedence over inherited environment variables. The API key is stored owner-only on the host and never shown again; leave it empty to keep the current one. Custom provider, media, and tool variables are in the Custom environment variables section below; per-workflow service variables use the workflow explorer\'s Environment button.'),
               settingsError && h('p', { role: 'alert', style: styles.notice }, settingsError),
               [['python', 'FLOWX_PYTHON'], ['workspace', 'FLOWX_WORKSPACE'], ['apiKey', 'FLOWX_LLM_API_KEY']].map(([key, label]) => h('div', { key }, h('label', { htmlFor: `flowx-${key}`, style: styles.label }, label), h('input', { id: `flowx-${key}`, ref: key === 'python' ? settingsRef : undefined, style: styles.input, type: key === 'apiKey' ? 'password' : 'text', autoComplete: key === 'apiKey' ? 'off' : undefined, placeholder: key === 'apiKey' && settings.apiKeySet ? 'Key is set' : undefined, value: settings[key], required: key !== 'apiKey', disabled: settingsBusy, onChange: event => setSettings(old => ({ ...old, [key]: event.target.value })) }))),
               h('div', { style: { marginTop: 18, paddingTop: 14, borderTop: '1px solid #e3e9f5' } },
-                h('h3', { style: styles.heading }, 'Environment variables'),
+                h('h3', { id: 'flowx-environment-heading', style: styles.heading }, 'Custom environment variables'),
                 h('p', { style: styles.muted }, 'Optional KEY=VALUE lines applied to FlowX build, inspection, and runtime processes that start after saving. Values are stored owner-only on the host and never shown again. Use the API key field above for FLOWX_LLM_API_KEY.'),
                 savedEnvKeys.length > 0 && h('p', { style: styles.label }, 'Saved variables (values hidden)'),
                 savedEnvKeys.length > 0 && h('div', { style: { ...styles.row, marginTop: 8 } },
@@ -579,7 +585,7 @@ window.__ModuleLoader__.load({
                     h('button', { type: 'button', 'aria-label': `Remove environment variable ${key}`, title: `Remove ${key}`, disabled: settingsBusy, onClick: () => setSettings(old => old && ({ ...old, envRemove: [...old.envRemove.filter(name => name !== key), key], envError: '', envNotice: '' })), style: { border: 0, background: 'transparent', color: '#953d4a', cursor: 'pointer', fontWeight: 800, padding: '0 0 0 2px', font: 'inherit' } }, '×'))),
                   pendingEnvRemovals.length > 0 && h('button', { type: 'button', style: styles.button, disabled: settingsBusy, onClick: () => setSettings(old => old && ({ ...old, envRemove: [], envError: '', envNotice: '' })) }, `Undo ${pendingEnvRemovals.length} removal${pendingEnvRemovals.length === 1 ? '' : 's'}`)),
                 h('label', { htmlFor: 'flowx-env', style: styles.label }, 'New or updated variables'),
-                h('textarea', { id: 'flowx-env', rows: 4, spellCheck: false, placeholder: 'FLOWX_LLM_PROVIDER=deepseek\nFLOWX_MEDIA_DRY_RUN=1', value: settings.envDraft, disabled: settingsBusy, onChange: event => setSettings(old => old && ({ ...old, envDraft: event.target.value, envError: '', envNotice: '' })), style: { ...styles.input, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', resize: 'vertical' } }),
+                h('textarea', { id: 'flowx-env', ref: envRef, rows: 4, spellCheck: false, placeholder: 'FLOWX_LLM_PROVIDER=deepseek\nFLOWX_MEDIA_DRY_RUN=1', value: settings.envDraft, disabled: settingsBusy, onChange: event => setSettings(old => old && ({ ...old, envDraft: event.target.value, envError: '', envNotice: '' })), style: { ...styles.input, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', resize: 'vertical' } }),
                 settings.envError && h('p', { role: 'alert', style: styles.notice }, settings.envError),
                 settings.envNotice && h('p', { role: 'status', style: { ...styles.muted, color: '#166534', marginTop: 8 } }, settings.envNotice),
                 h('button', { type: 'button', style: { ...styles.primary, marginTop: 10 }, disabled: settingsBusy || (settings.envDraft.trim() === '' && pendingEnvRemovals.length === 0), onClick: saveEnvironment }, 'Set environment variables')),

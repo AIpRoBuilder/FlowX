@@ -72,8 +72,9 @@ scripts import `plugin_settings.py`, which exports environment variables saved
 in the plugin before the SDK is created. When a build, workflow run, or the
 reported error needs a variable that is not set, name the exact variables and
 why they are needed, then ask the user to set them. Prefer the plugin's
-**Settings → Environment variables** area: the user enters `KEY=VALUE` lines,
-clicks **Set environment variables**, and can remove saved names there. The
+**Environment variables** header action (or **Settings → Custom environment
+variables**): the user enters `KEY=VALUE` lines, clicks **Set environment
+variables**, and can remove saved names there. The
 plugin stores values in its owner-only settings file, applies them to new
 build/inspection children, makes them available to skill scripts, and never
 returns the values to the browser. Alternatively, ask the user to configure the

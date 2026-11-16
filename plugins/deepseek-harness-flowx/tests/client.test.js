@@ -563,6 +563,22 @@ test('settings save environment variables and remove saved names', async () => {
   ui.unmount();
 });
 
+test('Environment variables header action opens the custom editor directly', async () => {
+  const ui = harness((url, endpoint) => {
+    if (endpoint === 'list') return ok(catalog('wf1'));
+    if (endpoint === 'getSettings') return ok({ ...settings, envKeys: ['OPENAI_BASE_URL'] });
+    throw new Error(endpoint);
+  });
+  await ui.mount();
+  await ui.toggle();
+  await ui.click(ui.button('Environment variables'));
+  assert.match(ui.text(ui.page()), /Custom environment variables/);
+  assert.equal(ui.textarea('env').props.value, '');
+  assert.equal(ui.focus.at(-1), 'flowx-env');
+  assert.match(ui.text(ui.page()), /OPENAI_BASE_URL/);
+  ui.unmount();
+});
+
 test('workflow environment panel saves service KEY=VALUE lines and removes saved names', async () => {
   const calls = [];
   let envKeys = ['OPENAI_BASE_URL'];
