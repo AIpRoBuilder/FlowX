@@ -1600,3 +1600,88 @@ test('media route streams safe PNG/MP4 bytes with HTTP Range support and blocks 
 
   assert.equal((await service.readMedia('wf1', 'runs/r1/media/Step/clip.mp4', {}, { principal: { kind: 'guest' } })).status, 403);
 });
+
+test('workflow environment reads and writes the service .env file without returning values', async t => {
+  const { directory, service } = await folderFixture(t);
+  const envFile = path.join(directory, 'service', 'service_main1', '.env');
+  const initial = await value(service, 'getWorkflowEnvironment', { workflowId: 'wf1' });
+  assert.deepEqual(initial, { workflowId: 'wf1', path: 'service/service_main1/.env', envKeys: [] });
+  await assert.rejects(fs.lstat(envFile), { code: 'ENOENT' });
+
+  const saved = await value(service, 'saveWorkflowEnvironment', {
+    workflowId: 'wf1',
+    set: { OPENAI_BASE_URL: 'https://gateway.test/v1', OPERATOR_FLAG: '1' },
+    remove: [],
+  });
+  assert.deepEqual(saved, {
+    workflowId: 'wf1',
+    path: 'service/service_main1/.env',
+    envKeys: ['OPENAI_BASE_URL', 'OPERATOR_FLAG'],
+  });
+  assert.equal((await fs.stat(envFile)).mode & 0o777, 0o600);
+  assert.equal(await fs.readFile(envFile, 'utf8'), 'OPENAI_BASE_URL=https://gateway.test/v1\nOPERATOR_FLAG=1\n');
+  const shown = await call(service, 'getWorkflowEnvironment', { workflowId: 'wf1' });
+  assert.deepEqual(shown.value.envKeys, ['OPENAI_BASE_URL', 'OPERATOR_FLAG']);
+  assert.doesNotMatch(JSON.stringify(shown), /gateway\.test|OPERATOR_FLAG=1/);
+
+  // User-authored comments and unrelated lines are preserved; changed keys are
+  // replaced and removed keys disappear. Workflow service files may contain
+  // FlowX names that global settings reserve.
+  await fs.writeFile(envFile, '# service settings\nOTHER=keep\nexport OPENAI_BASE_URL=old\nOPERATOR_FLAG=1\n', { mode: 0o600 });
+  const merged = await value(service, 'saveWorkflowEnvironment', {
+    workflowId: 'wf1',
+    set: { OPENAI_BASE_URL: 'https://new.test/v1', FLOWX_LLM_API_KEY: 'workflow-secret' },
+    remove: ['OPERATOR_FLAG'],
+  });
+  assert.deepEqual(merged.envKeys, ['FLOWX_LLM_API_KEY', 'OPENAI_BASE_URL', 'OTHER']);
+  assert.equal(await fs.readFile(envFile, 'utf8'), '# service settings\nOTHER=keep\nOPENAI_BASE_URL=https://new.test/v1\nFLOWX_LLM_API_KEY=workflow-secret\n');
+  assert.equal(service.redact('workflow-secret'), '[REDACTED]');
+  assert.doesNotMatch(JSON.stringify(await call(service, 'getWorkflowEnvironment', { workflowId: 'wf1' })), /workflow-secret|new\.test/);
+});
+
+test('workflow environment rejects unsafe payloads and redirected files', async t => {
+  const { directory, root, service } = await folderFixture(t);
+  const serviceDir = path.join(directory, 'service', 'service_main1');
+  await fs.mkdir(serviceDir, { recursive: true });
+  const outside = path.join(root, 'outside.env');
+  await fs.writeFile(outside, 'OUTSIDE=untouched\n', { mode: 0o600 });
+  await fs.symlink(outside, path.join(serviceDir, '.env'));
+  for (const endpoint of ['getWorkflowEnvironment', 'saveWorkflowEnvironment']) {
+    const payload = endpoint === 'getWorkflowEnvironment'
+      ? { workflowId: 'wf1' }
+      : { workflowId: 'wf1', set: { INNER: 'value' }, remove: [] };
+    assert.equal((await call(service, endpoint, payload)).error.code, 'flowx/artifact-unavailable', endpoint);
+  }
+  assert.equal(await fs.readFile(outside, 'utf8'), 'OUTSIDE=untouched\n');
+
+  await fs.unlink(path.join(serviceDir, '.env'));
+  const hardlink = path.join(root, 'outside-hardlink.env');
+  await fs.writeFile(hardlink, 'OUTSIDE=untouched\n', { mode: 0o600 });
+  await fs.link(hardlink, path.join(serviceDir, '.env'));
+  assert.equal((await call(service, 'getWorkflowEnvironment', { workflowId: 'wf1' })).error.code, 'flowx/artifact-unavailable');
+  await fs.unlink(path.join(serviceDir, '.env'));
+
+  for (const peer of [undefined, {}, { principal: { kind: 'guest' } }]) {
+    assert.equal((await service.dispatch('getWorkflowEnvironment', { workflowId: 'wf1' }, peer)).error.code, 'flowx/forbidden');
+    assert.equal((await service.dispatch('saveWorkflowEnvironment', { workflowId: 'wf1', set: {}, remove: [] }, peer)).error.code, 'flowx/forbidden');
+  }
+  for (const [endpoint, payload] of [
+    ['getWorkflowEnvironment', null],
+    ['getWorkflowEnvironment', { workflowId: '../wf1' }],
+    ['getWorkflowEnvironment', { workflowId: 'wf1', extra: true }],
+    ['saveWorkflowEnvironment', { workflowId: 'wf1', set: { 'bad-name': 'x' }, remove: [] }],
+    ['saveWorkflowEnvironment', { workflowId: 'wf1', set: JSON.parse('{"__proto__":"x"}'), remove: [] }],
+    ['saveWorkflowEnvironment', { workflowId: 'wf1', set: { A: 'line\nbreak' }, remove: [] }],
+    ['saveWorkflowEnvironment', { workflowId: 'wf1', set: {}, remove: ['bad-name'] }],
+    ['saveWorkflowEnvironment', { workflowId: 'wf1', set: {}, remove: [] , extra: true }],
+  ]) {
+    assert.equal((await service.dispatch(endpoint, payload, OWNER)).error.code, 'flowx/invalid-payload', `${endpoint} ${JSON.stringify(payload)}`);
+  }
+
+  await fs.rm(serviceDir, { recursive: true, force: true });
+  const redirectedRoot = path.join(root, 'redirected-service');
+  await fs.mkdir(redirectedRoot, { recursive: true });
+  await fs.symlink(redirectedRoot, path.join(directory, 'service', 'service_main1'));
+  assert.equal((await call(service, 'getWorkflowEnvironment', { workflowId: 'wf1' })).error.code, 'flowx/artifact-unavailable');
+  assert.equal((await call(service, 'saveWorkflowEnvironment', { workflowId: 'wf1', set: { A: '1' }, remove: [] })).error.code, 'flowx/artifact-unavailable');
+});

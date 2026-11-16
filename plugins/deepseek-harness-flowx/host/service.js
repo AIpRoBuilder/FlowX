@@ -60,11 +60,14 @@ const SETTINGS_KEYS = ['python', 'workspace'];
 const SAVE_KEYS = ['python', 'workspace', 'apiKey'];
 const ENV_SET_KEYS = ['set', 'remove'];
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const ENV_LINE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/;
 const ENV_COUNT_LIMIT = 64;
 const ENV_VALUE_LIMIT = 4096;
+const ENV_FILE_LIMIT = 64 * 1024;
 // These are managed by dedicated settings, the skill re-exec guard, or object
 // prototypes. Environment-variable names are case-insensitive on Windows.
-const ENV_RESERVED = new Set(['FLOWX_PYTHON', 'FLOWX_WORKSPACE', 'FLOWX_LLM_API_KEY', 'FLOWX_PLUGIN_PYTHON_ACTIVE', '__PROTO__', 'CONSTRUCTOR', 'PROTOTYPE']);
+const ENV_UNSAFE = new Set(['__PROTO__', 'CONSTRUCTOR', 'PROTOTYPE']);
+const ENV_RESERVED = new Set(['FLOWX_PYTHON', 'FLOWX_WORKSPACE', 'FLOWX_LLM_API_KEY', 'FLOWX_PLUGIN_PYTHON_ACTIVE', ...ENV_UNSAFE]);
 const SETTINGS_LIMIT = 16384;
 const PROVIDER_CREDENTIALS = new Set(['FLOWX_LLM_API_KEY', 'OPENAI_API_KEY', 'ZHIPU_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'ONEONEONEAPI_API_KEY']);
 const CREDENTIAL_PATHS = new Set(['GOOGLE_APPLICATION_CREDENTIALS', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR']);
@@ -129,7 +132,11 @@ function safeError(error) {
  * null). The key and environment values are never returned. Saved environment
  * variables are applied to spawned skill children and exported by the skill's
  * plugin_settings.py; FLOWX_PYTHON, FLOWX_WORKSPACE, FLOWX_LLM_API_KEY and the
- * skill re-exec guard are reserved. The skill directory is not configurable:
+ * skill re-exec guard are reserved. getWorkflowEnvironment takes {workflowId};
+ * saveWorkflowEnvironment takes {workflowId,set,remove} and merges KEY=VALUE
+ * lines into that workflow's service_<id>/.env file, which the generated main
+ * entrypoint loads when its service starts. Both return {workflowId,path,
+ * envKeys}; values are never returned. The skill directory is not configurable:
  * it is located automatically.
  * The owner must treat prompts, repair context, artifacts and logs as sensitive.
  * Nothing here locks other FlowX processes or prevents external workspace edits.
@@ -177,10 +184,15 @@ export class FlowXHostService {
           if (!exact(payload, SAVE_KEYS) || !SAVE_KEYS.every(key => text(payload[key], 4096))) throw invalid();
           value = await this.saveSettings({ python: payload.python, workspace: payload.workspace, apiKey: payload.apiKey }); break;
         case 'saveEnvironment':
-          if (!exact(payload, ENV_SET_KEYS) || !object(payload.set) || !Array.isArray(payload.remove) ||
-              payload.remove.length > ENV_COUNT_LIMIT || !this.validEnvironment(payload.set) ||
-              !payload.remove.every(name => typeof name === 'string' && ENV_NAME.test(name) && !ENV_RESERVED.has(name.toUpperCase()))) throw invalid();
+          if (!exact(payload, ENV_SET_KEYS) || !object(payload.set) || !this.validEnvironmentChange(payload.set, payload.remove)) throw invalid();
           value = await this.saveEnvironment({ set: { ...payload.set }, remove: [...payload.remove] }); break;
+        case 'getWorkflowEnvironment':
+          if (!exact(payload, ['workflowId']) || !workflowId(payload.workflowId)) throw invalid();
+          value = await this.getWorkflowEnvironment(payload.workflowId); break;
+        case 'saveWorkflowEnvironment':
+          if (!exact(payload, ['workflowId', 'set', 'remove']) || !workflowId(payload.workflowId) ||
+              !this.validEnvironmentChange(payload.set, payload.remove, true)) throw invalid();
+          value = await this.saveWorkflowEnvironment(payload.workflowId, { ...payload.set }, [...payload.remove]); break;
         case 'start':
           if (!exact(payload, ['prompt']) || !text(payload.prompt) || !payload.prompt.trim()) throw invalid();
           value = await this.start(payload.prompt); break;
@@ -290,12 +302,19 @@ export class FlowXHostService {
     } catch { throw problem('configuration', 'Building requires the FlowX skill (set FLOWX_SKILL_DIR or install it under ~/.dsh/skills/flowx-workflows).'); }
   }
 
-  validEnvironment(env) {
+  validEnvironment(env, { allowReserved = false } = {}) {
     if (!object(env)) return false;
+    const forbidden = allowReserved ? ENV_UNSAFE : ENV_RESERVED;
     const entries = Object.entries(env);
     return entries.length <= ENV_COUNT_LIMIT && entries.every(([name, value]) =>
-      ENV_NAME.test(name) && !ENV_RESERVED.has(name.toUpperCase()) &&
+      ENV_NAME.test(name) && !forbidden.has(name.toUpperCase()) &&
       text(value, ENV_VALUE_LIMIT) && !/[\x00-\x1f\x7f]/.test(value));
+  }
+
+  validEnvironmentChange(set, remove, allowReserved = false) {
+    const forbidden = allowReserved ? ENV_UNSAFE : ENV_RESERVED;
+    return this.validEnvironment(set, { allowReserved }) && Array.isArray(remove) && remove.length <= ENV_COUNT_LIMIT &&
+      remove.every(name => typeof name === 'string' && ENV_NAME.test(name) && !forbidden.has(name.toUpperCase()));
   }
 
   validSettings(settings) {
@@ -482,8 +501,7 @@ export class FlowXHostService {
   }
 
   saveEnvironment(submitted) {
-    if (!object(submitted) || !this.validEnvironment(submitted.set) || !Array.isArray(submitted.remove) || submitted.remove.length > ENV_COUNT_LIMIT ||
-        !submitted.remove.every(name => typeof name === 'string' && ENV_NAME.test(name) && !ENV_RESERVED.has(name.toUpperCase()))) throw invalid();
+    if (!object(submitted) || !this.validEnvironmentChange(submitted.set, submitted.remove)) throw invalid();
     return this.queueSettingsWrite(async () => {
       const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
       const base = previous ?? this.fallbackSettings();
@@ -1088,6 +1106,163 @@ export class FlowXHostService {
     try { if (JSON.parse(marker.content).workflow_id !== id) throw new Error(); }
     catch { throw problem('artifact-unavailable', 'The workflow directory is unavailable or unsafe.'); }
     return directory;
+  }
+
+  serviceEnvKey(line) {
+    const match = ENV_LINE.exec(line);
+    return match ? match[1] : null;
+  }
+
+  serviceEnvKeys(content) {
+    const keys = new Set();
+    for (const line of String(content).split(/\r?\n/)) {
+      const key = this.serviceEnvKey(line);
+      if (key) keys.add(key);
+    }
+    return [...keys].sort();
+  }
+
+  serviceEnvValues(content) {
+    const values = {};
+    for (const line of String(content).split(/\r?\n/)) {
+      const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/.exec(line);
+      if (!match) continue;
+      let value = match[2].trim();
+      if (value.length >= 2 && (value.startsWith('"') && value.endsWith('"') || value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      values[match[1]] = value;
+    }
+    return values;
+  }
+
+  mergeServiceEnv(content, set, remove) {
+    const changed = new Set([...Object.keys(set), ...remove]);
+    const kept = String(content).split(/\r?\n/).filter(line => {
+      const key = this.serviceEnvKey(line);
+      return !key || !changed.has(key);
+    });
+    while (kept.length > 0 && kept[kept.length - 1].trim() === '') kept.pop();
+    for (const [name, value] of Object.entries(set)) kept.push(`${name}=${value}`);
+    while (kept.length > 0 && kept[0].trim() === '') kept.shift();
+    return kept.length > 0 ? `${kept.join('\n')}\n` : '';
+  }
+
+  async serviceEnvLocation(config, id, create) {
+    const directory = await this.verifiedWorkflowDirectory(config, id);
+    let manifest;
+    try { manifest = JSON.parse((await this.readMapped(config.root, id, 'agent.json', true, { browse: true })).content); }
+    catch { throw problem('artifact-unavailable', 'The workflow service directory is unavailable or unsafe.'); }
+    const mainId = manifest.main_entrypoint_id;
+    if (typeof mainId !== 'string' || !workflowId(mainId) || !this.safeIdentifier(mainId)) {
+      throw problem('artifact-unavailable', 'The workflow service directory is unavailable or unsafe.');
+    }
+    const relative = `service/service_${mainId}`;
+    const serviceRoot = path.join(directory, 'service');
+    const serviceDirectory = path.join(serviceRoot, `service_${mainId}`);
+    const check = async target => {
+      let stat;
+      try { stat = await fs.lstat(target); }
+      catch (error) {
+        if (error.code !== 'ENOENT' || !create) return false;
+        try { await fs.mkdir(target, { mode: 0o700 }); }
+        catch (mkdirError) { if (mkdirError.code !== 'EEXIST') throw mkdirError; }
+        stat = await fs.lstat(target);
+      }
+      if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o022)) throw new Error();
+      if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) throw new Error();
+      if (await fs.realpath(target) !== target) throw new Error();
+      return true;
+    };
+    try {
+      if (!await check(serviceRoot)) return { directory: null, relative };
+      if (!await check(serviceDirectory)) return { directory: null, relative };
+      return { directory: serviceDirectory, relative };
+    } catch { throw problem('artifact-unavailable', 'The workflow service directory is unavailable or unsafe.'); }
+  }
+
+  async readServiceEnvFile(directory) {
+    const filename = path.join(directory, '.env');
+    let before;
+    try { before = await fs.lstat(filename); }
+    catch (error) {
+      if (error.code === 'ENOENT') return '';
+      throw problem('artifact-unavailable', 'The workflow environment file is unavailable or unsafe.');
+    }
+    let file;
+    try {
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size > ENV_FILE_LIMIT ||
+          (before.mode & 0o022) || (typeof process.getuid === 'function' && before.uid !== process.getuid())) throw new Error();
+      file = await fs.open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+      const opened = await file.stat();
+      if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > ENV_FILE_LIMIT) throw new Error();
+      const buffer = Buffer.alloc(ENV_FILE_LIMIT + 1);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
+        if (!bytesRead) break;
+        offset += bytesRead;
+      }
+      if (offset > ENV_FILE_LIMIT) throw new Error();
+      const after = await fs.lstat(filename);
+      if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino || after.nlink !== 1) throw new Error();
+      const content = new TextDecoder('utf-8', { fatal: true }).decode(buffer.subarray(0, offset));
+      if (content.includes('\0')) throw new Error();
+      this.collectSecrets(this.serviceEnvValues(content));
+      return content;
+    } catch (error) {
+      if (error instanceof HostError) throw error;
+      throw problem('artifact-unavailable', 'The workflow environment file is unavailable or unsafe.');
+    } finally { await file?.close().catch(() => {}); }
+  }
+
+  async getWorkflowEnvironment(id) {
+    return this.withInspection(async config => {
+      const location = await this.serviceEnvLocation(config, id, false);
+      const content = location.directory ? await this.readServiceEnvFile(location.directory) : '';
+      this.collectSecrets(this.serviceEnvValues(content));
+      return { workflowId: id, path: `${location.relative}/.env`, envKeys: this.serviceEnvKeys(content) };
+    });
+  }
+
+  async saveWorkflowEnvironment(id, set, remove) {
+    if (!this.validEnvironmentChange(set, remove, true)) throw invalid();
+    return this.withInspection(async config => {
+      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+      const location = await this.serviceEnvLocation(config, id, true);
+      if (!location.directory) throw problem('artifact-unavailable', 'The workflow service directory is unavailable or unsafe.');
+      const content = await this.readServiceEnvFile(location.directory);
+      this.collectSecrets({ ...this.serviceEnvValues(content), ...set });
+      const merged = this.mergeServiceEnv(content, set, remove);
+      if (Buffer.byteLength(merged) > ENV_FILE_LIMIT) throw problem('configuration', 'The workflow environment file would exceed the size limit.');
+      if (this.serviceEnvKeys(merged).length > ENV_COUNT_LIMIT) throw problem('configuration', 'The workflow environment file would contain too many variables.');
+      const filename = path.join(location.directory, '.env');
+      const temporary = path.join(location.directory, `.env-${randomUUID()}.tmp`);
+      let file, created = false;
+      try {
+        file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
+        created = true;
+        await file.chmod(0o600);
+        await file.writeFile(merged, 'utf8');
+        await file.sync();
+        await file.close();
+        file = null;
+        // Recheck the service directory and target immediately before replacement.
+        const recheck = await this.serviceEnvLocation(config, id, false);
+        if (!recheck.directory || recheck.directory !== location.directory) throw new Error();
+        await this.readServiceEnvFile(location.directory);
+        if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
+        await fs.rename(temporary, filename);
+        created = false;
+      } catch (error) {
+        if (error instanceof HostError) throw error;
+        throw problem('artifact-unavailable', 'Unable to save the workflow environment file.');
+      } finally {
+        await file?.close().catch(() => {});
+        if (created) await fs.unlink(temporary).catch(() => {});
+      }
+      return { workflowId: id, path: `${location.relative}/.env`, envKeys: this.serviceEnvKeys(merged) };
+    });
   }
 
   sanitizeRunRecord(raw, expectedRunId) {

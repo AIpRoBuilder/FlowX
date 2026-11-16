@@ -368,11 +368,37 @@ def test_runtime_service_returns_explicit_process_data_without_retaining_it(
     _assert_dependency_only_storage(service, dependencies)
 
 
-@pytest.mark.parametrize("outcome", ("success", "failure", "timeout", "exception"))
-def test_runtime_service_writes_requested_log_without_auditing_or_publishing_state(
-    runtime_service, tmp_path, outcome,
+def test_runtime_service_applies_the_service_folder_env_with_workflow_precedence(
+    runtime_service, monkeypatch, tmp_path,
 ) -> None:
     service, dependencies = runtime_service.service, runtime_service.dependencies
+    environment = {"INHERITED": "process", "SHARED": "process"}
+    monkeypatch.setattr(builder_services.os, "environ", environment)
+    service_dir = tmp_path / "service_main1"
+    service_dir.mkdir()
+    (service_dir / ".env").write_text("SHARED=workflow\nNEW=from-env\n", encoding="utf-8")
+    main_path = service_dir / "main.py"
+    main_path.write_text("", encoding="utf-8")
+    dependencies["popen_subprocess"].return_value = Mock(
+        spec_set=["pid", "poll", "terminate", "wait", "kill"], pid=321,
+    )
+
+    service.rerun_server(main_entrypoint_path=str(main_path))
+
+    used = dependencies["popen_subprocess"].call_args.kwargs["env"]
+    assert used["INHERITED"] == "process"
+    assert used["SHARED"] == "workflow"
+    assert used["NEW"] == "from-env"
+    assert environment == {"INHERITED": "process", "SHARED": "process"}
+
+
+@pytest.mark.parametrize("outcome", ("success", "failure", "timeout", "exception"))
+def test_runtime_service_writes_requested_log_without_auditing_or_publishing_state(
+    runtime_service, monkeypatch, tmp_path, outcome,
+) -> None:
+    service, dependencies = runtime_service.service, runtime_service.dependencies
+    environment = {"FLOWX_RUNTIME_TEST": "offline"}
+    monkeypatch.setattr(builder_services.os, "environ", environment)
     main_path = str(tmp_path / "main.py")
     log_path = tmp_path / "logs" / "main_test.txt"
     if outcome == "timeout":
@@ -399,7 +425,8 @@ def test_runtime_service_writes_requested_log_without_auditing_or_publishing_sta
         assert "--- STDOUT ---\nexample output" in text
         assert "--- STDERR ---\nexample diagnostic" in text
     dependencies["run_subprocess"].assert_called_once_with(
-        ["/custom/python", main_path], cwd=str(tmp_path), capture_output=True, text=True, timeout=60,
+        ["/custom/python", main_path], cwd=str(tmp_path), env=environment,
+        capture_output=True, text=True, timeout=60,
     )
     dependencies["select_python_command"].assert_called_once_with()
     dependencies["popen_subprocess"].assert_not_called()

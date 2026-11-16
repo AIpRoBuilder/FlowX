@@ -272,14 +272,15 @@ window.__ModuleLoader__.load({
       const [runs, setRuns] = useState([]), [selectedRunId, setSelectedRunId] = useState(''), [activeRun, setActiveRun] = useState(null);
       const [wideCanvas, setWideCanvas] = useState(false), [zoom, setZoom] = useState(1), [lightbox, setLightbox] = useState(null);
       const [selectedNode, setSelectedNode] = useState(null), [viewer, setViewer] = useState(null), [folders, setFolders] = useState({});
+      const [workflowEnv, setWorkflowEnv] = useState(null);
       const [settings, setSettings] = useState(null), [settingsError, setSettingsError] = useState(''), [settingsBusy, setSettingsBusy] = useState(false);
-      const mounted = useRef(false), generation = useRef(0), listTicket = useRef(0), viewTicket = useRef(0), runTicket = useRef(0), folderTickets = useRef({}), settingsTicket = useRef(0), operation = useRef(''), saving = useRef(false), dragRef = useRef(null);
+      const mounted = useRef(false), generation = useRef(0), listTicket = useRef(0), viewTicket = useRef(0), runTicket = useRef(0), folderTickets = useRef({}), envTicket = useRef(0), settingsTicket = useRef(0), operation = useRef(''), saving = useRef(false), dragRef = useRef(null);
       const closeRef = useRef(null), settingsRef = useRef(null), settingsButton = useRef(null);
       const clearExplorer = useCallback(() => {
-        generation.current++; viewTicket.current++; runTicket.current++; folderTickets.current = {};
+        generation.current++; viewTicket.current++; runTicket.current++; envTicket.current++; folderTickets.current = {};
         setWorkflow(null); setArtifacts(null); setRawGraph(null); setLayout({}); setGraphError('');
         setRuns([]); setSelectedRunId(''); setActiveRun(null); setLightbox(null);
-        setSelectedNode(null); setViewer(null); setFolders({});
+        setSelectedNode(null); setViewer(null); setFolders({}); setWorkflowEnv(null);
       }, []);
       const refresh = useCallback(async () => {
         const ticket = ++listTicket.current;
@@ -295,7 +296,7 @@ window.__ModuleLoader__.load({
         mounted.current = true; closeRef.current?.focus();
         const unsubscribe = subscribeSaved(refresh);
         refresh();
-        return () => { mounted.current = false; unsubscribe(); generation.current++; listTicket.current++; viewTicket.current++; runTicket.current++; settingsTicket.current++; };
+        return () => { mounted.current = false; unsubscribe(); generation.current++; listTicket.current++; viewTicket.current++; runTicket.current++; envTicket.current++; settingsTicket.current++; };
       }, [refresh, subscribeSaved]);
       useEffect(() => { if (settings && !settingsBusy) settingsRef.current?.focus(); }, [!!settings, settingsBusy]);
 
@@ -392,6 +393,49 @@ window.__ModuleLoader__.load({
           if (mounted.current && current === generation.current && ticket === viewTicket.current) setViewer({ path, label, content: file.content, bytes: file.bytes });
         } catch (failure) { if (mounted.current && current === generation.current && ticket === viewTicket.current) setViewer({ path, label, error: failure.message || 'Unable to read file.' }); }
       };
+      const openWorkflowEnv = async () => {
+        if (!workflow || busy || operation.current || workflowEnv?.busy) return;
+        if (workflowEnv) { envTicket.current++; setWorkflowEnv(null); return; }
+        const current = generation.current, ticket = ++envTicket.current;
+        setWorkflowEnv({ loading: true, path: '', envKeys: [], draft: '', remove: [], notice: '', error: '' });
+        try {
+          const value = await call('getWorkflowEnvironment', { workflowId: workflow });
+          if (!mounted.current || current !== generation.current || ticket !== envTicket.current) return;
+          const envKeys = Array.isArray(value?.envKeys) ? value.envKeys.filter(key => typeof key === 'string') : [];
+          setWorkflowEnv({ loading: false, path: typeof value?.path === 'string' ? value.path : '', envKeys, draft: '', remove: [], notice: '', error: '' });
+        } catch (failure) {
+          if (mounted.current && current === generation.current && ticket === envTicket.current) {
+            setWorkflowEnv({ loading: false, path: '', envKeys: [], draft: '', remove: [], notice: '', error: failure.message || 'Unable to load the workflow environment.' });
+          }
+        }
+      };
+      const saveWorkflowEnv = async () => {
+        if (!workflow || !workflowEnv || workflowEnv.busy || busy || operation.current) return;
+        let set;
+        try { set = parseEnvironment(workflowEnv.draft); }
+        catch (failure) { setWorkflowEnv(old => old && ({ ...old, error: failure.message, notice: '' })); return; }
+        const remove = workflowEnv.remove || [];
+        if (Object.keys(set).length === 0 && remove.length === 0) {
+          setWorkflowEnv(old => old && ({ ...old, error: 'Enter at least one KEY=VALUE line or remove a saved variable.', notice: '' }));
+          return;
+        }
+        const current = generation.current, ticket = ++envTicket.current;
+        setWorkflowEnv(old => old && ({ ...old, busy: true, error: '', notice: '' }));
+        try {
+          const value = await call('saveWorkflowEnvironment', { workflowId: workflow, set, remove });
+          if (!mounted.current || current !== generation.current || ticket !== envTicket.current) return;
+          const envKeys = Array.isArray(value?.envKeys) ? value.envKeys.filter(key => typeof key === 'string') : [];
+          setWorkflowEnv(old => old && ({
+            ...old, busy: false, path: typeof value?.path === 'string' ? value.path : old.path, envKeys,
+            draft: '', remove: [], error: '',
+            notice: `Saved ${envKeys.length} workflow environment ${envKeys.length === 1 ? 'variable' : 'variables'}. Restart this workflow's service to apply them.`,
+          }));
+        } catch (failure) {
+          if (mounted.current && current === generation.current && ticket === envTicket.current) {
+            setWorkflowEnv(old => old && ({ ...old, busy: false, error: failure.message || 'Unable to save the workflow environment.' }));
+          }
+        }
+      };
       const openSettings = async () => {
         const ticket = ++settingsTicket.current;
         setSettings({ python: '', workspace: '', apiKey: '', apiKeySet: false, envKeys: [], envDraft: '', envRemove: [], envNotice: '', envError: '' }); setSettingsError(''); setSettingsBusy(true);
@@ -466,7 +510,27 @@ window.__ModuleLoader__.load({
             busy === 'inspect' && h('p', { role: 'status', style: styles.muted }, 'Loading workflow and graph…'),
             artifacts && h(React.Fragment, null,
               h('p', { style: { ...styles.muted, marginBottom: 10 } }, `Published workflow revision ${artifacts.workflow_version ?? '—'}`),
-              h('div', { style: styles.row }, artifactButton('Requirement', artifacts.requirement), artifactButton('Main entrypoint', artifacts.main_entrypoint?.path), artifactButton('Graph JSON', artifacts.graph)),
+              h('div', { style: styles.row },
+                artifactButton('Requirement', artifacts.requirement), artifactButton('Main entrypoint', artifacts.main_entrypoint?.path), artifactButton('Graph JSON', artifacts.graph),
+                h('button', { type: 'button', style: styles.button, 'aria-expanded': !!workflowEnv, disabled: !!busy, onClick: openWorkflowEnv }, 'Environment')),
+              workflowEnv && h('div', { style: { marginTop: 12, padding: 12, border: '1px solid #e3e9f5', borderRadius: 10 } },
+                h('h3', { style: styles.heading }, 'Service environment (.env)'),
+                workflowEnv.loading ? h('p', { role: 'status', style: styles.muted }, 'Loading workflow environment…') :
+                  h(React.Fragment, null,
+                    h('p', { style: styles.muted }, `Saved to ${workflowEnv.path || 'the workflow service folder/.env'}. The generated service loads this file when it starts. Values are never shown here.`),
+                    workflowEnv.error && h('p', { role: 'alert', style: styles.notice }, workflowEnv.error),
+                    workflowEnv.envKeys.length > 0 && h('p', { style: styles.label }, 'Saved variables (values hidden)'),
+                    workflowEnv.envKeys.length > 0 && h('div', { style: { ...styles.row, marginTop: 8 } },
+                      workflowEnv.envKeys.filter(key => !(workflowEnv.remove || []).includes(key)).map(key => h('span', { key, style: { ...styles.badge, display: 'inline-flex', alignItems: 'center', gap: 6 } }, key,
+                        h('button', { type: 'button', 'aria-label': `Remove workflow environment variable ${key}`, title: `Remove ${key}`, disabled: workflowEnv.busy, onClick: () => setWorkflowEnv(old => old && ({ ...old, remove: [...old.remove.filter(name => name !== key), key], error: '', notice: '' })), style: { border: 0, background: 'transparent', color: '#953d4a', cursor: 'pointer', fontWeight: 800, padding: '0 0 0 2px', font: 'inherit' } }, '×'))),
+                      (workflowEnv.remove || []).length > 0 && h('button', { type: 'button', style: styles.button, disabled: workflowEnv.busy, onClick: () => setWorkflowEnv(old => old && ({ ...old, remove: [], error: '', notice: '' })) }, `Undo ${workflowEnv.remove.length} removal${workflowEnv.remove.length === 1 ? '' : 's'}`)),
+                    h('label', { htmlFor: 'flowx-workflow-env', style: styles.label }, 'New or updated variables'),
+                    h('textarea', { id: 'flowx-workflow-env', rows: 4, spellCheck: false, placeholder: 'OPENAI_BASE_URL=https://example.test/v1', value: workflowEnv.draft, disabled: workflowEnv.busy, onChange: event => setWorkflowEnv(old => old && ({ ...old, draft: event.target.value, error: '', notice: '' })), style: { ...styles.input, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', resize: 'vertical' } }),
+                    workflowEnv.notice && h('p', { role: 'status', style: { ...styles.muted, color: '#166534', marginTop: 8 } }, workflowEnv.notice),
+                    h('div', { style: { ...styles.row, marginTop: 10 } },
+                      h('button', { type: 'button', style: styles.primary, disabled: workflowEnv.busy || ((workflowEnv.remove || []).length === 0 && workflowEnv.draft.trim() === ''), onClick: saveWorkflowEnv }, workflowEnv.busy ? 'Saving…' : 'Save service environment'),
+                      h('button', { type: 'button', style: styles.button, disabled: workflowEnv.busy, onClick: () => setWorkflowEnv(old => old && ({ ...old, draft: '', remove: [], error: '', notice: '' })) }, 'Clear edits'),
+                      h('button', { type: 'button', style: styles.button, disabled: workflowEnv.busy, onClick: () => setWorkflowEnv(null) }, 'Close environment')))),
               h('div', { style: { ...styles.row, justifyContent: 'space-between', marginTop: 16, marginBottom: 6 } },
                 h('h3', { style: { ...styles.heading, margin: 0 } }, 'Current plan dependency graph'),
                 graph && h('div', { style: styles.row },

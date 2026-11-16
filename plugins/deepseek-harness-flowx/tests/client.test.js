@@ -563,6 +563,48 @@ test('settings save environment variables and remove saved names', async () => {
   ui.unmount();
 });
 
+test('workflow environment panel saves service KEY=VALUE lines and removes saved names', async () => {
+  const calls = [];
+  let envKeys = ['OPENAI_BASE_URL'];
+  const ui = harness((url, endpoint, payload) => {
+    calls.push({ endpoint, payload });
+    if (endpoint === 'list') return ok(catalog('wf1'));
+    if (endpoint === 'inspect') return ok({ artifacts: artifactMap() });
+    if (endpoint === 'listFolder') return ok(entries());
+    if (endpoint === 'getWorkflowEnvironment') return ok({ workflowId: 'wf1', path: 'service/service_main1/.env', envKeys });
+    if (endpoint === 'saveWorkflowEnvironment') {
+      assert.deepEqual(payload, {
+        workflowId: 'wf1',
+        set: { FLOWX_MEDIA_DRY_RUN: '1', OPENAI_API_KEY: 'secret' },
+        remove: ['OPENAI_BASE_URL'],
+      });
+      envKeys = ['FLOWX_MEDIA_DRY_RUN', 'OPENAI_API_KEY'];
+      return ok({ workflowId: 'wf1', path: 'service/service_main1/.env', envKeys });
+    }
+    throw new Error(endpoint);
+  });
+  await ui.mount();
+  await ui.toggle();
+  await ui.click(ui.workflow('wf1'));
+  await ui.click(ui.button('Environment'));
+  assert.match(ui.text(ui.page()), /Service environment \(\.env\)/);
+  assert.match(ui.text(ui.page()), /service\/service_main1\/\.env/);
+  assert.equal(ui.textarea('workflow-env').props.value, '');
+  assert.match(ui.text(ui.page()), /OPENAI_BASE_URL/);
+  assert.equal(ui.button('Save service environment').props.disabled, true);
+  await ui.click(ui.find(node => node.props['aria-label'] === 'Remove workflow environment variable OPENAI_BASE_URL'));
+  assert.ok(ui.button('Undo 1 removal'));
+  await ui.change('workflow-env', 'FLOWX_MEDIA_DRY_RUN=1\nOPENAI_API_KEY="secret"');
+  await ui.click(ui.button('Save service environment'));
+  assert.match(ui.text(ui.find(node => node.props.role === 'status' && /Saved/.test(ui.text(node)))), /Saved 2 workflow environment variables/);
+  assert.equal(ui.textarea('workflow-env').props.value, '');
+  assert.equal(ui.all().some(node => node.props['aria-label'] === 'Remove workflow environment variable OPENAI_BASE_URL'), false);
+  assert.ok(ui.find(node => node.props['aria-label'] === 'Remove workflow environment variable FLOWX_MEDIA_DRY_RUN'));
+  await ui.click(ui.button('Environment'));
+  assert.equal(ui.all().some(node => node.props.id === 'flowx-workflow-env'), false);
+  ui.unmount();
+});
+
 test('settings loading failures and cancel preserve the catalog and discard edits', async () => {
   let gets = 0, saves = 0;
   const ui = harness((url, endpoint) => {

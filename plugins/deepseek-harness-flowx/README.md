@@ -7,6 +7,7 @@
 <!-- Modified 2026-11-12: document Web and Desktop installation and configuration. -->
 <!-- Modified 2026-11-16: document per-node media canvas previews, run journals, layout storage, and Range streaming. -->
 <!-- Modified 2026-11-16: document saved environment variables for FlowX skill processes. -->
+<!-- Modified 2026-11-16: document per-workflow service .env editing. -->
 
 # FlowX for DeepSeek Harness
 
@@ -219,6 +220,27 @@ and [NOTICE](NOTICE).
    `workspace/workflows/<workflow_id>` and open eligible files. Select
    **Refresh** after a separate skill operation finishes; there is no automatic
    synchronization with other processes.
+
+### Per-workflow service environment
+
+Select **Environment** on an inspected workflow to manage that workflow
+service's variables. The panel shows saved variable names but never their
+values; the editor starts blank and accepts `KEY=VALUE` lines. **Save service
+environment** merges new or changed names and the selected removals into
+`workspace/workflows/<workflow_id>/service/service_<main_entrypoint_id>/.env`
+with mode `0600`. The generated main entrypoint loads this file from its service
+folder at startup, and service launch also applies it to the child process, so
+these workflow values override inherited values with the same name. Restart the
+workflow's service after saving. The plugin creates the service folder when
+needed and rejects symlinked or multiply-linked directories and files. The file
+is capped at 64 KiB with at most 64 variables and 4 KiB per value. Workflow
+`.env` files may contain FlowX/provider names that the global Settings
+environment area reserves; folder browsing still hides `.env`.
+
+Use the global **Settings → Environment variables** area for values shared by
+builds, inspections, and skill processes, and this per-workflow panel for
+service-specific values. Keep secrets out of chat and use only authorized
+values.
 
 The viewer has no build, repair, evolve, or runtime controls. Use the separate
 skill for those operations, review generated code before running it, and follow

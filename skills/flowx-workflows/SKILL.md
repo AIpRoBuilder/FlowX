@@ -16,6 +16,7 @@ description: 'Use when choosing, reusing, naming, building, auditing, inspecting
 <!-- Modified 2026-11-11: use user-provided or description-derived names for new workflow folders. -->
 <!-- Modified 2026-11-16: add media workflow guidance, dry-run limits, and artifact reporting. -->
 <!-- Modified 2026-11-16: ask users to configure needed workflow environment variables through the plugin. -->
+<!-- Modified 2026-11-16: document per-workflow service .env variables. -->
 
 # FlowX workflows
 
@@ -97,6 +98,16 @@ they started with. The skill and SDK do not load a `.env` file automatically.
 If a run fails for a missing or wrong value, report the variable and ask the
 user to correct it in the plugin rather than working around it with CLI flags.
 
+Each workflow can also have service-specific variables. The generated service
+loads `service/service_<main_entrypoint_id>/.env` from its service folder, and
+service launch applies that file to the child process. The plugin's workflow
+**Environment** button writes this file; ask the user to use it when one
+workflow needs different provider, media, or tool values from the global
+settings. Restart that workflow's service after changing the file, and do not
+read or print its values. If a service fails for a workflow-specific setting,
+report the variable and ask the user to update it rather than editing the file
+with guessed values.
+
 ## Media workflows
 
 When a request generates or edits images or video, agree with the user before
@@ -105,7 +116,9 @@ building on: which outputs are prompt, image, or video; the provider and model
 CLI arguments); size or aspect ratio; duration or trim range; and any resize or
 crop step. The planner receives only the prompt, so state these constraints
 explicitly in it. If provider URLs, models, or keys are missing, ask the user to
-set the specific variables before a real run.
+set the specific variables before a real run. For settings that only this
+workflow's service should use, ask the user to save them in the workflow's
+**Environment** panel, which writes its service `.env`.
 
 - Provider image and video calls are billable and may be rate-limited. FlowX
   forces node tests into dry run (`FLOWX_MEDIA_DRY_RUN=1`), so passing tests do
@@ -387,8 +400,9 @@ readiness does not prove a workflow run succeeded. If startup fails, the port is
 occupied, or the environment cannot keep the terminal and stdin open, report the
 service as not confirmed running and explain the limitation. If a runtime or
 node test fails because a required provider or tool variable is missing, do not
-guess it: report the variable, ask the user to save it in the plugin environment
-area, and start a new runtime process; the current process keeps its original
+guess it: report the variable, ask the user to save it in the plugin's global
+environment area or, for a running service, the workflow's **Environment**
+panel, and start a new runtime process; the current process keeps its original
 environment. The free-port check is not atomic; avoid competing launches on the
 same address. When the user wants to run a workflow step, send JSON lines to the
 **same process**, using a real step ID from inspection:
