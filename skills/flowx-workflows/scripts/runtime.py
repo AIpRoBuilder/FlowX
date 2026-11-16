@@ -5,6 +5,7 @@
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Adapted the generated service HTTP and SSE protocol from flowx_mcp.server.
 # Modified 2026-11-11: describe workflow IDs without assuming they are generated.
+# Modified 2026-11-16: note that step events include node cards with media paths.
 """Run one generated FlowX service and exchange JSON lines over stdin/stdout."""
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ and final if an SSE event supplied a result. To resume an input_required step, s
 another step with awaiting.stepId and its answer; the session ID stays the same.
 Reset returns the service response in reset and retains the session ID for the next
 run. Inspect events and final for failures: a received response does not imply
-workflow success. Invalid commands and request errors produce error events containing
+workflow success. Step events may include node cards whose media paths are
+workflow-relative. Invalid commands and request errors produce error events containing
 operation, error and error_type (and http_status for HTTP errors); details are
 sanitized. They do not end the session. Stop or stdin EOF closes the client and emits
 service_stopped after cleanup. Startup/cleanup errors produce an error and a nonzero
