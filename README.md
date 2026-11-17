@@ -77,10 +77,10 @@ FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 Turn an intent into an editable, reusable process instead of a one-off answer. Change the workflow later without rebuilding unchanged nodes.
 
 <p align="center">
-  <img src="assets/generative-workflow-demo.gif" alt="45-second illustrative FlowX walkthrough in a Codex-style desktop interface: project and thread navigation on the left, a continuous conversation with per-node result cards and a bottom composer, and a narrow workflow inspector on the right." width="90%" />
+  <img src="assets/picture-workflow-demo.gif" alt="57-second live recording of a FlowX picture-generation workflow: a DeepSeek Harness conversation builds and runs a five-node image workflow, then the FlowX plugin canvas syncs prompt and image cards." width="90%" />
 </p>
 
-*Illustrative walkthrough, not a live recording. The UI, cards, and timings are illustrative; FlowX does not bundle this interface. See the [storyboard](assets/README-demo.md).*
+*Live recording of a FlowX picture-generation workflow in DeepSeek Harness. See the [storyboard](assets/README-picture-demo.md) or [open the interactive demo](assets/picture-workflow-demo.html).*
 
 <a name="key-features"></a>
 ## 🚀 Key Features

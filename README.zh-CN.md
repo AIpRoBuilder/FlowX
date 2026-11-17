@@ -77,10 +77,10 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 将意图转换为可编辑、可复用的流程，而不是一次性回答。后续修改工作流时，无需重建未变化的节点。
 
 <p align="center">
-  <img src="assets/generative-workflow-demo.gif" alt="FlowX 45 秒示意演示：Codex 风格桌面界面，左侧为项目与线程导航，中间为连续对话与逐节点结果卡片，右侧为工作流检查器。" width="90%" />
+  <img src="assets/picture-workflow-demo.gif" alt="FlowX 57 秒图片生成工作流实录：DeepSeek Harness 对话中，FlowX 技能构建并运行五节点图片工作流，随后 FlowX 插件画布同步显示提示词与图片卡片。" width="90%" />
 </p>
 
-*示意演示，并非真实录屏。界面、卡片和耗时均为示意；FlowX 不捆绑该界面。参见[分镜说明](assets/README-demo.md)。*
+*DeepSeek Harness 中的 FlowX 图片生成工作流实录。参见[分镜说明](assets/README-picture-demo.md)，或[打开交互式演示](assets/picture-workflow-demo.html)。*
 
 <a name="key-features"></a>
 ## 🚀 核心特性

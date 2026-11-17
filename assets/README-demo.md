@@ -1,6 +1,8 @@
 # Generative Workflow walkthrough
 
-[generative-workflow-demo.gif](generative-workflow-demo.gif) is a **45-second, looping, illustrative animation** for the FlowX README. It shows the workflow layer behind an intelligent UI, not a shipped visual editor or a live recording. All tickets, results, node names, and timings are scripted examples; no model API or FlowX backend is called while rendering.
+[generative-workflow-demo.gif](generative-workflow-demo.gif) is a **45-second, looping, illustrative animation** originally created for the FlowX README. It shows the workflow layer behind an intelligent UI, not a shipped visual editor or a live recording. All tickets, results, node names, and timings are scripted examples; no model API or FlowX backend is called while rendering.
+
+The README now uses the [picture-generation demo](picture-workflow-demo.html) and its [GIF](picture-workflow-demo.gif); this storyboard is retained for the original generic-workflow walkthrough.
 
 The design is a clean, black-and-white **Codex-style desktop workspace**: a slim left sidebar for projects and threads, a spacious central conversation, a rounded bottom composer with agent and permission controls, and a narrow right workflow inspector. Assistant responses use plain inline prose and lightweight action summaries instead of repeated avatars and role headers. The layout follows the project/thread organization described in [OpenAI's Codex app introduction](https://openai.com/index/introducing-the-codex-app/).
 

@@ -1,0 +1,1595 @@
+<!DOCTYPE html>
+<!--
+  FlowX × DeepSeek Harness picture-generation workflow demo.
+  Reference workflow:
+  https://www.runninghub.ai/workflow/2122580909429194754 (login-gated).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>FlowX picture workflow demo · DeepSeek Harness</title>
+<style>
+  :root{
+    --ink:#171b26; --text:#1d2433; --muted:#667085; --faint:#98a2b3;
+    --line:#e6e9f0; --soft:#f4f6fa; --panel:#fff;
+    --blue:#5366db; --blue-soft:#eef2ff; --green:#16a34a; --run:#3b82f6;
+    --flowx-bg:#f5f8fc; --flowx-ink:#192a44; --flowx-muted:#5d6e87; --flowx-line:#dce5f3;
+  }
+  *{box-sizing:border-box}
+  [hidden]{display:none!important}
+  html,body{height:100%}
+  body{
+    margin:0;color:var(--text);
+    font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;
+    background:radial-gradient(1200px 620px at 50% -12%,#fafbff 0%,#edf0f7 52%,#e4e9f2 100%);
+    -webkit-font-smoothing:antialiased;
+  }
+  .demo{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:22px 20px 14px}
+  .app{
+    position:relative;display:flex;width:min(1440px,100%);
+    height:min(860px,calc(100vh - 98px));min-height:600px;background:#fff;
+    border:1px solid #e2e6ef;border-radius:18px;overflow:hidden;
+    box-shadow:0 30px 90px rgba(23,38,66,.18),0 4px 16px rgba(23,38,66,.06);
+  }
+  /* ---------- Harness shell ---------- */
+  .sidebar{
+    width:252px;flex:0 0 252px;background:#f3f4f8;border-right:1px solid #e5e8ef;
+    padding:14px 10px 10px;display:flex;flex-direction:column;gap:10px;
+  }
+  .brand{display:flex;align-items:center;gap:9px;padding:4px 8px 10px;font-weight:800;font-size:14px;letter-spacing:-.01em;color:#1b2433}
+  .brand-mark{
+    width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,#4d6bfe,#7b5cff);
+    color:#fff;display:grid;place-items:center;font-size:13px;font-weight:800;
+    box-shadow:0 4px 10px rgba(77,107,254,.35);
+  }
+  .new-chat{
+    display:flex;align-items:center;gap:8px;border:1px solid #dfe3ec;background:#fff;color:#283144;
+    border-radius:10px;padding:9px 11px;font:inherit;font-size:13px;font-weight:700;cursor:pointer;
+    box-shadow:0 1px 2px rgba(20,30,50,.04);
+  }
+  .nav-section{display:grid;gap:2px;margin-top:6px}
+  .nav-label{margin:8px 8px 4px;font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#8b95a7}
+  .thread{
+    border:0;background:transparent;text-align:left;padding:8px 9px;border-radius:8px;
+    font:inherit;font-size:13px;color:#41506a;cursor:pointer;display:flex;align-items:center;gap:8px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .thread.active{background:#e8ebf3;color:#1b2433;font-weight:700}
+  .thread-dot{width:6px;height:6px;border-radius:99px;background:#5366db;flex:0 0 auto}
+  .sidebar-foot{margin-top:auto;display:grid;gap:2px;padding-top:8px;border-top:1px solid #e3e6ee}
+  .flowx-launcher{
+    display:flex;align-items:center;gap:9px;border:0;background:transparent;color:#40506a;
+    border-radius:9px;padding:8px 9px;font:inherit;font-size:13px;font-weight:700;cursor:pointer;
+  }
+  .flowx-launcher.active{background:rgba(100,115,210,.14);color:#2c3a70}
+  .flowx-launcher.pulse{animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(83,102,219,0)}50%{box-shadow:0 0 0 5px rgba(83,102,219,.16)}}
+  .settings-link{border:0;background:transparent;text-align:left;padding:7px 9px;color:#7a8598;font:inherit;font-size:12px;cursor:pointer}
+  /* ---------- Conversation ---------- */
+  .chat{flex:1;min-width:0;display:flex;flex-direction:column;background:#fff}
+  .chat-head{
+    height:62px;flex:0 0 62px;display:flex;align-items:center;justify-content:space-between;gap:18px;
+    padding:0 24px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.94);
+  }
+  .chat-head h1{margin:0;font-size:15px;letter-spacing:-.01em}
+  .chat-head p{margin:2px 0 0;font-size:11.5px;color:var(--muted)}
+  .head-tags{display:flex;align-items:center;gap:7px;flex-wrap:wrap;justify-content:flex-end}
+  .pill{
+    display:inline-flex;align-items:center;gap:5px;border:1px solid #e2e6ef;background:#f7f8fb;
+    color:#5c687d;border-radius:999px;padding:4px 9px;font-size:10.5px;font-weight:700;
+    text-decoration:none;white-space:nowrap;
+  }
+  .pill.link{color:#3e51c6;border-color:#dbe2ff;background:#f4f6ff}
+  .chat-scroll{flex:1;overflow-y:auto;scrollbar-width:thin;background:linear-gradient(#fff,#fdfdff)}
+  .thread-list{max-width:790px;margin:0 auto;padding:22px 28px 28px;display:flex;flex-direction:column;gap:16px}
+  .msg{display:none}
+  .msg.on{display:block;animation:rise .32s ease both}
+  .msg.user.on{display:flex}
+  @keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+  .msg.assistant{font-size:14px;line-height:1.62;color:#2a3447}
+  .msg.assistant > p{margin:0 0 10px}
+  .msg.assistant > p:last-child{margin-bottom:0}
+  .msg.user{justify-content:flex-end}
+  .bubble{
+    max-width:78%;background:#eff2ff;border:1px solid #dfe4ff;border-radius:14px 14px 4px 14px;
+    padding:11px 14px;font-size:13.5px;line-height:1.55;color:#28345a;
+  }
+  .bubble p{margin:0 0 7px}.bubble p:last-child{margin:0}
+  .bubble a{color:#3d4fc9;font-weight:600;text-decoration:none;border-bottom:1px solid rgba(61,79,201,.25)}
+  code{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em;
+    background:#f2f4f9;border:1px solid #e6e9f1;border-radius:5px;padding:1px 5px;color:#35405a;
+  }
+  .msg.assistant code{background:#f5f7fc}
+  .card{
+    border:1px solid #e4e8f1;border-radius:13px;background:#fff;padding:14px 16px;
+    box-shadow:0 2px 8px rgba(20,35,60,.04);margin:10px 0 0;
+  }
+  .card-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .card-kicker{
+    font-size:10px;font-weight:800;letter-spacing:.11em;text-transform:uppercase;color:#5b6bd6;
+    background:#eef1ff;border-radius:6px;padding:3px 7px;
+  }
+  .card-head code{background:transparent;border:0;padding:0;color:#5a667d;font-size:11.5px}
+  .card-time{margin-left:auto;font-size:11px;color:#8b95a7;font-variant-numeric:tabular-nums}
+  .stages{display:grid;gap:6px}
+  .stage{
+    display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:9px;padding:6px 8px;
+    border-radius:8px;background:#fafbfe;border:1px solid #eef1f7;font-size:12.5px;
+  }
+  .stage strong{font-size:12.5px;color:#2d3a50}
+  .stage span{display:block;color:#7a869b;font-size:11px}
+  .stage em{font-style:normal;font-size:11px;color:#8b95a7;font-variant-numeric:tabular-nums}
+  .stage-icon{
+    width:16px;height:16px;border-radius:99px;border:2px solid #d6dce8;display:grid;place-items:center;
+    color:transparent;font-size:10px;font-weight:900;
+  }
+  .stage[data-state=active]{background:#f3f6ff;border-color:#dfe5ff}
+  .stage[data-state=active] .stage-icon{border-color:#5366db;border-top-color:transparent;animation:spin .7s linear infinite}
+  .stage[data-state=done] .stage-icon{background:#e8f7ee;border-color:#b9e7c8;color:#15803d}
+  .stage[data-state=done] .stage-icon::after{content:"✓"}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .kv{display:grid;grid-template-columns:72px 1fr;gap:10px;padding:6px 0;border-top:1px dashed #edf0f6;font-size:12.5px;color:#4a5870}
+  .kv:first-of-type{border-top:0}
+  .kv > span{font-weight:800;color:#6a778e;font-size:10.5px;letter-spacing:.04em;text-transform:uppercase;padding-top:2px}
+  .kv p{margin:0}
+  .note{font-size:12px;color:#77839a;margin:8px 0 0}
+  .chips{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+  .chip{
+    display:inline-flex;align-items:center;gap:5px;background:#f4f6ff;border:1px solid #dde3ff;color:#3d4c8e;
+    border-radius:7px;padding:5px 8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:700;
+  }
+  .chip i{width:6px;height:6px;border-radius:99px;background:#7181eb}
+  .arrow{color:#a5b0c4;font-size:11px}
+  .run-nodes{display:grid;gap:4px}
+  .run-node{display:grid;grid-template-columns:10px 1fr auto;gap:9px;align-items:center;padding:5px 7px;border-radius:7px;font-size:12px}
+  .run-node:nth-child(odd){background:#fafbfe}
+  .run-node .dot{width:7px;height:7px;border-radius:99px;background:#c6cddb}
+  .run-node[data-state=running] .dot{background:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.14)}
+  .run-node[data-state=completed] .dot{background:#16a34a}
+  .run-node .name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:#35425a}
+  .run-node .meta{color:#8b95a7;font-size:10.5px;font-variant-numeric:tabular-nums}
+  .run-progress{display:flex;align-items:center;gap:10px;margin-top:10px;font-size:10.5px;color:#7c889d}
+  .bar{flex:1;height:5px;border-radius:99px;background:#edf0f6;overflow:hidden}
+  .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#7d8cf2,#5366db);border-radius:99px;transition:width .18s linear}
+  .run-strip{display:flex;gap:6px;margin-top:10px}
+  .thumb{
+    position:relative;width:58px;height:58px;border-radius:8px;overflow:hidden;border:1px solid #e1e6f0;
+    background:#f2f5fa;opacity:.35;transition:opacity .25s ease;
+  }
+  .thumb.on{opacity:1}
+  .thumb svg{display:block;width:100%;height:100%}
+  .thumb b{
+    position:absolute;left:3px;top:3px;width:14px;height:14px;border-radius:99px;background:rgba(17,25,40,.72);
+    color:#fff;font-size:8px;display:grid;place-items:center;
+  }
+  .thumb.pick{border-color:#16a34a;box-shadow:0 0 0 1px #16a34a}
+  .thumb.pick::after{
+    content:"kept";position:absolute;right:3px;bottom:3px;background:#16a34a;color:#fff;font-size:7px;
+    font-weight:800;border-radius:99px;padding:1px 4px;
+  }
+  .result-card{display:grid;grid-template-columns:180px 1fr;gap:14px;border:1px solid #e2e7f0;border-radius:13px;padding:10px;background:#fff;margin-top:10px}
+  .result-card .hero{height:132px;border-radius:9px;overflow:hidden;background:#0f172a;cursor:zoom-in}
+  .result-card .hero svg{width:100%;height:100%;display:block}
+  .result-card h3{margin:2px 0 6px;font-size:13px}
+  .result-card p{margin:0 0 6px;font-size:12px;color:#4a5870}
+  .paths{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10px;color:#6d7a90;line-height:1.5;word-break:break-all}
+  .composer{flex:0 0 76px;border-top:1px solid var(--line);padding:14px 24px;background:#fff;display:flex;justify-content:center}
+  .composer-box{
+    width:100%;max-width:770px;border:1px solid #dfe4ee;border-radius:14px;
+    box-shadow:0 6px 18px rgba(20,35,60,.06);display:flex;align-items:center;gap:10px;padding:10px 12px;background:#fff;
+  }
+  .composer-box .ph{flex:1;color:#9aa4b6;font-size:13px}
+  .composer-box .send{width:30px;height:30px;border-radius:9px;background:#5366db;color:#fff;display:grid;place-items:center;border:0;font-size:14px}
+  /* ---------- FlowX plugin overlay ---------- */
+  .flowx-overlay{
+    position:absolute;z-index:20;top:8px;bottom:8px;left:8px;width:min(680px,calc(100% - 16px));
+    background:var(--flowx-bg);color:var(--flowx-ink);border:1px solid var(--flowx-line);border-radius:16px;
+    box-shadow:0 20px 70px rgba(17,33,61,.25);font-size:14px;overflow-y:auto;overflow-x:hidden;
+    transition:width .28s ease,opacity .2s ease,transform .2s ease;scrollbar-width:thin;
+    opacity:0;visibility:hidden;transform:translateX(-10px);pointer-events:none;
+  }
+  .flowx-overlay.open{opacity:1;visibility:visible;transform:none;pointer-events:auto}
+  .flowx-overlay.expanded{width:calc(100% - 16px)}
+  .fx-content{padding:18px;display:grid;gap:14px}
+  .fx-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+  .fx-eyebrow{margin:0 0 5px;color:#5366cc;font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase}
+  .fx-head h1{margin:0 0 4px;font-size:22px;letter-spacing:-.04em;color:var(--flowx-ink)}
+  .fx-head p{margin:0;color:var(--flowx-muted);font-size:12.5px;line-height:1.5;max-width:330px}
+  .fx-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+  .fx-btn{
+    border:1px solid #d5dff0;background:#fff;color:#324864;border-radius:8px;padding:7px 10px;
+    font:inherit;font-size:12.5px;font-weight:700;cursor:pointer;
+  }
+  .fx-btn:hover{background:#f7faff}
+  .fx-btn.primary{background:#5366db;border-color:#5366db;color:#fff}
+  .fx-btn.busy{opacity:.75;cursor:progress}
+  .fx-card{background:#fff;border:1px solid #e1e8f2;border-radius:13px;padding:14px 16px;min-width:0}
+  .fx-card h2{margin:0 0 8px;font-size:15.5px;letter-spacing:-.02em}
+  .fx-muted{margin:0;color:var(--flowx-muted);font-size:12px;line-height:1.5}
+  .fx-workflows{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .wf{
+    display:block;width:100%;text-align:left;border:1px solid #e1e8f2;background:#fff;border-radius:8px;
+    padding:7px 9px;font:inherit;font-size:12.5px;font-weight:700;color:#324864;cursor:pointer;
+  }
+  .wf small{display:block;font-weight:400;color:var(--flowx-muted);font-size:10.5px;margin-top:2px}
+  .wf.selected{background:#f0f3ff;border-color:#d5dcff}
+  .fx-explorer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
+  .fx-artifacts{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
+  .canvas-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:10px 0 6px}
+  .canvas-head h3{margin:0;font-size:14px}
+  .fx-select{
+    border:1px solid #cfd9e8;border-radius:8px;padding:5px 8px;color:var(--flowx-ink);
+    font:inherit;font-size:11px;background:#fff;max-width:252px;
+  }
+  .fx-badge{display:inline-block;border-radius:999px;padding:2px 8px;font-size:10.5px;font-weight:700;background:#edf2ff;color:#3b4cc0}
+  .fx-badge.run{background:#eef5ff;color:#1d4ed8}
+  .fx-badge.done{background:#eafaf0;color:#15803d}
+  .canvas-viewport{
+    position:relative;height:370px;overflow:auto;border:1px solid #edf1f8;border-radius:12px;
+    background:radial-gradient(#dce4f2 1px,#f8faff 1px);background-size:18px 18px;scrollbar-width:thin;
+  }
+  .flowx-overlay.expanded .canvas-viewport{height:460px}
+  .canvas-sizer{position:relative;min-width:100%;min-height:100%}
+  .canvas-world{position:absolute;left:0;top:0;transform-origin:0 0}
+  .edge-layer{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
+  .node{
+    position:absolute;width:236px;min-height:68px;box-sizing:border-box;padding:12px;border-radius:12px;
+    border:1px solid var(--flowx-line);background:#fff;box-shadow:0 8px 20px rgba(25,42,68,.08);
+    cursor:pointer;transition:border-color .15s ease,background .15s ease;
+  }
+  .node.selected{border:2px solid #6071df;background:#eef0ff;padding:11px}
+  .node-head{display:flex;align-items:center;gap:7px;min-height:20px}
+  .node-dot{width:9px;height:9px;border-radius:99px;background:#7181eb;flex:0 0 auto}
+  .node[data-status=running] .node-dot{background:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.16)}
+  .node[data-status=completed] .node-dot{background:#16a34a}
+  .node[data-status=pending] .node-dot{background:#7181eb}
+  .node-name{font-weight:700;font-size:13px;color:#223451;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .node-status{margin-left:auto;font-size:9.5px;font-weight:800;color:#7181eb;text-transform:lowercase}
+  .node[data-status=running] .node-status{color:#2563eb}
+  .node[data-status=completed] .node-status{color:#15803d}
+  .node-body{display:none;margin-top:9px}
+  .node.has-card .node-body{display:block}
+  .node-prompt{
+    background:#f3f6fc;border:1px solid #e3eaf6;border-radius:7px;padding:6px 8px;font-size:11px;
+    line-height:1.4;color:#2b3e5e;max-height:62px;overflow:hidden;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;
+  }
+  .node-shot{border-radius:8px;overflow:hidden;border:1px solid #e2e8f4;background:#0f172a}
+  .node-shot svg{display:block;width:100%;height:104px}
+  .node-shot .shot-meta{display:flex;justify-content:space-between;align-items:center;padding:4px 8px;background:#f8faff;font-size:10px;color:#4c5d77}
+  .shot-tag{font-weight:700;color:#5366db}
+  .shot-tag.running{color:#2563eb}
+  .node-progress{height:3px;background:#e8edf7}
+  .node-progress i{display:block;height:100%;background:#3b82f6}
+  .node-detail{margin-top:10px;padding:10px 12px;border:1px solid #e3e9f5;border-radius:10px;font-size:11.5px;color:var(--flowx-muted);line-height:1.5;background:#fff}
+  .node-detail strong{display:block;color:#223451;font-size:12.5px;margin-bottom:3px}
+  .node-detail .fine{margin-top:4px;color:#7b879b;font-size:10.5px}
+  .sync-notice{margin:8px 0 0;font-size:11px;color:var(--flowx-muted);display:flex;align-items:center;gap:6px;min-height:16px}
+  .sync-notice.busy{color:#1d4ed8}
+  .sync-notice.done{color:#15803d}
+  .sync-dot{width:7px;height:7px;border-radius:99px;background:#7181eb;flex:0 0 auto}
+  .sync-notice.busy .sync-dot{background:#3b82f6;animation:blink .9s infinite}
+  .sync-notice.done .sync-dot{background:#16a34a}
+  @keyframes blink{50%{opacity:.35}}
+  .folder{margin-top:10px}
+  .folder h3{margin:0 0 4px;font-size:13px}
+  .folder-tree{
+    margin-top:8px;border:1px solid #e9eef7;border-radius:9px;background:#fbfcff;padding:8px 10px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;line-height:1.7;color:var(--flowx-muted);
+  }
+  .folder-tree b{color:#324864;font-weight:700}
+  .folder-tree .ind{color:#a2adc0}
+  .contact-queued{animation:shimmer 1.15s ease-in-out infinite}
+  @keyframes shimmer{0%,100%{opacity:.28}50%{opacity:.68}}
+  .toast{
+    position:absolute;left:50%;bottom:20px;transform:translateX(-50%) translateY(8px);
+    background:#192a44;color:#fff;font-size:12px;font-weight:600;border-radius:999px;padding:8px 14px;
+    box-shadow:0 12px 30px rgba(17,33,61,.3);opacity:0;visibility:hidden;transition:.2s ease;z-index:30;
+    pointer-events:none;white-space:nowrap;max-width:calc(100% - 40px);overflow:hidden;text-overflow:ellipsis;
+  }
+  .toast.on{opacity:1;visibility:visible;transform:translateX(-50%)}
+  .lightbox{
+    position:absolute;inset:0;z-index:40;background:rgba(10,18,32,.72);display:flex;align-items:center;
+    justify-content:center;padding:24px;
+  }
+  .lightbox-card{
+    background:#fff;border-radius:14px;padding:12px;max-width:min(860px,94%);max-height:92%;
+    display:flex;flex-direction:column;gap:10px;box-shadow:0 30px 80px rgba(0,0,0,.35);
+  }
+  .lightbox-head{display:flex;align-items:center;justify-content:space-between;gap:16px;font-size:12.5px;color:#324864}
+  .lightbox-media{overflow:auto;border-radius:10px;background:#0f172a;display:flex;justify-content:center}
+  .lightbox-media svg{display:block;width:auto;height:min(66vh,720px);max-width:100%}
+  /* ---------- Controls ---------- */
+  .controls{
+    width:min(1440px,100%);display:flex;align-items:center;gap:11px;flex-wrap:wrap;padding:0 4px;
+    color:#4c5a72;font-size:11px;
+  }
+  .controls-title{display:grid;gap:1px;min-width:230px}
+  .controls-title strong{font-size:12.5px;color:#26334b}
+  .controls-title span{font-size:10.5px;color:#7b879b}
+  .controls button{
+    border:1px solid #d6deea;background:#fff;border-radius:7px;padding:5px 9px;font:inherit;font-size:11px;
+    font-weight:700;color:#36445e;cursor:pointer;
+  }
+  .controls button:hover{background:#f8faff}
+  .controls input[type=range]{flex:1;min-width:150px;accent-color:#5366db}
+  .controls .time{font-variant-numeric:tabular-nums;color:#5d6b82;min-width:72px;text-align:right}
+  .controls .phase{background:#eef1ff;color:#4657c9;border-radius:999px;padding:3px 8px;font-weight:700;white-space:nowrap}
+  .controls label{display:flex;align-items:center;gap:4px;cursor:pointer}
+  .controls select{border:1px solid #d6deea;background:#fff;border-radius:7px;padding:4px 6px;font:inherit;font-size:11px;color:#36445e}
+  @media (max-width:860px){
+    .sidebar{display:none}
+    .flowx-overlay{width:calc(100% - 16px)}
+    .result-card{grid-template-columns:1fr}
+    .result-card .hero{height:150px}
+    .thread-list{max-width:none}
+  }
+  @media (max-width:720px){
+    .demo{padding:10px}
+    .app{height:calc(100vh - 92px);border-radius:12px}
+    .thread-list{padding:16px}
+    .chat-head{padding:0 14px}
+    .composer{padding:10px 14px}
+    .controls-title{min-width:100%}
+    .head-tags{display:none}
+    .fx-head p{max-width:none}
+  }
+  @media (prefers-reduced-motion:reduce){
+    *{animation:none!important;transition:none!important}
+  }
+  body.static *{animation:none!important;transition:none!important}
+</style>
+</head>
+<body>
+<div class="demo">
+  <div class="app" id="app">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">D</span><span>DeepSeek Harness</span></div>
+      <button class="new-chat" type="button"><span>＋</span> New chat</button>
+      <div class="nav-section">
+        <p class="nav-label">Today</p>
+        <button class="thread active" type="button"><span class="thread-dot"></span> Picture workflow demo</button>
+        <button class="thread" type="button">Support triage v7</button>
+        <button class="thread" type="button">Podcast clip workflow</button>
+      </div>
+      <div class="nav-section">
+        <p class="nav-label">Yesterday</p>
+        <button class="thread" type="button">Release notes</button>
+      </div>
+      <div class="sidebar-foot">
+        <button class="flowx-launcher" id="flowxLauncher" type="button" aria-expanded="false" aria-controls="flowxOverlay" title="Open the FlowX workflow canvas">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M5 6h6v6H5zM13 12h6v6h-6zM11 9h4v3M5 15h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="5" cy="15" r="1.5" fill="currentColor"/>
+          </svg>
+          <span>FlowX</span>
+        </button>
+        <button class="settings-link" type="button">Settings</button>
+      </div>
+    </aside>
+
+    <main class="chat">
+      <header class="chat-head">
+        <div>
+          <h1>Picture workflow demo</h1>
+          <p>DeepSeek Harness · <code>flowx-workflows</code> skill</p>
+        </div>
+        <div class="head-tags">
+          <span class="pill">Live recording</span>
+          <span class="pill">deepseek-flash</span>
+          <a class="pill link" href="https://www.runninghub.ai/workflow/2122580909429194754" target="_blank" rel="noreferrer" title="Reference workflow on RunningHub">RunningHub ref ↗</a>
+        </div>
+      </header>
+
+      <div class="chat-scroll" id="chatScroll">
+        <div class="thread-list">
+
+          <div class="msg user" data-at="0.2">
+            <div class="bubble">
+              <p>Build a text-to-image workflow based on this <a href="https://www.runninghub.ai/workflow/2122580909429194754" target="_blank" rel="noreferrer">RunningHub workflow</a>.</p>
+              <p>Generate four cinematic variants, score them, keep the top two, and show the outputs in the FlowX canvas.</p>
+            </div>
+          </div>
+
+          <div class="msg assistant" data-at="1.8">
+            <p>I'll build a five-node workflow with the <code>flowx-workflows</code> skill, test every node in dry-run, then run it with your scene brief.</p>
+            <div class="card build-card">
+              <div class="card-head">
+                <span class="card-kicker">FlowX skill</span>
+                <code>build.py new --name picture_studio</code>
+                <span class="card-time" id="buildTime">working…</span>
+              </div>
+              <div class="stages">
+                <div class="stage" data-state="pending" data-start="2.2" data-end="3.6">
+                  <span class="stage-icon"></span>
+                  <div><strong>Requirement</strong><span>requirement_analysis.md</span></div>
+                  <em>—</em>
+                </div>
+                <div class="stage" data-state="pending" data-start="3.6" data-end="5.4">
+                  <span class="stage-icon"></span>
+                  <div><strong>Graph</strong><span>workflow.json · 5 nodes</span></div>
+                  <em>—</em>
+                </div>
+                <div class="stage" data-state="pending" data-start="5.4" data-end="13.2" data-nodes-stage="true">
+                  <span class="stage-icon"></span>
+                  <div><strong>Nodes</strong><span class="stage-detail">5 node tests · dry-run</span></div>
+                  <em>—</em>
+                </div>
+                <div class="stage" data-state="pending" data-start="13.2" data-end="15.6">
+                  <span class="stage-icon"></span>
+                  <div><strong>Entrypoint</strong><span>main.py + FastAPI service</span></div>
+                  <em>—</em>
+                </div>
+              </div>
+              <p class="note">Each stage is generated, audited, and tested before the next one starts.</p>
+            </div>
+          </div>
+
+          <div class="msg assistant" data-at="5.8">
+            <div class="card">
+              <div class="card-head">
+                <span class="card-kicker">Requirement</span>
+                <code>picture_studio</code>
+                <span class="card-time">5 nodes</span>
+              </div>
+              <div class="kv"><span>Goal</span><p>Text-to-image workflow inspired by <a href="https://www.runninghub.ai/workflow/2122580909429194754" target="_blank" rel="noreferrer">RunningHub workflow 2122580909429194754</a>.</p></div>
+              <div class="kv"><span>Inputs</span><p><code>scene_brief</code> · square <code>1:1</code> · <code>4</code> variants · seed <code>4815</code></p></div>
+              <div class="kv"><span>Outputs</span><p>Four generated images · two finalists · contact sheet and run manifest</p></div>
+              <div class="kv"><span>Review</span><p>Score each variant, keep the top two, and package the winners.</p></div>
+              <div class="kv"><span>Provider</span><p><code>FLOWX_IMAGE_API_URL</code> · model and key stay in the workflow service <code>.env</code></p></div>
+            </div>
+          </div>
+
+          <div class="msg assistant" data-at="8.4">
+            <div class="card">
+              <div class="card-head">
+                <span class="card-kicker">Graph</span>
+                <code>workflow.json</code>
+                <span class="card-time">5 nodes</span>
+              </div>
+              <div class="chips">
+                <span class="chip"><i></i>scene_brief</span><span class="arrow">→</span>
+                <span class="chip"><i></i>prompt_design</span><span class="arrow">→</span>
+                <span class="chip"><i></i>render_variants</span><span class="arrow">→</span>
+                <span class="chip"><i></i>score_and_select</span><span class="arrow">→</span>
+                <span class="chip"><i></i>package_outputs</span>
+              </div>
+              <p class="note">Each node returns a typed card; the FlowX plugin renders prompt, image, and video cards on its canvas.</p>
+            </div>
+          </div>
+
+          <div class="msg assistant" data-at="12.2">
+            <p><code>render_variants</code> calls <code>space.generate_image(...)</code> from <code>flowx_core.media</code> and returns <code>card.kind = "image"</code> with a workflow-relative media path. Node tests run with <code>FLOWX_MEDIA_DRY_RUN=1</code>, so the image provider is only called in the run below.</p>
+          </div>
+
+          <div class="msg user" data-at="17.2">
+            <div class="bubble">
+              <p>Run it with this brief:</p>
+              <p><em>A red fox in a misty pine forest at dawn, cinematic, volumetric light.</em></p>
+              <p>Keep the top two and show me the canvas.</p>
+            </div>
+          </div>
+
+          <div class="msg assistant" data-at="18.8">
+            <p>The service is up. Each step writes its card into <code>runs/run-20261117-101842/</code>.</p>
+            <div class="card run-card">
+              <div class="card-head">
+                <span class="card-kicker">Run</span>
+                <code>run-20261117-101842</code>
+                <span class="card-time" id="runState">queued</span>
+              </div>
+              <div class="run-nodes">
+                <div class="run-node" data-run-node="scene_brief"><span class="dot"></span><span class="name">scene_brief</span><span class="meta">queued</span></div>
+                <div class="run-node" data-run-node="prompt_design"><span class="dot"></span><span class="name">prompt_design</span><span class="meta">queued</span></div>
+                <div class="run-node" data-run-node="render_variants"><span class="dot"></span><span class="name">render_variants</span><span class="meta">queued</span></div>
+                <div class="run-node" data-run-node="score_and_select"><span class="dot"></span><span class="name">score_and_select</span><span class="meta">queued</span></div>
+                <div class="run-node" data-run-node="package_outputs"><span class="dot"></span><span class="name">package_outputs</span><span class="meta">queued</span></div>
+              </div>
+              <div class="run-progress">
+                <div class="bar"><i id="runBar"></i></div>
+                <span id="runProgressLabel">0 / 4 variants</span>
+              </div>
+              <div class="run-strip" id="runStrip" aria-label="Generated variants"></div>
+            </div>
+            <p class="note">Image generation is billable.</p>
+          </div>
+
+          <div class="msg assistant" data-at="42.6">
+            <p>Run complete: four variants, two finalists. All five node cards are journaled under <code>runs/run-20261117-101842/</code>.</p>
+          </div>
+
+          <div class="msg assistant" data-at="51.2">
+            <p>Done — <code>picture_studio</code> is published at revision 3, and the canvas is in sync with the latest run journal.</p>
+            <div class="result-card">
+              <div class="hero" id="resultHero" title="Open a larger preview"></div>
+              <div>
+                <h3>Finalists · C 94 and A 92</h3>
+                <p>4 variants · 5 node cards · 19.6s runtime</p>
+                <p class="paths">runs/run-20261117-101842/node_outputs/<br>├─ render_variants/contact_sheet.png<br>└─ package_outputs/picture_studio_album.png</p>
+                <p class="note">After a future run, open FlowX and select <strong>Sync outputs</strong> to refresh the canvas cards.</p>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <footer class="composer">
+        <div class="composer-box">
+          <span class="ph">Ask DeepSeek…</span>
+          <button class="send" type="button" aria-label="Send" title="Send">↑</button>
+        </div>
+      </footer>
+    </main>
+
+    <aside class="flowx-overlay" id="flowxOverlay" role="region" aria-label="FlowX workflow explorer">
+      <div class="fx-content">
+        <header class="fx-head">
+          <div>
+            <p class="fx-eyebrow">FlowX · workflow &amp; media canvas</p>
+            <h1>Your workflows</h1>
+            <p>Explore plans, generated files, and per-node media outputs without leaving your conversation.</p>
+          </div>
+          <div class="fx-row">
+            <button class="fx-btn" id="expandBtn" type="button">Expand canvas</button>
+            <button class="fx-btn" id="settingsBtn" type="button">Settings</button>
+            <button class="fx-btn" id="closeOverlayBtn" type="button" aria-label="Close FlowX">Close</button>
+          </div>
+        </header>
+
+        <section class="fx-card" aria-labelledby="fxWorkflowsHeading">
+          <div class="fx-explorer-head">
+            <h2 id="fxWorkflowsHeading">Workflows</h2>
+            <button class="fx-btn" id="refreshBtn" type="button">Refresh</button>
+          </div>
+          <div class="fx-workflows">
+            <button class="wf selected" type="button" aria-pressed="true">picture_studio<small>Published revision 3 · 5 listed nodes</small></button>
+            <button class="wf" type="button" data-demo-only>support_triage<small>Published revision 7 · 5 listed nodes</small></button>
+          </div>
+        </section>
+
+        <section class="fx-card" aria-labelledby="fxExplorerHeading">
+          <p class="fx-eyebrow">Workflow explorer</p>
+          <div class="fx-explorer-head">
+            <h2 id="fxExplorerHeading" style="margin:0">picture_studio</h2>
+            <span class="fx-badge">rev 3</span>
+          </div>
+          <p class="fx-muted">Published workflow revision 3</p>
+          <div class="fx-artifacts">
+            <button class="fx-btn" type="button" data-demo-only>Requirement</button>
+            <button class="fx-btn" type="button" data-demo-only>Main entrypoint</button>
+            <button class="fx-btn" type="button" data-demo-only>Graph JSON</button>
+            <button class="fx-btn" type="button" data-demo-only>Edit .env</button>
+          </div>
+
+          <div class="canvas-head">
+            <h3>Current plan dependency graph</h3>
+            <div class="fx-row">
+              <select class="fx-select" id="runSelect" aria-label="Select workflow run" disabled>
+                <option>No run loaded</option>
+              </select>
+              <span class="fx-badge run" id="runBadge" hidden>Run · running</span>
+              <button class="fx-btn primary" id="syncBtn" type="button">Sync outputs</button>
+              <button class="fx-btn" id="zoomOutBtn" type="button" aria-label="Zoom out">−</button>
+              <span id="zoomLabel" style="font-size:12px;color:#5d6e87;min-width:38px;text-align:center">70%</span>
+              <button class="fx-btn" id="zoomInBtn" type="button" aria-label="Zoom in">+</button>
+            </div>
+          </div>
+          <p class="fx-muted" style="font-size:10.5px">Published artifacts may differ after graph-only updates. Cards are read from run journals, not rebuilt from the graph.</p>
+
+          <div class="canvas-viewport" id="canvasViewport">
+            <div class="canvas-sizer" id="canvasSizer">
+              <div class="canvas-world" id="canvasWorld">
+                <svg class="edge-layer" id="edgeLayer" aria-hidden="true"></svg>
+              </div>
+            </div>
+          </div>
+          <p class="sync-notice" id="syncNotice"><span class="sync-dot"></span><span id="syncNoticeText">No run loaded. Select Sync outputs to read the latest run journal.</span></p>
+          <div class="node-detail" id="nodeDetail" hidden></div>
+
+          <div class="folder">
+            <h3>Workflow folder</h3>
+            <p class="fx-muted" style="font-size:10.5px">Expand folders and open supported text files.</p>
+            <div class="folder-tree">
+              <div><span class="ind">▾</span> <b>runs/</b></div>
+              <div><span class="ind">&nbsp;&nbsp;▾</span> <b>run-20261117-101842/</b></div>
+              <div><span class="ind">&nbsp;&nbsp;&nbsp;&nbsp;</span> manifest.json</div>
+              <div><span class="ind">&nbsp;&nbsp;&nbsp;&nbsp;</span> node_outputs/ <span class="ind">· 5 nodes</span></div>
+              <div><span class="ind">▸</span> <b>artifacts/</b> <span class="ind">workflow.json · requirement_analysis.md</span></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </aside>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="Media preview">
+      <div class="lightbox-card">
+        <div class="lightbox-head">
+          <strong id="lightboxLabel">Preview</strong>
+          <button class="fx-btn" id="lightboxCloseBtn" type="button">Close preview</button>
+        </div>
+        <div class="lightbox-media" id="lightboxMedia"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div class="controls-title">
+      <strong>FlowX × DeepSeek Harness</strong>
+      <span>Picture-generation workflow demo · live recording</span>
+    </div>
+    <button id="playBtn" type="button">Pause</button>
+    <button id="restartBtn" type="button">Restart</button>
+    <input id="scrub" type="range" min="0" max="56" step="0.1" value="0" aria-label="Demo timeline">
+    <span class="time" id="timeLabel">0:00 / 0:56</span>
+    <span class="phase" id="phaseLabel">Brief</span>
+    <label><input id="loopToggle" type="checkbox" checked> Loop</label>
+    <select id="speed" aria-label="Playback speed">
+      <option value="0.5">0.5×</option>
+      <option value="1" selected>1×</option>
+      <option value="2">2×</option>
+    </select>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (selector, root) { return (root || document).querySelector(selector); };
+  var $$ = function (selector, root) { return Array.prototype.slice.call((root || document).querySelectorAll(selector)); };
+  var esc = function (value) {
+    return String(value).replace(/[&<>"]/g, function (character) {
+      return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[character];
+    });
+  };
+
+  /* ---------------- Timeline ---------------- */
+  var T = {
+    buildStart: 1.8,
+    buildEnd: 15.6,
+    runStart: 19.0,
+    runEnd: 38.6,
+    open: 28.8,
+    sync1: 30.2,
+    sync1Done: 31.3,
+    sync2: 40.0,
+    sync2Done: 41.1,
+    expand: 42.2,
+    close: 50.5,
+    end: 56
+  };
+  var STAGES = [
+    { start: 2.2, end: 3.6, done: '1.4s' },
+    { start: 3.6, end: 5.4, done: '1.8s' },
+    { start: 5.4, end: 13.2, done: '7.8s' },
+    { start: 13.2, end: 15.6, done: '2.4s' }
+  ];
+  var RUN = [
+    { name: 'scene_brief', start: 19.0, end: 19.8, duration: '0.8s' },
+    { name: 'prompt_design', start: 19.8, end: 21.2, duration: '1.4s' },
+    { name: 'render_variants', start: 21.2, end: 35.2, duration: '14.0s' },
+    { name: 'score_and_select', start: 35.2, end: 37.0, duration: '1.8s' },
+    { name: 'package_outputs', start: 37.0, end: 38.6, duration: '1.6s' }
+  ];
+
+  var VERSION = 'rev 3';
+  var RUN_ID = '20261117-101842';
+  var RUN_LABEL = 'Run ' + RUN_ID.slice(0, 8) + '-' + RUN_ID.slice(9, 13);
+  var VARIANTS = ['A', 'B', 'C', 'D'];
+  var SCORES = [92, 87, 94, 81];
+  var KEPT = [2, 0];
+
+  /* ---------------- Procedural artwork ---------------- */
+  var uidCounter = 0;
+  var uid = function () { uidCounter += 1; return uidCounter; };
+
+  function rng(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  var PALETTES = [
+    {
+      name: 'Dawn gold', seed: 11,
+      sky: ['#101d2c', '#4f5867', '#d99a61', '#f3d3a3'],
+      sun: '#ffe1a8', sunX: 470, sunY: 176,
+      mountain: ['#3a4652', '#1b2733'],
+      trees: ['#1b2a31', '#0f1c21', '#091317'],
+      ground: '#0c1517', mist: '#efc18c', tint: '#f1a15e',
+      fox: { x: 402, y: 520, s: 1.04, flip: false }
+    },
+    {
+      name: 'Teal mist', seed: 23,
+      sky: ['#071a22', '#27545c', '#7faeaa', '#d5e5dc'],
+      sun: '#e7f4ea', sunX: 176, sunY: 140,
+      mountain: ['#28464b', '#11282d'],
+      trees: ['#143338', '#0b2328', '#06161b'],
+      ground: '#081616', mist: '#b9ddd7', tint: '#78c2ba',
+      fox: { x: 248, y: 526, s: 0.95, flip: true }
+    },
+    {
+      name: 'Violet dusk', seed: 37,
+      sky: ['#120f24', '#3c2a51', '#955b79', '#dfa29f'],
+      sun: '#ffd0c2', sunX: 520, sunY: 196,
+      mountain: ['#43355c', '#211a35'],
+      trees: ['#2a2043', '#19132b', '#0f0c1d'],
+      ground: '#120f1e', mist: '#d1a3bf', tint: '#bd7fa9',
+      fox: { x: 424, y: 524, s: 1.1, flip: false }
+    },
+    {
+      name: 'Ember storm', seed: 51,
+      sky: ['#1a0f0d', '#54241b', '#a6492d', '#e3a15e'],
+      sun: '#ffbe78', sunX: 320, sunY: 208,
+      mountain: ['#593225', '#2b1712'],
+      trees: ['#331d17', '#21110d', '#140a08'],
+      ground: '#170c0a', mist: '#d18d5d', tint: '#d37641',
+      fox: { x: 302, y: 524, s: 1.0, flip: true }
+    }
+  ];
+
+  function pine(x, baseY, h, color, sway) {
+    var half = h * 0.22;
+    var lean = (sway - 0.5) * 10;
+    var d = '';
+    var i;
+    for (i = 0; i < 4; i += 1) {
+      var top = baseY - h + i * h * 0.17;
+      var bottom = baseY - h * 0.42 + i * h * 0.16;
+      var w = half * (0.44 + i * 0.2);
+      d += 'M' + (x + lean * (i / 4)) + ' ' + top +
+        ' L' + (x - w) + ' ' + bottom +
+        ' Q' + x + ' ' + (bottom - h * 0.04) + ' ' + (x + w) + ' ' + bottom + ' Z ';
+    }
+    return '<path d="' + d + '" fill="' + color + '"/>' +
+      '<rect x="' + (x - 2) + '" y="' + (baseY - 16) + '" width="4" height="18" fill="' + color + '"/>';
+  }
+
+  function treeBand(p, layer, count) {
+    var random = rng(p.seed + layer * 101);
+    var out = '';
+    var i;
+    for (i = 0; i < count; i += 1) {
+      var x = -42 + i * (724 / count) + (random() - 0.5) * 42;
+      var base = 506 + layer * 22 + (random() - 0.5) * 12;
+      var h = (118 + random() * 105) * (1 + layer * 0.16);
+      out += pine(x, base, h, p.trees[layer], random());
+    }
+    return out;
+  }
+
+  function foxMarkup(p, u) {
+    var flip = p.fox.flip ? -p.fox.s : p.fox.s;
+    return '<ellipse cx="' + (p.fox.x - 4) + '" cy="' + (p.fox.y + 38) + '" rx="58" ry="9" fill="#05090d" opacity=".38"/>' +
+      '<g transform="translate(' + p.fox.x + ',' + p.fox.y + ') scale(' + flip + ',' + p.fox.s + ')">' +
+        '<path d="M-24 6 C-48 0 -66 -20 -70 -42 C-50 -36 -36 -28 -26 -16 Z" fill="url(#fox' + u + ')"/>' +
+        '<path d="M-70 -42 C-63 -36 -60 -30 -54 -26" stroke="#f2d8b8" stroke-width="8" stroke-linecap="round" fill="none" opacity=".86"/>' +
+        '<ellipse cx="-8" cy="0" rx="36" ry="18" fill="url(#fox' + u + ')"/>' +
+        '<path d="M-40 8 L-44 34 L-35 34 L-30 10 Z" fill="#9b431a"/>' +
+        '<path d="M-15 10 L-17 36 L-8 36 L-5 12 Z" fill="#a84a1d"/>' +
+        '<path d="M12 8 L10 34 L19 34 L22 8 Z" fill="#8d3a16"/>' +
+        '<path d="M-34 10 L-36 32 L-28 32 L-24 10 Z" fill="#b25220"/>' +
+        '<circle cx="26" cy="-16" r="14" fill="url(#fox' + u + ')"/>' +
+        '<path d="M16 -27 L12 -43 L25 -31 Z" fill="#b9541f"/>' +
+        '<path d="M25 -30 L31 -46 L37 -28 Z" fill="#a8481a"/>' +
+        '<path d="M35 -15 L54 -9 L38 1 Z" fill="#8d3a16"/>' +
+        '<circle cx="33" cy="-20" r="1.8" fill="#160b06"/>' +
+        '<path d="M39 -6 L47 -4" stroke="#2a140c" stroke-width="1.4" opacity=".7"/>' +
+        '<path d="M-42 -8 C-24 -17 0 -18 18 -10" stroke="' + p.sun + '" stroke-width="2.4" fill="none" opacity=".5"/>' +
+      '</g>';
+  }
+
+  function sceneInner(index) {
+    var p = PALETTES[index];
+    var u = uid();
+    var random = rng(p.seed + 7);
+    var particles = '';
+    var i;
+    for (i = 0; i < 12; i += 1) {
+      particles += '<circle cx="' + Math.round(random() * 620 + 10) + '" cy="' + Math.round(260 + random() * 220) +
+        '" r="' + (0.7 + random() * 1.4).toFixed(1) + '" fill="' + p.sun + '" opacity="' + (0.12 + random() * 0.22).toFixed(2) + '"/>';
+    }
+    return '<defs>' +
+        '<linearGradient id="sky' + u + '" x1="0" y1="0" x2="0" y2="1">' +
+          '<stop offset="0" stop-color="' + p.sky[0] + '"/><stop offset=".42" stop-color="' + p.sky[1] + '"/>' +
+          '<stop offset=".72" stop-color="' + p.sky[2] + '"/><stop offset="1" stop-color="' + p.sky[3] + '"/>' +
+        '</linearGradient>' +
+        '<radialGradient id="glow' + u + '"><stop offset="0" stop-color="' + p.sun + '" stop-opacity=".82"/>' +
+          '<stop offset=".55" stop-color="' + p.sun + '" stop-opacity=".2"/><stop offset="1" stop-color="' + p.sun + '" stop-opacity="0"/></radialGradient>' +
+        '<linearGradient id="mtn' + u + '" x1="0" y1="0" x2="0" y2="1">' +
+          '<stop offset="0" stop-color="' + p.mountain[0] + '"/><stop offset="1" stop-color="' + p.mountain[1] + '"/>' +
+        '</linearGradient>' +
+        '<linearGradient id="fox' + u + '" x1="0" y1="0" x2="1" y2="1">' +
+          '<stop offset="0" stop-color="#f1914c"/><stop offset=".55" stop-color="#d26027"/><stop offset="1" stop-color="#8a3815"/>' +
+        '</linearGradient>' +
+        '<radialGradient id="vig' + u + '" cx=".5" cy=".45" r=".78">' +
+          '<stop offset=".55" stop-color="#000" stop-opacity="0"/><stop offset="1" stop-color="#04070b" stop-opacity=".55"/>' +
+        '</radialGradient>' +
+        '<filter id="blur' + u + '"><feGaussianBlur stdDeviation="16"/></filter>' +
+      '</defs>' +
+      '<rect width="640" height="640" fill="url(#sky' + u + ')"/>' +
+      '<circle cx="' + p.sunX + '" cy="' + p.sunY + '" r="132" fill="url(#glow' + u + ')"/>' +
+      '<circle cx="' + p.sunX + '" cy="' + p.sunY + '" r="34" fill="' + p.sun + '" opacity=".92"/>' +
+      '<path d="M0 408 L72 330 L146 374 L232 292 L322 368 L412 316 L502 364 L578 320 L640 352 L640 640 L0 640 Z" fill="url(#mtn' + u + ')" opacity=".94"/>' +
+      '<path d="M0 408 L72 330 L146 374 L232 292 L322 368 L412 316 L502 364 L578 320 L640 352" stroke="' + p.sky[3] + '" stroke-opacity=".22" fill="none"/>' +
+      '<path d="M0 462 L96 396 L186 444 L276 386 L376 448 L474 402 L562 442 L640 408 L640 640 L0 640 Z" fill="' + p.mountain[1] + '" opacity=".85"/>' +
+      '<rect x="0" y="496" width="640" height="144" fill="' + p.ground + '"/>' +
+      treeBand(p, 0, 13) +
+      '<g filter="url(#blur' + u + ')" opacity=".55">' +
+        '<ellipse cx="160" cy="470" rx="286" ry="34" fill="' + p.mist + '"/>' +
+        '<ellipse cx="506" cy="492" rx="326" ry="38" fill="' + p.mist + '"/>' +
+      '</g>' +
+      treeBand(p, 1, 9) +
+      '<g filter="url(#blur' + u + ')" opacity=".36"><ellipse cx="330" cy="520" rx="360" ry="30" fill="' + p.mist + '"/></g>' +
+      treeBand(p, 2, 7) +
+      '<path d="M0 566 C110 548 212 578 322 562 C440 544 536 572 640 552 L640 640 L0 640 Z" fill="' + p.ground + '" opacity=".96"/>' +
+      particles +
+      foxMarkup(p, u) +
+      '<path d="M0 602 C96 584 176 612 268 596 C374 578 474 606 566 588 C602 582 626 588 640 584 L640 640 L0 640 Z" fill="#060c0f" opacity=".9"/>' +
+      '<rect width="640" height="640" fill="' + p.tint + '" opacity=".045"/>' +
+      '<rect width="640" height="640" fill="url(#vig' + u + ')"/>';
+  }
+
+  function sceneSVG(index, label) {
+    return '<svg viewBox="0 0 640 640" preserveAspectRatio="xMidYMid slice" role="img" aria-label="' + esc(label) + '">' +
+      sceneInner(index) + '</svg>';
+  }
+
+  function contactSheetSVG(count) {
+    var cells = '';
+    var i;
+    for (i = 0; i < 4; i += 1) {
+      var x = (i % 2) * 320;
+      var y = Math.floor(i / 2) * 210;
+      if (i >= count) {
+        cells += '<g><rect x="' + x + '" y="' + y + '" width="320" height="210" fill="#101a28"/>' +
+          '<rect class="contact-queued" x="' + (x + 86) + '" y="' + (y + 78) + '" width="148" height="54" rx="10" fill="#ffffff" fill-opacity=".1"/>' +
+          '<text x="' + (x + 160) + '" y="' + (y + 111) + '" text-anchor="middle" font-family="Arial,sans-serif" font-size="11" fill="#93a4bb">queued</text></g>';
+        continue;
+      }
+      cells += '<g><svg x="' + x + '" y="' + y + '" width="320" height="210" viewBox="0 0 640 640" preserveAspectRatio="xMidYMid slice">' +
+        sceneInner(i) + '</svg>' +
+        '<rect x="' + (x + 11) + '" y="' + (y + 11) + '" width="24" height="24" rx="7" fill="rgba(8,12,20,.78)" stroke="rgba(255,255,255,.22)"/>' +
+        '<text x="' + (x + 23) + '" y="' + (y + 27) + '" text-anchor="middle" font-family="Arial,sans-serif" font-size="11" font-weight="700" fill="#fff">' + VARIANTS[i] + '</text></g>';
+    }
+    return '<svg viewBox="0 0 640 420" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Four cinematic variants contact sheet">' +
+      cells +
+      '<rect x="319" y="0" width="2" height="420" fill="#0b1220" opacity=".55"/>' +
+      '<rect x="0" y="209" width="640" height="2" fill="#0b1220" opacity=".55"/>' +
+      '</svg>';
+  }
+
+  function finalistsSVG() {
+    return '<svg viewBox="0 0 640 320" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Finalists C and A">' +
+      '<svg x="0" y="0" width="320" height="320" viewBox="0 0 640 640" preserveAspectRatio="xMidYMid slice">' + sceneInner(2) + '</svg>' +
+      '<svg x="320" y="0" width="320" height="320" viewBox="0 0 640 640" preserveAspectRatio="xMidYMid slice">' + sceneInner(0) + '</svg>' +
+      '<rect x="319" y="0" width="2" height="320" fill="#0b1220" opacity=".55"/>' +
+      '<rect x="10" y="10" width="66" height="24" rx="7" fill="rgba(8,12,20,.62)"/>' +
+      '<text x="43" y="26" text-anchor="middle" font-family="Arial,sans-serif" font-size="10" font-weight="700" fill="#e8ffe8">C · 94</text>' +
+      '<rect x="330" y="10" width="66" height="24" rx="7" fill="rgba(8,12,20,.62)"/>' +
+      '<text x="363" y="26" text-anchor="middle" font-family="Arial,sans-serif" font-size="10" font-weight="700" fill="#e8ffe8">A · 92</text>' +
+      '</svg>';
+  }
+
+  function albumSVG() {
+    return '<svg viewBox="0 0 640 420" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Selected variant C, score 94">' +
+      '<svg x="0" y="0" width="640" height="420" viewBox="0 0 640 640" preserveAspectRatio="xMidYMid slice">' + sceneInner(2) + '</svg>' +
+      '<rect x="14" y="14" width="74" height="26" rx="8" fill="rgba(8,12,20,.62)"/>' +
+      '<text x="51" y="31" text-anchor="middle" font-family="Arial,sans-serif" font-size="10" font-weight="700" fill="#e8ffe8">C · 94</text>' +
+      '</svg>';
+  }
+
+  /* ---------------- Graph data ---------------- */
+  var NODES = [
+    {
+      name: 'scene_brief', x: 24, y: 24, deps: [],
+      desc: 'Normalize the scene brief, aspect ratio, variant count, and seed into a typed input.',
+      preview: { kind: 'prompt', text: 'A red fox in a misty pine forest at dawn. Square 1:1 · 4 variants · seed 4815.' }
+    },
+    {
+      name: 'prompt_design', x: 320, y: 24, deps: ['scene_brief'],
+      desc: 'Expand the brief into a positive prompt, negative prompt, and camera notes.',
+      preview: { kind: 'prompt', text: 'Cinematic wildlife photograph, red fox, misty pine forest, dawn rim light, volumetric fog, 35mm, shallow depth of field. Negative: text, watermark.' }
+    },
+    {
+      name: 'render_variants', x: 616, y: 24, deps: ['prompt_design'],
+      desc: 'Generate four image variants through flowx_core.media and return an image card.',
+      preview: { kind: 'image' }
+    },
+    {
+      name: 'score_and_select', x: 616, y: 270, deps: ['render_variants'],
+      desc: 'Score the four variants, keep the top two, and journal the selection.',
+      preview: { kind: 'prompt', text: 'C 94 · A 92 · B 87 · D 81 — keep C and A. Selection recorded in the run journal.' }
+    },
+    {
+      name: 'package_outputs', x: 912, y: 270, deps: ['score_and_select'],
+      desc: 'Write the finalists, contact sheet, and run manifest into the output folder.',
+      preview: { kind: 'image' }
+    }
+  ];
+  var WORLD_W = 1196;
+  var WORLD_H = 500;
+  var CARD_W = 236;
+
+  var RUN_BY_NAME = {};
+  RUN.forEach(function (item) { RUN_BY_NAME[item.name] = item; });
+
+  function stateAt(name, time) {
+    var item = RUN_BY_NAME[name];
+    if (!item || time === null || time === undefined || time < item.start) return { status: 'pending', progress: 0 };
+    if (time >= item.end) return { status: 'completed', progress: 1 };
+    return { status: 'running', progress: (time - item.start) / (item.end - item.start) };
+  }
+
+  function previewMarkup(node, state) {
+    if (!node.preview || state === 'none') return '';
+    if (node.preview.kind === 'prompt') {
+      return '<div class="node-prompt">' + esc(node.preview.text) + '</div>';
+    }
+    if (node.name === 'render_variants') {
+      if (state === 'partial') {
+        return '<div class="node-shot" data-media="render">' + contactSheetSVG(2) +
+          '<div class="node-progress"><i style="width:64%"></i></div>' +
+          '<div class="shot-meta"><span>2 / 4 variants</span><span class="shot-tag running">running</span></div></div>';
+      }
+      return '<div class="node-shot" data-media="render">' + contactSheetSVG(4) +
+        '<div class="shot-meta"><span>640×420</span><span class="shot-tag">image</span></div></div>';
+    }
+    if (node.name === 'package_outputs') {
+      return '<div class="node-shot" data-media="album">' + albumSVG() +
+        '<div class="shot-meta"><span>640×420</span><span class="shot-tag">image</span></div></div>';
+    }
+    return '';
+  }
+
+  function edgeMarkup(from, to) {
+    var x1 = from.x + CARD_W;
+    var y1 = from.y + 34;
+    var x2 = to.x;
+    var y2 = to.y + 34;
+    var d;
+    if (Math.abs(x2 - x1) < 40) {
+      var midY = (y1 + y2) / 2;
+      d = 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + 48) + ' ' + midY + ', ' + (x2 + 48) + ' ' + midY + ', ' + x2 + ' ' + y2;
+    } else {
+      var bend = Math.max(36, Math.abs(x2 - x1) / 2);
+      d = 'M ' + x1 + ' ' + y1 + ' C ' + (x1 + bend) + ' ' + y1 + ', ' + (x2 - bend) + ' ' + y2 + ', ' + x2 + ' ' + y2;
+    }
+    return '<g><path d="' + d + '" stroke="#8ea0df" stroke-width="2.2" fill="none"/>' +
+      '<path d="M ' + (x2 - 7) + ' ' + (y2 - 4) + ' L ' + x2 + ' ' + y2 + ' L ' + (x2 - 7) + ' ' + (y2 + 4) + '" stroke="#8ea0df" stroke-width="2.2" fill="none"/></g>';
+  }
+
+  /* ---------------- DOM setup ---------------- */
+  var els = {
+    app: $('#app'),
+    overlay: $('#flowxOverlay'),
+    launcher: $('#flowxLauncher'),
+    expandBtn: $('#expandBtn'),
+    closeOverlayBtn: $('#closeOverlayBtn'),
+    syncBtn: $('#syncBtn'),
+    runSelect: $('#runSelect'),
+    runBadge: $('#runBadge'),
+    zoomLabel: $('#zoomLabel'),
+    zoomOutBtn: $('#zoomOutBtn'),
+    zoomInBtn: $('#zoomInBtn'),
+    canvasViewport: $('#canvasViewport'),
+    canvasSizer: $('#canvasSizer'),
+    canvasWorld: $('#canvasWorld'),
+    edgeLayer: $('#edgeLayer'),
+    syncNotice: $('#syncNotice'),
+    syncNoticeText: $('#syncNoticeText'),
+    nodeDetail: $('#nodeDetail'),
+    buildTime: $('#buildTime'),
+    runState: $('#runState'),
+    runBar: $('#runBar'),
+    runProgressLabel: $('#runProgressLabel'),
+    runStrip: $('#runStrip'),
+    resultHero: $('#resultHero'),
+    lightbox: $('#lightbox'),
+    lightboxMedia: $('#lightboxMedia'),
+    lightboxLabel: $('#lightboxLabel'),
+    lightboxCloseBtn: $('#lightboxCloseBtn'),
+    toast: $('#toast'),
+    playBtn: $('#playBtn'),
+    restartBtn: $('#restartBtn'),
+    scrub: $('#scrub'),
+    timeLabel: $('#timeLabel'),
+    phaseLabel: $('#phaseLabel'),
+    loopToggle: $('#loopToggle'),
+    speed: $('#speed'),
+    chatScroll: $('#chatScroll')
+  };
+
+  var chatMessages = $$('.msg[data-at]');
+  var stageEls = $$('.stage');
+  var nodeEls = {};
+  var lastVisibleCount = -1;
+  var lastZoom = -1;
+  var lastRunKey = '';
+  var lastWasOpen = false;
+  var lastExpanded = null;
+  var didScrollToCanvas = false;
+  var lastCanvasScrollAt = -100000;
+  var lastCanvasTopAt = -100000;
+
+  function buildGraph() {
+    els.canvasWorld.style.width = WORLD_W + 'px';
+    els.canvasWorld.style.height = WORLD_H + 'px';
+    els.edgeLayer.setAttribute('viewBox', '0 0 ' + WORLD_W + ' ' + WORLD_H);
+    els.edgeLayer.setAttribute('width', WORLD_W);
+    els.edgeLayer.setAttribute('height', WORLD_H);
+
+    var byName = {};
+    NODES.forEach(function (node) { byName[node.name] = node; });
+    NODES.forEach(function (node) {
+      node.deps.forEach(function (dep) {
+        els.edgeLayer.insertAdjacentHTML('beforeend', edgeMarkup(byName[dep], node));
+      });
+    });
+
+    NODES.forEach(function (node) {
+      var el = document.createElement('div');
+      el.className = 'node';
+      el.dataset.node = node.name;
+      el.dataset.status = 'idle';
+      el.style.left = node.x + 'px';
+      el.style.top = node.y + 'px';
+      el.setAttribute('role', 'button');
+      el.setAttribute('tabindex', '0');
+      el.setAttribute('aria-label', 'Inspect node ' + node.name);
+      el.innerHTML = '<div class="node-head"><span class="node-dot"></span>' +
+        '<span class="node-name">' + esc(node.name) + '</span>' +
+        '<span class="node-status"></span></div><div class="node-body"></div>';
+      el.addEventListener('click', function (event) {
+        if (event.target.closest('.node-shot')) {
+          event.stopPropagation();
+          openNodePreview(node);
+          return;
+        }
+        selectedNode = selectedNode === node.name ? null : node.name;
+        renderOverlay(t);
+      });
+      el.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          selectedNode = selectedNode === node.name ? null : node.name;
+          renderOverlay(t);
+        }
+      });
+      els.canvasWorld.appendChild(el);
+      nodeEls[node.name] = el;
+      node.el = el;
+      node.cardState = 'none';
+    });
+  }
+
+  function buildRunStrip() {
+    VARIANTS.forEach(function (letter, index) {
+      var thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      thumb.dataset.variant = String(index);
+      thumb.innerHTML = sceneSVG(index, 'Variant ' + letter + ' preview') + '<b>' + letter + '</b>';
+      els.runStrip.appendChild(thumb);
+    });
+  }
+
+  function buildResultHero() {
+    els.resultHero.innerHTML = albumSVG();
+    els.resultHero.addEventListener('click', function () {
+      openLightbox(albumSVG(), 'Selected variant C · picture_studio_album.png');
+    });
+  }
+
+  /* ---------------- State ---------------- */
+  var initialParams = new URLSearchParams(window.location.search);
+  var STATIC_MODE = initialParams.has('static');
+  if (STATIC_MODE) document.body.classList.add('static');
+  var initialTime = initialParams.has('t')
+    ? Math.max(0, Math.min(T.end, Number(initialParams.get('t')) || 0))
+    : 0;
+  var initialPaused = initialParams.has('t') || initialParams.get('paused') === '1';
+  var t = initialTime;
+  var playing = !initialPaused && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var speed = 1;
+  var loop = true;
+  var lastFrame = performance.now();
+  var lastRender = -1;
+  var selectedNode = null;
+  var overlayUserClosed = false;
+  var manualOpen = false;
+  var expandOverride = null;
+  var zoomUser = null;
+  var wasPlayingBeforeLightbox = false;
+  var toastTimer = 0;
+
+  function resetTransient() {
+    selectedNode = null;
+    overlayUserClosed = false;
+    manualOpen = false;
+    expandOverride = null;
+    zoomUser = null;
+    lastVisibleCount = -1;
+    lastZoom = -1;
+    lastRunKey = '';
+    lastWasOpen = false;
+    lastExpanded = null;
+    didScrollToCanvas = false;
+    closeLightbox(true);
+    els.overlay.scrollTop = 0;
+    els.canvasViewport.scrollLeft = 0;
+    els.canvasViewport.scrollTop = 0;
+    lastCanvasScrollAt = -100000;
+    lastCanvasTopAt = -100000;
+  }
+
+  function formatTime(value) {
+    var whole = Math.max(0, Math.floor(value));
+    var minutes = Math.floor(whole / 60);
+    var seconds = whole % 60;
+    return minutes + ':' + (seconds < 10 ? '0' : '') + seconds;
+  }
+
+  function phaseAt(time) {
+    if (time < 2) return 'Brief';
+    if (time < 17.2) return 'Generate workflow';
+    if (time < T.open) return 'Run workflow';
+    if (time < T.close) return 'Sync canvas';
+    return 'Inspect outputs';
+  }
+
+  function frozenTime(time) {
+    if (time >= T.sync2Done) return 999;
+    if (time >= T.sync1Done) return T.sync1;
+    return null;
+  }
+
+  function defaultZoom(expanded) {
+    if (!expanded) return 0.70;
+    var fit = (els.app.clientWidth - 60) / WORLD_W;
+    return Math.max(0.55, Math.min(0.88, Math.round(fit * 100) / 100));
+  }
+
+  function runStatusAt(time) {
+    if (time < T.runStart) return 'queued';
+    if (time >= T.runEnd) return 'completed';
+    return 'running';
+  }
+
+  function updateMessages(time) {
+    var visible = 0;
+    chatMessages.forEach(function (message) {
+      var on = time >= Number(message.dataset.at);
+      message.classList.toggle('on', on);
+      if (on) visible += 1;
+    });
+    if (visible !== lastVisibleCount) {
+      lastVisibleCount = visible;
+      var scroller = els.chatScroll;
+      requestAnimationFrame(function () { scroller.scrollTop = scroller.scrollHeight; });
+    }
+  }
+
+  function updateBuildCard(time) {
+    stageEls.forEach(function (stage, index) {
+      var config = STAGES[index];
+      var state = time >= config.end ? 'done' : time >= config.start ? 'active' : 'pending';
+      stage.dataset.state = state;
+      var label = stage.querySelector('em');
+      if (state === 'done') label.textContent = config.done;
+      else if (state === 'active') label.textContent = 'working';
+      else label.textContent = '—';
+
+      if (stage.dataset.nodesStage === 'true') {
+        var detail = stage.querySelector('.stage-detail');
+        if (state === 'pending') detail.textContent = '5 node tests · dry-run';
+        else if (state === 'done') detail.textContent = '5 / 5 tests passed';
+        else {
+          var fraction = Math.min(0.999, Math.max(0, (time - config.start) / (config.end - config.start)));
+          var count = Math.min(4, Math.floor(fraction * 5) + 1);
+          detail.textContent = count + ' / 5 node tests · ' + RUN[count - 1].name;
+        }
+      }
+    });
+    els.buildTime.textContent = time >= T.buildEnd ? '13.4s' : time >= T.buildStart ? 'working…' : '—';
+  }
+
+  function updateRunCard(time) {
+    RUN.forEach(function (item) {
+      var row = document.querySelector('[data-run-node="' + item.name + '"]');
+      if (!row) return;
+      var state = stateAt(item.name, time);
+      var meta = row.querySelector('.meta');
+      row.dataset.state = state.status;
+      if (state.status === 'pending') meta.textContent = 'queued';
+      else if (state.status === 'completed') meta.textContent = item.duration;
+      else if (item.name === 'render_variants') {
+        var done = Math.min(4, Math.floor(state.progress * 4 + 0.0001));
+        meta.textContent = done + ' / 4 · rendering';
+      } else meta.textContent = 'running';
+    });
+
+    var renderState = stateAt('render_variants', time);
+    var percent = Math.round(renderState.progress * 100);
+    els.runBar.style.width = percent + '%';
+    var doneCount = Math.min(4, Math.floor(renderState.progress * 4 + 0.0001));
+    els.runProgressLabel.textContent = doneCount + ' / 4 variants';
+
+    var thumbEls = $$('.thumb', els.runStrip);
+    thumbEls.forEach(function (thumb, index) {
+      thumb.classList.toggle('on', index < doneCount);
+      thumb.classList.toggle('pick', time >= 37.0 && KEPT.indexOf(index) !== -1);
+    });
+
+    var status = runStatusAt(time);
+    els.runState.textContent = status;
+    els.runState.style.color = status === 'completed' ? '#15803d' : status === 'running' ? '#2563eb' : '#8b95a7';
+  }
+
+  function updateOverlayChrome(time, open, expanded, zoom) {
+    var syncBusy = (time >= T.sync1 && time < T.sync1Done) || (time >= T.sync2 && time < T.sync2Done);
+    var loaded = time >= T.sync1Done;
+    var frozen = frozenTime(time);
+
+    if (lastZoom !== zoom) {
+      lastZoom = zoom;
+      els.canvasWorld.style.transform = 'scale(' + zoom + ')';
+      els.canvasSizer.style.width = (WORLD_W * zoom) + 'px';
+      els.canvasSizer.style.height = (WORLD_H * zoom) + 'px';
+      els.zoomLabel.textContent = Math.round(zoom * 100) + '%';
+    }
+
+    els.syncBtn.textContent = syncBusy ? 'Syncing…' : 'Sync outputs';
+    els.syncBtn.classList.toggle('busy', syncBusy);
+    els.syncBtn.disabled = syncBusy;
+
+    var runKey = loaded ? runStatusAt(frozen === 999 ? T.runEnd : frozen) : 'none';
+    if (runKey !== lastRunKey) {
+      lastRunKey = runKey;
+      if (!loaded) {
+        els.runSelect.innerHTML = '<option>No run loaded</option>';
+        els.runSelect.disabled = true;
+      } else {
+        var status = runKey;
+        els.runSelect.innerHTML = '<option>' + RUN_LABEL + ' · ' + status + ' (' + VERSION + ')</option>';
+        els.runSelect.disabled = false;
+      }
+    }
+
+    els.runBadge.hidden = !loaded;
+    if (loaded) {
+      var badgeStatus = runKey;
+      els.runBadge.textContent = 'Run · ' + badgeStatus;
+      els.runBadge.className = 'fx-badge ' + (badgeStatus === 'completed' ? 'done' : 'run');
+    }
+
+    if (syncBusy) {
+      els.syncNotice.className = 'sync-notice busy';
+      els.syncNoticeText.textContent = 'Reading run journals from runs/' + RUN_ID + '/…';
+    } else if (loaded && frozen === 999) {
+      els.syncNotice.className = 'sync-notice done';
+      els.syncNoticeText.textContent = 'Synced 5 node cards · 4 variants from run-20261117-101842.';
+    } else if (loaded) {
+      els.syncNotice.className = 'sync-notice';
+      els.syncNoticeText.textContent = 'Run in progress. Cards are frozen at the last sync; select Sync outputs to refresh.';
+    } else {
+      els.syncNotice.className = 'sync-notice';
+      els.syncNoticeText.textContent = 'No run loaded. Select Sync outputs to read the latest run journal.';
+    }
+
+    NODES.forEach(function (node) {
+      var el = nodeEls[node.name];
+      var state = frozen === null ? { status: 'idle', progress: 0 } : stateAt(node.name, frozen);
+      var hasCard = state.status === 'completed' ||
+        (node.name === 'render_variants' && state.status === 'running' && frozen !== null);
+      var cardState = 'none';
+      if (state.status === 'completed') cardState = 'full';
+      else if (hasCard) cardState = 'partial';
+
+      el.dataset.status = state.status;
+      el.classList.toggle('has-card', hasCard);
+      el.classList.toggle('selected', selectedNode === node.name);
+      var statusEl = el.querySelector('.node-status');
+      statusEl.textContent = state.status === 'idle' ? '' : state.status;
+
+      if (node.cardState !== cardState) {
+        node.cardState = cardState;
+        el.querySelector('.node-body').innerHTML = previewMarkup(node, cardState);
+      }
+    });
+
+    if (selectedNode) {
+      var selected = NODES.filter(function (node) { return node.name === selectedNode; })[0];
+      var selectedState = frozen === null ? { status: 'idle' } : stateAt(selected.name, frozen);
+      els.nodeDetail.hidden = false;
+      els.nodeDetail.innerHTML = '<strong>' + esc(selected.name) + '</strong>' + esc(selected.desc) +
+        '<div class="fine">Status: ' + selectedState.status + ' · Depends on: ' +
+        (selected.deps.length ? selected.deps.join(', ') : 'None') + ' · Workflow revision 3</div>';
+    } else {
+      els.nodeDetail.hidden = true;
+    }
+
+    if (open && !lastWasOpen) {
+      els.overlay.scrollTop = 0;
+      lastCanvasScrollAt = -100000;
+      lastCanvasTopAt = -100000;
+      lastZoom = -1;
+      lastExpanded = expanded;
+      if (expanded) requestAnimationFrame(scrollOverlayToCanvas);
+    } else if (open && expanded !== lastExpanded) {
+      lastExpanded = expanded;
+      if (expanded) scrollOverlayToCanvas();
+      else els.overlay.scrollTop = 0;
+    }
+    if (open && time >= T.sync1Done && !didScrollToCanvas) {
+      didScrollToCanvas = true;
+      scrollOverlayToCanvas();
+    }
+    lastWasOpen = open;
+
+    if (open) {
+      var now = performance.now();
+      var targetX = expanded ? 0 : (time >= T.sync2Done ? 214 : 0);
+      var targetY = expanded ? 0 : (time >= T.sync2Done ? 8 : 0);
+      if (now - lastCanvasScrollAt > 4000) {
+        var maxX = Math.max(0, els.canvasViewport.scrollWidth - els.canvasViewport.clientWidth);
+        var nextX = Math.min(targetX, maxX);
+        if (STATIC_MODE) els.canvasViewport.scrollLeft = nextX;
+        else els.canvasViewport.scrollLeft += (nextX - els.canvasViewport.scrollLeft) * 0.12;
+      }
+      if (now - lastCanvasTopAt > 4000) {
+        var maxY = Math.max(0, els.canvasViewport.scrollHeight - els.canvasViewport.clientHeight);
+        var nextY = Math.min(targetY, maxY);
+        if (STATIC_MODE) els.canvasViewport.scrollTop = nextY;
+        else els.canvasViewport.scrollTop += (nextY - els.canvasViewport.scrollTop) * 0.12;
+      }
+    }
+  }
+
+  function render(time) {
+    updateMessages(time);
+    updateBuildCard(time);
+    updateRunCard(time);
+
+    var autoOpen = time >= T.open && time < T.close;
+    var open = !overlayUserClosed && (autoOpen || manualOpen);
+    els.overlay.classList.toggle('open', open);
+    els.overlay.setAttribute('aria-hidden', open ? 'false' : 'true');
+    els.launcher.classList.toggle('active', open);
+    els.launcher.classList.toggle('pulse', time >= 27.5 && time < T.open);
+    els.launcher.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (!open) didScrollToCanvas = false;
+
+    if (open) {
+      var expanded = expandOverride === null ? (time >= T.expand && time < T.close) : expandOverride;
+      var zoom = zoomUser === null ? defaultZoom(expanded) : zoomUser;
+      els.overlay.classList.toggle('expanded', expanded);
+      els.expandBtn.textContent = expanded ? 'Compact view' : 'Expand canvas';
+      updateOverlayChrome(time, open, expanded, zoom);
+    }
+
+    els.scrub.value = String(time);
+    els.timeLabel.textContent = formatTime(time) + ' / ' + formatTime(T.end);
+    els.phaseLabel.textContent = phaseAt(time);
+    els.playBtn.textContent = playing ? 'Pause' : 'Play';
+  }
+
+  /* ---------------- Lightbox ---------------- */
+  function openNodePreview(node) {
+    if (node.name === 'render_variants') {
+      openLightbox(contactSheetSVG(node.cardState === 'partial' ? 2 : 4), 'render_variants · contact_sheet.png');
+    } else if (node.name === 'package_outputs') {
+      openLightbox(albumSVG(), 'package_outputs · picture_studio_album.png');
+    } else {
+      openLightbox(sceneSVG(2, 'Selected variant C'), node.name + ' · media preview');
+    }
+  }
+
+  function openLightbox(html, label) {
+    els.lightboxMedia.innerHTML = html;
+    els.lightboxLabel.textContent = label;
+    els.lightbox.hidden = false;
+    wasPlayingBeforeLightbox = playing;
+    playing = false;
+    els.playBtn.textContent = 'Play';
+  }
+
+  function closeLightbox(silent) {
+    if (els.lightbox.hidden) return;
+    els.lightbox.hidden = true;
+    els.lightboxMedia.innerHTML = '';
+    if (!silent) {
+      playing = wasPlayingBeforeLightbox;
+      lastFrame = performance.now();
+      els.playBtn.textContent = playing ? 'Pause' : 'Play';
+    }
+  }
+
+  function showToast(message, duration) {
+    els.toast.textContent = message;
+    els.toast.classList.add('on');
+    window.clearTimeout(toastTimer);
+    toastTimer = window.setTimeout(function () { els.toast.classList.remove('on'); }, duration || 2600);
+  }
+
+  function scrollOverlayToCanvas() {
+    var anchor = $('.fx-card .fx-eyebrow');
+    if (!anchor) return;
+    els.overlay.scrollTop = Math.max(0,
+      els.overlay.scrollTop + anchor.getBoundingClientRect().top - els.overlay.getBoundingClientRect().top - 10);
+  }
+
+  /* ---------------- Interactions ---------------- */
+  function toggleOpen() {
+    if (els.overlay.classList.contains('open')) {
+      overlayUserClosed = true;
+      manualOpen = false;
+    } else {
+      overlayUserClosed = false;
+      manualOpen = true;
+      lastZoom = -1;
+    }
+    render(t);
+  }
+
+  els.launcher.addEventListener('click', toggleOpen);
+  els.closeOverlayBtn.addEventListener('click', function () {
+    overlayUserClosed = true;
+    manualOpen = false;
+    render(t);
+  });
+  els.expandBtn.addEventListener('click', function () {
+    var expanded = els.overlay.classList.contains('expanded');
+    expandOverride = !expanded;
+    lastZoom = -1;
+    render(t);
+  });
+  els.zoomOutBtn.addEventListener('click', function () {
+    var expanded = els.overlay.classList.contains('expanded');
+    var current = zoomUser === null ? (lastZoom > 0 ? lastZoom : defaultZoom(expanded)) : zoomUser;
+    zoomUser = Math.max(0.55, Math.round((current - 0.1) * 100) / 100);
+    lastZoom = -1;
+    render(t);
+  });
+  els.zoomInBtn.addEventListener('click', function () {
+    var expanded = els.overlay.classList.contains('expanded');
+    var current = zoomUser === null ? (lastZoom > 0 ? lastZoom : defaultZoom(expanded)) : zoomUser;
+    zoomUser = Math.min(1.3, Math.round((current + 0.1) * 100) / 100);
+    lastZoom = -1;
+    render(t);
+  });
+  els.syncBtn.addEventListener('click', function () {
+    if (!els.overlay.classList.contains('open')) return;
+    if (t < T.sync1Done) {
+      t = T.sync1Done + 0.05;
+      showToast('Synced the running run journal');
+    } else if (t < T.sync2Done) {
+      t = T.sync2Done + 0.05;
+      showToast('Synced the completed run · 5 node cards');
+    } else {
+      showToast('Run journal is up to date · 5 node cards');
+    }
+    render(t);
+  });
+  els.runSelect.addEventListener('change', function () {
+    showToast('Loaded ' + RUN_LABEL + ' · revision 3');
+  });
+  $$('[data-demo-only]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      showToast('This interactive demo focuses on picture_studio.');
+    });
+  });
+  els.canvasViewport.addEventListener('wheel', function () { lastCanvasScrollAt = performance.now(); lastCanvasTopAt = performance.now(); }, { passive: true });
+  els.canvasViewport.addEventListener('pointerdown', function () { lastCanvasScrollAt = performance.now(); lastCanvasTopAt = performance.now(); });
+  els.lightboxCloseBtn.addEventListener('click', function () { closeLightbox(false); });
+  els.lightbox.addEventListener('click', function (event) {
+    if (event.target === els.lightbox) closeLightbox(false);
+  });
+
+  els.playBtn.addEventListener('click', function () {
+    playing = !playing;
+    lastFrame = performance.now();
+    render(t);
+  });
+  els.restartBtn.addEventListener('click', function () {
+    t = 0;
+    playing = true;
+    resetTransient();
+    lastFrame = performance.now();
+    render(t);
+  });
+  els.scrub.addEventListener('input', function () {
+    t = Number(els.scrub.value);
+    resetTransient();
+    render(t);
+  });
+  els.loopToggle.addEventListener('change', function () { loop = els.loopToggle.checked; });
+  els.speed.addEventListener('change', function () { speed = Number(els.speed.value); });
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') {
+      if (!els.lightbox.hidden) { closeLightbox(false); return; }
+      if (els.overlay.classList.contains('open')) {
+        overlayUserClosed = true;
+        manualOpen = false;
+        render(t);
+      }
+      return;
+    }
+    var tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'BUTTON' || tag === 'TEXTAREA') return;
+    if (event.key === ' ') {
+      event.preventDefault();
+      playing = !playing;
+      lastFrame = performance.now();
+      render(t);
+    } else if (event.key === 'ArrowRight') {
+      t = Math.min(T.end, t + 1);
+      render(t);
+    } else if (event.key === 'ArrowLeft') {
+      t = Math.max(0, t - 1);
+      render(t);
+    }
+  });
+
+  /* ---------------- Animation loop ---------------- */
+  function tick(now) {
+    var delta = (now - lastFrame) / 1000;
+    lastFrame = now;
+    if (playing) {
+      t += delta * speed;
+      if (t >= T.end) {
+        if (loop) {
+          t = 0;
+          resetTransient();
+        } else {
+          t = T.end;
+          playing = false;
+        }
+      }
+    }
+    if (now - lastRender > 45 || !playing) {
+      lastRender = now;
+      render(t);
+    }
+    requestAnimationFrame(tick);
+  }
+
+  window.flowxDemo = {
+    seek: function (seconds) {
+      t = Math.max(0, Math.min(T.end, Number(seconds) || 0));
+      playing = false;
+      resetTransient();
+      lastFrame = performance.now();
+      render(t);
+      return t;
+    },
+    play: function () { playing = true; lastFrame = performance.now(); render(t); },
+    pause: function () { playing = false; render(t); },
+    time: function () { return t; },
+    end: T.end
+  };
+
+  buildGraph();
+  buildRunStrip();
+  buildResultHero();
+  resetTransient();
+  render(t);
+  requestAnimationFrame(function (now) {
+    lastFrame = now;
+    lastRender = now - 100;
+    requestAnimationFrame(tick);
+  });
+})();
+</script>
+</body>
+</html>
