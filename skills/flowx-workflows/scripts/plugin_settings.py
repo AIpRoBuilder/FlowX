@@ -4,54 +4,22 @@
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Added 2026-11-10: read the python, workspace and API key saved by the DeepSeek Harness plugin.
 # Modified 2026-11-16: export plugin-saved environment variables to skill processes.
-"""Use the interpreter, workspace, API key and environment variables saved in the FlowX Harness plugin settings.
+# Modified 2026-11-17: stop applying saved environment variables to skill processes.
+"""Use the interpreter, workspace and API key saved in the FlowX Harness plugin settings.
 
-Run directly to print the saved python, workspace, API key presence and
-environment-variable names as JSON (never the key or environment values).
+Run directly to print the saved python and workspace as JSON (never the key).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import stat
 import sys
 from pathlib import Path
 from typing import Any
 
 _REEXEC_GUARD = "FLOWX_PLUGIN_PYTHON_ACTIVE"
-_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
-_ENV_COUNT_LIMIT = 64
-_ENV_VALUE_LIMIT = 4096
-# Keep in sync with the Harness host service. These values are managed by
-# dedicated settings or protect re-execution; prototype names are rejected.
-_RESERVED_ENV = frozenset({
-    "FLOWX_PYTHON",
-    "FLOWX_WORKSPACE",
-    "FLOWX_LLM_API_KEY",
-    "FLOWX_PLUGIN_PYTHON_ACTIVE",
-    "__PROTO__",
-    "CONSTRUCTOR",
-    "PROTOTYPE",
-})
-
-
-def environment(saved: dict[str, Any]) -> dict[str, str]:
-    """Return safe saved environment variables; invalid entries are ignored."""
-    raw = saved.get("env")
-    if not isinstance(raw, dict) or len(raw) > _ENV_COUNT_LIMIT:
-        return {}
-    result: dict[str, str] = {}
-    for name, value in raw.items():
-        if (not isinstance(name, str) or not _ENV_NAME.fullmatch(name)
-                or name.upper() in _RESERVED_ENV):
-            continue
-        if (not isinstance(value, str) or len(value.encode("utf-8")) > _ENV_VALUE_LIMIT
-                or any(ord(character) < 32 or ord(character) == 127 for character in value)):
-            continue
-        result[name] = value
-    return result
 
 
 def settings_path() -> Path:
@@ -76,13 +44,8 @@ def load() -> dict[str, Any]:
 
 
 def apply(workspace: str | None) -> str | None:
-    """Apply saved environment variables, re-exec under the saved Python, export the saved API key, and return the workspace to use."""
+    """Re-exec under the saved Python, export the saved API key and return the workspace to use."""
     saved = load()
-    # Saved values override inherited process values, matching the plugin's
-    # precedence for its path settings. The dedicated API key below wins over
-    # any environment value, and FLOWX_LLM_API_KEY is not accepted in `env`.
-    for name, value in environment(saved).items():
-        os.environ[name] = value
     python = saved.get("python")
     if (isinstance(python, str) and os.path.isabs(python) and os.access(python, os.X_OK)
             and os.path.normpath(python) != os.path.normpath(sys.executable)
@@ -101,5 +64,4 @@ def apply(workspace: str | None) -> str | None:
 if __name__ == "__main__":
     data = load()
     print(json.dumps({"python": data.get("python"), "workspace": data.get("workspace"),
-                      "api_key_set": bool(data.get("apiKey")),
-                      "env_keys": sorted(environment(data))}))
+                      "api_key_set": bool(data.get("apiKey"))}))

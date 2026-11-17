@@ -7,7 +7,7 @@
 <!-- Modified 2026-11-12: document Web and Desktop installation and configuration. -->
 <!-- Modified 2026-11-16: document per-node media canvas previews, run journals, layout storage, and Range streaming. -->
 <!-- Modified 2026-11-16: document saved environment variables for FlowX skill processes. -->
-<!-- Modified 2026-11-16: document per-workflow service .env editing. -->
+<!-- Modified 2026-11-17: remove global environment settings and document per-workflow .env editing. -->
 
 # FlowX for DeepSeek Harness
 
@@ -132,11 +132,9 @@ by the offline tests below.
 
 ### Viewer settings
 
-Select **Settings** in the overlay to edit two existing absolute paths, the
-API key, and optional environment variables. Select **Environment variables** in
-the overlay header to open the same dialog focused directly on the custom
-environment editor. No skill directory is needed to save settings or view
-workflows; build endpoints locate the skill on demand
+Select **Settings** in the overlay to edit two existing absolute paths and the
+API key. No skill directory is needed to save settings or view workflows; build
+endpoints locate the skill on demand
 (`FLOWX_SKILL_DIR`, the source checkout, then
 `$DSH_HOME/skills/flowx-workflows` or `~/.dsh/skills/flowx-workflows`, then
 `./.dsh/skills/flowx-workflows`). The dialog reloads the workflow list
@@ -148,23 +146,10 @@ host restart.
 | `python` | `FLOWX_PYTHON` | Executable Python interpreter with the FlowX SDK installed. Preserve the virtual-environment executable path rather than resolving it to the base interpreter. |
 | `workspace` | `FLOWX_WORKSPACE` | Existing directory for FlowX artifacts, independent of the workspace selected in Harness. |
 | `apiKey` | `FLOWX_LLM_API_KEY` | Optional provider key. It is stored in the owner-only settings file, never returned to the browser, and an empty value keeps the saved key. |
-| `env` | — | Optional `KEY=VALUE` lines saved as environment variables. They are applied to newly spawned build/inspection processes and exported by the skill's `plugin_settings.py`; values are stored owner-only and never returned to the browser. |
-
-Use **New or updated variables** to enter `KEY=VALUE` lines (comments and an
-optional `export` prefix are accepted), then select **Set environment
-variables**. The button merges new or changed names into the saved set; use the
-**×** control next to a saved name to remove it. `FLOWX_PYTHON`,
-`FLOWX_WORKSPACE`, `FLOWX_LLM_API_KEY`, and `FLOWX_PLUGIN_PYTHON_ACTIVE` are
-managed by dedicated settings and cannot be set here. Typical uses are
-`FLOWX_LLM_PROVIDER`, `FLOWX_LLM_MODEL`, `OPENAI_BASE_URL`, media provider
-URLs/models/keys, `FLOWX_MEDIA_DRY_RUN`, and `FLOWX_ENABLE_BLENDER` or
-`FLOWX_BLENDER_BIN`.
 
 The separately installed skill's scripts read this same settings file, so they
-use the saved `python`, `workspace`, API key, and environment variables by
-default (explicit `--workspace` still wins). Saved environment values override
-inherited values in skill processes; the saved API key still wins for
-`FLOWX_LLM_API_KEY`.
+use the saved `python`, `workspace` and API key by default (explicit
+`--workspace` still wins).
 
 The host persists these paths in
 `$DSH_HOME/plugins/deepseek-harness-flowx/settings.json`, or
@@ -179,12 +164,8 @@ can be corrected.
 
 The host snapshots inherited environment variables at initialization, so
 restart it after changing host environment fallbacks or provider credentials.
-Variables saved in the viewer settings do not need a host restart: new
-build/inspection children and new skill processes read them. Start a new
-runtime process after changing saved variables because a running process keeps
-its original environment. The Web and Desktop profiles run separate installed
-plugin copies: if the **Environment variables** action or section is missing,
-fully restart Harness and reinstall the current plugin in the active profile
+The Web and Desktop profiles run separate installed plugin copies: fully restart
+Harness and reinstall the current plugin in the active profile
 (`dsh plugin --profile web add ...` or `--profile desktop add ...`) before
 assuming the build is current. The source-checkout
 layout supplies a default skill path when available; for linked, installed,
@@ -210,8 +191,7 @@ and [NOTICE](NOTICE).
    narrow windows this dismisses Harness's navigation drawer first; the current
    conversation and its selection are preserved. Press **Escape**, select
    **Close**, or use the footer action again to close the overlay. Select
-  **Settings** to configure `python`, `workspace`, the API key, and optional
-  environment variables.
+  **Settings** to configure `python`, `workspace`, and the API key.
 2. Select a workflow to inspect its graph, dependencies, requirements, main
    entrypoint, and available node artifacts. The graph is the **current plan**,
    not necessarily the published revision: published workflow and node
@@ -227,26 +207,21 @@ and [NOTICE](NOTICE).
    **Refresh** after a separate skill operation finishes; there is no automatic
    synchronization with other processes.
 
-### Per-workflow service environment
+### Per-workflow service `.env` file
 
-Select **Environment** on an inspected workflow to manage that workflow
-service's variables. The panel shows saved variable names but never their
-values; the editor starts blank and accepts `KEY=VALUE` lines. **Save service
-environment** merges new or changed names and the selected removals into
+Select **Edit .env** on an inspected workflow to view and edit that workflow
+service's environment file. The panel loads the current contents of
 `workspace/workflows/<workflow_id>/service/service_<main_entrypoint_id>/.env`
-with mode `0600`. The generated main entrypoint loads this file from its service
-folder at startup, and service launch also applies it to the child process, so
-these workflow values override inherited values with the same name. Restart the
-workflow's service after saving. The plugin creates the service folder when
-needed and rejects symlinked or multiply-linked directories and files. The file
-is capped at 64 KiB with at most 64 variables and 4 KiB per value. Workflow
-`.env` files may contain FlowX/provider names that the global Settings
-environment area reserves; folder browsing still hides `.env`.
-
-Use the global **Settings → Environment variables** area for values shared by
-builds, inspections, and skill processes, and this per-workflow panel for
-service-specific values. Keep secrets out of chat and use only authorized
-values.
+into a text editor; **Save .env** replaces the file with the editor contents,
+and **Reload** discards local edits and reads it again. The editor shows values
+to the authenticated owner, and the file is stored with mode `0600`. The
+generated main entrypoint loads this file from its service folder at startup,
+and service launch also applies it to the child process, so these workflow
+values override inherited values with the same name. Restart the workflow's
+service after saving. The plugin creates the service folder when needed and
+rejects symlinked or multiply-linked directories and files. The file is capped
+at 64 KiB. Folder browsing still hides `.env`. Keep secrets out of chat and use
+only authorized values.
 
 The viewer has no build, repair, evolve, or runtime controls. Use the separate
 skill for those operations, review generated code before running it, and follow

@@ -7,7 +7,7 @@
 // Modified 2026-11-09: exercise shared Fetch requests and transport failures.
 // Modified 2026-11-10: test the read-only footer overlay, settings, folder browser and asynchronous races.
 // Modified 2026-11-10: verify navigation drawer handoff in narrow windows.
-// Modified 2026-11-16: cover the settings environment-variable area.
+// Modified 2026-11-17: cover the raw workflow .env editor.
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -527,97 +527,38 @@ test('settings load, validate on the host, save paths and refresh the catalog', 
   ui.unmount();
 });
 
-test('settings save environment variables and remove saved names', async () => {
+test('workflow .env panel shows, edits and saves the service file content', async () => {
   const calls = [];
-  let envKeys = ['FLOWX_MEDIA_DRY_RUN', 'OPENAI_BASE_URL'];
-  const ui = harness((url, endpoint, payload) => {
-    calls.push({ endpoint, payload });
-    if (endpoint === 'list') return ok(catalog('wf1'));
-    if (endpoint === 'getSettings') return ok({ ...settings, envKeys });
-    if (endpoint === 'saveEnvironment') {
-      if (payload.remove.includes('OPENAI_BASE_URL')) envKeys = ['FLOWX_MEDIA_DRY_RUN', 'OPENAI_API_KEY', 'FLOWX_LLM_MODEL'];
-      return ok({ ...settings, envKeys });
-    }
-    throw new Error(endpoint);
-  });
-  await ui.mount();
-  await ui.toggle();
-  await ui.click(ui.button('Settings'));
-  assert.match(ui.text(ui.page()), /FLOWX_MEDIA_DRY_RUN/);
-  assert.equal(ui.button('Set environment variables').props.disabled, true);
-  await ui.change('env', 'INVALID');
-  await ui.click(ui.button('Set environment variables'));
-  assert.match(ui.text(ui.find(node => node.props.role === 'alert')), /expected KEY=VALUE/);
-  assert.equal(calls.some(call => call.endpoint === 'saveEnvironment'), false);
-  await ui.click(ui.find(node => node.props['aria-label'] === 'Remove environment variable OPENAI_BASE_URL'));
-  assert.ok(ui.button('Undo 1 removal'));
-  await ui.change('env', 'export OPENAI_API_KEY="secret"\nFLOWX_LLM_MODEL=deepseek-flash\n# comment');
-  await ui.click(ui.button('Set environment variables'));
-  assert.deepEqual(calls.find(call => call.endpoint === 'saveEnvironment').payload, {
-    set: { OPENAI_API_KEY: 'secret', FLOWX_LLM_MODEL: 'deepseek-flash' },
-    remove: ['OPENAI_BASE_URL'],
-  });
-  assert.match(ui.text(ui.find(node => node.props.role === 'status' && /Saved/.test(ui.text(node)))), /Saved 3 environment variables/);
-  assert.equal(ui.textarea('env').props.value, '');
-  assert.equal(ui.all().some(node => node.props['aria-label'] === 'Remove environment variable OPENAI_BASE_URL'), false);
-  ui.unmount();
-});
-
-test('Environment variables header action opens the custom editor directly', async () => {
-  const ui = harness((url, endpoint) => {
-    if (endpoint === 'list') return ok(catalog('wf1'));
-    if (endpoint === 'getSettings') return ok({ ...settings, envKeys: ['OPENAI_BASE_URL'] });
-    throw new Error(endpoint);
-  });
-  await ui.mount();
-  await ui.toggle();
-  await ui.click(ui.button('Environment variables'));
-  assert.match(ui.text(ui.page()), /Custom environment variables/);
-  assert.equal(ui.textarea('env').props.value, '');
-  assert.equal(ui.focus.at(-1), 'flowx-env');
-  assert.match(ui.text(ui.page()), /OPENAI_BASE_URL/);
-  ui.unmount();
-});
-
-test('workflow environment panel saves service KEY=VALUE lines and removes saved names', async () => {
-  const calls = [];
-  let envKeys = ['OPENAI_BASE_URL'];
+  const original = '# service settings\nOPENAI_BASE_URL=https://gateway.test/v1\nOPENAI_API_KEY=secret\n';
+  let content = original;
   const ui = harness((url, endpoint, payload) => {
     calls.push({ endpoint, payload });
     if (endpoint === 'list') return ok(catalog('wf1'));
     if (endpoint === 'inspect') return ok({ artifacts: artifactMap() });
     if (endpoint === 'listFolder') return ok(entries());
-    if (endpoint === 'getWorkflowEnvironment') return ok({ workflowId: 'wf1', path: 'service/service_main1/.env', envKeys });
+    if (endpoint === 'getWorkflowEnvironment') return ok({ workflowId: 'wf1', path: 'service/service_main1/.env', content });
     if (endpoint === 'saveWorkflowEnvironment') {
-      assert.deepEqual(payload, {
-        workflowId: 'wf1',
-        set: { FLOWX_MEDIA_DRY_RUN: '1', OPENAI_API_KEY: 'secret' },
-        remove: ['OPENAI_BASE_URL'],
-      });
-      envKeys = ['FLOWX_MEDIA_DRY_RUN', 'OPENAI_API_KEY'];
-      return ok({ workflowId: 'wf1', path: 'service/service_main1/.env', envKeys });
+      assert.deepEqual(payload, { workflowId: 'wf1', content });
+      return ok({ workflowId: 'wf1', path: 'service/service_main1/.env', content });
     }
     throw new Error(endpoint);
   });
   await ui.mount();
   await ui.toggle();
   await ui.click(ui.workflow('wf1'));
-  await ui.click(ui.button('Environment'));
-  assert.match(ui.text(ui.page()), /Service environment \(\.env\)/);
+  await ui.click(ui.button('Edit .env'));
   assert.match(ui.text(ui.page()), /service\/service_main1\/\.env/);
-  assert.equal(ui.textarea('workflow-env').props.value, '');
-  assert.match(ui.text(ui.page()), /OPENAI_BASE_URL/);
-  assert.equal(ui.button('Save service environment').props.disabled, true);
-  await ui.click(ui.find(node => node.props['aria-label'] === 'Remove workflow environment variable OPENAI_BASE_URL'));
-  assert.ok(ui.button('Undo 1 removal'));
-  await ui.change('workflow-env', 'FLOWX_MEDIA_DRY_RUN=1\nOPENAI_API_KEY="secret"');
-  await ui.click(ui.button('Save service environment'));
-  assert.match(ui.text(ui.find(node => node.props.role === 'status' && /Saved/.test(ui.text(node)))), /Saved 2 workflow environment variables/);
-  assert.equal(ui.textarea('workflow-env').props.value, '');
-  assert.equal(ui.all().some(node => node.props['aria-label'] === 'Remove workflow environment variable OPENAI_BASE_URL'), false);
-  assert.ok(ui.find(node => node.props['aria-label'] === 'Remove workflow environment variable FLOWX_MEDIA_DRY_RUN'));
-  await ui.click(ui.button('Environment'));
+  assert.equal(ui.textarea('workflow-env').props.value, original);
+  content = '# edited by the owner\nOPENAI_BASE_URL=https://new.test/v1\n';
+  await ui.change('workflow-env', content);
+  await ui.click(ui.button('Save .env'));
+  assert.match(ui.text(ui.find(node => node.props.role === 'status' && /Saved/.test(ui.text(node)))), /Saved the workflow service \.env file/);
+  assert.equal(ui.textarea('workflow-env').props.value, content);
+  await ui.click(ui.button('Reload'));
+  assert.deepEqual(calls.filter(call => call.endpoint === 'getWorkflowEnvironment').length, 2);
+  await ui.click(ui.button('Close editor'));
   assert.equal(ui.all().some(node => node.props.id === 'flowx-workflow-env'), false);
+  assert.ok(ui.page());
   ui.unmount();
 });
 

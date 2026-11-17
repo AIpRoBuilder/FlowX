@@ -9,6 +9,7 @@
 // Modified 2026-11-10: add bounded, owner-only workflow folder browsing.
 // Modified 2026-11-10: save the API key in settings and locate the skill automatically.
 // Modified 2026-11-16: save owner-configured environment variables for FlowX skill processes.
+// Modified 2026-11-17: remove global environment settings and expose each workflow's .env content.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -58,16 +59,7 @@ except Exception as exc:
 `;
 const SETTINGS_KEYS = ['python', 'workspace'];
 const SAVE_KEYS = ['python', 'workspace', 'apiKey'];
-const ENV_SET_KEYS = ['set', 'remove'];
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
-const ENV_LINE = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/;
-const ENV_COUNT_LIMIT = 64;
-const ENV_VALUE_LIMIT = 4096;
 const ENV_FILE_LIMIT = 64 * 1024;
-// These are managed by dedicated settings, the skill re-exec guard, or object
-// prototypes. Environment-variable names are case-insensitive on Windows.
-const ENV_UNSAFE = new Set(['__PROTO__', 'CONSTRUCTOR', 'PROTOTYPE']);
-const ENV_RESERVED = new Set(['FLOWX_PYTHON', 'FLOWX_WORKSPACE', 'FLOWX_LLM_API_KEY', 'FLOWX_PLUGIN_PYTHON_ACTIVE', ...ENV_UNSAFE]);
 const SETTINGS_LIMIT = 16384;
 const PROVIDER_CREDENTIALS = new Set(['FLOWX_LLM_API_KEY', 'OPENAI_API_KEY', 'ZHIPU_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'ONEONEONEAPI_API_KEY']);
 const CREDENTIAL_PATHS = new Set(['GOOGLE_APPLICATION_CREDENTIALS', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR']);
@@ -126,18 +118,14 @@ function safeError(error) {
  * Manifest error details and absolute entrypoint paths are withheld. Redaction
  * is best-effort, and other workflow contents may still contain sensitive data.
  * getSettings takes null; saveSettings takes {python,workspace,apiKey} (empty
- * apiKey keeps the saved one); saveEnvironment takes {set,remove}, where set
- * maps environment names to values and remove lists names to delete. They
- * return {python,workspace,apiKeySet,envKeys} (unset environment fallbacks are
- * null). The key and environment values are never returned. Saved environment
- * variables are applied to spawned skill children and exported by the skill's
- * plugin_settings.py; FLOWX_PYTHON, FLOWX_WORKSPACE, FLOWX_LLM_API_KEY and the
- * skill re-exec guard are reserved. getWorkflowEnvironment takes {workflowId};
- * saveWorkflowEnvironment takes {workflowId,set,remove} and merges KEY=VALUE
- * lines into that workflow's service_<id>/.env file, which the generated main
- * entrypoint loads when its service starts. Both return {workflowId,path,
- * envKeys}; values are never returned. The skill directory is not configurable:
- * it is located automatically.
+ * apiKey keeps the saved one) and both return {python,workspace,apiKeySet}
+ * (unset environment fallbacks are null); the key is never returned.
+ * getWorkflowEnvironment takes {workflowId}; saveWorkflowEnvironment takes
+ * {workflowId,content} and writes that workflow's service_<id>/.env file,
+ * which the generated main entrypoint loads when its service starts. Both
+ * return {workflowId,path,content}. Service .env content is owner-only and is
+ * returned to the authenticated owner for editing. The skill directory is not
+ * configurable: it is located automatically.
  * The owner must treat prompts, repair context, artifacts and logs as sensitive.
  * Nothing here locks other FlowX processes or prevents external workspace edits.
  * Revisions are scoped to instanceId; callers should compare both across reloads.
@@ -183,16 +171,13 @@ export class FlowXHostService {
         case 'saveSettings':
           if (!exact(payload, SAVE_KEYS) || !SAVE_KEYS.every(key => text(payload[key], 4096))) throw invalid();
           value = await this.saveSettings({ python: payload.python, workspace: payload.workspace, apiKey: payload.apiKey }); break;
-        case 'saveEnvironment':
-          if (!exact(payload, ENV_SET_KEYS) || !object(payload.set) || !this.validEnvironmentChange(payload.set, payload.remove)) throw invalid();
-          value = await this.saveEnvironment({ set: { ...payload.set }, remove: [...payload.remove] }); break;
         case 'getWorkflowEnvironment':
           if (!exact(payload, ['workflowId']) || !workflowId(payload.workflowId)) throw invalid();
           value = await this.getWorkflowEnvironment(payload.workflowId); break;
         case 'saveWorkflowEnvironment':
-          if (!exact(payload, ['workflowId', 'set', 'remove']) || !workflowId(payload.workflowId) ||
-              !this.validEnvironmentChange(payload.set, payload.remove, true)) throw invalid();
-          value = await this.saveWorkflowEnvironment(payload.workflowId, { ...payload.set }, [...payload.remove]); break;
+          if (!exact(payload, ['workflowId', 'content']) || !workflowId(payload.workflowId) ||
+              !text(payload.content, ENV_FILE_LIMIT) || payload.content.includes('\0')) throw invalid();
+          value = await this.saveWorkflowEnvironment(payload.workflowId, payload.content); break;
         case 'start':
           if (!exact(payload, ['prompt']) || !text(payload.prompt) || !payload.prompt.trim()) throw invalid();
           value = await this.start(payload.prompt); break;
@@ -235,7 +220,7 @@ export class FlowXHostService {
   }
 
   fallbackSettings() {
-    return { python: this.env.FLOWX_PYTHON ?? null, workspace: this.env.FLOWX_WORKSPACE ?? null, apiKeySet: Boolean(this.env.FLOWX_LLM_API_KEY), envKeys: [] };
+    return { python: this.env.FLOWX_PYTHON ?? null, workspace: this.env.FLOWX_WORKSPACE ?? null, apiKeySet: Boolean(this.env.FLOWX_LLM_API_KEY) };
   }
 
   settingsView(settings) {
@@ -243,7 +228,6 @@ export class FlowXHostService {
       python: settings.python,
       workspace: settings.workspace,
       apiKeySet: Boolean(settings.apiKey) || Boolean(this.env.FLOWX_LLM_API_KEY),
-      envKeys: Object.keys(settings.env || {}).sort(),
     };
   }
 
@@ -302,27 +286,11 @@ export class FlowXHostService {
     } catch { throw problem('configuration', 'Building requires the FlowX skill (set FLOWX_SKILL_DIR or install it under ~/.dsh/skills/flowx-workflows).'); }
   }
 
-  validEnvironment(env, { allowReserved = false } = {}) {
-    if (!object(env)) return false;
-    const forbidden = allowReserved ? ENV_UNSAFE : ENV_RESERVED;
-    const entries = Object.entries(env);
-    return entries.length <= ENV_COUNT_LIMIT && entries.every(([name, value]) =>
-      ENV_NAME.test(name) && !forbidden.has(name.toUpperCase()) &&
-      text(value, ENV_VALUE_LIMIT) && !/[\x00-\x1f\x7f]/.test(value));
-  }
-
-  validEnvironmentChange(set, remove, allowReserved = false) {
-    const forbidden = allowReserved ? ENV_UNSAFE : ENV_RESERVED;
-    return this.validEnvironment(set, { allowReserved }) && Array.isArray(remove) && remove.length <= ENV_COUNT_LIMIT &&
-      remove.every(name => typeof name === 'string' && ENV_NAME.test(name) && !forbidden.has(name.toUpperCase()));
-  }
-
   validSettings(settings) {
-    return object(settings) && Object.keys(settings).every(key => key === 'apiKey' || key === 'env' || SETTINGS_KEYS.includes(key)) &&
+    return object(settings) && Object.keys(settings).every(key => key === 'apiKey' || SETTINGS_KEYS.includes(key)) &&
       SETTINGS_KEYS.every(key =>
         text(settings[key], 4096) && path.isAbsolute(settings[key]) && !/[\x00-\x1f\x7f]/.test(settings[key]) && this.redact(settings[key]) === settings[key]) &&
       (settings.apiKey === undefined || (text(settings.apiKey, 4096) && settings.apiKey.length > 0 && !/[\x00-\x1f\x7f]/.test(settings.apiKey))) &&
-      (settings.env === undefined || this.validEnvironment(settings.env)) &&
       Buffer.byteLength(JSON.stringify(settings) + '\n') <= SETTINGS_LIMIT;
   }
 
@@ -417,7 +385,6 @@ export class FlowXHostService {
       this.secrets.add(settings.apiKey);
       this.secretPattern = this.buildSecretPattern();
     }
-    if (settings?.env) this.collectSecrets(settings.env);
     return settings;
   }
 
@@ -463,7 +430,6 @@ export class FlowXHostService {
       service.artifacts.clear();
       service.graphSnapshot = null;
     }
-    if (settings.env) this.collectSecrets(settings.env);
   }
 
   queueSettingsWrite(operation) {
@@ -484,37 +450,12 @@ export class FlowXHostService {
   saveSettings(submitted) {
     return this.queueSettingsWrite(async () => {
       const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
-      // An empty key keeps the previously saved one; saved environment variables are preserved.
+      // An empty key keeps the previously saved one.
       const apiKey = submitted.apiKey || previous?.apiKey;
       const settings = {
         python: submitted.python,
         workspace: submitted.workspace,
         ...(apiKey ? { apiKey } : {}),
-        ...(previous?.env ? { env: previous.env } : {}),
-      };
-      if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
-      await this.validateConfig(settings, false);
-      if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
-      await this.writeSettings(settings);
-      return this.settingsView(settings);
-    });
-  }
-
-  saveEnvironment(submitted) {
-    if (!object(submitted) || !this.validEnvironmentChange(submitted.set, submitted.remove)) throw invalid();
-    return this.queueSettingsWrite(async () => {
-      const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
-      const base = previous ?? this.fallbackSettings();
-      if (!base.python || !base.workspace) throw problem('configuration', 'Save the Python interpreter and workspace before setting environment variables.');
-      const env = { ...(previous?.env ?? {}) };
-      for (const name of submitted.remove) delete env[name];
-      for (const [name, value] of Object.entries(submitted.set)) env[name] = value;
-      if (!this.validEnvironment(env)) throw problem('configuration', 'Environment variables must use valid names and printable values within the size limits.');
-      const settings = {
-        python: base.python,
-        workspace: base.workspace,
-        ...(base.apiKey ? { apiKey: base.apiKey } : {}),
-        ...(Object.keys(env).length ? { env } : {}),
       };
       if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
       await this.validateConfig(settings, false);
@@ -578,9 +519,6 @@ export class FlowXHostService {
       return !SECRET_ENV.test(key) && !(typeof value === 'string' && URL_CREDENTIALS.test(value));
     }));
     if (settings) {
-      // Saved variables configure FlowX providers, media, and tools. Dedicated
-      // path and key settings are assigned last so they always win.
-      if (settings.env) Object.assign(env, settings.env);
       Object.assign(env, { FLOWX_PYTHON: settings.python, FLOWX_WORKSPACE: settings.workspace });
       if (settings.apiKey) env.FLOWX_LLM_API_KEY = settings.apiKey;
     }
@@ -1108,20 +1046,6 @@ export class FlowXHostService {
     return directory;
   }
 
-  serviceEnvKey(line) {
-    const match = ENV_LINE.exec(line);
-    return match ? match[1] : null;
-  }
-
-  serviceEnvKeys(content) {
-    const keys = new Set();
-    for (const line of String(content).split(/\r?\n/)) {
-      const key = this.serviceEnvKey(line);
-      if (key) keys.add(key);
-    }
-    return [...keys].sort();
-  }
-
   serviceEnvValues(content) {
     const values = {};
     for (const line of String(content).split(/\r?\n/)) {
@@ -1134,18 +1058,6 @@ export class FlowXHostService {
       values[match[1]] = value;
     }
     return values;
-  }
-
-  mergeServiceEnv(content, set, remove) {
-    const changed = new Set([...Object.keys(set), ...remove]);
-    const kept = String(content).split(/\r?\n/).filter(line => {
-      const key = this.serviceEnvKey(line);
-      return !key || !changed.has(key);
-    });
-    while (kept.length > 0 && kept[kept.length - 1].trim() === '') kept.pop();
-    for (const [name, value] of Object.entries(set)) kept.push(`${name}=${value}`);
-    while (kept.length > 0 && kept[0].trim() === '') kept.shift();
-    return kept.length > 0 ? `${kept.join('\n')}\n` : '';
   }
 
   async serviceEnvLocation(config, id, create) {
@@ -1221,21 +1133,18 @@ export class FlowXHostService {
       const location = await this.serviceEnvLocation(config, id, false);
       const content = location.directory ? await this.readServiceEnvFile(location.directory) : '';
       this.collectSecrets(this.serviceEnvValues(content));
-      return { workflowId: id, path: `${location.relative}/.env`, envKeys: this.serviceEnvKeys(content) };
+      return { workflowId: id, path: `${location.relative}/.env`, content };
     });
   }
 
-  async saveWorkflowEnvironment(id, set, remove) {
-    if (!this.validEnvironmentChange(set, remove, true)) throw invalid();
+  async saveWorkflowEnvironment(id, content) {
+    if (typeof content !== 'string' || !text(content, ENV_FILE_LIMIT) || content.includes('\0')) throw invalid();
     return this.withInspection(async config => {
       if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
       const location = await this.serviceEnvLocation(config, id, true);
       if (!location.directory) throw problem('artifact-unavailable', 'The workflow service directory is unavailable or unsafe.');
-      const content = await this.readServiceEnvFile(location.directory);
-      this.collectSecrets({ ...this.serviceEnvValues(content), ...set });
-      const merged = this.mergeServiceEnv(content, set, remove);
-      if (Buffer.byteLength(merged) > ENV_FILE_LIMIT) throw problem('configuration', 'The workflow environment file would exceed the size limit.');
-      if (this.serviceEnvKeys(merged).length > ENV_COUNT_LIMIT) throw problem('configuration', 'The workflow environment file would contain too many variables.');
+      await this.readServiceEnvFile(location.directory);
+      this.collectSecrets(this.serviceEnvValues(content));
       const filename = path.join(location.directory, '.env');
       const temporary = path.join(location.directory, `.env-${randomUUID()}.tmp`);
       let file, created = false;
@@ -1243,7 +1152,7 @@ export class FlowXHostService {
         file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
         created = true;
         await file.chmod(0o600);
-        await file.writeFile(merged, 'utf8');
+        await file.writeFile(content, 'utf8');
         await file.sync();
         await file.close();
         file = null;
@@ -1261,7 +1170,7 @@ export class FlowXHostService {
         await file?.close().catch(() => {});
         if (created) await fs.unlink(temporary).catch(() => {});
       }
-      return { workflowId: id, path: `${location.relative}/.env`, envKeys: this.serviceEnvKeys(merged) };
+      return { workflowId: id, path: `${location.relative}/.env`, content };
     });
   }
 
