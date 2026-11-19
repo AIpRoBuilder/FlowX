@@ -1,0 +1,187 @@
+<!-- SPDX-FileCopyrightText: 2026 FlowX contributors -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466 -->
+<!-- Upstream: https://github.com/AIpRoBuilder/FlowX -->
+<!-- Added 2026-11-19: standalone visual smoke test for the FlowX dashboard bundle. -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlowX Hermes viewer demo</title>
+  <link rel="stylesheet" href="../dashboard/dist/style.css">
+  <style>
+    html, body { margin: 0; min-height: 100%; background: #070d19; color: #e6edf7; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    #root { padding: 16px; }
+    .demo-note { margin: 0 0 12px; color: #94a3b8; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <p class="demo-note" style="padding: 0 16px 16px;">Static harness with mock FlowX data. The real plugin serves these routes under <code>/api/plugins/flowx/</code>.</p>
+
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script>
+    (function () {
+      "use strict";
+      var React = window.React;
+      var graph = {
+        available: true,
+        path: "plan/workflow.json",
+        nodes: [
+          { id: "Intake", name: "Intake", type: "UserInputNode", description: "Collect the request, target audience, and constraints from the user.", meta_node_kind: "WorkflowStepNode", ext_data: { type: "user_input", desc: "request text" }, inputs_format: { request: "string" }, loop: null, enabled: true, dependencies: [] },
+          { id: "Analyze", name: "Analyze", type: "WorkflowStepNode", description: "Break the request into verifiable research questions and success criteria.", meta_node_kind: "WorkflowStepNode", ext_data: { type: "none", desc: "no need for ext data" }, inputs_format: {}, loop: null, enabled: true, dependencies: ["Intake"] },
+          { id: "Research", name: "Research", type: "WorkflowStepNode", description: "Gather supporting evidence and cite each source for the brief.", meta_node_kind: "WorkflowStepNode", ext_data: { type: "url", desc: "source pages" }, inputs_format: {}, loop: null, enabled: true, dependencies: ["Analyze"] },
+          { id: "Draft", name: "Draft", type: "WorkflowStepNode", description: "Write a concise brief with an executive summary and recommendations.", meta_node_kind: "WorkflowStepNode", ext_data: { type: "none", desc: "no need for ext data" }, inputs_format: {}, loop: null, enabled: true, dependencies: ["Analyze"] },
+          { id: "Review", name: "Review", type: "WorkflowStepNode", description: "Check claims against sources, score confidence, and flag open questions.", meta_node_kind: "WorkflowStepNode", ext_data: { type: "none", desc: "no need for ext data" }, inputs_format: {}, loop: null, enabled: true, dependencies: ["Research", "Draft"] },
+          { id: "Publish", name: "Publish", type: "WorkflowStepNode", description: "Store the brief and return the final artifact path to the caller.", meta_node_kind: "WorkflowStepNode", ext_data: { type: "none", desc: "no need for ext data" }, inputs_format: {}, loop: null, enabled: true, dependencies: ["Review"] }
+        ],
+        edges: [
+          { from: "Intake", to: "Analyze" },
+          { from: "Analyze", to: "Research" },
+          { from: "Analyze", to: "Draft" },
+          { from: "Research", to: "Review" },
+          { from: "Draft", to: "Review" },
+          { from: "Review", to: "Publish" }
+        ],
+        missing_dependencies: [],
+        roots: ["Intake"],
+        terminal: ["Publish"]
+      };
+      var workflows = [
+        { workflow_id: "market_brief", workflow_version: 4, main_entrypoint_id: "abc", main_entrypoint_version: 2, main_entrypoint_path: "service/service_abc/main_entrypoint.py", has_graph: true, has_main: true, node_count: 6, built_node_count: 6, error_count: 1, errors: ["nodes/Review"], updated_at: "2026-11-19T08:52:00+00:00", latest_run: { run_id: "run-20261119-0850", status: "running", updated_at: "2026-11-19T08:52:00+00:00" } },
+        { workflow_id: "cinema_flow", workflow_version: 2, main_entrypoint_id: "def", main_entrypoint_version: 1, main_entrypoint_path: "service/service_def/main_entrypoint.py", has_graph: true, has_main: true, node_count: 4, built_node_count: 4, error_count: 0, errors: [], updated_at: "2026-11-18T21:10:00+00:00", latest_run: { run_id: "run-20261118-2108", status: "completed", updated_at: "2026-11-18T21:10:00+00:00" } },
+        { workflow_id: "ticket_triage", workflow_version: 1, main_entrypoint_id: "ghi", main_entrypoint_version: 0, main_entrypoint_path: null, has_graph: true, has_main: false, node_count: 3, built_node_count: 1, error_count: 0, errors: [], updated_at: "2026-11-17T16:20:00+00:00", latest_run: null }
+      ];
+      var detail = {
+        workflow_id: "market_brief",
+        workflow_version: 4,
+        main_entrypoint_id: "abc",
+        main_entrypoint_version: 2,
+        main_entrypoint_path: "service/service_abc/main_entrypoint.py",
+        has_graph: true,
+        has_main: true,
+        node_count: 6,
+        built_node_count: 6,
+        error_count: 1,
+        errors: ["nodes/Review"],
+        updated_at: "2026-11-19T08:52:00+00:00",
+        latest_run: { run_id: "run-20261119-0850", status: "running", updated_at: "2026-11-19T08:52:00+00:00" },
+        graph: graph,
+        nodes: {
+          Intake: { node_id: "n1", version: 1, artifacts: { source: "nodes/n1/00000001/Intake.py", test: "nodes/n1/00000001/tests/test_Intake.py", log: "nodes/n1/00000001/logs/Intake_test.log" } },
+          Analyze: { node_id: "n2", version: 2, artifacts: { source: "nodes/n2/00000002/Analyze.py", test: "nodes/n2/00000002/tests/test_Analyze.py", log: "nodes/n2/00000002/logs/Analyze_test.log" } },
+          Research: { node_id: "n3", version: 1, artifacts: { source: "nodes/n3/00000001/Research.py", log: "nodes/n3/00000001/logs/Research_test.log" } },
+          Draft: { node_id: "n4", version: 1, artifacts: { source: "nodes/n4/00000001/Draft.py", test: "nodes/n4/00000001/tests/test_Draft.py" } },
+          Review: { node_id: "n5", version: 1, artifacts: { source: "nodes/n5/00000001/Review.py", log: "nodes/n5/00000001/logs/Review_test.log" } },
+          Publish: { node_id: "n6", version: 1, artifacts: { source: "nodes/n6/00000001/Publish.py" } }
+        },
+        requirement_path: "plan/requirement_analysis.md",
+        graph_path: "plan/workflow.json",
+        log_path: "logs/main_run.log"
+      };
+      var runs = {
+        latestRunId: "run-20261119-0850",
+        runs: [
+          { run_id: "run-20261119-0850", workflow_version: 4, status: "running", created_at: "2026-11-19T08:50:00+00:00", updated_at: "2026-11-19T08:52:00+00:00", node_count: 6, has_error: false },
+          { run_id: "run-20261118-2108", workflow_version: 3, status: "completed", created_at: "2026-11-18T21:08:00+00:00", updated_at: "2026-11-18T21:10:00+00:00", node_count: 6, has_error: false },
+          { run_id: "run-20261117-1600", workflow_version: 2, status: "failed", created_at: "2026-11-17T16:00:00+00:00", updated_at: "2026-11-17T16:03:00+00:00", node_count: 6, has_error: true }
+        ]
+      };
+      var run = {
+        run_id: "run-20261119-0850",
+        workflow_version: 4,
+        status: "running",
+        created_at: "2026-11-19T08:50:00+00:00",
+        updated_at: "2026-11-19T08:52:00+00:00",
+        awaiting: null,
+        has_error: false,
+        nodes: {
+          Intake: { status: "completed", title: "Intake", card: { kind: "prompt", prompt: "Request: produce a market brief on autonomous workflow agents for a product strategy review." }, is_final: false, updated_at: "2026-11-19T08:50:10+00:00" },
+          Analyze: { status: "completed", title: "Analyze", card: { kind: "prompt", prompt: "Questions: 1) Which segments adopt workflow agents first? 2) What evidence supports the ROI claims? 3) Which vendors are credible?" }, is_final: false, updated_at: "2026-11-19T08:50:30+00:00" },
+          Research: { status: "running", title: "Research", card: { kind: "prompt", prompt: "Gathering sources from vendor documentation, analyst notes, and public case studies." }, is_final: false, updated_at: "2026-11-19T08:52:00+00:00" },
+          Draft: { status: "completed", title: "Draft", card: { kind: "prompt", prompt: "Draft outline: market context, adoption drivers, vendor landscape, risks, recommendations." }, is_final: false, updated_at: "2026-11-19T08:51:40+00:00" },
+          Review: { status: "pending", title: "Review", card: {}, is_final: false, updated_at: null },
+          Publish: { status: "pending", title: "Publish", card: {}, is_final: false, updated_at: null }
+        }
+      };
+      var files = {
+        path: "",
+        truncated: false,
+        entries: [
+          { name: "plan", path: "plan", kind: "dir", size: null, readable: true },
+          { name: "nodes", path: "nodes", kind: "dir", size: null, readable: true },
+          { name: "runs", path: "runs", kind: "dir", size: null, readable: true },
+          { name: "service", path: "service", kind: "dir", size: null, readable: true },
+          { name: "agent.json", path: "agent.json", kind: "text", mime: "text/plain", size: 482, readable: true },
+          { name: "manifest.json", path: "manifest.json", kind: "text", mime: "text/plain", size: 3910, readable: true },
+          { name: "canvas_layout.json", path: "canvas_layout.json", kind: "text", mime: "text/plain", size: 190, readable: true }
+        ]
+      };
+      var requirement = "# Market brief\n\nProduce a concise market brief on autonomous workflow agents for a product strategy review.\n\n## Audience\nProduct leadership and go-to-market.\n\n## Success criteria\n- Claims are sourced.\n- Recommendations are explicit.\n- Open questions are listed.\n";
+
+      function mockFetch(path) {
+        var clean = String(path || "").replace("/api/plugins/flowx", "");
+        if (clean === "/workflows") {
+          return Promise.resolve({ ok: true, workspace: "/Users/demo/flowx_workspaces", workspace_exists: true, workflows: workflows });
+        }
+        if (clean === "/workflows/market_brief") {
+          return Promise.resolve({ ok: true, workflow: detail });
+        }
+        if (clean === "/workflows/market_brief/runs") {
+          return Promise.resolve(Object.assign({ ok: true }, runs));
+        }
+        if (clean === "/workflows/market_brief/runs/run-20261119-0850") {
+          return Promise.resolve({ ok: true, run: run });
+        }
+        if (clean === "/workflows/market_brief/layout") {
+          return Promise.resolve({ ok: true, positions: {} });
+        }
+        if (clean.indexOf("/workflows/market_brief/files") === 0) {
+          return Promise.resolve(Object.assign({ ok: true }, files));
+        }
+        if (clean.indexOf("/workflows/market_brief/file") === 0) {
+          return Promise.resolve({ ok: true, path: "plan/workflow.json", content: JSON.stringify(graph, null, 2), bytes: 2048 });
+        }
+        if (clean === "/workflows/market_brief/requirement") {
+          return Promise.resolve({ ok: true, path: "plan/requirement_analysis.md", content: requirement, bytes: requirement.length });
+        }
+        return Promise.reject(new Error("Mock route not found: " + clean));
+      }
+
+      window.__HERMES_PLUGIN_SDK__ = {
+        React: React,
+        hooks: {
+          useState: React.useState,
+          useEffect: React.useEffect,
+          useMemo: React.useMemo,
+          useRef: React.useRef,
+          useCallback: React.useCallback,
+        },
+        fetchJSON: mockFetch,
+        authedFetch: function (path) { return mockFetch(path); },
+      };
+      window.__HERMES_PLUGINS__ = {
+        register: function (name, Component) {
+          window.__FLOWX_DEMO_COMPONENT__ = Component;
+        },
+      };
+    })();
+  </script>
+  <script src="../dashboard/dist/index.js"></script>
+  <script>
+    (function () {
+      "use strict";
+      var React = window.React;
+      var ReactDOM = window.ReactDOM;
+      var Component = window.__FLOWX_DEMO_COMPONENT__;
+      if (!Component) {
+        document.getElementById("root").textContent = "FlowX bundle did not register a component.";
+        return;
+      }
+      ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(Component));
+    })();
+  </script>
+</body>
+</html>

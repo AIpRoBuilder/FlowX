@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 FlowX contributors
+# SPDX-License-Identifier: Apache-2.0
+# FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
+# Upstream: https://github.com/AIpRoBuilder/FlowX
+# Added 2026-11-19: Hermes agent plugin manifest for the read-only FlowX viewer and tools.
+
+name: flowx
+version: 0.1.0
+description: Read-only FlowX workflow viewer and inspection tools for Hermes (Web dashboard and agent).
+author: FlowX contributors
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
+
+provides_tools:
+  - flowx_list_workflows
+  - flowx_get_workflow
+  - flowx_list_runs
+  - flowx_get_run
+  - flowx_read_file
+
+config_schema:
+  workspace:
+    type: str
+    default: ""
+    description: Absolute path to the FlowX workspace that contains the workflows/ directory.
+  python:
+    type: str
+    default: ""
+    description: Optional path to the Python interpreter with FlowX installed. Shown in the viewer for reference.

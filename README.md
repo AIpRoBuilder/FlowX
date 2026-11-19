@@ -60,6 +60,7 @@ FlowX remains Apache-2.0 licensed; compliant forks and reuse are welcome.
 <details>
 <summary>📣 News</summary>
 
+- **[2026.11.19]** 🎛️ **Hermes Agent plugin.** The new [Hermes plugin](plugins/hermes-flowx/README.md) adds a read-only FlowX dashboard tab with a draggable plan graph, run journal cards, bounded media previews, and a workflow file browser, plus five agent tools. It never builds, runs, or mutates workflows; `canvas_layout.json` is the only file it writes. Install it separately with `hermes plugins install AIpRoBuilder/FlowX/plugins/hermes-flowx --enable`.
 - **[2026.11.16]** 🖼️ **Media workflow support.** Generated nodes can return `prompt`, `image`, and `video` cards in addition to structured text. The new `flowx_core.media` toolkit adds provider image/video helpers, Pillow resize and crop, FFmpeg trim and resize, optional headless Blender (`FLOWX_ENABLE_BLENDER=1`), and `FLOWX_MEDIA_DRY_RUN=1` for zero-cost node tests. Media outputs and step cards are journaled under `workflows/<workflow_id>/runs/`. Provider calls can be billable, and generated code and tests are not sandboxed.
 - **[2026.11.16]** 🎛️ **DeepSeek Harness plugin update.** The workflow canvas now previews each node's `prompt`, `image`, and `video` cards, with run history (**Sync outputs**), stale-revision badges, zoom/wide canvas, drag-to-arrange layout saved per workflow, and a lightbox for full-size previews. Media is delivered through an owner-only `/api/flowx/media` route using authenticated HTTP `Range` responses. Each workflow also has an **Edit .env** panel that shows and edits its `service_<id>/.env` file for service-specific provider, media, and tool configuration. See the [plugin README](plugins/deepseek-harness-flowx/README.md).
 - **[2026.11.10]** 🔑 **Skill and plugin update.** The DeepSeek Harness plugin settings now accept `FLOWX_LLM_API_KEY` and no longer ask for a skill directory. The FlowX skill scripts reuse the plugin's saved Python, workspace, and API key.
@@ -92,6 +93,7 @@ Turn an intent into an editable, reusable process instead of a one-off answer. C
 - 🔌 **Choose an interface:** local stdio MCP, Python SDK, or non-streaming A2A.
 - 📦 **Reuse artifacts** stored under `workspace/workflows/<workflow_id>`.
 - 🧠 **Bring your own model and UI:** the optional [DeepSeek Harness plugin](plugins/deepseek-harness-flowx/README.md) provides a read-only workflow viewer for Web and Desktop, installed separately in each profile; use the separate FlowX skill to create, evolve, and run workflows.
+- 🎛️ **Inspect from Hermes Agent:** the optional [Hermes plugin](plugins/hermes-flowx/README.md) adds a read-only FlowX dashboard tab and five agent tools; install it separately with `hermes plugins install AIpRoBuilder/FlowX/plugins/hermes-flowx --enable`.
 
 <a name="setup"></a>
 ## ⚙️ Setup

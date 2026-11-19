@@ -1,0 +1,15 @@
+{
+  "name": "flowx",
+  "label": "FlowX",
+  "description": "Read-only workflow graph, run journal, and artifact viewer for a FlowX workspace.",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/flowx",
+    "position": "after:skills"
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
