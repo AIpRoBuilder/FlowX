@@ -15,6 +15,7 @@
 <!-- Modified 2026-11-12: clarify Harness Web and Desktop plugin installation. -->
 <!-- Modified 2026-11-16: announce media workflow support and the Harness media canvas. -->
 <!-- Modified 2026-11-17: announce workflow service .env editing. -->
+<!-- Modified 2026-11-20: add Discord community badge and invite link. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
@@ -32,6 +33,7 @@
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB.svg" alt="Python 3.10+" />
   <img src="https://img.shields.io/badge/MCP-Local%20stdio-0A7E3B.svg" alt="Local stdio MCP server" />
   <img src="https://img.shields.io/badge/A2A-non--streaming-6f42c1.svg" alt="A2A adapter" />
+  <a href="https://discord.com/invite/KHnDtNqxp"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2.svg?logo=discord&logoColor=white" alt="Join the FlowX Discord community" /></a>
   <a href="https://github.com/AIpRoBuilder/FlowX/stargazers"><img src="https://img.shields.io/github/stars/AIpRoBuilder/FlowX?style=social" alt="GitHub stars" /></a>
   <a href="https://hub.xerj.org/contributors/xiechuxi"><img src="https://hub.xerj.org/contributors/xiechuxi/badge.svg" alt="XERJ Corpus Hub contributor" /></a>
 </p>
@@ -45,6 +47,7 @@
   <a href="#a2a-server">🤝 A2A</a> ·
   <a href="#architecture">🏗️ Architecture</a> ·
   <a href="docs/DYNAMIC_WORKFLOW.md">📖 Docs</a> ·
+  <a href="https://discord.com/invite/KHnDtNqxp">💬 Discord</a> ·
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
