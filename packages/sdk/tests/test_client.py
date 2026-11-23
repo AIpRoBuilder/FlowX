@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified 2026-11-22: cover the contract protocol; the SDK no longer calls an LLM.
+# Modified 2026-11-23: cover begin_evolve, verify_workflow, and read_artifact.
 from pathlib import Path
 
 import pytest
@@ -165,3 +166,23 @@ def test_services_are_idle_until_started_and_close_is_idempotent(client):
         client.run_service(workflow_id)
     client.close()
     client.close()
+
+
+def test_evolve_verify_and_read_artifact(client):
+    workflow_id = client.create_workflow("echo-evolve")
+    assert client.build(workflow_id, "Echo text", solve)["status"] == "completed"
+    assert client.verify_workflow(workflow_id)["ok"] is True
+
+    art = client.read_artifact(workflow_id, "source", node="Echo")
+    assert art["read_only"] is True and 'STEP_ID = "Echo"' in art["content"]
+
+    opened = client.begin_evolve(workflow_id, "echo louder", scope="node", node="Echo")
+    assert opened["mode"] == "edit_node" and opened["baseline_version"] == 1
+    task = opened["next_tasks"][0]
+    assert task["context"]["baseline"]["version"] == 1
+    updated_code = CODE.replace('value = "echo"', 'value = "ECHO"')
+    updated_test = TEST.replace('"echo"', '"ECHO"')
+    done = client.submit_task(workflow_id, task["task_id"], {"code": updated_code, "test": updated_test})
+    assert done["accepted"] is True and done["state"]["status"] == "completed"
+    assert client.list_nodes(workflow_id)[0]["version"] == 2
+    assert client.verify_workflow(workflow_id)["ok"] is True

@@ -13,6 +13,7 @@
 # Modified 2026-11-11: allow an explicit workflow folder name during allocation.
 # Modified 2026-11-22: expose the contract protocol of the two FlowX entities (workflow builder and service
 #   manager) instead of LLM-driven build methods; read methods keep their names and shapes.
+# Modified 2026-11-23: expose begin_evolve, verify_workflow, and read_artifact for safe read-only access and edits.
 """Python SDK: drive the FlowX workflow builder as a coding agent, and run what it builds."""
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from threading import RLock
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 from flowx_core.agent_builder import AgentBuilder
 from flowx_core.builder import BuildSettings, WorkflowBuilder
@@ -81,13 +82,40 @@ class FlowXClient:
         return self.builder.list_nodes(workflow_id)
 
     def artifacts(self, workflow_id: str) -> dict[str, Any]:
-        """Locations of a workflow's requirement, workflow.json, nodes and main entrypoint."""
+        """Read-only locations of a workflow's requirement, graph, nodes and main entrypoint."""
         return self.builder.artifacts(workflow_id)
 
-    # -- build protocol ---------------------------------------------------------------------
+    def verify_workflow(self, workflow_id: str, *, include_service: bool = True) -> dict[str, Any]:
+        """Verify FlowX-owned workflow files against their recorded SHA-256 digests."""
+        return self.builder.verify_workflow(workflow_id, include_service=include_service)
+
+    def read_artifact(
+        self, workflow_id: str, slot: str, *, node: str | None = None, version: int | None = None,
+    ) -> dict[str, Any]:
+        """Return verified read-only text for one FlowX-owned artifact."""
+        return self.builder.read_artifact(workflow_id, slot, node=node, version=version)
+
+    # -- build & evolve protocol ------------------------------------------------------------
     def begin_build(self, workflow_id: str, intent: str = "", **options: Any) -> dict[str, Any]:
         """Open a build revision: the state plus ``next_tasks``; see :meth:`WorkflowBuilder.begin_build`."""
         return self.builder.begin_build(workflow_id, intent, **options)
+
+    def begin_evolve(
+        self,
+        workflow_id: str,
+        intent: str = "",
+        *,
+        scope: Literal["graph", "node"],
+        node: str | None = None,
+        update_requirement: bool = False,
+        cascade: str = "revalidate",
+        **options: Any,
+    ) -> dict[str, Any]:
+        """Open an edit revision (``scope='node'`` freezes topology; ``scope='graph'`` stages plan edits)."""
+        return self.builder.begin_evolve(
+            workflow_id, intent, scope=scope, node=node,
+            update_requirement=update_requirement, cascade=cascade, **options,
+        )
 
     def get_build_state(self, workflow_id: str) -> dict[str, Any]:
         return self.builder.get_build_state(workflow_id)

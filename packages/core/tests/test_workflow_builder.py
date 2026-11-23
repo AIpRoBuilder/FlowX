@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-23: cover begin_evolve (edit_node/edit_graph), revalidation, staging, and direct-edit integrity checks.
 """Contract-driven builds with a scripted stand-in for the host coding agent."""
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from builder_fixtures import (
     CHAIN, DIAMOND, REQUIREMENT, Agent, good, graph_of, node_code, node_test, plan_script,
 )
 
-from flowx_core.builder import BuildInProgress, BuildSettings, WorkflowBuilder
+from flowx_core.builder import BuildInProgress, BuildSettings, WorkflowBuilder, WorkflowFilesModified
 
 
 @pytest.fixture
@@ -266,3 +267,193 @@ def test_unsafe_workflow_names_are_rejected(builder: WorkflowBuilder) -> None:
     with pytest.raises(FileExistsError):
         builder.create_workflow("demo")
     assert json.loads((builder.storage_dir / "demo" / "agent.json").read_text())["workflow_id"] == "demo"
+
+
+def test_evolve_node_freezes_topology_and_revalidates_compatible_children(builder: WorkflowBuilder) -> None:
+    workflow_id, _ = build_chain(builder)
+    plan_before = (builder.record(workflow_id).graph_path).read_text(encoding="utf-8")
+
+    opened = builder.begin_evolve(workflow_id, "change greeting text", scope="node", node="Greeter")
+    assert opened["mode"] == "edit_node" and opened["baseline_version"] == 1
+    assert [task["step_id"] for task in opened["next_tasks"]] == ["Greeter"]
+    task = opened["next_tasks"][0]
+    assert task["reason"] == "targeted"
+    assert task["context"]["baseline"]["version"] == 1
+    assert task["context"]["edit"] == {"mode": "edit_node", "baseline_version": 1, "topology_frozen": True}
+
+    changed = {"code": node_code("Greeter", text="hey"), "test": node_test("Greeter", expected="hey")}
+    reply = builder.submit_task(workflow_id, task["task_id"], changed)
+    assert reply["accepted"] is True
+    assert reply["next_tasks"] == []
+    state = builder.get_build_state(workflow_id)
+    assert state["status"] == "completed" and state["summary"]["workflow_version"] == 2
+    assert {node["step_id"]: node["status"] for node in state["nodes"]} == {
+        "Greeter": "published", "Shouter": "revalidated",
+    }
+    assert builder.record(workflow_id).graph_path.read_text(encoding="utf-8") == plan_before
+    assert builder.verify_workflow(workflow_id)["ok"] is True
+
+
+def test_evolve_node_reopens_broken_child_with_findings_and_parent_diff(builder: WorkflowBuilder) -> None:
+    workflow_id, _ = build_chain(builder)
+
+    opened = builder.begin_evolve(workflow_id, "rename derived key", scope="node", node="Greeter")
+    greeter_task = opened["next_tasks"][0]
+    renamed_code = node_code("Greeter", text="hey").replace('derived={"value": value}', 'derived={"greeting": value}')
+    renamed_test = node_test("Greeter", expected="hey").replace('derived["value"]', 'derived["greeting"]')
+    reply = builder.submit_task(workflow_id, greeter_task["task_id"], {"code": renamed_code, "test": renamed_test})
+    assert reply["accepted"] is True
+
+    # Shouter fails audit against Greeter's renamed derived key and opens with findings + parent source_diff.
+    assert [t["step_id"] for t in reply["next_tasks"]] == ["Shouter"]
+    shouter = builder.get_tasks(workflow_id)[0]
+    assert shouter["reason"] == "upstream_changed"
+    assert shouter["context"]["baseline"]["version"] == 1
+    assert "node.dependency_results_derived_key_invalid" in {f["rule_id"] for f in shouter["context"]["last_findings"]}
+    parent_changes = shouter["context"]["changes"]["parents"]
+    assert len(parent_changes) == 1 and parent_changes[0]["name"] == "Greeter"
+    assert parent_changes[0]["from_version"] == 1 and parent_changes[0]["to_version"] == 2
+    assert '-        return StepRunOutput(card={"label": "Greeter", "value": value}, derived={"value": value})' in parent_changes[0]["source_diff"]
+    assert '+        return StepRunOutput(card={"label": "Greeter", "value": value}, derived={"greeting": value})' in parent_changes[0]["source_diff"]
+
+    fixed_shouter_code = node_code("Shouter", ["Greeter"]).replace('.derived["value"]', '.derived["greeting"]')
+    fixed_shouter_test = node_test("Shouter", ["Greeter"]).replace('derived={"value": "Greeter-"}', 'derived={"greeting": "Greeter-"}')
+    done = builder.submit_task(workflow_id, shouter["task_id"], {"code": fixed_shouter_code, "test": fixed_shouter_test})
+    assert done["accepted"] is True
+    assert builder.get_build_state(workflow_id)["status"] == "completed"
+
+
+def test_evolve_graph_stages_plan_rejects_noop_and_aborts_cleanly(builder: WorkflowBuilder) -> None:
+    workflow_id, _ = build_chain(builder)
+    original_graph_text = builder.record(workflow_id).graph_path.read_text(encoding="utf-8")
+
+    opened = builder.begin_evolve(workflow_id, "add Formatter node", scope="graph")
+    assert opened["mode"] == "edit_graph" and opened["baseline_version"] == 1
+    assert [task["stage"] for task in opened["next_tasks"]] == ["graph"]
+    graph_task = opened["next_tasks"][0]
+    assert graph_task["context"]["edit"] == {"mode": "edit_graph", "baseline_version": 1, "topology_frozen": False}
+
+    # Identical graph is rejected as a no-op.
+    noop = builder.submit_task(workflow_id, graph_task["task_id"], {"graph": CHAIN})
+    assert noop["accepted"] is False
+    assert [f["rule_id"] for f in noop["findings"]] == ["graph.edit_noop"]
+
+    extended = graph_of(("Greeter", []), ("Shouter", ["Greeter"]), ("Formatter", ["Shouter"]))
+    accepted = builder.submit_task(workflow_id, noop["next_tasks"][0]["task_id"], {"graph": extended})
+    assert accepted["accepted"] is True
+    assert accepted["published"]["staged"] is True
+    assert accepted["published"]["diff"]["added"] == ["Formatter"]
+    assert accepted["published"]["diff"]["unchanged"] == ["Greeter", "Shouter"]
+    assert accepted["published"]["diff"]["rebuild"] == ["Formatter"]
+    assert [task["step_id"] for task in accepted["next_tasks"]] == ["Formatter"]
+    # Plan on disk stays untouched while the graph edit is still in flight.
+    assert builder.record(workflow_id).graph_path.read_text(encoding="utf-8") == original_graph_text
+    assert builder.get_build_state(workflow_id)["edit_impact"]["added"] == ["Formatter"]
+
+    # Aborting leaves plan/ equal to the previous pinned snapshot.
+    builder.abort_build(workflow_id, "cancel graph edit")
+    assert builder.record(workflow_id).graph_path.read_text(encoding="utf-8") == original_graph_text
+    assert builder.verify_workflow(workflow_id)["ok"] is True
+
+    # Re-run and complete: plan/ is committed only after Formatter passes.
+    reopened = builder.begin_evolve(workflow_id, "add Formatter node", scope="graph")
+    g_reply = builder.submit_task(workflow_id, reopened["next_tasks"][0]["task_id"], {"graph": extended})
+    f_reply = builder.submit_task(
+        workflow_id, g_reply["next_tasks"][0]["task_id"], good("Formatter", ["Shouter"]),
+    )
+    assert f_reply["accepted"] is True
+    final = builder.get_build_state(workflow_id)
+    assert final["status"] == "completed" and final["summary"]["workflow_version"] == 2
+    assert {n["step_id"]: n["status"] for n in final["nodes"]} == {
+        "Greeter": "reused", "Shouter": "reused", "Formatter": "published",
+    }
+    assert [n["step_id"] for n in builder.list_nodes(workflow_id)] == ["Greeter", "Shouter", "Formatter"]
+    assert builder.verify_workflow(workflow_id)["ok"] is True
+
+
+def test_evolve_graph_modified_node_gets_spec_diff_and_baseline(builder: WorkflowBuilder) -> None:
+    workflow_id, _ = build_chain(builder)
+    modified_graph = graph_of(("Greeter", []), ("Shouter", ["Greeter"]))
+    modified_graph["nodes"][1]["desc"] = "Shouter node with emphasis"
+
+    opened = builder.begin_evolve(workflow_id, "update Shouter spec", scope="graph")
+    reply = builder.submit_task(workflow_id, opened["next_tasks"][0]["task_id"], {"graph": modified_graph})
+    assert reply["accepted"] is True
+    assert [t["step_id"] for t in reply["next_tasks"]] == ["Shouter"]
+    shouter = builder.get_tasks(workflow_id)[0]
+    assert shouter["reason"] == "spec_changed"
+    assert shouter["context"]["baseline"]["version"] == 1
+    assert shouter["context"]["changes"]["spec"]["before"]["desc"] == "Shouter node"
+    assert shouter["context"]["changes"]["spec"]["after"]["desc"] == "Shouter node with emphasis"
+
+
+def test_evolve_requires_consistent_snapshot(builder: WorkflowBuilder) -> None:
+    workflow_id = builder.create_workflow()["workflow_id"]
+    with pytest.raises(ValueError, match="no consistent published snapshot"):
+        builder.begin_evolve(workflow_id, "edit", scope="graph")
+
+
+def test_integrity_blocks_direct_edits_to_plan_nodes_and_snapshots(builder: WorkflowBuilder) -> None:
+    workflow_id, _ = build_chain(builder)
+    record = builder.record(workflow_id)
+    assert builder.verify_workflow(workflow_id)["ok"] is True
+    assert builder.artifacts(workflow_id)["read_only"] is True
+    graph_art = builder.read_artifact(workflow_id, "graph")
+    assert graph_art["read_only"] is True and "Greeter" in graph_art["content"]
+
+    # 1. Tamper with plan/workflow.json (inject a Rogue node).
+    orig_graph = record.graph_path.read_text(encoding="utf-8")
+    tampered = json.loads(orig_graph)
+    tampered["nodes"].append({
+        "name": "Rogue", "type": "Rogue", "meta_node_kind": "WorkflowStepNode",
+        "desc": "injected", "ext_data": {"type": "none", "desc": "none"}, "depends": ["Shouter"],
+    })
+    record.graph_path.write_text(json.dumps(tampered, indent=2), encoding="utf-8")
+
+    report = builder.verify_workflow(workflow_id)
+    assert report["ok"] is False
+    assert any(item["path"] == "plan/workflow.json" for item in report["modified"])
+    assert "Rogue" not in [node["step_id"] for node in builder.list_nodes(workflow_id)]
+    cat = builder.catalog()[workflow_id]
+    assert "Rogue" not in cat["nodes"] and "integrity" in cat["errors"]
+    with pytest.raises(WorkflowFilesModified):
+        builder.begin_build(workflow_id)
+    with pytest.raises(WorkflowFilesModified):
+        builder.begin_evolve(workflow_id, "x", scope="node", node="Greeter")
+    with pytest.raises(WorkflowFilesModified):
+        builder.read_artifact(workflow_id, "graph")
+    record.graph_path.write_text(orig_graph, encoding="utf-8")
+
+    # 2. Tamper with a published node source.
+    node_src = Path(builder.artifacts(workflow_id)["nodes"]["Greeter"]["artifacts"]["source"])
+    # Also locate the versioned node file under nodes/<id>/00000001/Greeter.py.
+    latest_node = builder.store(workflow_id).latest_node("Greeter")
+    assert latest_node is not None
+    versioned_src = builder.store(workflow_id).artifacts_of(latest_node)["source"]
+    orig_node = versioned_src.read_text(encoding="utf-8")
+    versioned_src.write_text(orig_node + "\n# tampered\n", encoding="utf-8")
+    assert builder.verify_workflow(workflow_id)["ok"] is False
+    with pytest.raises(WorkflowFilesModified):
+        builder.begin_build(workflow_id)
+    with pytest.raises(WorkflowFilesModified):
+        builder.read_artifact(workflow_id, "source", node="Greeter")
+    versioned_src.write_text(orig_node, encoding="utf-8")
+
+    # 3. Tamper with the workflow snapshot copy.
+    orig_snap = node_src.read_text(encoding="utf-8")
+    node_src.write_text(orig_snap + "\n# snapshot tampered\n", encoding="utf-8")
+    assert builder.verify_workflow(workflow_id)["ok"] is False
+    with pytest.raises(WorkflowFilesModified):
+        builder.begin_build(workflow_id)
+    node_src.write_text(orig_snap, encoding="utf-8")
+
+    # 4. Tamper mid-build before submit_task.
+    opened = builder.begin_evolve(workflow_id, "change greeting", scope="node", node="Greeter")
+    task = opened["next_tasks"][0]
+    record.graph_path.write_text(orig_graph + "\n", encoding="utf-8")
+    rejected = builder.submit_task(workflow_id, task["task_id"], good("Greeter"))
+    assert rejected["accepted"] is False
+    assert rejected["error"] == "workflow_files_modified_outside_flowx"
+    record.graph_path.write_text(orig_graph, encoding="utf-8")
+    builder.abort_build(workflow_id)
+    assert builder.verify_workflow(workflow_id)["ok"] is True

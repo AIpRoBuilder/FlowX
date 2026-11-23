@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-23: add Mode/SessionPlan, staged graph edits, baseline diffs, child revalidation, and integrity checks.
 """Build steps for the ag_ui_workflow engine: agent gates plus the deterministic exit steps.
 
 An :class:`AgentGate` is a native step whose wait function pauses the run and hands a
@@ -12,10 +13,12 @@ structured findings, an acceptance publishes the artifact and lets the run conti
 
 from __future__ import annotations
 
+import difflib
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from threading import Event, RLock
 from typing import Any, Callable, Mapping
@@ -36,7 +39,7 @@ from flowx_core.builder.contracts import (
 from flowx_core.builder.entrypoint import EntrypointWriter
 from flowx_core.builder.findings import Finding, finding
 from flowx_core.builder.journal import BuildBoard
-from flowx_core.builder.store import WorkflowRecord, WorkflowStore
+from flowx_core.builder.store import WorkflowFilesModified, WorkflowRecord, WorkflowStore
 from flowx_core.builder.verify import (
     Verdict,
     ancestors_of,
@@ -44,6 +47,7 @@ from flowx_core.builder.verify import (
     check_graph,
     check_node,
     check_requirement,
+    diff_graphs,
     parse_graph,
     stage_node,
 )
@@ -57,6 +61,53 @@ NODES_EXIT_STEP = "nodes_exit"
 COMPILE_STEP = "compile_entrypoint"
 _LOG_LIMIT = 12000
 _NODE_SLOTS = {"code": "source", "test": "test", "markdown": "markdown"}
+
+
+class Mode(str, Enum):
+    """Explicit build/evolve mode of one revision."""
+
+    BUILD = "build"
+    EDIT_GRAPH = "edit_graph"
+    EDIT_NODE = "edit_node"
+
+
+@dataclass(frozen=True)
+class SessionPlan:
+    """What one revision will ask, force, and freeze."""
+
+    mode: Mode = Mode.BUILD
+    asked: frozenset[str] = frozenset()
+    forced: frozenset[str] = frozenset()
+    baseline_version: int = 0
+    baseline_plan_digest: str = ""
+    topology_frozen: bool = False
+    cascade: str = "rewrite"  # revalidate | rewrite
+
+
+def render_service_package(
+    store: WorkflowStore,
+    record: WorkflowRecord,
+    version: Mapping[str, Any],
+    *,
+    fastapi_host: str,
+    fastapi_port: int,
+) -> Path:
+    """Deterministically materialize ``service/service_<id>/`` from a verified workflow snapshot."""
+    package = record.service_dir
+    package.mkdir(parents=True, exist_ok=True)
+    for stale in package.glob("*.py"):
+        stale.unlink()
+    workflow_path, _ = store.workflow_paths(version)
+    shutil.copy2(workflow_path, package / "workflow.json")
+    for name, node in version["nodes"].items():
+        store.verify_node_record(node)
+        shutil.copy2(store.artifacts_of(node)["source"], package / f"{name}.py")
+    path = EntrypointWriter().write(
+        project_root=package, graph_json=package / "workflow.json", output=package / "main.py",
+        fastapi_host=fastapi_host, fastapi_port=fastapi_port,
+    )
+    store.record_service_digests(package)
+    return path
 
 
 def author_step(name: str) -> str:
@@ -95,7 +146,7 @@ class BuildSettings:
 class GateState:
     """What one gate remembers across attempts of its task."""
 
-    decision: str | None = None  # ask | reuse | skip | blocked | failed
+    decision: str | None = None  # ask | reuse | revalidated | skip | blocked | failed
     reason: str = "new"
     attempt: int = 1
     packet: ContractPacket | None = None
@@ -105,6 +156,7 @@ class GateState:
     findings: list[Finding] = field(default_factory=list)
     last_test_log: str = ""
     texts: dict[str, str] = field(default_factory=dict)
+    baseline: dict[str, Any] | None = None
     published: dict[str, Any] | None = None
 
 
@@ -118,6 +170,7 @@ class BuildContext:
         board: BuildBoard,
         settings: BuildSettings,
         intent: str = "",
+        plan: SessionPlan | None = None,
         asked: frozenset[str] = frozenset(),
         force_nodes: frozenset[str] = frozenset(),
         runtime_evidence: Any = None,
@@ -129,13 +182,17 @@ class BuildContext:
         self.store, self.board, self.settings = store, board, settings
         self.workflow_id, self.revision = store.workflow_id, board.revision
         self.intent = intent
-        self.asked = asked
-        self.force_nodes = force_nodes
+        self.plan = plan if plan is not None else SessionPlan(asked=asked, forced=force_nodes)
+        self.asked = self.plan.asked
+        self.force_nodes = self.plan.forced
         self.runtime_evidence = runtime_evidence
         self.fastapi_host, self.fastapi_port = fastapi_host, int(fastapi_port)
         self.rebuild_entrypoint = rebuild_entrypoint
         self.smoke_test = smoke_test
         self.scratch = store.directory / "build" / f"r{board.revision}"
+        self.staged_requirement: str | None = None
+        self.staged_graph: dict[str, Any] | None = None
+        self.graph_diff: dict[str, Any] | None = None
         self.cancelled = Event()
         self.node_order: list[str] = []
         self.changed_nodes: list[str] = []
@@ -158,8 +215,33 @@ class BuildContext:
                 }[kind]()
             return self._auditors[kind]
 
+    def requirement(self) -> str:
+        if self.staged_requirement is not None:
+            return self.staged_requirement
+        return self.store.read_requirement()
+
     def graph(self) -> dict[str, Any]:
+        if self.staged_graph is not None:
+            return dict(self.staged_graph)
         return self.store.read_graph() or {"nodes": []}
+
+    def commit_plan(self) -> None:
+        """Persist staged plan artifacts atomically after all nodes pass."""
+        if self.staged_requirement is not None:
+            self.store.write_requirement(self.staged_requirement)
+        if self.staged_graph is not None:
+            self.store.write_graph(self.staged_graph)
+            self.store.record.clear_errors("graph")
+            self.store.record.save()
+
+    def edit_info(self) -> dict[str, Any] | None:
+        if self.plan.mode == Mode.BUILD:
+            return None
+        return {
+            "mode": self.plan.mode.value,
+            "baseline_version": self.plan.baseline_version,
+            "topology_frozen": self.plan.topology_frozen,
+        }
 
     def raw_node(self, name: str) -> dict[str, Any]:
         for node in self.graph().get("nodes", []):
@@ -172,6 +254,8 @@ class BuildContext:
 
     def source_digest(self, name: str) -> str:
         record = self.store.latest_node(name)
+        if record is not None:
+            self.store.verify_node_record(record)
         source = self.store.artifacts_of(record).get("source") if record else None
         if source is None or not source.is_file():
             raise FileNotFoundError(f"node {name} has no published source")
@@ -184,6 +268,48 @@ class BuildContext:
             "spec": fingerprint_json(self.raw_node(name)),
             "parents": {parent: self.source_digest(parent) for parent in sorted(self.parents(name))},
         }
+
+    def node_changes(self, name: str, latest: Mapping[str, Any]) -> dict[str, Any]:
+        """Spec and upstream parent diffs relative to ``latest``."""
+        raw = self.raw_node(name)
+        prev_spec = latest.get("spec")
+        spec_change = (
+            {"before": prev_spec, "after": raw}
+            if isinstance(prev_spec, Mapping) and fingerprint_json(prev_spec) != fingerprint_json(raw)
+            else None
+        )
+        prev_parents = (latest.get("fingerprint_inputs") or {}).get("parents") or {}
+        parent_changes: list[dict[str, Any]] = []
+        for parent in self.parents(name):
+            curr_digest = self.source_digest(parent)
+            prev_digest = prev_parents.get(parent)
+            if prev_digest == curr_digest:
+                continue
+            old_rec = self.store.version_by_digest(parent, prev_digest) if prev_digest else None
+            new_rec = self.store.latest_node(parent)
+            old_text = ""
+            if old_rec is not None:
+                old_path = self.store.artifacts_of(old_rec).get("source")
+                if old_path is not None and old_path.is_file():
+                    old_text = old_path.read_text(encoding="utf-8")
+            new_text = ""
+            if new_rec is not None:
+                new_path = self.store.artifacts_of(new_rec).get("source")
+                if new_path is not None and new_path.is_file():
+                    new_text = new_path.read_text(encoding="utf-8")
+            diff = "".join(difflib.unified_diff(
+                old_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=f"{parent}.py (v{old_rec['version']})" if old_rec else f"{parent}.py (previous)",
+                tofile=f"{parent}.py (v{new_rec['version']})" if new_rec else f"{parent}.py (current)",
+            ))
+            parent_changes.append({
+                "name": parent,
+                "from_version": old_rec["version"] if old_rec else None,
+                "to_version": new_rec["version"] if new_rec else None,
+                "source_diff": diff,
+            })
+        return {"spec": spec_change, "parents": parent_changes}
 
     def issue(self, packet: ContractPacket) -> None:
         with self._lock:
@@ -201,6 +327,8 @@ class BuildContext:
 
     def ancestor_context(self, name: str) -> dict[str, Any]:
         record = self.store.latest_node(name)
+        if record is not None:
+            self.store.verify_node_record(record)
         artifact = node_source_artifact(name, self.store.artifacts_of(record)["source"]) if record else {"parent_node": name}
         artifact.pop("source_path", None)
         artifact["version"] = record["version"] if record else 0
@@ -320,7 +448,9 @@ class AgentGate(WorkflowStepNode):
         elif gate.decision == "ask":
             status = "accepted" if gate.accepted else "failed"
         else:
-            status = {"skip": "skipped", "reuse": "reused", "blocked": "blocked"}[gate.decision or "blocked"]
+            status = {
+                "skip": "skipped", "reuse": "reused", "revalidated": "revalidated", "blocked": "blocked",
+            }[gate.decision or "blocked"]
         error = gate.error or ("; ".join(item.message[:200] for item in gate.findings[:3]) if status == "failed" else "")
         extra = self.finish(ctx, gate, status)
         derived = {"status": status, "attempts": gate.attempt, "error": error, **extra}
@@ -359,14 +489,15 @@ class RequirementGate(_PlanGate):
 
     def open_packet(self, ctx: BuildContext, gate: GateState) -> ContractPacket:
         self.announce(ctx, gate, "active")
-        return self.make_packet(
-            ctx, gate, contract=requirement_contract(),
-            context={
-                "brief": ctx.store.read_brief(),
-                "current_requirement": ctx.store.read_requirement(),
-                "current_graph": ctx.store.read_graph(),
-            },
-        )
+        context: dict[str, Any] = {
+            "brief": ctx.store.read_brief(),
+            "current_requirement": ctx.store.read_requirement(),
+            "current_graph": ctx.store.read_graph(),
+        }
+        edit = ctx.edit_info()
+        if edit is not None:
+            context["edit"] = edit
+        return self.make_packet(ctx, gate, contract=requirement_contract(), context=context)
 
     def check(self, ctx: BuildContext, gate: GateState, artifacts: Mapping[str, Any]) -> Verdict:
         text = artifacts.get("requirement")
@@ -376,6 +507,9 @@ class RequirementGate(_PlanGate):
             findings.append(finding("builder.bad_submission", f"Unknown slots: {extra}."))
         if findings:
             return Verdict(False, findings)
+        if ctx.plan.mode == Mode.EDIT_GRAPH:
+            ctx.staged_requirement = text
+            return Verdict(True, published={"path": "plan/requirement_analysis.md", "staged": True})
         ctx.store.write_requirement(text)
         return Verdict(True, published={"path": "plan/requirement_analysis.md"})
 
@@ -401,14 +535,15 @@ class GraphGate(_PlanGate):
 
     def open_packet(self, ctx: BuildContext, gate: GateState) -> ContractPacket:
         self.announce(ctx, gate, "active")
-        return self.make_packet(
-            ctx, gate, contract=graph_contract(),
-            context={
-                "brief": ctx.store.read_brief(),
-                "requirement": ctx.store.read_requirement(),
-                "current_graph": ctx.store.read_graph(),
-            },
-        )
+        context: dict[str, Any] = {
+            "brief": ctx.store.read_brief(),
+            "requirement": ctx.requirement(),
+            "current_graph": ctx.store.read_graph(),
+        }
+        edit = ctx.edit_info()
+        if edit is not None:
+            context["edit"] = edit
+        return self.make_packet(ctx, gate, contract=graph_contract(), context=context)
 
     def check(self, ctx: BuildContext, gate: GateState, artifacts: Mapping[str, Any]) -> Verdict:
         extra = sorted(set(artifacts) - {"graph"})
@@ -420,10 +555,23 @@ class GraphGate(_PlanGate):
         findings = check_graph(graph, ctx.scratch / "graph", ctx.auditor("graph"))
         if findings:
             return Verdict(False, findings)
+        names = [node["name"] for node in graph["nodes"] if node.get("enable", True) is True]
+        if ctx.plan.mode == Mode.EDIT_GRAPH:
+            baseline_graph = ctx.store.read_graph() or {"nodes": []}
+            diff = diff_graphs(baseline_graph, graph)
+            if not diff["changed"]:
+                return Verdict(False, [finding(
+                    "graph.edit_noop",
+                    "The submitted graph is identical to the current workflow.json.",
+                    file="workflow.json",
+                )])
+            ctx.staged_graph = graph
+            ctx.graph_diff = diff
+            ctx.board.emit("edit_impact", **diff)
+            return Verdict(True, published={"path": "plan/workflow.json", "staged": True, "nodes": names, "diff": diff})
         ctx.store.write_graph(graph)
         ctx.store.record.clear_errors("graph")
         ctx.store.record.save()
-        names = [node["name"] for node in graph["nodes"] if node.get("enable", True) is True]
         return Verdict(True, published={"path": "plan/workflow.json", "nodes": names})
 
     def finish(self, ctx: BuildContext, gate: GateState, status: str) -> dict[str, Any]:
@@ -459,6 +607,8 @@ class NodeGate(AgentGate):
         name = self.NODE
         inputs = ctx.fingerprint_inputs(name)
         latest = ctx.store.latest_node(name)
+        if latest is not None:
+            ctx.store.verify_node_record(latest)
         if name not in ctx.force_nodes and latest is not None and latest.get("scheme") != SCHEME:
             return "reuse"  # published by an earlier FlowX build; never rewritten implicitly
         if name in ctx.force_nodes:
@@ -476,7 +626,46 @@ class NodeGate(AgentGate):
                 path = artifacts.get(key)
                 if path is not None and path.is_file():
                     gate.texts[slot] = path.read_text(encoding="utf-8")
+            gate.baseline = {"version": latest["version"], **gate.texts}
+        if gate.reason == "upstream_changed" and ctx.plan.cascade == "revalidate" and latest is not None:
+            if self._try_revalidate(ctx, gate, inputs, latest):
+                return "revalidated"
         return "ask"
+
+    def _try_revalidate(
+        self, ctx: BuildContext, gate: GateState, inputs: Mapping[str, Any], latest: Mapping[str, Any],
+    ) -> bool:
+        """Re-run audit and tests on the published node against updated parents; publish on pass."""
+        name = self.NODE
+        directory = ctx.scratch / "nodes" / f"{name}_revalidate"
+        targets = stage_node(
+            ctx.store, directory, name, ctx.graph(),
+            {key: gate.texts.get(slot) for slot, key in _NODE_SLOTS.items()},
+        )
+        findings, test = check_node(
+            name=name, raw_node=ctx.raw_node(name), targets=targets, graph_path=directory / "workflow.json",
+            auditor=ctx.auditor("node"), require_tests=ctx.settings.require_tests,
+            timeout=ctx.settings.test_timeout, python_command=ctx.settings.python_command,
+            run_subprocess=ctx.settings.run_subprocess,
+        )
+        if test is not None:
+            gate.last_test_log = test["log"][-_LOG_LIMIT:]
+        if findings:
+            gate.findings = findings
+            shutil.rmtree(directory, ignore_errors=True)
+            return False
+        source_text = targets["source"].read_text(encoding="utf-8")
+        ctx.store.publish_node(
+            name, fingerprint_json(inputs), targets,
+            extra={
+                "scheme": SCHEME, "fingerprint_inputs": dict(inputs), "contract_version": CONTRACT_VERSION,
+                "source_digest": text_digest(source_text), "spec": ctx.raw_node(name),
+                "revalidated_from": latest["version"],
+            },
+        )
+        ctx.changed_nodes.append(name)
+        shutil.rmtree(directory, ignore_errors=True)
+        return True
 
     def open_packet(self, ctx: BuildContext, gate: GateState) -> ContractPacket:
         name = self.NODE
@@ -484,7 +673,7 @@ class NodeGate(AgentGate):
         raw = ctx.raw_node(name)
         parents = ctx.parents(name)
         context: dict[str, Any] = {
-            "requirement": ctx.store.read_requirement(),
+            "requirement": ctx.requirement(),
             "graph": graph,
             "node": raw,
             "parents": parents,
@@ -492,6 +681,14 @@ class NodeGate(AgentGate):
             "current": dict(gate.texts),
             "last_test_log": gate.last_test_log,
         }
+        latest = ctx.store.latest_node(name)
+        if gate.baseline is not None:
+            context["baseline"] = dict(gate.baseline)
+        if latest is not None:
+            context["changes"] = ctx.node_changes(name, latest)
+        edit = ctx.edit_info()
+        if edit is not None:
+            context["edit"] = edit
         if ctx.runtime_evidence and name in ctx.force_nodes:
             context["runtime_evidence"] = ctx.runtime_evidence
         meta = {
@@ -541,7 +738,7 @@ class NodeGate(AgentGate):
             name, fingerprint_json(inputs), targets,
             extra={
                 "scheme": SCHEME, "fingerprint_inputs": inputs, "contract_version": CONTRACT_VERSION,
-                "source_digest": text_digest(source_text),
+                "source_digest": text_digest(source_text), "spec": ctx.raw_node(name),
             },
         )
         ctx.changed_nodes.append(name)
@@ -555,10 +752,10 @@ class NodeGate(AgentGate):
         extra: dict[str, Any] = {"node": self.NODE}
         if latest is not None:
             extra.update(node_id=latest["node_id"], version=latest["version"])
-        if status in ("accepted", "reused"):
-            self._status(ctx, "published" if status == "accepted" else "reused",
-                         version=extra.get("version"), node_id=extra.get("node_id"))
-            if status == "accepted":
+        if status in ("accepted", "reused", "revalidated"):
+            node_status = "published" if status == "accepted" else status
+            self._status(ctx, node_status, version=extra.get("version"), node_id=extra.get("node_id"))
+            if status in ("accepted", "revalidated"):
                 record.clear_errors(key)
                 record.save()
         elif status == "blocked":
@@ -610,9 +807,25 @@ class NodesExit(WorkflowStepNode):
         if failed:
             ctx.board.emit("stage", stage="nodes", status="failed", detail=", ".join(sorted(failed)))
             return StepRunOutput(card={"status": "failed"}, derived={"status": "failed", "failed": failed})
+        if ctx.plan.topology_frozen:
+            report = ctx.store.verify(include_service=False)
+            if not report["ok"]:
+                detail = str(WorkflowFilesModified(ctx.workflow_id, report["modified"]))
+                ctx.store.record.errors["integrity"] = detail
+                ctx.store.record.save()
+                ctx.board.emit("integrity_violation", modified=report["modified"])
+                ctx.board.emit("stage", stage="nodes", status="failed", detail=detail[:300])
+                return StepRunOutput(card={"status": "failed"}, derived={"status": "failed", "failed": {"integrity": detail}})
+            if ctx.plan.baseline_plan_digest and ctx.store.plan_digest() != ctx.plan.baseline_plan_digest:
+                detail = "workflow plan changed during a topology-frozen node edit"
+                ctx.store.record.errors["integrity"] = detail
+                ctx.store.record.save()
+                ctx.board.emit("stage", stage="nodes", status="failed", detail=detail)
+                return StepRunOutput(card={"status": "failed"}, derived={"status": "failed", "failed": {"integrity": detail}})
         record, created = ctx.store.publish_workflow(
-            ctx.node_order, ctx.graph(), ctx.store.read_requirement(), list(ctx.changed_nodes),
+            ctx.node_order, ctx.graph(), ctx.requirement(), list(ctx.changed_nodes),
         )
+        ctx.commit_plan()
         ctx.board.emit("stage", stage="nodes", status="done")
         ctx.board.emit("phase", phase="entrypoint")
         return StepRunOutput(
@@ -645,7 +858,8 @@ class CompileEntrypoint(WorkflowStepNode):
         version = ctx.store.latest_workflow()
         assert version is not None
         current = record.main_entrypoint_path is not None and record.main_entrypoint_path.is_file()
-        if current and record.main_workflow_version == version["version"] and not ctx.rebuild_entrypoint:
+        service_clean = ctx.store.verify(include_service=True)["ok"]
+        if current and service_clean and record.main_workflow_version == version["version"] and not ctx.rebuild_entrypoint:
             board.emit("stage", stage="entrypoint", status="skipped", detail="up to date")
             return StepRunOutput(card={"status": "reused"}, derived={
                 "status": "reused", "workflow_version": version["version"], "main_entrypoint_path": str(record.main_entrypoint_path),
@@ -676,19 +890,11 @@ class CompileEntrypoint(WorkflowStepNode):
     def _render(ctx: BuildContext, record: WorkflowRecord, version: Mapping[str, Any]) -> Path:
         store = ctx.store
         package = record.service_dir
-        package.mkdir(parents=True, exist_ok=True)
-        for stale in package.glob("*.py"):
-            stale.unlink()
-        workflow_path, _ = store.workflow_paths(version)
-        shutil.copy2(workflow_path, package / "workflow.json")
-        for name, node in version["nodes"].items():
-            shutil.copy2(store.artifacts_of(node)["source"], package / f"{name}.py")
         try:
-            path = EntrypointWriter().write(
-                project_root=package, graph_json=package / "workflow.json", output=package / "main.py",
-                fastapi_host=ctx.fastapi_host, fastapi_port=ctx.fastapi_port,
+            path = render_service_package(
+                store, record, version, fastapi_host=ctx.fastapi_host, fastapi_port=ctx.fastapi_port,
             )
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, WorkflowFilesModified) as exc:
             raise _EntrypointFailure("main", str(exc), [finding("main.render_failed", str(exc))]) from exc
         ok, violations = ctx.auditor("main").audit_file(str(path), nodes_root=str(package))
         if not ok:
@@ -722,6 +928,7 @@ __all__ = [
     "GRAPH_STEP",
     "GateState",
     "GraphGate",
+    "Mode",
     "NODES_EXIT_STEP",
     "NodeGate",
     "NodesExit",
@@ -729,7 +936,9 @@ __all__ = [
     "RUN_KEY",
     "RequirementGate",
     "SCHEME",
+    "SessionPlan",
     "author_step",
     "gate_step",
     "node_gate_class",
+    "render_service_package",
 ]

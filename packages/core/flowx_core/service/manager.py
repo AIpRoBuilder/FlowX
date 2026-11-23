@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-23: verify workflow integrity and re-render derived service package from the verified snapshot before launch.
 """Run, drive and inspect the services FlowX built."""
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from typing import IO, Any
 
 from flowx_core.auditor import OutputAuditor
 from flowx_core.builder import WorkflowBuilder
+from flowx_core.builder.gates import render_service_package
 from flowx_core.builder.store import WorkflowRecord
 from flowx_core.builder_services import service_environment
 from flowx_core.tools.agent_builder_tools import select_python_command
@@ -134,12 +136,25 @@ class ServiceManager:
     def run_service(self, workflow_id: str, *, wait: bool = True) -> dict[str, Any]:
         """Start the main entrypoint as a service, replacing a previous run of it."""
         record = self.builder.record(workflow_id)
-        main = record.main_entrypoint_path
-        if main is None or not main.is_file():
+        if record.main_entrypoint_path is None:
             raise FileNotFoundError(f"workflow {workflow_id} has no main entrypoint; build it first")
+        self.builder._require_integrity(workflow_id, include_service=False)
+        store = self.builder.store(workflow_id)
+        version = store.latest_workflow()
         with self._lock:
             if self._closed:
                 raise RuntimeError("service manager is closed")
+            if version is not None:
+                # Re-render the derived service package so hand-edited service files cannot run.
+                main = render_service_package(
+                    store, record, version, fastapi_host=record.fastapi_host, fastapi_port=record.fastapi_port,
+                )
+                record.main_entrypoint_path = main
+                record.save()
+            else:
+                main = record.main_entrypoint_path
+            if main is None or not main.is_file():
+                raise FileNotFoundError(f"workflow {workflow_id} has no main entrypoint; build it first")
             _terminate(record.process)
             record.process = self._spawn(record, main, self.log_path(record))
             try:

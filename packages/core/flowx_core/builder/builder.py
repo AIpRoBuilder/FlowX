@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-23: add begin_evolve (edit_node/edit_graph modes), verify_workflow, read_artifact, and integrity gating.
 """The workflow builder: a deterministic pipeline a host coding agent drives.
 
 FlowX no longer writes code. A build is a native ag_ui_workflow run whose gate steps
@@ -19,7 +20,7 @@ import time
 import uuid
 from pathlib import Path
 from threading import RLock
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from flowx_core.builder.contracts import ContractPacket, parse_task_id
 from flowx_core.builder.gates import (
@@ -32,18 +33,21 @@ from flowx_core.builder.gates import (
     BuildSettings,
     CompileEntrypoint,
     GraphGate,
+    Mode,
     NodesExit,
     RequirementGate,
+    SessionPlan,
     gate_step,
     node_gate_class,
 )
 from flowx_core.builder.journal import BuildBoard, BuildJournal
-from flowx_core.builder.store import WorkflowRecord, WorkflowStore
+from flowx_core.builder.store import WorkflowFilesModified, WorkflowRecord, WorkflowStore
 from flowx_core.builder.verify import topological_order, validate_graph_structure
 from flowx_core.tools.workflow_engine import FlowXWorkflowEngine, init_workflow_engine
 
 _SETTLE_SECONDS = 30.0
 _STAGES = frozenset({"requirement", "graph", "nodes", "entrypoint"})
+_CASCADES = frozenset({"revalidate", "rewrite"})
 _UNSAFE_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _RESERVED_NAME = re.compile(r"(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?")
 
@@ -149,24 +153,32 @@ class WorkflowBuilder:
             record, store = self.record(workflow_id), self.store(workflow_id)
             ids = store.node_ids()
             main = record.main_entrypoint_path
+            errors = dict(record.errors)
+            try:
+                enabled = store.enabled_nodes()
+                nodes = {name: ids.get(name) for name in enabled} or ids
+            except WorkflowFilesModified as exc:
+                nodes = ids
+                errors["integrity"] = str(exc)
             result[workflow_id] = {
-                "nodes": {name: ids.get(name) for name in store.enabled_nodes()} or ids,
+                "nodes": nodes,
                 "workflow_version": store.workflow_version(),
                 "main_entrypoint_id": record.main_entrypoint_id,
                 "has_graph": record.graph_path.is_file(),
                 "has_main": bool(main and main.is_file()),
-                "errors": dict(record.errors),
+                "errors": errors,
             }
         return result
 
     def artifacts(self, workflow_id: str) -> dict[str, Any]:
-        """Locations of a workflow's requirement, graph, node versions and main entrypoint."""
+        """Read-only locations of a workflow's requirement, graph, node versions and main entrypoint."""
         record, store = self.record(workflow_id), self.store(workflow_id)
         version = store.latest_workflow()
         main = record.main_entrypoint_path
         return {
             "workflow_id": workflow_id,
             "workflow_version": version["version"] if version else 0,
+            "read_only": True,
             "requirement": str(record.requirement_path) if record.requirement_path.is_file() else None,
             "graph": str(record.graph_path) if record.graph_path.is_file() else None,
             "nodes": {
@@ -187,7 +199,10 @@ class WorkflowBuilder:
         store = self.store(workflow_id)
         workflow = store.latest_workflow()
         published = workflow["nodes"] if workflow else {}
-        names = store.enabled_nodes() or list(published)
+        try:
+            names = store.enabled_nodes() or list(published)
+        except WorkflowFilesModified:
+            names = list(published)
         return [
             {
                 "step_id": name,
@@ -197,7 +212,66 @@ class WorkflowBuilder:
             for name in names
         ]
 
-    # -- build lifecycle --------------------------------------------------------------------
+    def verify_workflow(self, workflow_id: str, *, include_service: bool = True) -> dict[str, Any]:
+        """Verify FlowX-owned workflow files against their recorded SHA-256 digests."""
+        return self.store(workflow_id).verify(include_service=include_service)
+
+    def read_artifact(
+        self, workflow_id: str, slot: str, *, node: str | None = None, version: int | None = None,
+    ) -> dict[str, Any]:
+        """Return verified read-only text of one FlowX-owned artifact."""
+        return self.store(workflow_id).read_artifact(slot, node=node, version=version)
+
+    def _require_integrity(self, workflow_id: str, *, include_service: bool = False) -> None:
+        record, store = self.record(workflow_id), self.store(workflow_id)
+        report = store.verify(include_service=include_service)
+        if not report["ok"]:
+            exc = WorkflowFilesModified(workflow_id, report["modified"], remedy=report["remedy"])
+            record.errors["integrity"] = str(exc)
+            record.save()
+            self._journal(workflow_id).append({
+                "workflow_id": workflow_id, "revision": self._journal(workflow_id).last_revision,
+                "type": "integrity_violation", "modified": report["modified"],
+            })
+            raise exc
+        if "integrity" in record.errors:
+            record.clear_errors("integrity")
+            record.save()
+
+    # -- build & evolve lifecycle -----------------------------------------------------------
+    def begin_evolve(
+        self,
+        workflow_id: str,
+        intent: str = "",
+        *,
+        scope: Literal["graph", "node"],
+        node: str | None = None,
+        update_requirement: bool = False,
+        cascade: str = "revalidate",
+        runtime_evidence: Any = None,
+        fastapi_host: str | None = None,
+        fastapi_port: int | None = None,
+        rebuild_entrypoint: bool = False,
+        smoke_test: bool = False,
+    ) -> dict[str, Any]:
+        """Open an edit revision (``edit_node`` with frozen topology, or ``edit_graph`` with staged plan)."""
+        if scope not in ("graph", "node"):
+            raise ValueError("scope must be 'graph' or 'node'")
+        if cascade not in _CASCADES:
+            raise ValueError(f"cascade must be one of {sorted(_CASCADES)}")
+        self._require_integrity(workflow_id, include_service=False)
+        store = self.store(workflow_id)
+        plan = self._plan_edit(
+            store, scope=scope, node=node, update_requirement=update_requirement, cascade=cascade,
+        )
+        return self._open(
+            workflow_id, plan, intent=intent,
+            target=node if scope == "node" else "workflow",
+            runtime_evidence=runtime_evidence,
+            fastapi_host=fastapi_host, fastapi_port=fastapi_port,
+            rebuild_entrypoint=rebuild_entrypoint, smoke_test=smoke_test,
+        )
+
     def begin_build(
         self,
         workflow_id: str,
@@ -217,6 +291,45 @@ class WorkflowBuilder:
         requirement and graph) or a node name or id (rewrite that node).  ``stages`` picks the
         planning stages explicitly: any of ``requirement``, ``graph``, ``nodes``, ``entrypoint``.
         """
+        self._require_integrity(workflow_id, include_service=False)
+        store = self.store(workflow_id)
+        if stages is None and target not in (None, "resume"):
+            snapshot = store.latest_workflow()
+            if snapshot is not None and self._snapshot_matches_plan(store, snapshot):
+                if target == "workflow":
+                    return self.begin_evolve(
+                        workflow_id, intent, scope="graph", update_requirement=True, cascade="rewrite",
+                        runtime_evidence=runtime_evidence, fastapi_host=fastapi_host, fastapi_port=fastapi_port,
+                        rebuild_entrypoint=rebuild_entrypoint, smoke_test=smoke_test,
+                    )
+                return self.begin_evolve(
+                    workflow_id, intent, scope="node", node=target, cascade="rewrite",
+                    runtime_evidence=runtime_evidence, fastapi_host=fastapi_host, fastapi_port=fastapi_port,
+                    rebuild_entrypoint=rebuild_entrypoint, smoke_test=smoke_test,
+                )
+        plan = self._plan_build(store, intent, target, stages)
+        if "entrypoint" in (stages or ()):
+            rebuild_entrypoint = True
+        return self._open(
+            workflow_id, plan, intent=intent, target=target,
+            runtime_evidence=runtime_evidence,
+            fastapi_host=fastapi_host, fastapi_port=fastapi_port,
+            rebuild_entrypoint=rebuild_entrypoint, smoke_test=smoke_test,
+        )
+
+    def _open(
+        self,
+        workflow_id: str,
+        plan: SessionPlan,
+        *,
+        intent: str = "",
+        target: str | None = None,
+        runtime_evidence: Any = None,
+        fastapi_host: str | None = None,
+        fastapi_port: int | None = None,
+        rebuild_entrypoint: bool = False,
+        smoke_test: bool = False,
+    ) -> dict[str, Any]:
         record, store = self.record(workflow_id), self.store(workflow_id)
         with self._registry:
             if self._closed:
@@ -227,36 +340,40 @@ class WorkflowBuilder:
                     f"workflow {workflow_id} has an open build (revision {existing.board.revision}); "
                     "submit its tasks or abort it first"
                 )
-            asked, forced = self._plan(store, intent, target, stages)
-            if "entrypoint" in (stages or ()) or (
+            if (
                 fastapi_port is not None and int(fastapi_port) != record.fastapi_port
             ) or (fastapi_host is not None and fastapi_host != record.fastapi_host):
                 rebuild_entrypoint = True
             if smoke_test and self.settings.smoke is None:
                 raise ValueError("smoke_test needs a service manager; create one with ServiceManager(builder)")
-            if "requirement" in asked and not (intent.strip() or store.read_brief().strip()):
+            if "requirement" in plan.asked and not (intent.strip() or store.read_brief().strip()):
                 raise ValueError("an intent is required to write the requirement analysis")
             if intent.strip() and not store.read_brief().strip():
                 store.write_brief(intent.strip())
             journal = self._journal(workflow_id)
-            board = BuildBoard(workflow_id, journal.last_revision + 1, journal)
+            board = BuildBoard(
+                workflow_id, journal.last_revision + 1, journal,
+                mode=plan.mode.value, baseline_version=plan.baseline_version,
+            )
             ctx = BuildContext(
                 store=store, board=board, settings=self.settings, intent=intent.strip(),
-                asked=frozenset(asked), force_nodes=frozenset(forced), runtime_evidence=runtime_evidence,
+                plan=plan, runtime_evidence=runtime_evidence,
                 fastapi_host=fastapi_host or record.fastapi_host,
                 fastapi_port=int(fastapi_port if fastapi_port is not None else record.fastapi_port),
                 rebuild_entrypoint=rebuild_entrypoint or smoke_test, smoke_test=smoke_test,
             )
-            session = _Session(ctx, board, head=bool(asked))
+            session = _Session(ctx, board, head=bool(plan.asked))
             self._sessions[workflow_id] = session
         with session.lock:
-            board.emit("build_started", intent=intent.strip()[:500], target=target, asked=sorted(asked),
-                       forced=sorted(forced))
+            board.emit(
+                "build_started", mode=plan.mode.value, baseline_version=plan.baseline_version,
+                intent=intent.strip()[:500], target=target, asked=sorted(plan.asked), forced=sorted(plan.forced),
+            )
             try:
-                if asked:
+                if plan.asked:
                     board.emit("phase", phase="planning")
                     for stage in ("requirement", "graph"):
-                        if stage not in asked:
+                        if stage not in plan.asked:
                             board.emit("stage", stage=stage, status="skipped")
                     result = self._start(session, self._head_engine(workflow_id), "head")
                 else:
@@ -280,7 +397,7 @@ class WorkflowBuilder:
             finished = {event["revision"] for event in journal.read(0, 10**9) if event["type"] == "build_finished"}
             last = journal.last_revision
             state = {
-                "workflow_id": workflow_id, "revision": last,
+                "workflow_id": workflow_id, "revision": last, "mode": "idle", "baseline_version": 0,
                 "status": "interrupted" if last and last not in finished else "idle",
                 "phase": "idle", "stages": [], "nodes": [], "tasks": [], "error": "", "summary": {},
                 "next_action": {"kind": "begin_build"}, "last_event_seq": journal.last_seq,
@@ -298,11 +415,26 @@ class WorkflowBuilder:
 
     def submit_task(self, workflow_id: str, task_id: str, artifacts: Mapping[str, Any]) -> dict[str, Any]:
         """Check one task's artifacts; accepted ones are published, rejected ones come back with findings."""
-        self.record(workflow_id)
+        record, store = self.record(workflow_id), self.store(workflow_id)
         session = self._sessions.get(workflow_id)
         if session is None or session.board.status != "running":
             return {"accepted": False, "error": "no_active_build", "state": self.get_build_state(workflow_id)}
         with session.lock:
+            report = store.verify(include_service=False)
+            if not report["ok"]:
+                exc = WorkflowFilesModified(workflow_id, report["modified"], remedy=report["remedy"])
+                record.errors["integrity"] = str(exc)
+                record.save()
+                session.board.emit("integrity_violation", modified=report["modified"])
+                return {
+                    "task_id": task_id,
+                    "accepted": False,
+                    "error": "workflow_files_modified_outside_flowx",
+                    "message": str(exc),
+                    "modified": report["modified"],
+                    "remedy": report["remedy"],
+                    "state": self.get_build_state(workflow_id),
+                }
             parsed = parse_task_id(task_id)
             packet = session.ctx.packets.get(task_id)
             if parsed is None or packet is None:
@@ -385,9 +517,51 @@ class WorkflowBuilder:
             self._release_engine(session)
 
     # -- planning ---------------------------------------------------------------------------
-    def _plan(
+    @staticmethod
+    def _resolve_node(store: WorkflowStore, target: str | None) -> str:
+        ids = store.node_ids()
+        names = {name for name in store.enabled_nodes()}
+        by_id = {node_id: name for name, node_id in ids.items()}
+        name = target if target in names else by_id.get(target or "")
+        if name is None or name not in names:
+            raise ValueError(f"unknown target {target!r}: expected 'workflow' or a node name or id")
+        return name
+
+    @staticmethod
+    def _snapshot_matches_plan(store: WorkflowStore, snapshot: Mapping[str, Any]) -> bool:
+        expected = snapshot.get("plan_digest")
+        if not expected:
+            return True
+        return store.plan_digest() == expected
+
+    def _plan_edit(
+        self, store: WorkflowStore, *, scope: str, node: str | None, update_requirement: bool, cascade: str,
+    ) -> SessionPlan:
+        snapshot = store.latest_workflow()
+        if snapshot is None or not self._snapshot_matches_plan(store, snapshot):
+            raise ValueError(
+                "workflow has no consistent published snapshot to evolve; finish or repair it with begin_build first"
+            )
+        baseline_digest = str(snapshot.get("plan_digest") or store.plan_digest())
+        if scope == "node":
+            if not node:
+                raise ValueError("node is required when scope='node'")
+            name = self._resolve_node(store, node)
+            return SessionPlan(
+                mode=Mode.EDIT_NODE, asked=frozenset(), forced=frozenset({name}),
+                baseline_version=int(snapshot["version"]), baseline_plan_digest=baseline_digest,
+                topology_frozen=True, cascade=cascade,
+            )
+        asked = {"graph", *(("requirement",) if update_requirement else ())}
+        return SessionPlan(
+            mode=Mode.EDIT_GRAPH, asked=frozenset(asked), forced=frozenset(),
+            baseline_version=int(snapshot["version"]), baseline_plan_digest=baseline_digest,
+            topology_frozen=False, cascade=cascade,
+        )
+
+    def _plan_build(
         self, store: WorkflowStore, intent: str, target: str | None, stages: Iterable[str] | None,
-    ) -> tuple[set[str], set[str]]:
+    ) -> SessionPlan:
         """Which planning stages the agent must write and which nodes are forced."""
         graph = store.read_graph()
         asked: set[str] = set()
@@ -400,19 +574,13 @@ class WorkflowBuilder:
         elif target == "workflow":
             asked = {"requirement", "graph"}
         elif target not in (None, "resume"):
-            ids = store.node_ids()
-            names = {name for name in store.enabled_nodes()}
-            by_id = {node_id: name for name, node_id in ids.items()}
-            name = target if target in names else by_id.get(target)
-            if name is None or name not in names:
-                raise ValueError(f"unknown target {target!r}: expected 'workflow' or a node name or id")
-            forced.add(name)
+            forced.add(self._resolve_node(store, target))
         graph_ok = graph is not None and not validate_graph_structure(graph)
         if not graph_ok:
             asked.add("graph")
             if stages is None and target is None and not store.read_requirement():
                 asked.add("requirement")
-        return asked, forced
+        return SessionPlan(mode=Mode.BUILD, asked=frozenset(asked), forced=frozenset(forced))
 
     # -- engine plumbing --------------------------------------------------------------------
     def _head_engine(self, workflow_id: str) -> FlowXWorkflowEngine:

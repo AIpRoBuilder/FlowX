@@ -1,6 +1,7 @@
 # Workflow runtime compatibility
 
 Modified 2026-11-22: describe the workflow builder's gate steps; the LLM generation workflows are gone.
+Modified 2026-11-23: document FlowX-owned workflow file integrity checks, evolve modes, and optional OS sandboxing.
 
 FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream
 revision `0319046` (2026-10-23). That revision still reports package version `0.1.0`;
@@ -52,3 +53,34 @@ the version string alone does not distinguish the older API.
 - Nodes install their own wait callbacks. Paused requests retain a pipeline slot;
   session reset cancels the old request before rotating its ID. Pool size comes
   from the planning config and resources close at backend shutdown.
+
+## Workflow file ownership, integrity, and evolve modes
+
+- FlowX owns `<workspace>/workflows/<workflow_id>/` (`plan/`, `nodes/`,
+  `workflows/`, `manifest.json`, `agent.json`, `build/`, and rendered files in
+  `service/service_<id>/`). Only `service/service_<id>/.env` is user-editable
+  runtime configuration.
+- FlowX records SHA-256 digests when writing `plan/*`, publishing node versions,
+  pinning workflow snapshots, and rendering the service package. `verify_workflow`
+  checks those digests; `begin_build`, `begin_evolve`, `submit_task`,
+  `read_artifact`, and `run_service` fail closed (`WorkflowFilesModified` /
+  `workflow_files_modified_outside_flowx`) when FlowX-owned files are modified
+  outside FlowX. `run_service` also re-renders `service/service_<id>/`
+  deterministically from the verified snapshot before spawning (preserving `.env`).
+- Revisions carry an explicit mode (`Mode.BUILD`, `Mode.EDIT_NODE`,
+  `Mode.EDIT_GRAPH`):
+  - `begin_evolve(..., scope="node", node=...)` runs in `edit_node` mode (body
+    engine only, graph topology frozen, verified at `NodesExit`). With default
+    `cascade="revalidate"`, compatible downstream nodes are re-tested and
+    re-published automatically without issuing an agent task; broken children
+    open a task with findings and the upstream `source_diff`.
+  - `begin_evolve(..., scope="graph", update_requirement=...)` runs in
+    `edit_graph` mode (head engine then body engine). Plan writes are staged in
+    memory and committed only after `NodesExit` publishes the new workflow
+    snapshot, so aborting or failing mid-edit leaves `plan/` matching the
+    previous snapshot.
+- In-process digest checks and MCP/skill rules provide detection and capability
+  boundaries, not DRM or OS-level tamper-proofing. When running untrusted agents
+  that have shell access on the same host, mount `<workspace>/workflows` read-only
+  in the agent sandbox (for example `bwrap --ro-bind` on Linux or a `:ro` volume
+  mount in a container) and grant write access only to the FlowX/MCP process.

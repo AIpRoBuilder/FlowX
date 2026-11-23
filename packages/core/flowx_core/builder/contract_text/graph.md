@@ -1,6 +1,7 @@
 <!-- FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 Moved 2026-11-22 from architect/prompts/graph_planner_prompt.md and adapted from an LLM system prompt into a contract for a coding agent.
-Modified 2026-10-13: request-scoped nodes complete once; do not promise native repeated execution. -->
+Modified 2026-10-13: request-scoped nodes complete once; do not promise native repeated execution.
+Modified 2026-11-23: add graph-editing rules and prohibit direct edits to FlowX-owned workflow files. -->
 # Graph contract
 
 You plan the workflow graph from the requirement analysis. Submit one JSON object `workflow.json`.
@@ -60,3 +61,12 @@ You plan the workflow graph from the requirement analysis. Submit one JSON objec
   parallel.
 - The graph is one connected, acyclic component. Enabled nodes never depend on disabled nodes.
 - Names and types are always English, even when descriptions are not.
+
+## Editing an existing workflow
+
+- Never edit `plan/workflow.json` or any file under `<workspace>/workflows/` directly; submit the updated JSON through
+  `submit_task`.
+- When `context.current_graph` is present, change only what `context.intent` requires and keep unchanged nodes
+  byte-identical in `name`, `type`, `meta_node_kind`, `desc`, `ext_data`, `inputs_format`, and `depends` so FlowX
+  reuses their published versions.
+- In `edit_graph` mode, submitting an unchanged graph is rejected (`graph.edit_noop`).

@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified 2026-11-22: test the contract protocol through the real MCP SDK and FlowX client.
+# Modified 2026-11-23: cover begin_evolve, read_workflow_artifact, verify_workflow, and inline-only submit_task.
 """The MCP tools expose the workflow builder and service manager as JSON."""
 
 from __future__ import annotations
@@ -38,9 +39,10 @@ GRAPH = {"nodes": [{
 }]}
 
 EXPECTED_TOOLS = {
-    "create_workflow", "begin_build", "get_build_state", "get_tasks", "submit_task", "get_build_events",
-    "reopen_stage", "abort_build", "list_workflows", "list_nodes", "get_workflow", "run_service",
-    "stop_service", "service_status", "run_step", "reset_session", "list_runs", "get_run", "get_evidence",
+    "create_workflow", "begin_build", "begin_evolve", "get_build_state", "get_tasks", "submit_task",
+    "get_build_events", "reopen_stage", "abort_build", "list_workflows", "list_nodes", "get_workflow",
+    "read_workflow_artifact", "verify_workflow", "run_service", "stop_service", "service_status",
+    "run_step", "reset_session", "list_runs", "get_run", "get_evidence",
 }
 
 
@@ -148,3 +150,49 @@ def test_native_output_stays_off_the_protocol_stream():
 
     assert result.stdout == "protocol line\n"
     assert "native runtime line" in result.stderr
+
+
+def test_mcp_verify_read_evolve_and_inline_only_submit(mcp, tmp_path):
+    async def steps(call, session):
+        await call("create_workflow", name="demo", brief="Echo text")
+        opened = await call("begin_build", workflow_id="demo", intent="Echo text")
+        req_task = opened["next_tasks"][0]
+
+        # File path wrapper and non-string slots are rejected by MCP submit_task.
+        file_attempt = await call(
+            "submit_task", workflow_id="demo", task_id=req_task["task_id"],
+            artifacts={"requirement": {"file": str(tmp_path / "req.md")}},
+        )
+        assert file_attempt["ok"] is False and "inline" in file_attempt["error"]
+
+        non_str = await call(
+            "submit_task", workflow_id="demo", task_id=req_task["task_id"],
+            artifacts={"requirement": ["not", "a", "string"]},
+        )
+        assert non_str["ok"] is False and "string" in non_str["error"]
+
+        # Valid requirement + graph + clean verify + read_workflow_artifact.
+        req_done = await call(
+            "submit_task", workflow_id="demo", task_id=req_task["task_id"],
+            artifacts={"requirement": REQUIREMENT},
+        )
+        assert req_done["accepted"] is True
+        graph_task = req_done["next_tasks"][0]
+        await call("submit_task", workflow_id="demo", task_id=graph_task["task_id"], artifacts={"graph": GRAPH})
+
+        read_graph = await call("read_workflow_artifact", workflow_id="demo", slot="graph")
+        assert read_graph["ok"] is True and read_graph["read_only"] is True and "Echo" in read_graph["content"]
+
+        clean = await call("verify_workflow", workflow_id="demo")
+        assert clean["ok"] is True and clean["modified"] == []
+
+        # Tampering with plan/workflow.json is caught by verify_workflow and blocks begin_evolve.
+        await call("abort_build", workflow_id="demo")
+        (tmp_path / "workflows" / "demo" / "plan" / "workflow.json").write_text('{"nodes": []}', encoding="utf-8")
+        dirty = await call("verify_workflow", workflow_id="demo")
+        # verify_workflow returns payload dict with its own "ok": False, so check modified directly.
+        assert dirty["modified"] and dirty["modified"][0]["path"] == "plan/workflow.json"
+        blocked = await call("begin_evolve", workflow_id="demo", intent="change", scope="graph")
+        assert blocked["ok"] is False and blocked["error_code"] == "workflow_files_modified_outside_flowx"
+
+    run(mcp, steps)

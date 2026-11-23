@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-23: add graph diffing for evolve mode and verify published nodes during staging.
 """Deterministic checks a submitted artifact must pass before it is accepted."""
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from flowx_core.architect.graph import Graph, NodeMeta
 from flowx_core.auditor import GraphJsonAuditor, NodeAuditor
 from flowx_core.builder.findings import Finding, finding, from_violations
 from flowx_core.builder.store import WorkflowStore, artifact_targets
+from flowx_core.tools.artifact_tools import fingerprint_json
 
 _RESERVED_MODULES = frozenset(name.casefold() for name in sys.stdlib_module_names) | {
     "pytest", "conftest", "ag_ui_workflow", "pydaograph", "flowx_core",
@@ -209,6 +211,58 @@ def ancestors_of(graph: Mapping[str, Any], name: str) -> list[str]:
     return [item for item in topological_order(graph) if item in wanted]
 
 
+def diff_graphs(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare two workflow graphs into added, removed, modified, rewired, unchanged, and rebuild sets."""
+    before_nodes = {
+        node["name"]: node for node in before.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("name"), str) and node.get("enable", True) is True
+    }
+    after_nodes = {
+        node["name"]: node for node in after.get("nodes", [])
+        if isinstance(node, Mapping) and isinstance(node.get("name"), str) and node.get("enable", True) is True
+    }
+    order = topological_order(after)
+    added = [name for name in order if name not in before_nodes]
+    removed = [name for name in before_nodes if name not in after_nodes]
+    modified: list[str] = []
+    rewired: list[str] = []
+    unchanged: list[str] = []
+    for name in order:
+        if name not in before_nodes:
+            continue
+        old, new = before_nodes[name], after_nodes[name]
+        if fingerprint_json(old) == fingerprint_json(new):
+            unchanged.append(name)
+        else:
+            modified.append(name)
+            if list(old.get("depends", [])) != list(new.get("depends", [])):
+                rewired.append(name)
+    dirty = set(added) | set(modified)
+    children: dict[str, list[str]] = {name: [] for name in order}
+    for name in order:
+        for dep in after_nodes[name].get("depends", []):
+            if dep in children:
+                children[dep].append(name)
+    queue = list(dirty)
+    while queue:
+        current = queue.pop(0)
+        for child in children.get(current, []):
+            if child not in dirty:
+                dirty.add(child)
+                queue.append(child)
+    rebuild = [name for name in order if name in dirty]
+    changed = bool(added or removed or modified or fingerprint_json(before) != fingerprint_json(after))
+    return {
+        "changed": changed,
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "rewired": rewired,
+        "unchanged": unchanged,
+        "rebuild": rebuild,
+    }
+
+
 def run_node_test(
     *,
     node_name: str,
@@ -278,6 +332,8 @@ def stage_node(
         if other == name:
             continue
         record = store.latest_node(other)
+        if record is not None:
+            store.verify_node_record(record)
         source = store.artifacts_of(record).get("source") if record else None
         if source is not None and source.is_file():
             shutil.copy2(source, scratch / f"{other}.py")
@@ -347,6 +403,7 @@ __all__ = [
     "check_graph",
     "check_node",
     "check_requirement",
+    "diff_graphs",
     "parse_graph",
     "run_node_test",
     "stage_node",

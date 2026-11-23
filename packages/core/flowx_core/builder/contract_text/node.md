@@ -2,7 +2,8 @@
 Moved 2026-11-22 from worker/prompts/pydaograph_node_prompt.md and adapted from an LLM system prompt into a contract for a coding agent.
 Modified: explicit subclass wait gates for the pooled AG-UI runtime.
 Modified: bytes-only file processing, explicit persistence, and undecorated fresh node construction.
-Modified 2026-11-02: clarify runtime variable types and metadata dictionary access. -->
+Modified 2026-11-02: clarify runtime variable types and metadata dictionary access.
+Modified 2026-11-23: add node-editing baseline guidance and prohibit direct edits to FlowX-owned workflow files. -->
 # Node contract
 
 You write one workflow node: a Python module that defines one `WorkflowStepNode` or `WorkflowFileNode` subclass. Submit it as the `code` artifact, together with its pytest module as the `test` artifact (see the test contract). Keep the code runnable with real logic inside the preferred subclass hook declared by the selected base-node reference in `meta.node_reference`.
@@ -75,6 +76,10 @@ Minimality checklist (must follow):
 - Do not add debug prints, test stubs, or markdown/comments beyond concise TODOs.
 - Use straightforward guard clauses and `.get(...)` defaults instead of complex validation frameworks.
 - Keep summaries/cards concise and requirement-focused.
+
+Editing an existing node:
+- Never edit files under `<workspace>/workflows/` directly (published node versions, snapshots, `plan/`, or `service/`); submit changes only through `submit_task`.
+- When `context.baseline` is present, start from that published version and apply only the change requested by `context.intent` and `context.changes` (spec diff or upstream parent `source_diff`). Keep outputs backward-compatible with downstream nodes unless the change explicitly requires updating them.
 
 Example:
 

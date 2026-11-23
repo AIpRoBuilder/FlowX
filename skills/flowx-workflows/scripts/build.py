@@ -7,6 +7,7 @@
 # Modified 2026-11-11: require a workflow folder name when allocating from the skill.
 # Modified 2026-11-22: serve the contract protocol (begin_build/get_tasks/submit_task/...) as JSON lines; the
 #   calling agent writes the artifacts and FlowX no longer calls an LLM.
+# Modified 2026-11-23: add begin_evolve, verify_workflow, and read_artifact; forbid submitting files inside <WS>/workflows.
 """Drive the FlowX workflow builder over stdin/stdout as JSON lines (the contract protocol)."""
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ if __name__ == "__main__":
 else:
     _PLUGIN_WORKSPACE = None
 
+from flowx_core.builder import WorkflowFilesModified  # noqa: E402
 from flowx_sdk import FlowXClient  # noqa: E402
 
 MAX_FILE_BYTES = 2_000_000
@@ -38,18 +40,21 @@ send begin_build: published nodes are reused, so only unfinished work is request
 Commands ({"op": ..., arguments}):
   create_workflow  name?, brief?
   begin_build      workflow_id, intent?, target?, stages?, runtime_evidence?, fastapi_port?, fastapi_host?, smoke_test?
+  begin_evolve     workflow_id, intent?, scope ("node"|"graph"), node?, update_requirement?, cascade?, runtime_evidence?, fastapi_port?, fastapi_host?, smoke_test?
   get_build_state  workflow_id
   get_tasks        workflow_id, compact?
   submit_task      workflow_id, task_id, artifacts
   get_build_events workflow_id, since?, limit?
   reopen_stage     workflow_id, stage, step_id?, reason?
   abort_build      workflow_id, reason?
+  verify_workflow  workflow_id, include_service?
+  read_artifact    workflow_id, slot, node?, version?
   list_workflows | list_nodes workflow_id | get_workflow workflow_id
   stop             close the client and exit
 
-begin_build and submit_task return the open contract tasks (`next_tasks`): each has a contract, context,
-and submit.slots naming the artifacts to return. For submit_task, artifacts maps slot names to text, or to
-{"file": "path"} to read the text from a UTF-8 file (best for code and tests), for example:
+begin_build, begin_evolve, and submit_task return the open contract tasks (`next_tasks`): each has a contract,
+context, and submit.slots naming the artifacts to return. For submit_task, artifacts maps slot names to text, or to
+{"file": "path"} pointing to a UTF-8 file OUTSIDE <workspace>/workflows/ (best for code and tests), for example:
   {"op":"submit_task","workflow_id":"w","task_id":"node:Echo:r1:a1",
    "artifacts":{"code":{"file":"/tmp/Echo.py"},"test":{"file":"/tmp/test_Echo.py"}}}
 A rejection returns findings and a repair task; fix exactly those findings and submit again.
@@ -60,14 +65,21 @@ def emit(stream: TextIO, **fields: Any) -> None:
     print(json.dumps(fields, ensure_ascii=False, default=str), file=stream, flush=True)
 
 
-def resolve_artifacts(artifacts: Any) -> dict[str, Any]:
-    """Replace ``{"file": path}`` values with the file's text."""
+def resolve_artifacts(artifacts: Any, *, forbidden_root: Path | None = None) -> dict[str, Any]:
+    """Replace ``{"file": path}`` values with the file's text, rejecting FlowX-owned workflow paths."""
     if not isinstance(artifacts, dict):
         raise ValueError("artifacts must be an object mapping slot names to text")
+    forbidden = forbidden_root.expanduser().resolve() if forbidden_root is not None else None
     resolved: dict[str, Any] = {}
     for slot, value in artifacts.items():
         if isinstance(value, dict) and set(value) == {"file"}:
             path = Path(str(value["file"])).expanduser()
+            resolved_path = path.resolve()
+            if forbidden is not None and resolved_path.is_relative_to(forbidden):
+                raise ValueError(
+                    f"artifact file for {slot!r} points inside FlowX-owned workflow storage ({path}); "
+                    "draft artifacts in a temp directory outside <workspace>/workflows/ and submit those"
+                )
             if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
                 raise ValueError(f"artifact file for {slot!r} is missing or larger than {MAX_FILE_BYTES} bytes")
             resolved[slot] = path.read_text(encoding="utf-8")
@@ -76,12 +88,25 @@ def resolve_artifacts(artifacts: Any) -> dict[str, Any]:
     return resolved
 
 
+def _forbidden_root(client: Any) -> Path | None:
+    builder = getattr(client, "builder", None)
+    root = getattr(builder, "storage_dir", None)
+    if isinstance(root, (str, Path)):
+        return Path(root)
+    return None
+
+
 def handlers(client: FlowXClient) -> dict[str, Callable[..., Any]]:
     def submit_task(workflow_id: str, task_id: str, artifacts: Any) -> Any:
-        return client.submit_task(workflow_id, task_id, resolve_artifacts(artifacts))
+        return client.submit_task(
+            workflow_id, task_id, resolve_artifacts(artifacts, forbidden_root=_forbidden_root(client)),
+        )
 
     def begin_build(workflow_id: str, intent: str = "", **options: Any) -> Any:
         return client.begin_build(workflow_id, intent, **{key: value for key, value in options.items() if value is not None})
+
+    def begin_evolve(workflow_id: str, intent: str = "", **options: Any) -> Any:
+        return client.begin_evolve(workflow_id, intent, **{key: value for key, value in options.items() if value is not None})
 
     def method(name: str) -> Callable[..., Any]:
         return lambda **arguments: getattr(client, name)(**arguments)
@@ -89,12 +114,15 @@ def handlers(client: FlowXClient) -> dict[str, Callable[..., Any]]:
     return {
         "create_workflow": lambda name=None, brief="": {"workflow_id": client.create_workflow(name, brief)},
         "begin_build": begin_build,
+        "begin_evolve": begin_evolve,
         "get_build_state": method("get_build_state"),
         "get_tasks": lambda workflow_id, compact=False: {"tasks": client.get_tasks(workflow_id, compact=compact)},
         "submit_task": submit_task,
         "get_build_events": method("get_build_events"),
         "reopen_stage": method("reopen_stage"),
         "abort_build": method("abort_build"),
+        "verify_workflow": method("verify_workflow"),
+        "read_artifact": method("read_artifact"),
         "list_workflows": lambda: {"workflows": client.workflows()},
         "list_nodes": lambda workflow_id: {"nodes": client.list_nodes(workflow_id)},
         "get_workflow": lambda workflow_id: {"workflow": client.artifacts(workflow_id)},
@@ -118,7 +146,13 @@ def serve(client: FlowXClient, lines: Any, output: TextIO) -> int:
                 raise ValueError(f"unknown op {op!r}; one of {sorted([*commands, 'stop'])}")
             with contextlib.redirect_stdout(sys.stderr):  # native runtime output must not reach the protocol
                 result = commands[op](**command)
-            emit(output, ok=True, op=op, **(result if isinstance(result, dict) else {"result": result}))
+            payload = {"ok": True, **(result if isinstance(result, dict) else {"result": result}), "op": op}
+            emit(output, **payload)
+        except WorkflowFilesModified as exc:
+            emit(
+                output, ok=False, op=op, error=str(exc), error_type=type(exc).__name__,
+                error_code="workflow_files_modified_outside_flowx", modified=exc.modified, remedy=exc.remedy,
+            )
         except Exception as exc:
             emit(output, ok=False, op=op, error=str(exc), error_type=type(exc).__name__)
     return 0

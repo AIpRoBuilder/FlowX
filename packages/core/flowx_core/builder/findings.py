@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-23: add graph.edit_noop and builder.integrity rules.
 """Structured audit findings and the rule catalog shared by contracts and auditors."""
 
 from __future__ import annotations
@@ -83,6 +84,8 @@ CATALOG: dict[str, Rule] = _rules(
     Rule("graph.cycle_detected", "The graph must be acyclic.", "Remove one dependency from the cycle."),
     Rule("graph.disconnected", "The graph must be one connected component.",
          "Connect the isolated node or merge it into the flow."),
+    Rule("graph.edit_noop", "A graph edit must change workflow.json relative to the current baseline.",
+         "Submit a modified workflow.json that implements the requested change, or abort the edit."),
     # Node source.
     Rule("node.source_missing", "A node submission must include `code` (the node's Python module).",
          "Submit the `code` artifact."),
@@ -122,6 +125,8 @@ CATALOG: dict[str, Rule] = _rules(
     # Builder internals.
     Rule("builder.bad_submission", "`artifacts` maps the task's slot names to text (the graph may be a JSON object).",
          "Submit only the slot names listed in the task's `submit.slots`, each as a string."),
+    Rule("builder.integrity", "FlowX-owned workflow files must not be edited outside FlowX.",
+         "Do not edit files under <workspace>/workflows/ directly; use FlowX begin_build or begin_evolve."),
     Rule("builder.internal_error", "The builder could not validate the submission.",
          "Retry; if it persists report the message."),
 )

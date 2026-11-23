@@ -6,6 +6,7 @@
 # Modified 2026-11-06: cover node-pause answer help.
 # Modified 2026-11-11: cover named workflow allocation and existing IDs.
 # Modified 2026-11-22: cover the JSON-lines contract protocol.
+# Modified 2026-11-23: cover begin_evolve, verify_workflow, read_artifact, and rejecting FlowX-owned file paths.
 from __future__ import annotations
 
 import importlib.util
@@ -167,9 +168,76 @@ def test_inspection_dispatch_and_close(monkeypatch, capsys):
     client.__enter__ = Mock(return_value=client)
     client.__exit__ = Mock(return_value=False)
     client.list_nodes.return_value = [{"step_id": "s1"}]
+    client.verify_workflow.return_value = {"ok": True, "workflow_id": "wf1", "modified": [], "remedy": ""}
+    client.read_artifact.return_value = {"workflow_id": "wf1", "slot": "graph", "content": "{}", "read_only": True}
     monkeypatch.setattr(inspect_workflow, "FlowXClient", lambda **kwargs: client)
 
     assert inspect_workflow.main(["--workspace", "/tmp/work", "nodes", "--workflow-id", "wf1"]) == 0
+    assert inspect_workflow.main(["--workspace", "/tmp/work", "verify", "--workflow-id", "wf1"]) == 0
+    assert inspect_workflow.main([
+        "--workspace", "/tmp/work", "read", "--workflow-id", "wf1", "--slot", "graph",
+    ]) == 0
 
     client.list_nodes.assert_called_once_with("wf1")
-    client.__exit__.assert_called_once()
+    client.verify_workflow.assert_called_once_with("wf1")
+    client.read_artifact.assert_called_once_with("wf1", "graph", node=None, version=None)
+    assert client.__exit__.call_count == 3
+
+
+def test_resolve_artifacts_rejects_paths_inside_flowx_workflow_tree(tmp_path):
+    ws = tmp_path / "ws"
+    wf_root = ws / "workflows"
+    inside = wf_root / "demo" / "plan" / "workflow.json"
+    inside.parent.mkdir(parents=True)
+    inside.write_text('{"nodes": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="FlowX-owned workflow storage"):
+        build.resolve_artifacts({"graph": {"file": str(inside)}}, forbidden_root=wf_root)
+
+    outside = tmp_path / "draft_workflow.json"
+    outside.write_text('{"nodes": []}', encoding="utf-8")
+    assert build.resolve_artifacts({"graph": {"file": str(outside)}}, forbidden_root=wf_root) == {
+        "graph": '{"nodes": []}',
+    }
+
+
+def test_build_script_blocks_workspace_file_submission_and_reports_integrity_errors(tmp_path):
+    import flowx_sdk
+
+    with flowx_sdk.FlowXClient(workspace=tmp_path / "ws") as client:
+        responses = run(
+            client,
+            {"op": "create_workflow", "name": "echo"},
+            {"op": "begin_build", "workflow_id": "echo", "intent": "Echo"},
+        )
+        task_id = responses[1]["next_tasks"][0]["task_id"]
+        # Try submitting a file located inside <WS>/workflows/.
+        inside_file = client.builder.storage_dir / "echo" / "plan" / "brief.md"
+        inside_file.parent.mkdir(parents=True, exist_ok=True)
+        # Do not tamper with brief.md yet; test path rejection using an existing file inside workflows/.
+        agent_json = client.builder.storage_dir / "echo" / "agent.json"
+        blocked = run(
+            client,
+            {"op": "submit_task", "workflow_id": "echo", "task_id": task_id,
+             "artifacts": {"requirement": {"file": str(agent_json)}}},
+        )[0]
+        assert blocked["ok"] is False and "FlowX-owned workflow storage" in blocked["error"]
+
+        # Submit from an external temp file, then tamper with plan/requirement_analysis.md and verify error reporting.
+        req_file = tmp_path / "req.md"
+        req_file.write_text(REQUIREMENT, encoding="utf-8")
+        accepted = run(
+            client,
+            {"op": "submit_task", "workflow_id": "echo", "task_id": task_id,
+             "artifacts": {"requirement": {"file": str(req_file)}}},
+            {"op": "read_artifact", "workflow_id": "echo", "slot": "requirement"},
+            {"op": "verify_workflow", "workflow_id": "echo"},
+        )
+        assert accepted[0]["accepted"] is True
+        assert accepted[1]["ok"] is True and accepted[1]["read_only"] is True
+        assert accepted[2]["ok"] is True and accepted[2]["modified"] == []
+
+        client.builder.record("echo").requirement_path.write_text("# tampered\n", encoding="utf-8")
+        tampered = run(client, {"op": "abort_build", "workflow_id": "echo"}, {"op": "begin_build", "workflow_id": "echo"})[1]
+        assert tampered["ok"] is False and tampered["error_code"] == "workflow_files_modified_outside_flowx"
+        assert tampered["modified"]

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-23: record build mode, baseline_version, edit_impact, and revalidated node status.
 """Build journal and the state board an agent reads.
 
 Every change to a build goes through :meth:`BuildBoard.emit`: the event is appended to
@@ -18,7 +19,7 @@ from threading import RLock
 from typing import Any, Mapping
 
 STAGE_NAMES = ("requirement", "graph", "nodes", "entrypoint")
-DONE_NODE_STATUSES = frozenset({"published", "reused", "skipped"})
+DONE_NODE_STATUSES = frozenset({"published", "reused", "revalidated", "skipped"})
 
 
 class BuildJournal:
@@ -77,15 +78,19 @@ class BuildJournal:
 class BuildBoard:
     """The live state of one build revision, reduced from its events."""
 
-    def __init__(self, workflow_id: str, revision: int, journal: BuildJournal) -> None:
+    def __init__(self, workflow_id: str, revision: int, journal: BuildJournal, *,
+                 mode: str = "build", baseline_version: int = 0) -> None:
         self.workflow_id = workflow_id
         self.revision = revision
         self.journal = journal
         self._lock = RLock()
+        self.mode = mode
+        self.baseline_version = baseline_version
         self.status = "running"  # running | completed | failed | aborted
         self.phase = "starting"
         self.error = ""
         self.summary: dict[str, Any] = {}
+        self.edit_impact: dict[str, Any] | None = None
         self.stages: dict[str, dict[str, Any]] = {name: {"name": name, "status": "pending"} for name in STAGE_NAMES}
         self.nodes: dict[str, dict[str, Any]] = {}
         self.tasks: dict[str, dict[str, Any]] = {}
@@ -99,7 +104,17 @@ class BuildBoard:
 
     def apply(self, event: Mapping[str, Any]) -> None:
         kind = event["type"]
-        if kind == "stage":
+        if kind == "build_started":
+            if event.get("mode"):
+                self.mode = str(event["mode"])
+            if "baseline_version" in event:
+                self.baseline_version = int(event["baseline_version"] or 0)
+        elif kind == "edit_impact":
+            self.edit_impact = {
+                key: value for key, value in event.items()
+                if key not in ("seq", "ts", "workflow_id", "revision", "type")
+            }
+        elif kind == "stage":
             self.stages.setdefault(event["stage"], {"name": event["stage"]}).update(
                 status=event["status"], **({"detail": event["detail"]} if event.get("detail") else {}),
             )
@@ -132,9 +147,11 @@ class BuildBoard:
                     entry.update(done=done, total=total)
                 stages.append(entry)
             tasks = list(self.tasks.values())
-            return {
+            result: dict[str, Any] = {
                 "workflow_id": self.workflow_id,
                 "revision": self.revision,
+                "mode": self.mode,
+                "baseline_version": self.baseline_version,
                 "status": self.status,
                 "phase": self.phase,
                 "stages": stages,
@@ -145,6 +162,9 @@ class BuildBoard:
                 "next_action": self.next_action(tasks),
                 "last_event_seq": self.journal.last_seq,
             }
+            if self.edit_impact is not None:
+                result["edit_impact"] = dict(self.edit_impact)
+            return result
 
     def next_action(self, tasks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         tasks = list(self.tasks.values()) if tasks is None else tasks

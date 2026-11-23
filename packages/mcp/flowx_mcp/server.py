@@ -17,6 +17,7 @@
 # Modified 2026-11-11: accept an optional workflow folder name at allocation.
 # Modified 2026-11-22: replace the background LLM build jobs with the contract protocol of the workflow builder
 #   (begin_build/get_tasks/submit_task/...) and expose the service manager; keep native output off the stdio stream.
+# Modified 2026-11-23: add begin_evolve, read_workflow_artifact, and verify_workflow; forbid direct workflow file edits.
 """FastMCP server exposing the FlowX workflow builder and service manager to a coding agent."""
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import logging
 import os
 import sys
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 from .bootstrap import bootstrap_import_paths, load_env_from_runtime_context
 
@@ -59,28 +60,39 @@ INSTRUCTIONS = """\
 FlowX builds executable AG-UI workflows, but YOU write the code: FlowX hands you contracts, audits and tests what
 you submit, versions it, and renders and runs the service.
 
+Workflow files are owned by FlowX (READ-ONLY)
+- Never create, edit, delete, or overwrite files under `<workspace>/workflows/` directly (`plan/`, `nodes/`,
+  `workflows/`, `manifest.json`, `agent.json`, `build/`, `service/service_<id>/`).
+- To inspect file contents use `read_workflow_artifact` (read-only); `get_workflow` returns read-only locations.
+- All changes go through `begin_build` or `begin_evolve`, followed by inline-text `submit_task`.
+- Use `verify_workflow` to check digest integrity. If `workflow_files_modified_outside_flowx` is returned, stop and
+  report the modified files; never hand-edit them back.
+
 Build loop
 1. create_workflow -> workflow_id.
 2. begin_build(workflow_id, intent). The result has `next_tasks`: contract packets. A task has `contract`
    (instructions, rules, schema), `context` (requirement, graph, upstream node sources, current artifacts, last
    findings), `meta` and `submit.slots` (the artifact names you must return).
-3. For each task write the artifacts and call submit_task(workflow_id, task_id, artifacts). Stages in order:
+3. For each task submit inline text with submit_task(workflow_id, task_id, artifacts). Stages in order:
    requirement (Markdown) -> graph (workflow.json) -> one node task per business node (`code` + `test`).
    Independent nodes are open at the same time; answer them in any order, or in parallel.
 4. A rejected submission returns `findings` ({rule_id, message, line, remediation}) and a repair task with
    attempt+1. Fix exactly those findings; omitted slots keep their previous content. After max_attempts the node is
    marked failed and its descendants blocked.
-5. get_build_state shows stages, per-node status (blocked, ready, validating, repair_needed, published, reused,
-   failed) and `next_action` (submit_task, wait, run_service, escalate_to_user, begin_build). get_build_events is the
-   journal; pass the last `seq` as `since` to read only what is new. get_tasks re-reads open tasks after a lost
-   context.
+5. get_build_state shows mode, baseline_version, stages, per-node status (blocked, ready, validating, repair_needed,
+   published, reused, revalidated, failed) and `next_action` (submit_task, wait, run_service, escalate_to_user,
+   begin_build). get_build_events is the journal; pass the last `seq` as `since` to read only what is new. get_tasks
+   re-reads open tasks after a lost context.
 6. status=completed -> run_service, then run_step to drive it. status=failed -> read `errors` and the findings, then
    reopen_stage or ask the user. abort_build cancels an open build; published versions are kept.
 
-Changing a workflow: begin_build(workflow_id, intent=<the change>, target="workflow") redoes requirement and graph;
-target=<node name or node_id> rewrites one node (its descendants are rebuilt when their inputs changed). Unchanged
-nodes are reused, never rewritten. If a running service misbehaves, call get_evidence and pass it as
-`runtime_evidence` to begin_build with the faulty node as `target`.
+Evolving a built workflow
+- Edit one node without changing graph topology: begin_evolve(workflow_id, intent=<change>, scope="node",
+  node=<name or node_id>, cascade="revalidate"|"rewrite"). Topology is frozen; compatible children auto-revalidate
+  without a task, broken children re-open with findings and parent `source_diff`.
+- Edit graph topology / node specs: begin_evolve(workflow_id, intent=<change>, scope="graph",
+  update_requirement=False|True). Plan writes are staged until all nodes pass; aborting leaves `plan/` untouched.
+- If a running service misbehaves, call get_evidence and pass it as `runtime_evidence` to begin_evolve.
 Build state lives in this server process and in <workspace>/workflows/<id>/build/events.jsonl; after a restart call
 begin_build again: published nodes are reused.
 """
@@ -128,7 +140,28 @@ async def _call(tool: str, func: Callable[[], Any]) -> str:
         return _json({"ok": True, **payload} if isinstance(payload, dict) else {"ok": True, "result": payload})
     except Exception as exc:
         logger.exception("%s failed", tool)
-        return _error(tool, str(exc), error_type=type(exc).__name__)
+        extra: dict[str, Any] = {"error_type": type(exc).__name__}
+        if hasattr(exc, "modified") and hasattr(exc, "remedy"):
+            extra.update(
+                error_code="workflow_files_modified_outside_flowx",
+                modified=getattr(exc, "modified"),
+                remedy=getattr(exc, "remedy"),
+            )
+        return _error(tool, str(exc), **extra)
+
+
+def _validate_mcp_artifacts(artifacts: Any) -> dict[str, Any]:
+    """MCP submit_task accepts inline text (or a JSON object for `graph`), never file paths."""
+    if not isinstance(artifacts, dict):
+        raise ValueError("artifacts must be an object mapping slot names to inline text")
+    for slot, value in artifacts.items():
+        if isinstance(value, dict) and set(value) == {"file"}:
+            raise ValueError(
+                f"MCP submit_task does not accept file paths for {slot!r}; pass the artifact text inline"
+            )
+        if slot != "graph" and not isinstance(value, str):
+            raise ValueError(f"MCP submit_task slot {slot!r} must be inline text (string)")
+    return artifacts
 
 
 def create_server() -> Any:
@@ -167,7 +200,7 @@ def create_server() -> Any:
 
         intent: what to build (new workflow) or the change to make (existing one).
         target: omit to build whatever is missing or stale; "workflow" to redo requirement and graph;
-            or a node name / node_id to rewrite that node.
+            or a node name / node_id to rewrite that node. Prefer `begin_evolve` for editing built workflows.
         stages: explicit subset of requirement, graph, nodes, entrypoint (advanced).
         runtime_evidence: observations from a running service (see get_evidence) for a targeted rewrite.
         smoke_test: start the rendered service once and audit its log before accepting the entrypoint.
@@ -178,6 +211,33 @@ def create_server() -> Any:
             "fastapi_port": fastapi_port, "fastapi_host": fastapi_host, "smoke_test": smoke_test,
         }
         return await _call("begin_build", lambda: _get_client().begin_build(workflow_id, intent, **options))
+
+    @flowx_mcp.tool()
+    async def begin_evolve(
+        workflow_id: str,
+        intent: str = "",
+        scope: Literal["graph", "node"] = "node",
+        node: Optional[str] = None,
+        update_requirement: bool = False,
+        cascade: Literal["revalidate", "rewrite"] = "revalidate",
+        runtime_evidence: Any = None,
+        fastapi_port: Optional[int] = None,
+        fastapi_host: Optional[str] = None,
+        smoke_test: bool = False,
+    ) -> str:
+        """Open an edit revision on a built workflow; never edit workflow files directly.
+
+        scope="node" edits `node` with graph topology frozen (body engine only); compatible children
+            auto-revalidate when `cascade="revalidate"`, or re-open with findings and parent diff on failure.
+        scope="graph" edits `workflow.json` (and optionally requirement when `update_requirement=True`)
+            with plan writes staged until all nodes pass.
+        """
+        options: dict[str, Any] = {
+            "scope": scope, "node": node or None, "update_requirement": update_requirement,
+            "cascade": cascade, "runtime_evidence": runtime_evidence,
+            "fastapi_port": fastapi_port, "fastapi_host": fastapi_host, "smoke_test": smoke_test,
+        }
+        return await _call("begin_evolve", lambda: _get_client().begin_evolve(workflow_id, intent, **options))
 
     @flowx_mcp.tool()
     async def get_build_state(workflow_id: str) -> str:
@@ -191,12 +251,16 @@ def create_server() -> Any:
 
     @flowx_mcp.tool()
     async def submit_task(workflow_id: str, task_id: str, artifacts: dict[str, Any]) -> str:
-        """Submit the artifacts of one task: {requirement}, {graph} or {code, test, markdown?}.
+        """Submit inline text artifacts for one task: {requirement}, {graph} or {code, test, markdown?}.
 
+        File path wrappers are rejected; always pass inline text (or a JSON object for `graph`).
         Returns `accepted`, `findings` (with remediation), the node `test` result, what was `published`,
         the new `next_tasks` and the build `state`. Blocks while the node's test runs.
         """
-        return await _call("submit_task", lambda: _get_client().submit_task(workflow_id, task_id, artifacts))
+        return await _call(
+            "submit_task",
+            lambda: _get_client().submit_task(workflow_id, task_id, _validate_mcp_artifacts(artifacts)),
+        )
 
     @flowx_mcp.tool()
     async def get_build_events(workflow_id: str, since: int = 0, limit: int = 200) -> str:
@@ -229,8 +293,30 @@ def create_server() -> Any:
 
     @flowx_mcp.tool()
     async def get_workflow(workflow_id: str) -> str:
-        """Locations of a workflow's requirement, workflow.json, node versions and main entrypoint."""
+        """Read-only locations of a workflow's requirement, workflow.json, node versions and main entrypoint.
+        Never write to these paths directly; use `read_workflow_artifact` to inspect and `begin_build`/`begin_evolve` to change."""
         return await _call("get_workflow", lambda: {"workflow": _get_client().artifacts(workflow_id)})
+
+    @flowx_mcp.tool()
+    async def read_workflow_artifact(
+        workflow_id: str,
+        slot: Literal["requirement", "graph", "brief", "source", "test", "markdown", "log"],
+        node: Optional[str] = None,
+        version: Optional[int] = None,
+    ) -> str:
+        """Read a FlowX-owned workflow artifact as verified read-only text. Edit only via begin_build/begin_evolve."""
+        return await _call(
+            "read_workflow_artifact",
+            lambda: _get_client().read_artifact(workflow_id, slot, node=node or None, version=version),
+        )
+
+    @flowx_mcp.tool()
+    async def verify_workflow(workflow_id: str, include_service: bool = True) -> str:
+        """Check that FlowX-owned files still match their recorded SHA-256 digests. Never repair mismatches by hand."""
+        return await _call(
+            "verify_workflow",
+            lambda: _get_client().verify_workflow(workflow_id, include_service=include_service),
+        )
 
     # -- service manager --------------------------------------------------------------------
     @flowx_mcp.tool()
