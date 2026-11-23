@@ -1,8 +1,0 @@
-{
-  "pool_size": 1,
-  "nodes": [
-    {"name": "generate_node_test"},
-    {"name": "run_node_test", "depends": ["generate_node_test"]},
-    {"name": "amend_node", "depends": ["run_node_test"]}
-  ]
-}

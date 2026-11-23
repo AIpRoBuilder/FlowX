@@ -1,88 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Evolve an existing FlowX workflow: the whole workflow, one node, or let the engine decide.
+# Modified 2026-11-22: evolve with begin_build(target=...) and agent-written artifacts; no LLM key is needed.
+"""Evolve an existing FlowX workflow: the whole workflow or one node.
 
 Setup (from the repository root):
 
     pip install -e .
-    export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-flash FLOWX_LLM_API_KEY=<your key>
     python examples/sdk_evolve.py
 
-``evolve(workflow_id, command, target=...)`` takes the change to make as ``command``:
+``begin_build(workflow_id, intent, target=...)`` takes the change to make as ``intent``:
 
-* ``target="workflow"``: change the workflow itself (graph and requirement); nodes and the
-  main entrypoint that depend on the change are rebuilt too.
-* ``target=<step id or node id>`` (see ``list_nodes``): change only that node; the main
-  entrypoint is regenerated because its nodes changed.
-* no ``target``: the engine's judge reads the command and decides what it refers to.
+* ``target="workflow"``: redo the requirement and graph; nodes whose inputs changed are asked again.
+* ``target=<step id or node id>`` (see ``list_nodes``): rewrite only that node. Its descendants are asked again
+  because their upstream code changed; every other node is reused, never rewritten.
+* no ``target``: build whatever is missing or stale.
+
+The task's ``context.current`` holds the published files, so the agent edits instead of starting over.
 """
 
 from __future__ import annotations
 
-import sys
-
-from flowx_sdk import WORKFLOW_TARGET, FlowXClient
-
-REQUIREMENT = (
-    "Build a workflow that accepts a support ticket, classifies its category, assigns a priority, "
-    "and drafts a reply. Return the category, priority and draft reply as structured output."
-)
-
-# This example automates the whole run, so it never pauses for repair guidance:
-# a failing node test amends from its own log instead.
-AUTO = {"await_repair_input": False}
-
-
-def show(label: str, result) -> None:
-    print(label, {name: stage.status for name, stage in result.stages.items()})
+from _demo_agent import INTENT, solve
+from flowx_sdk import FlowXClient
 
 
 def main() -> None:
     with FlowXClient() as flowx:
-        if not flowx.api_key:
-            sys.exit("Set FLOWX_LLM_API_KEY (or pass api_key=...) before running this example.")
+        workflow_id = flowx.create_workflow()
+        flowx.build(workflow_id, INTENT, solve)
+        print("v1:", [(node["step_id"], node["version"]) for node in flowx.list_nodes(workflow_id)])
 
-        # Build a complete workflow first: graph, nodes and main entrypoint in one request.
-        built = flowx.build_workflow(REQUIREMENT, **AUTO).raise_for_failure()
-        workflow_id = built.workflow_id
+        # Rewrite Greeter. FlowX asks for it (reason "targeted"), then for Shouter ("upstream_changed").
+        opened = flowx.begin_build(workflow_id, "Greet with 'hey' instead of 'hello'.", target="Greeter")
+        task = opened["next_tasks"][0]
+        print(f"asked: {task['step_id']} ({task['reason']}), current code has {len(task['context']['current']['code'])} chars")
 
-        # List the nodes: each has a step id (its name in workflow.json) and a stable node id.
-        nodes = flowx.list_nodes(workflow_id)
-        for node in nodes:
-            print(f"{node['step_id']}: node_id={node['node_id']} version={node['version']}")
+        louder = lambda current: solve(current, greeting="hey")  # noqa: E731
+        state = flowx.get_build_state(workflow_id)
+        while state["status"] == "running":
+            task = flowx.get_tasks(workflow_id)[0]
+            print(f"  answering {task['step_id']} ({task['reason']})")
+            flowx.submit_task(workflow_id, task["task_id"], louder(task))
+            state = flowx.get_build_state(workflow_id)
 
-        # 1. Evolve the whole workflow: add or reshape nodes, change what the workflow does.
-        evolved = flowx.evolve(
-            workflow_id, "Add a step that detects the ticket language before classifying it.",
-            target=WORKFLOW_TARGET, **AUTO,
-        ).raise_for_failure()
-        show("workflow:", evolved)
-
-        # 2. Evolve one node, named by step id ...
-        nodes = flowx.list_nodes(workflow_id)  # the workflow changed, so list again
-        first = nodes[0]
-        node_evolved = flowx.evolve(
-            workflow_id, "Validate the input and raise a clear error when it is empty.",
-            target=first["step_id"], **AUTO,
-        ).raise_for_failure()
-        show(f"node {first['step_id']}:", node_evolved)
-
-        # ... or by node id.
-        last = nodes[-1]
-        flowx.evolve(
-            workflow_id, "Keep the draft reply under 100 words.", target=last["node_id"], **AUTO,
-        ).raise_for_failure()
-
-        # 3. No target: the engine judges whether the command changes the workflow, a node or both.
-        judged = flowx.evolve(workflow_id, "Also return a one-line summary of the ticket.", **AUTO)
-        judged.raise_for_failure()
-        print("judged intent:", judged.intent.to_dict() if judged.intent else None)
-
-        # Evolve options are the same as for build_workflow, e.g. skip rebuilding later stages.
-        flowx.evolve(
-            workflow_id, "Tone down the reply.", target=last["step_id"], cascade=False, **AUTO,
-        ).raise_for_failure()
+        print(f"build {state['status']}: workflow version {state['summary']['workflow_version']}")
+        print("v2:", [(node["step_id"], node["version"]) for node in flowx.list_nodes(workflow_id)])
 
 
 if __name__ == "__main__":
     main()
-    

@@ -7,7 +7,7 @@ from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
 
 
 def _main_source() -> str:
-    template = Path(__file__).resolve().parents[1] / "flowx_core/worker/templates/pydaograph_main.py.tmpl"
+    template = Path(__file__).resolve().parents[1] / "flowx_core/builder/templates/pydaograph_main.py.tmpl"
     source = template.read_text(encoding="utf-8")
     replacements = {
         "__NODES_PACKAGE_NAME__": "example_nodes",

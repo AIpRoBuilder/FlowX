@@ -1,16 +1,17 @@
 flowchart LR
-    A[Raw requirement] --> B[requirement_analysis.md]
+    A[Intent] --> B[requirement_analysis.md]
     B --> C[workflow.json]
-    C --> D[node_docs/*.md]
-    D --> E[nodes/*.py]
-    E --> F[main.py]
+    C --> E[nodes/*.py + tests]
+    E --> F[main.py rendered from published nodes]
 
+    B --> R[Requirement check]
     C --> G[Graph audit]
-    E --> H[Node audit]
+    E --> H[Node audit + pytest]
     F --> I[Entrypoint audit]
-    F --> J[Runtime log audit]
+    F --> J[Optional smoke run]
 
-    G -->|feedback| C
-    H -->|feedback| E
-    I -->|feedback| F
-    J -->|feedback| E
+    R -->|findings| B
+    G -->|findings| C
+    H -->|findings| E
+    I -->|fix node set| E
+    J -->|findings| E

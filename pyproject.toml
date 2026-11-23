@@ -1,3 +1,5 @@
+# Modified 2026-11-22: drop the openai dependency; FlowX no longer calls an LLM and the host coding agent writes
+# the workflow artifacts.
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -5,16 +7,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flowx"
 version = "0.2.0"
-description = "Generative Workflow layer for AI Agents with MCP, SDK, and A2A interfaces"
+description = "Agent-driven workflow builder and service manager with MCP, SDK, and A2A interfaces"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
-keywords = ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "agent-workflow", "workflow-generation", "a2a", "llm", "fastapi"]
+keywords = ["mcp", "mcp-server", "model-context-protocol", "ai-agents", "agent-workflow", "workflow-generation", "a2a", "fastapi"]
 dependencies = [
     "ag-ui-workflow @ git+https://github.com/AIpRoBuilder/ag_ui_worflow.git",
     "fastapi>=0.110",
     "mcp>=1.2.0",
-    "openai>=1.0",
     "python-dotenv",
     "uvicorn>=0.30",
 ]

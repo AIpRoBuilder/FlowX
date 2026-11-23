@@ -66,7 +66,7 @@ def harness(monkeypatch, tmp_path):
             state.lifecycle.append("enter")
             return self
 
-        def run_service(self, workflow_id):
+        def run_service(self, workflow_id, **_options):
             state.lifecycle.append("start")
             state.workflow = workflow_id
             print("SDK startup output")
@@ -294,7 +294,7 @@ def test_check_service_setup_rejects_an_occupied_port(monkeypatch):
         listener.bind(("127.0.0.1", 0))
         listener.listen()
         record = SimpleNamespace(fastapi_host="127.0.0.1", fastapi_port=listener.getsockname()[1])
-        client = SimpleNamespace(builder=SimpleNamespace(engine=SimpleNamespace(record=lambda _: record)))
+        client = SimpleNamespace(builder=SimpleNamespace(record=lambda _: record))
         with pytest.raises(runtime.ServiceConfigurationError, match="unavailable"):
             runtime._check_service_setup(client, "wf1")
 
@@ -429,10 +429,10 @@ class FlowXClient:
         assert workspace == "workspace"
         urllib.request.urlopen = urlopen
         record = SimpleNamespace(fastapi_host="127.0.0.1", fastapi_port=0, process=None)
-        self.builder = SimpleNamespace(engine=SimpleNamespace(record=lambda workflow_id: record))
+        self.builder = SimpleNamespace(record=lambda workflow_id: record)
     def __enter__(self):
         return self
-    def run_service(self, workflow_id):
+    def run_service(self, workflow_id, **_options):
         assert workflow_id == "wf1"
         print("SDK startup log")
         return {"base_url": "http://127.0.0.1:8123"}

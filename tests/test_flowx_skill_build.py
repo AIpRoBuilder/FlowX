@@ -5,17 +5,18 @@
 # Added 2026-11-05: offline coverage for the SDK-backed workflow skill scripts.
 # Modified 2026-11-06: cover node-pause answer help.
 # Modified 2026-11-11: cover named workflow allocation and existing IDs.
+# Modified 2026-11-22: cover the JSON-lines contract protocol.
 from __future__ import annotations
 
 import importlib.util
 import io
 import json
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 
+from flowx_sdk import FlowXClient
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "flowx-workflows" / "scripts"
 
@@ -31,143 +32,133 @@ def load(name):
 build = load("build")
 inspect_workflow = load("inspect_workflow")
 
+REQUIREMENT = """## Background
+Echo.
 
-def result(*, status="completed", ok=True, request_id="", awaiting=None):
-    from flowx_core.agent_workflow_engine import AgentResult
-    return AgentResult(workflow_id="wf1", ok=ok, intent=None, stages={}, errors={} if ok else {"nodes": "failed"},
-                       logs={}, artifacts={}, status=status, request_id=request_id, awaiting=awaiting)
+## Goals
+Echo.
+
+## Scope
+One node.
+
+## Functional Details
+| node id | meta_node_kind | ext_data.type | purpose | depends |
+| --- | --- | --- | --- | --- |
+| Echo | WorkflowStepNode | none | Echo | - |
+"""
 
 
-def events(capsys):
-    return [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+def run(client, *commands):
+    output = io.StringIO()
+    lines = [command if isinstance(command, str) else json.dumps(command) for command in commands]
+    assert build.serve(client, iter(lines), output) == 0
+    return [json.loads(line) for line in output.getvalue().splitlines()]
 
 
-@pytest.mark.parametrize("arguments", [["--help"], ["nodes", "--help"]])
-def test_help_explains_node_pause_answers(arguments, capsys):
+def test_help_describes_the_contract_protocol(capsys):
     with pytest.raises(SystemExit) as exc:
-        build.make_parser().parse_args(arguments)
+        build.make_parser().parse_args(["--help"])
+
     assert exc.value.code == 0
     output = capsys.readouterr().out
-    assert '"action":"answer"' in output
-    assert '"action":"abort"' in output
-    assert "awaiting.test_log" in output
-    assert "Audit violations are repaired automatically" in output
+    for text in ("begin_build", "submit_task", "next_tasks", '{"file": "path"}', "findings", "repair task"):
+        assert text in output
 
 
-@pytest.mark.parametrize("arguments,method,expected", [
-    (["new", "--name", "Ticket Triage", "--prompt", "hi", "--host", "127.0.0.1", "--port", "8123"], "build_new_workflow", ("wf1", "hi")),
-    (["graph", "--name", "Ticket Triage", "--prompt", "hi"], "build_allocated_workflow_json", ("wf1", "hi")),
-    (["new", "--workflow-id", "wf1", "--prompt", "hi"], "build_new_workflow", ("wf1", "hi")),
-    (["graph", "--workflow-id", "wf1", "--prompt", "hi"], "build_allocated_workflow_json", ("wf1", "hi")),
-    (["nodes", "--workflow-id", "wf1", "--amend", "s1", "fix", "--amend", "s2", "change"], "build_nodes", ("wf1", {"s1": "fix", "s2": "change"})),
-    (["main", "--workflow-id", "wf1"], "build_main_entrypoint", ("wf1",)),
-    (["evolve", "--workflow-id", "wf1", "--target", "s1", "--prompt", "change"], "evolve", ("wf1", "change")),
-    (["repair", "--workflow-id", "wf1", "--fix-errors"], "build_workflow", ("",)),
-])
-def test_dispatch(arguments, method, expected, capsys):
+def test_commands_dispatch_to_the_client():
     client = Mock()
     client.create_workflow.return_value = "wf1"
-    client.builder.engine.record.return_value = SimpleNamespace(fastapi_host="127.0.0.1", fastapi_port=9000)
-    args = build.make_parser().parse_args(arguments)
-    build.run_operation(client, args)
-    if "--name" in arguments:
-        client.create_workflow.assert_called_once_with(name="Ticket Triage")
-    else:
-        client.create_workflow.assert_not_called()
-    call = getattr(client, method).call_args
-    assert call.args == expected
-    assert call.kwargs["await_repair_input"] is True
-    assert call.kwargs["max_retries"] == 1
-    if method in {"evolve", "build_workflow"}:
-        assert call.kwargs["fastapi_host"] == "127.0.0.1" and call.kwargs["fastapi_port"] == 9000
-    if method == "build_nodes":
-        assert call.kwargs["cascade"] is False
-    if method == "evolve":
-        assert call.kwargs["target"] == "s1"
-    if method == "build_workflow":
-        assert call.kwargs["fix_errors"] is True and call.kwargs["workflow_id"] == "wf1"
-    assert events(capsys)[-1]["event"] == "started"
+    client.get_tasks.return_value = [{"task_id": "t"}]
+    client.begin_build.return_value = {"status": "running", "next_tasks": []}
+
+    responses = run(
+        client,
+        {"op": "create_workflow", "name": "wf1", "brief": "b"},
+        {"op": "begin_build", "workflow_id": "wf1", "intent": "do it", "target": "workflow", "stages": None},
+        {"op": "get_tasks", "workflow_id": "wf1", "compact": True},
+        {"op": "abort_build", "workflow_id": "wf1", "reason": "stop"},
+        {"op": "stop"},
+        {"op": "get_tasks", "workflow_id": "never"},
+    )
+
+    assert responses[0] == {"ok": True, "op": "create_workflow", "workflow_id": "wf1"}
+    assert responses[1]["status"] == "running"
+    client.create_workflow.assert_called_once_with("wf1", "b")
+    client.begin_build.assert_called_once_with("wf1", "do it", target="workflow")
+    assert responses[2]["tasks"] == [{"task_id": "t"}]
+    client.get_tasks.assert_called_once_with("wf1", compact=True)
+    client.abort_build.assert_called_once_with(workflow_id="wf1", reason="stop")
+    assert len(responses) == 4  # nothing runs after stop
 
 
-@pytest.mark.parametrize("arguments", [
-    ["allocate"], ["new", "--prompt", "hi"], ["graph", "--prompt", "hi"],
-    ["new", "--name", "Name", "--workflow-id", "wf1", "--prompt", "hi"],
-    ["graph", "--name", "Name", "--workflow-id", "wf1", "--prompt", "hi"],
+@pytest.mark.parametrize("line, fragment", [
+    ("not json", "Expecting value"),
+    ("[1]", "expected a JSON object"),
+    ('{"op": "nope"}', "unknown op"),
+    ('{"op": "get_build_state"}', "workflow_id"),
 ])
-def test_creation_requires_one_explicit_target(arguments):
-    with pytest.raises(SystemExit):
-        build.make_parser().parse_args(arguments)
+def test_bad_commands_get_an_error_line_and_do_not_end_the_session(line, fragment):
+    responses = run(create_autospec(FlowXClient, instance=True), line, {"op": "list_workflows"})
+
+    assert responses[0]["ok"] is False and fragment in responses[0]["error"]
+    assert responses[1]["ok"] is True
 
 
-def test_files_options_and_no_cascade(tmp_path, capsys):
-    prompt = tmp_path / "requirement.txt"
-    prompt.write_text("long requirement", encoding="utf-8")
-    log = tmp_path / "run.log"
-    log.write_text("trace", encoding="utf-8")
-    client = Mock()
-    args = build.make_parser().parse_args([
-        "repair", "--workflow-id", "wf1", "--prompt-file", str(prompt), "--log-file", str(log),
-        "--auto-repair", "--no-cascade", "--max-retries", "3",
-    ])
-    build.run_operation(client, args)
-    client.build_workflow.assert_called_once_with("long requirement", workflow_id="wf1", logs=["trace"],
-                                                   fix_errors=False, cascade=False, temperature=0.35,
-                                                   max_retries=3, await_repair_input=False,
-                                                   node_options={"temperature": 0.35, "python_command": build.sys.executable})
-    assert events(capsys)[0]["workflow_id"] == "wf1"
+def test_file_artifacts_are_read_as_text(tmp_path):
+    code = tmp_path / "Echo.py"
+    code.write_text("print('é')\n", encoding="utf-8")
+
+    assert build.resolve_artifacts({"code": {"file": str(code)}, "markdown": "inline"}) == {
+        "code": "print('é')\n", "markdown": "inline",
+    }
+    with pytest.raises(ValueError, match="missing"):
+        build.resolve_artifacts({"code": {"file": str(tmp_path / "absent.py")}})
+    with pytest.raises(ValueError, match="mapping"):
+        build.resolve_artifacts("code")
 
 
-def test_guided_repair_handles_invalid_answer_and_multiple_pauses(monkeypatch, capsys):
-    pending1 = result(status="input_required", request_id="r1", awaiting={"stepId": "s1", "test_log": "failure"})
-    pending2 = result(status="input_required", request_id="r1", awaiting={"stepId": "s2"})
-    client = Mock()
-    client.answer.side_effect = [pending2, result()]
-    monkeypatch.setattr(build.sys, "stdin", io.StringIO(
-        'invalid\n{"action":"answer","step_id":"wrong"}\n'
-        '{"action":"answer","input":"test: fix fixture"}\n{"action":"answer","input":""}\n'))
-    assert build.finish(client, pending1) == 0
-    assert [call.args for call in client.answer.call_args_list] == [("r1", "test: fix fixture", "s1"), ("r1", "", "s2")]
-    output = events(capsys)
-    assert [item["event"] for item in output] == ["input_required", "error", "error", "input_required", "result"]
-    assert output[-1]["result"]["ok"] is True
+def test_a_real_client_round_trip(tmp_path):
+    import flowx_sdk
 
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text(REQUIREMENT, encoding="utf-8")
+    with flowx_sdk.FlowXClient(workspace=tmp_path / "ws") as client:
+        responses = run(
+            client,
+            {"op": "create_workflow", "name": "echo"},
+            {"op": "begin_build", "workflow_id": "echo", "intent": "Echo"},
+            {"op": "submit_task", "workflow_id": "echo", "task_id": "requirement:requirement:r1:a1",
+             "artifacts": {"requirement": {"file": str(requirement)}}},
+            {"op": "get_build_state", "workflow_id": "echo"},
+        )
 
-@pytest.mark.parametrize("answer", ['', '{"action":"abort"}\n'])
-def test_abort_and_eof_release_pending(monkeypatch, capsys, answer):
-    client = Mock()
-    monkeypatch.setattr(build.sys, "stdin", io.StringIO(answer))
-    assert build.finish(client, result(status="input_required", request_id="r1", awaiting={"stepId": "s"})) == 1
-    client.abort.assert_called_once_with("r1")
-    assert events(capsys)[-1]["event"] == "aborted"
-
-
-def test_failed_build_is_not_success(capsys):
-    assert build.finish(Mock(), result(ok=False)) == 1
-    assert events(capsys)[0]["result"]["errors"] == {"nodes": "failed"}
-
-
-def test_abort_failure_is_not_treated_as_invalid_answer(monkeypatch, capsys):
-    client = Mock()
-    client.abort.side_effect = ValueError("cleanup failed")
-    monkeypatch.setattr(build.sys, "stdin", io.StringIO('{"action":"abort"}\n'))
-    with pytest.raises(ValueError, match="cleanup failed"):
-        build.finish(client, result(status="input_required", request_id="r1", awaiting={"stepId": "s"}))
-    assert [event["event"] for event in events(capsys)] == ["input_required"]
+    assert responses[1]["next_tasks"][0]["task_id"] == "requirement:requirement:r1:a1"
+    assert responses[2]["accepted"] is True and responses[2]["next_tasks"][0]["stage"] == "graph"
+    assert responses[3]["next_action"]["kind"] == "submit_task"
 
 
 def test_main_keeps_sdk_output_off_json_stdout(monkeypatch, capsys):
     class Client:
+        workspace = Path("/tmp/ws")
+
         def __init__(self, *, workspace):
             print("constructor output")
-        def create_workflow(self, name):
+
+        def create_workflow(self, name, brief):
             print("SDK output")
             return name
+
         def close(self):
             print("close output")
+
     monkeypatch.setattr(build, "FlowXClient", Client)
-    assert build.main(["allocate", "--name", "Ticket Triage"]) == 0
+    monkeypatch.setattr(build.sys, "stdin", io.StringIO('{"op": "create_workflow", "name": "wf"}\n{"op": "stop"}\n'))
+
+    assert build.main([]) == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"event": "allocated", "workflow_id": "Ticket Triage"}
+    lines = [json.loads(line) for line in captured.out.splitlines()]
+    assert lines[0] == {"event": "ready", "workspace": "/tmp/ws"}
+    assert lines[1] == {"ok": True, "op": "create_workflow", "workflow_id": "wf"}
     assert "SDK output" in captured.err and "close output" in captured.err
 
 
@@ -177,7 +168,8 @@ def test_inspection_dispatch_and_close(monkeypatch, capsys):
     client.__exit__ = Mock(return_value=False)
     client.list_nodes.return_value = [{"step_id": "s1"}]
     monkeypatch.setattr(inspect_workflow, "FlowXClient", lambda **kwargs: client)
+
     assert inspect_workflow.main(["--workspace", "/tmp/work", "nodes", "--workflow-id", "wf1"]) == 0
+
     client.list_nodes.assert_called_once_with("wf1")
     client.__exit__.assert_called_once()
-    assert events(capsys)[0]["data"] == [{"step_id": "s1"}]

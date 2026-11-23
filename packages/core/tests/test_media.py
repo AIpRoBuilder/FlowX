@@ -28,7 +28,7 @@ from flowx_core.tools.file_tools import (
     compile_node_file_and_get_derived_keys,
     compile_node_file_and_get_step_output_card_schema,
 )
-from flowx_core.worker.main_writer import PromptMainFileCoder
+from flowx_core.builder.entrypoint import EntrypointWriter
 
 
 def test_media_space_dry_run_image_resize_crop_video_and_blender(tmp_path: Path) -> None:
@@ -371,10 +371,10 @@ class MakeTrailer(WorkflowStepNode):
         encoding="utf-8",
     )
 
-    main_path = PromptMainFileCoder().write_main_entrypoint(
-        project_root_path=str(service_pkg),
-        graph_plan_json_path=str(graph_path),
-        output_path=str(service_pkg / "main.py"),
+    main_path = EntrypointWriter().write(
+        project_root=service_pkg,
+        graph_json=graph_path,
+        output=service_pkg / "main.py",
     )
     assert MainEntryPointAuditor().audit_file(str(main_path), nodes_root=str(service_pkg)) == (True, [])
 

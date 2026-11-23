@@ -1,25 +1,23 @@
 from ag_ui_workflow import WorkflowStepNode
 
-from flowx_core.architect.graph_planner import GraphPlanner
-from flowx_core.architect.node_planner import NodePlanElement
 from flowx_core.auditor.graph_json_auditor import GraphJsonAuditor
 from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
 from flowx_core.auditor.node_auditor import NodeAuditor
 from flowx_core.auditor.output_auditor import OutputAuditor
-from flowx_core.demand_analyzer.requirement_disector import RequirementDisector
-from flowx_core.worker.main_writer import PromptMainFileCoder
+from flowx_core.builder.gates import CompileEntrypoint, GraphGate, NodesExit, RequirementGate, node_gate_class
 
 
-def test_planners_writers_and_auditors_subclass_workflow_step_node() -> None:
+def test_auditors_and_build_steps_subclass_workflow_step_node() -> None:
     instances = [
-        GraphPlanner(client=object()),
-        NodePlanElement(client=object()),
-        RequirementDisector(client=object()),
-        PromptMainFileCoder(),
         GraphJsonAuditor(),
         MainEntryPointAuditor(),
         NodeAuditor(),
         OutputAuditor(),
+        RequirementGate(),
+        GraphGate(),
+        node_gate_class("Example", [])(),
+        NodesExit(),
+        CompileEntrypoint(),
     ]
 
     for instance in instances:
