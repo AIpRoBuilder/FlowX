@@ -10,6 +10,7 @@
 // Modified 2026-11-10: save the API key in settings and locate the skill automatically.
 // Modified 2026-11-16: save owner-configured environment variables for FlowX skill processes.
 // Modified 2026-11-17: remove global environment settings and expose each workflow's .env content.
+// Modified 2026-11-23: FlowX calls no LLM, so the plugin saves no API key and passes none to children.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -58,12 +59,12 @@ except Exception as exc:
     sys.exit(1)
 `;
 const SETTINGS_KEYS = ['python', 'workspace'];
-const SAVE_KEYS = ['python', 'workspace', 'apiKey'];
+const SAVE_KEYS = ['python', 'workspace'];
 const ENV_FILE_LIMIT = 64 * 1024;
 const SETTINGS_LIMIT = 16384;
-const PROVIDER_CREDENTIALS = new Set(['FLOWX_LLM_API_KEY', 'OPENAI_API_KEY', 'ZHIPU_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'ONEONEONEAPI_API_KEY']);
+const PROVIDER_CREDENTIALS = new Set(['OPENAI_API_KEY', 'ZHIPU_API_KEY', 'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'ONEONEONEAPI_API_KEY']);
 const CREDENTIAL_PATHS = new Set(['GOOGLE_APPLICATION_CREDENTIALS', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR']);
-const PROVIDER_URLS = new Set(['FLOWX_LLM_BASE_URL', 'OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
+const PROVIDER_URLS = new Set(['OPENAI_BASE_URL', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']);
 const SECRET_ENV = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PRIVATE|COOKIE|JWT|(?:^|_)PAT(?:_|$))/i;
 const SECRET_FIELD = /(?:api[_-]?key|access[_-]?key|token|secret|password|passwd|credential|authorization|private[_-]?key)/i;
 const SECRET_PATH = /(?:api[_-]?key|access[_-]?key|token|secret|password|passwd|credential|authorization|private[_-]?key|(?:^|[._-])id[_-](?:rsa|dsa|ecdsa|ed25519)(?:[._-]|$)|\.(?:key|pem|p12|pfx)$)/i;
@@ -117,9 +118,8 @@ function safeError(error) {
  * Folder reads are limited to 1 MiB, and JSON is structurally sanitized.
  * Manifest error details and absolute entrypoint paths are withheld. Redaction
  * is best-effort, and other workflow contents may still contain sensitive data.
- * getSettings takes null; saveSettings takes {python,workspace,apiKey} (empty
- * apiKey keeps the saved one) and both return {python,workspace,apiKeySet}
- * (unset environment fallbacks are null); the key is never returned.
+ * getSettings takes null; saveSettings takes {python,workspace}, and both return
+ * {python,workspace} (unset environment fallbacks are null).
  * getWorkflowEnvironment takes {workflowId}; saveWorkflowEnvironment takes
  * {workflowId,content} and writes that workflow's service_<id>/.env file,
  * which the generated main entrypoint loads when its service starts. Both
@@ -170,7 +170,7 @@ export class FlowXHostService {
         case 'getSettings': if (payload !== null) throw invalid(); value = await this.getSettings(); break;
         case 'saveSettings':
           if (!exact(payload, SAVE_KEYS) || !SAVE_KEYS.every(key => text(payload[key], 4096))) throw invalid();
-          value = await this.saveSettings({ python: payload.python, workspace: payload.workspace, apiKey: payload.apiKey }); break;
+          value = await this.saveSettings({ python: payload.python, workspace: payload.workspace }); break;
         case 'getWorkflowEnvironment':
           if (!exact(payload, ['workflowId']) || !workflowId(payload.workflowId)) throw invalid();
           value = await this.getWorkflowEnvironment(payload.workflowId); break;
@@ -220,15 +220,11 @@ export class FlowXHostService {
   }
 
   fallbackSettings() {
-    return { python: this.env.FLOWX_PYTHON ?? null, workspace: this.env.FLOWX_WORKSPACE ?? null, apiKeySet: Boolean(this.env.FLOWX_LLM_API_KEY) };
+    return { python: this.env.FLOWX_PYTHON ?? null, workspace: this.env.FLOWX_WORKSPACE ?? null };
   }
 
   settingsView(settings) {
-    return {
-      python: settings.python,
-      workspace: settings.workspace,
-      apiKeySet: Boolean(settings.apiKey) || Boolean(this.env.FLOWX_LLM_API_KEY),
-    };
+    return { python: settings.python, workspace: settings.workspace };
   }
 
   buildSecretPattern() {
@@ -287,10 +283,9 @@ export class FlowXHostService {
   }
 
   validSettings(settings) {
-    return object(settings) && Object.keys(settings).every(key => key === 'apiKey' || SETTINGS_KEYS.includes(key)) &&
+    return object(settings) && Object.keys(settings).every(key => SETTINGS_KEYS.includes(key)) &&
       SETTINGS_KEYS.every(key =>
         text(settings[key], 4096) && path.isAbsolute(settings[key]) && !/[\x00-\x1f\x7f]/.test(settings[key]) && this.redact(settings[key]) === settings[key]) &&
-      (settings.apiKey === undefined || (text(settings.apiKey, 4096) && settings.apiKey.length > 0 && !/[\x00-\x1f\x7f]/.test(settings.apiKey))) &&
       Buffer.byteLength(JSON.stringify(settings) + '\n') <= SETTINGS_LIMIT;
   }
 
@@ -380,12 +375,7 @@ export class FlowXHostService {
 
   async loadSettings() {
     const directory = await this.settingsDirectoryAccess(false);
-    const settings = directory ? await this.readSettingsFile(directory) : null;
-    if (settings?.apiKey && !this.secrets.has(settings.apiKey)) {
-      this.secrets.add(settings.apiKey);
-      this.secretPattern = this.buildSecretPattern();
-    }
-    return settings;
+    return directory ? await this.readSettingsFile(directory) : null;
   }
 
   async getSettings() {
@@ -396,7 +386,7 @@ export class FlowXHostService {
   }
 
   async writeSettings(settings) {
-    if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
+    if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths.');
     const directory = await this.settingsDirectoryAccess(true);
     const filename = path.join(directory, 'settings.json');
     await this.readSettingsFile(directory);
@@ -449,15 +439,9 @@ export class FlowXHostService {
 
   saveSettings(submitted) {
     return this.queueSettingsWrite(async () => {
-      const previous = await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
-      // An empty key keeps the previously saved one.
-      const apiKey = submitted.apiKey || previous?.apiKey;
-      const settings = {
-        python: submitted.python,
-        workspace: submitted.workspace,
-        ...(apiKey ? { apiKey } : {}),
-      };
-      if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths and a printable API key.');
+      await this.loadSettings(); // Never overwrite a corrupt or unsafe existing file.
+      const settings = { python: submitted.python, workspace: submitted.workspace };
+      if (!this.validSettings(settings)) throw problem('configuration', 'FlowX settings must contain safe absolute paths.');
       await this.validateConfig(settings, false);
       if (this.closed) throw problem('disposed', 'The plugin has been disposed.');
       await this.writeSettings(settings);
@@ -512,7 +496,7 @@ export class FlowXHostService {
 
   spawnChild(command, args, settings) {
     // Keep Python, proxy and provider configuration, but drop unrelated secrets.
-    // Credential paths and the explicitly supported FlowX/LLM keys are retained.
+    // Credential paths and supported provider keys are retained.
     const env = Object.fromEntries(Object.entries(this.env).filter(([key, value]) => {
       const upper = key.toUpperCase();
       if (PROVIDER_CREDENTIALS.has(upper) || CREDENTIAL_PATHS.has(upper) || PROVIDER_URLS.has(upper)) return true;
@@ -520,7 +504,6 @@ export class FlowXHostService {
     }));
     if (settings) {
       Object.assign(env, { FLOWX_PYTHON: settings.python, FLOWX_WORKSPACE: settings.workspace });
-      if (settings.apiKey) env.FLOWX_LLM_API_KEY = settings.apiKey;
     }
     const child = this.spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], shell: false, detached: process.platform !== 'win32' });
     this.children.add(child);

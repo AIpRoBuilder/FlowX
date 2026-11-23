@@ -1,274 +1,128 @@
-# Dynamic workflow orchestration
+# Workflow builder and service manager
 
 Modified 2026-10-15: document the initial versioned generation coordinator.
 Modified 2026-10-15: schedule generation through JSON-built WorkflowEngine graphs.
 Modified 2026-10-16: AgentBuilder publishes the child workflows; one engine reloads its pool.
 Modified 2026-10-28: expand each business node into namespaced generation, audit-guard, repair-loop and finalizer steps in one engine.
 Modified 2026-10-28: expose the expanded graph as `ExpandedWorkflowEngine` and diff it in place from a changed business DAG.
-Modified 2026-10-30: the orchestrator is an `ExpandedWorkflowEngine`; a transit `nodes_stage_exit` step
-publishes the run, an optional continuation graph is bridged after every leaf finalizer, and an
-optional `head` graph (`reformat_request -> graph_plan`) is bridged into every root entry so the
-connected graph runs one or two passes on the same engine.
-Modified 2026-11-01: an initial generation audit failure enters the repair loop and is amended from
-its violation report; only failing tests use the interactive gate.
+Modified 2026-10-30: the orchestrator is an `ExpandedWorkflowEngine`; a transit `nodes_stage_exit` step publishes the run.
+Modified 2026-11-01: an initial generation audit failure enters the repair loop; only failing tests use the interactive gate.
 Modified 2026-11-02: correct the audit guard behavior and default repair retry count.
+Modified 2026-11-22: replace the orchestrator documentation. FlowX no longer calls an LLM: a host coding agent writes
+the artifacts, and the workflow builder is a deterministic pipeline of contracts, audits, tests and versions.
 
-`DynamicWorkflowOrchestrator` coordinates node generation and isolated node repair.
-It does **not** execute the generated business workflow, edit graph topology through
-an LLM, or provide a ReAct judge. Supply the desired workflow JSON to each run.
+FlowX manages two things.
 
-## Ownership and construction
+- **`WorkflowBuilder`** (`flowx_core.builder`) turns a request into published artifacts. It sends the host agent
+  *contract tasks*, checks what comes back with the auditors and pytest, versions what passes, and renders the service
+  entrypoint. It never writes code and never calls a model.
+- **`ServiceManager`** (`flowx_core.service`) runs, drives and inspects the services the builder produced.
 
-Import the coordinator and `DynamicWorkflowRequest` from
-`flowx_core.dynamic_workflow_orchestrator`.
+`AgentBuilder` (`flowx_core.agent_builder`) owns both for one workspace; `FlowXClient`, the MCP server and the A2A
+adapter are thin layers over the same two objects.
 
-The keyword-only constructor accepts:
+## The pipeline
 
-- `storage_dir`: a dedicated directory for **one** logical workflow.
-- `workflow_id`: optional on first creation; generated automatically if omitted.
-  Reloading the same directory restores its identity. A conflicting supplied ID
-  is rejected.
-- `keep_last_versions`: `None` keeps all history; a positive integer retains the
-  most recent N workflow revisions and, independently, N revisions per node.
-- `continuation`: optional `GraphSpec` merged after every leaf finalizer. The
-  agent engine passes its `main_entrypoint_generation` stage here, so one native
-  run covers node generation, publication and that stage.
-- `head`: optional `GraphSpec` run before the chains. The agent engine passes
-  `reformat_request -> graph_plan`, which is bridged into every business root's
-  `__enter` step; the shared head engine still runs those two steps alone when a
-  request has to resolve which workflow it targets.
-
-The node generation workflow and runtime modifier are **not** constructor
-arguments. `AgentBuilder` creates them and publishes them as the module globals
-`NODE_GENERATION_WORKFLOW` and `NODE_RUNTIME_MODIFIER_PIPELINE`.
-`AgentBuilder.close()` unpublishes only its own workflows before closing them.
-`run()` fails before creating any files if they are not published, so a
-`DynamicWorkflowOrchestrator` needs a live `AgentBuilder` in the process. The
-globals are process-wide: with several builders, the most recently initialized one
-is used. The orchestrator never closes them; `close()` releases only its engine.
-
-## Expanded business engine
-
-When the published workflows expose native `GraphSpec`s, the coordinator expands
-each enabled business node into prefixed native steps inside one engine:
+A build is a native `ag_ui_workflow` run, so the pipeline keeps the engine's step structure: dependency edges, per-step
+state, and waiting steps. Its steps are *agent gates*: a step whose wait function pauses the run until the agent submits
+an artifact, then verifies it.
 
 ```text
-<node>__enter
-  -> <node>__node_plan
-  -> <node>__node_generate
-  -> <node>__node_audit
-  -> <node>__repair_audit_guard
-  -> <node>__generate_node_test
-  -> <node>__repair_loop
-       <node>__run_node_test
-       -> <node>__amend_node
-       -> <node>__verify_node_test
-       -> <node>__audit_amended_node
-       -> <node>__amend_from_audit
-  -> <node>__finalize
+planning run (only when requirement or graph is asked)
+  requirement_gate -> graph_gate
+
+nodes run (graph read from plan/workflow.json after planning)
+  <Node>__author  (one gate per enabled business node, edges = the graph's depends)
+      \-> nodes_exit -> compile_entrypoint
 ```
 
-A business edge `A -> B` becomes `B__enter depends on A__finalize`. The
-finalizer is therefore the completion boundary for the whole generation, audit,
-repair and re-audit chain. `B__enter` receives only its direct parents'
-finalizer outputs; each finalizer carries cumulative ancestor artifacts.
+- `requirement_gate`: accepts `requirement` (Markdown), checked for the required sections and a node design table.
+- `graph_gate`: accepts `graph` (workflow.json as an object or text), checked structurally (unique names, dependencies,
+  cycles, enabled/disabled consistency) and by `GraphJsonAuditor`.
+- `<Node>__author`: accepts `code` and `test` (and optionally `markdown`). The candidate is staged with the graph and the
+  published upstream nodes, audited by `NodeAuditor`, and its pytest module runs offline (`FLOWX_MEDIA_DRY_RUN=1`, time
+  limited). Only a candidate that passes both is published as a new immutable node version, immediately.
+- `nodes_exit`: if every node is published or reused, pins the latest node versions as a workflow snapshot.
+- `compile_entrypoint`: copies the snapshot into `service/service_<id>/`, renders `main.py` from the template
+  (`EntrypointWriter`), audits it with `MainEntryPointAuditor`, and optionally starts it once (`smoke_test`).
 
-Every leaf finalizer is bridged into a transit step, so the graph always ends
-with a join that publishes the run:
+Independent nodes are open at the same time. A rejected submission re-issues the same task with `attempt + 1`, the
+structured findings and the failing test log; after `max_attempts` the node is `failed` and its descendants `blocked`.
+Nodes that already published stay published.
+
+## Task packets
+
+`get_tasks` and `submit_task` exchange `ContractPacket`s:
+
+| Field | Meaning |
+| --- | --- |
+| `task_id` | `<stage>:<step>:r<revision>:a<attempt>`; a stale id is rejected. |
+| `stage`, `step_id` | `requirement`, `graph` or `node` with the node name. |
+| `reason` | `new`, `modify`, `targeted`, `spec_changed`, `upstream_changed`, or `repair`. |
+| `contract` | `instructions`, `rules` (the same ids the auditors report), `schema`, `node_types`, and for nodes `test_instructions`. |
+| `context` | The requirement, graph, node spec, upstream node sources with `derived_keys` and `session_state_keys`, the current artifacts, `last_findings`, `last_test_log`, and `runtime_evidence` for a targeted rewrite. |
+| `meta` | For nodes, the base-class reference for the node's `meta_node_kind`. |
+| `submit` | The artifact slots: name, path inside the version, required or not. |
+
+Contract text lives next to the code that enforces it (`flowx_core/builder/contract_text`, `findings.py`); there is no
+copy in the skill. `CONTRACT_VERSION` is stored with every node version.
+
+A finding is `{rule_id, message, file, line, severity, remediation}`. Auditor rule ids are namespaced (`node.`, `graph.`,
+`main.`, `requirement.`); `node.test_failed` carries the log tail.
+
+## State and events
+
+`get_build_state` returns, per revision: `status` (`running`, `completed`, `failed`, `aborted`, or `idle` /
+`interrupted` when no build is open), `phase`, `stages` (requirement, graph, nodes, entrypoint), `nodes` (`blocked`,
+`ready`, `validating`, `repair_needed`, `published`, `reused`, `failed`), open task summaries, unresolved `errors`
+(keys `graph`, `main`, `nodes/<step>`), and `next_action`:
+
+| `next_action.kind` | Agent should |
+| --- | --- |
+| `submit_task` | answer the listed `task_ids` |
+| `wait` | poll again; a verification is running |
+| `run_service` | the build completed |
+| `escalate_to_user` | the build failed; read `errors` and the findings |
+| `begin_build` | no build is open |
+
+Every change is an event appended to `<workflow>/build/events.jsonl` (`build_started`, `stage`, `phase`, `node`,
+`task_issued`, `task_closed`, `build_finished`) and then reduced into that state, so the journal and the board cannot
+disagree. `get_build_events(since=<seq>)` reads the journal incrementally.
+
+## Reuse, versions and changes
+
+A node version records `input_fingerprint`, a hash of the node's spec in `workflow.json`, the source digests of its
+parents, and a scheme marker. On the next `begin_build`:
+
+- a node whose fingerprint is unchanged is `reused`; no task is issued;
+- a changed spec or a changed parent asks for the node again (`spec_changed` / `upstream_changed`), with the published
+  files in `context.current`;
+- `target=<node name or node_id>` forces one node (`targeted`), then its descendants follow by the rule above;
+- `target="workflow"` asks for the requirement and graph again; `stages` selects them explicitly;
+- nodes published by an earlier FlowX build (no scheme marker) are reused as they are, never rewritten implicitly.
+
+A build that stops early (abort, failure, process exit) keeps every node it published, so the next `begin_build` asks
+only for what is missing. Build state is in memory; a restarted process reports `interrupted` and recovers by
+`begin_build`.
+
+## Storage layout
 
 ```text
-reformat_request -> graph_plan                                        (head)
-  -> <root>__enter ... <leaf>__finalize                               (chains)
-  -> nodes_stage_exit -> <continuation root>                          (optional)
+<workspace>/workflows/<workflow_id>/
+  plan/{workflow.json, requirement_analysis.md, brief.md}
+  nodes/<node_id>/<version>/        every published node version: code, tests/, node_docs/, logs/, version.json
+  workflows/<version>/              self-contained workflow snapshots: workflow.json, requirement, node files
+  manifest.json                     node registry and workflow history (schema_version 1)
+  agent.json                        ids, entrypoint, host/port and unresolved errors
+  service/service_<main_id>/        importable package with main.py, workflow.json and the node modules
+  logs/                             service.log, main_run.log
+  build/                            events.jsonl and per-revision staging (removed after a completed build)
+  runs/                             run journal written by the generated service
 ```
 
-Because the business DAG is an output of `graph_plan`, the connected graph runs
-in one or two `run_steps` passes on the same engine and pool:
+## Service manager
 
-- one pass when `workflow.json` exists and the graph stage will not rewrite it
-  (`agent_graph_stable`), so reformat, graph, chains, publication and the
-  continuation share a single native run;
-- two passes otherwise. Pass 1 skips every body step and runs the head only
-  (`agent_head_done`); the orchestrator then reloads the graph from the new
-  `workflow.json` and runs pass 2 with the head steps skipped. A graph-only
-  request never runs the body: the agent reports the nodes and main stages as
-  skipped.
-
-`nodes_stage_exit` publishes this revision (node records, manifest, retention)
-inside the native run, because a continuation stage reads the published workflow
-version in the same run. A failed node chain makes it discard the candidate and
-report the per-node root causes instead. `merge_graphs` rewrites the native
-dependencies but not class attributes, so the exit step, every continuation
-root and every bridged business root are rebound with `rebind_step_class`.
-
-The repair chain is a native loop region. Its loop policy stops when the verify
-test and amended audit both pass, when the request's `max_repair_retries` budget
-is exhausted, or when the node is reused/repair was disabled. The guard sits
-outside the loop and records generation's audit result without disabling repair
-on failure. If tests pass but the audit fails, `amend_from_audit` applies the
-violation report before the next verification pass; one extra pass is allowed to
-verify that amendment.
-
-Each business node has a request namespace in `WorkflowParam.state` containing
-its generation state and runtime-modifier request. Namespaced step classes read
-only their own namespace. This lets independent business branches run
-concurrently without overwriting another node's `node_writer`, `auditor` or
-`node_runtime_modifier` state, and keeps prompt context local to the node.
-
-The published node-generation workflow and runtime modifier must expose their
-native `GraphSpec`s. Publishing graph-less workflow objects is rejected at
-engine construction time; there is no wrapper-step fallback.
-
-The native `WorkflowParam.state` carries one request-local generation-run payload,
-the orchestrator, the node namespaces and the node logs. Pooled steps retain no
-requests or results. Child-step exceptions become failed step outputs and block
-descendants; independent branches drain before the transit exit step discards the
-candidate and `run()` raises.
-
-`DynamicWorkflowOrchestrator` **is** an `ExpandedWorkflowEngine`: `generation_engine`
-returns the orchestrator itself (or `None` before the first nonempty run).
-`ExpandedWorkflowEngine._init_expanded` builds the merged graph on the first run and
-`update(business_nodes=...)` reloads the existing pool afterwards. Because the
-transit exit step is bridged from every leaf finalizer, a changed business DAG
-rebuilds the whole graph; a bare `ExpandedWorkflowEngine` without a continuation
-still diffs and preserves unaffected chains. The
-underlying pipeline pool builds the replacement before swapping it in, so active
-leases finish on the old graph and a failed build leaves the current graph
-serving. Request content changes do not rebuild the graph. The JSON `pool_size`
-defaults to 1 and controls concurrent whole-workflow runs. An all-disabled graph
-publishes a workflow snapshot with an empty node map and schedules nothing.
-
-## Requests and incremental generation
-
-Create `DynamicWorkflowRequest(workflow_json_path=..., requirement_md_path=...)`
-and pass it to `orchestrator.run(request)`. The result is a `WorkflowVersion`.
-The agent engine calls the same entry point with `agent_state`, which seeds the
-run payload (`agent_run`), the previous stage's context (`agent_context`) and the
-nodes-stage attempt/skip flags for the continuation; standalone callers omit it.
-A runnable, LLM-free expanded-engine smoke example is in
-[`examples/dynamic_workflow_orchestrator.py`](../examples/dynamic_workflow_orchestrator.py).
-It writes a persistent bundle under `examples/output/dynamic_workflow_orchestrator`
-with generated node source/test files and runs an incremental business-graph update.
-
-The coordinator validates node names, dependencies, disabled-node dependencies,
-duplicate names and cycles before invoking either child. Nodes are processed in
-dependency order by `WorkflowEngine`, not by a Python generation loop.
-Source, static output previews and session-state key names
-from already generated ancestors become the next node's `dependency_context`.
-These are **static generation inputs**, not actual runtime outputs. Each step
-publishes its own artifact facts in its `StepRunOutput` (`derived["artifacts"]`,
-cumulative over its ancestors), and a child builds its context and ancestor
-digests from its parents' outputs plus the run-level `session_state`, so no
-source file is re-read or re-parsed per descendant.
-
-New nodes are generated. Existing nodes are amended when their specification,
-global requirement, generation options, explicit `node_formats`, or ancestor
-source changes. An unchanged build returns the current version without calling
-either child or incrementing the version counter. Graph-only metadata changes
-can produce a new workflow version while reusing every node version.
-
-Request options include:
-
-- `node_amendments` and `markdown_amendments`, keyed by node name.
-- `force_nodes` for explicitly rebuilding selected nodes.
-- `node_formats` for extra generation contract context.
-- `generate_markdown` and `skip_node_planner` for planner control.
-- `run_runtime_modifier` (default `True`) for isolated pytest generation/repair.
-- `max_repair_retries` (default `5`) for how many more times a failing repair is requested.
-- `state` for request-local context; it is not serialized in the manifest.
-- Generation/test temperatures, Python command and per-test timeout.
-
-Because runtime `state` can contain non-serializable values, it is not part of
-the persistent fingerprint. Use `force_nodes` or an amendment when state-only
-changes should trigger regeneration. Requirements are currently global: changing
-them conservatively invalidates all enabled nodes. Python is the supported node
-language for this initial coordinator.
-
-A repair pass tests the node, and when its test fails it amends the source from the
-log, reruns the existing test without another amendment, and re-audits the source.
-An initial generation audit failure is not terminal: the node enters this same repair
-loop and is amended from its audit violations. Audit repairs never pause; only a
-failing test uses the interactive gate described below.
-If a pass still fails its test or audit, another pass is requested, up to
-`max_repair_retries` more times (`0` restores a single pass). The generated test is
-reused; a failing test is amended from its fresh log, and an audit violation is
-amended from the violation report before the node is retested and re-audited. A
-still-failing node is not published. A failed build does not advance
-the workflow/node counters or replace historical files. Disabling the modifier
-does not imply runtime validation; old test logs are not carried into changed,
-untested node versions. With `await_repair_input=True`, a failing test pauses at the
-node's own `amend_node` wait callback (`DynamicWorkflowRequest.await_repair_input` ->
-`NodeRuntimeModifierRequest.await_input`); the orchestrator's `start()` returns an
-`OrchestratorRun` with `status="awaiting_input"` and the waiting step's metadata, and
-`resume(request_id, step_id, value)` feeds the answer. Guidance amends the node, which
-stays the default target; `test: <guidance>` (or `tests=...`, `fix the test`, or a JSON
-`{"target": "test"}`) amends the generated test instead; `skip` skips that amendment; an
-empty string amends the node from the log alone; the next repair pass asks again with the
-fresh log. `await_repair_input` defaults to `True`; `execute()` always runs
-non-interactively, and `await_repair_input=False` makes `start()` amend from the test log
-automatically.
-
-## Saved identities and versions
-
-Public accessors:
-
-- `workflow_id`, `workflow_version`.
-- `generated_node_id_map`: current enabled node name to persistent node UUID.
-- `list_workflow_versions()` and `get_workflow_version(version=None)`.
-- `list_node_versions(node_id)` and `get_node_version(node_id, version=None)`.
-- `prune_versions()` to apply the configured retention policy immediately.
-
-Each `WorkflowVersion` includes a saved JSON path, saved requirement path,
-`changed_nodes`, and a node-name-to-`NodeVersion` mapping. Each `NodeVersion`
-includes `node_id`, `version`, `input_fingerprint` and artifact paths for source,
-optional markdown, test, log and pre-repair failure log.
-
-The storage layout is:
-
-```text
-manifest.json
-workflows/<workflow-version>/
-  workflow.json
-  generation_workflow.json
-  requirement_analysis.md
-  version.json
-  <NodeName>.py
-  node_docs/<NodeName>.md
-  tests/test_<NodeName>.py
-  logs/...
-nodes/<node-id>/<node-version>/
-  version.json
-  <NodeName>.py
-  node_docs/<NodeName>.md
-  tests/test_<NodeName>.py
-  logs/...
-```
-
-Versions start at 1 and remain monotonic after pruning. A workflow revision pins
-each node's identity and version. It contains independent artifact copies, so
-pruning a node's standalone history does not break retained workflow bundles.
-Literal generated test paths are rebased to their saved bundle; logs retain the
-original paths as historical execution evidence.
-
-Deleting a node removes it from the current ID map, not from historical records.
-Re-adding the same name restores its identity. Renaming is currently remove+add,
-not an identity-preserving rename. Returned dataclasses describe snapshots;
-callers should not edit the saved files or mutate artifact mappings.
-
-## Persistence boundaries
-
-Files are written to a candidate directory and the manifest is atomically
-replaced only after all selected nodes succeed. Retention is applied at reload
-and after successful publication. Failed ordinary requests clean their candidate
-files. Pruned versions cannot be retrieved through the history APIs.
-
-Use one writer per storage directory. Calls on the same instance are serialized;
-this is not a multi-process/distributed revision database. An interrupted process
-can leave an unreferenced candidate directory: a subsequent build refuses to
-overwrite it. Inspect and remove that orphan only after confirming no writer is
-still active; historical snapshots referenced by the manifest must not be removed.
-
-Generated Python tests execute code through the existing modifier subprocess;
-that subprocess is **not a security sandbox**. Use trusted generators/nodes or
-provide an externally isolated execution environment. Runtime session persistence,
-side-effect rollback and full workflow observation collection are separate work.
+`run_service` starts `main.py` with the interpreter from `select_python_command()` and the service folder's `.env`,
+logs to `logs/service.log`, and waits until `GET /` answers. `run_step` and `reset_session` use the generated
+service's `/api/run-step` and `/api/reset-session`; `list_runs`, `get_run` and `evidence` read `runs/`. `evidence`
+returns the latest run journal and the service log tail for `begin_build(runtime_evidence=..., target=<node>)`.

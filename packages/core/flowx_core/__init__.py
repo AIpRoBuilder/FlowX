@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified 2026-10-16: drop the removed context_builder subpackage from __all__.
+# Modified 2026-11-22: export the builder and service packages; the LLM subpackages are gone.
 from importlib import import_module
 
 from .provenance import ORIGIN_ID as __origin_id__
@@ -13,10 +14,9 @@ __version__ = "0.2.0"
 __all__ = [
     "architect",
     "auditor",
-    "demand_analyzer",
-    "llm_client",
+    "builder",
+    "service",
     "tools",
-    "worker",
 ]
 
 

@@ -589,7 +589,6 @@ class MediaSpace:
             or os.environ.get("FLOWX_IMAGE_API_KEY")
             or os.environ.get("FLOWX_MEDIA_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
-            or os.environ.get("FLOWX_LLM_API_KEY")
             or ""
         )
         if not key:
@@ -669,7 +668,6 @@ class MediaSpace:
             or os.environ.get("FLOWX_VIDEO_API_KEY")
             or os.environ.get("FLOWX_MEDIA_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
-            or os.environ.get("FLOWX_LLM_API_KEY")
             or ""
         )
         if not key:

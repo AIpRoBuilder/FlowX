@@ -16,13 +16,14 @@
 <!-- Modified 2026-11-16: announce media workflow support and the Harness media canvas. -->
 <!-- Modified 2026-11-17: announce workflow service .env editing. -->
 <!-- Modified 2026-11-20: add Discord community badge and invite link. -->
+<!-- Modified 2026-11-22: FlowX no longer calls an LLM; document the agent-driven workflow builder and service manager. -->
 
 <p align="center">
   <img src="assets/flowx_log.png" alt="FlowX logo" width="180" />
 </p>
 
 <h2 align="center">FlowX</h2>
-<h3 align="center">用自然语言生成、运行和演进 AI Agent 工作流</h3>
+<h3 align="center">由你的编码 Agent 编写工作流，FlowX 负责审计、测试、版本化和运行</h3>
 
 <p align="center">
   <a href="README.md">English</a> · <strong>简体中文</strong>
@@ -51,7 +52,7 @@
   <a href="README.md">English</a>
 </p>
 
-FlowX 通过 MCP、Python SDK 或 A2A 让 AI Agent **构建、运行和演进工作流**。描述流程后，FlowX 会生成工作流图、经过审计和测试的 Python 节点及 FastAPI 后端。
+FlowX 通过 MCP、Python SDK 或 A2A 让 AI Agent **构建、运行和演进工作流**。FlowX 自身不调用模型：它为每个产物（需求、工作流图、每个节点一个任务）向你的编码 Agent 下发*契约*，审计并测试返回的内容，发布带版本的节点，渲染 FastAPI 后端并运行它。
 
 <p align="center"><strong>描述 → 生成 → 检查 → 运行 → 演进 → 复用</strong></p>
 
@@ -63,10 +64,11 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 <details>
 <summary>📣 更新动态</summary>
 
+- **[2026.11.22]** 🧭 **由 Agent 驱动构建，FlowX 内部不再有 LLM。** FlowX 现在由两部分组成：**工作流构建器**和**服务管理器**。构建器保留 `ag_ui_workflow` 流水线（需求 → 图 → 每个节点一个 Gate → 入口），但各步骤等待*你的 Agent*：每个 Gate 返回契约包，接收产物，运行审计器和节点的 pytest，然后发布版本，或返回结构化的发现项并发出修复任务。Agent 可通过 `get_build_state` 和只追加的事件日志查看每个阶段与节点状态。旧的 `start_*`/`get_build_status` MCP 工具、`evolve`/`build_*` SDK 方法、修复门控以及 LLM 提供商/API 密钥设置均已移除。详见 [docs/DYNAMIC_WORKFLOW.md](docs/DYNAMIC_WORKFLOW.md)。
 - **[2026.11.16]** 🖼️ **媒体工作流支持。** 生成的节点除了结构化文本外，还可以返回 `prompt`、`image` 和 `video` 卡片。新增的 `flowx_core.media` 工具包含图像/视频服务商调用封装、Pillow 缩放与裁剪、FFmpeg 裁剪与缩放、可选的 Blender 无界面渲染（需设置 `FLOWX_ENABLE_BLENDER=1`），以及用于零成本节点测试的 `FLOWX_MEDIA_DRY_RUN=1`。媒体产物与步骤卡片会记录到 `workflows/<workflow_id>/runs/`。服务商调用可能产生费用，生成的代码与测试也不在沙箱中运行。
 - **[2026.11.19]** 🎛️ **Hermes Agent 插件。**新的 [Hermes 插件](plugins/hermes-flowx/README.md)提供只读 FlowX Dashboard 标签页（可拖拽的计划图、运行日志卡片、受限媒体预览、工作流文件浏览器）以及五个 Agent 工具。它不会构建、运行或修改工作流，唯一写入的文件是 `canvas_layout.json`。使用 `hermes plugins install AIpRoBuilder/FlowX/plugins/hermes-flowx --enable` 单独安装。
 - **[2026.11.16]** 🎛️ **DeepSeek Harness 插件更新。** 工作流画布现在可以预览每个节点的 `prompt`、`image` 和 `video` 卡片，并支持运行历史（**Sync outputs**）、版本过期标记、缩放与宽画布、按工作流保存的拖拽布局，以及全尺寸灯箱预览。媒体通过仅限所有者的 `/api/flowx/media` 路由以带鉴权的 HTTP `Range` 响应提供。每个工作流还提供 **Edit .env** 面板，可查看和编辑其 `service_<id>/.env` 文件，用于配置该服务专用的提供商、媒体与工具参数。详见[插件 README](plugins/deepseek-harness-flowx/README.md)。
-- **[2026.11.10]** 🔑 **技能与插件更新。** DeepSeek Harness 插件设置现在可填写 `FLOWX_LLM_API_KEY`，且不再需要填写技能目录；FlowX 技能脚本会复用插件保存的 Python、工作区和 API Key。
+- **[2026.11.10]** 🔑 **技能与插件更新。** DeepSeek Harness 插件不再需要填写技能目录；FlowX 技能脚本会复用插件保存的 Python 和工作区。
 - **[2026.10.28]** 🧩 **扩展节点引擎。** 每个业务节点在发布前都会执行“生成 → 审计 → 测试 → 有界修复”链路。
 - **[2026.10.24]** ⚙️ **原生 WorkflowEngine 生成。** 图、节点和入口生成工作流现在都是 `WorkflowEngine` 的子类。
 - **[2026.10.22]** 🚀 **交互式运行时。** `run_service` 返回可连接的 `base_url`；MCP 新增 `run_step` 与 `reset_session`。
@@ -89,13 +91,14 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 <a name="key-features"></a>
 ## 🚀 核心特性
 
-- 🧩 **生成**工作流图、节点文档、Python 代码和后端。
-- 🛡️ **审计和测试**每个节点，并进行有界修复；失败的节点不会发布。
-- 🔁 **演进**整个工作流或指定节点，复用未变化的节点。
-- 🚀 **本地运行**工作流；MCP 还支持步骤输入和会话重置。
-- 🔌 **选择接口：**本地 stdio MCP、Python SDK 或非流式 A2A。
+- 🧩 **契约而非提示词：**每个构建步骤返回包含契约、规则、上下文和产物槽位的任务包；代码由宿主 Agent 编写。
+- 🛡️ **审计并测试每个节点**，沿用相同的审计器和 pytest；失败的节点不会发布，并以带修复建议的发现项返回。
+- 👀 **随时掌握进度：**`get_build_state` 报告各阶段、每个节点的状态、待办任务和下一步动作；`get_build_events` 是事件日志。
+- 🔁 **演进**整个工作流或单个节点（`target`），复用输入未变化的节点。
+- 🚀 **本地运行：**可通过 MCP 或 SDK 运行；服务管理器可驱动步骤、重置会话，并返回运行证据以便下一次修复。
+- 🔌 **选择接口：**本地 stdio MCP、Python SDK 或非流式 A2A（一次构建就是一个 `input-required` 任务）。
 - 📦 **复用产物：**工作流保存在 `workspace/workflows/<workflow_id>` 下。
-- 🧠 **自选模型和 UI：**可选的 [DeepSeek Harness 插件](plugins/deepseek-harness-flowx/README.md)为 Web 和 Desktop 提供只读工作流查看器，两个配置需分别安装；创建、演进和运行工作流请使用独立的 FlowX 技能。
+- 🧠 **自选 Agent 和 UI：**可选的 [DeepSeek Harness 插件](plugins/deepseek-harness-flowx/README.md)为 Web 和 Desktop 提供只读工作流查看器，两个配置需分别安装；创建、演进和运行工作流请使用独立的 FlowX 技能。
 - 🎛️ **在 Hermes Agent 中查看：**可选的 [Hermes 插件](plugins/hermes-flowx/README.md)提供只读的 FlowX Dashboard 标签页和五个 Agent 工具；使用 `hermes plugins install AIpRoBuilder/FlowX/plugins/hermes-flowx --enable` 单独安装。
 
 <a name="setup"></a>
@@ -105,8 +108,7 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 
 - **Python 3.10 或更高版本。**
 - Git，用于获取 FlowX 及其工作流运行时依赖。
-- 用于本地 stdio 路径的支持 MCP 的 Agent 客户端。
-- 兼容 OpenAI API 的 LLM 提供商（默认使用 DeepSeek）。
+- 能编写 FlowX 所需产物的支持 MCP 的编码 Agent（或你自己的 Python / A2A Agent）。
 
 <a name="installation"></a>
 ### 安装
@@ -183,14 +185,13 @@ uv pip install --python .venv/bin/python -e ../ag_ui_worflow --no-deps
 cp .env.example .env
 ```
 
-编辑 `.env`，设置提供商、模型、API 密钥和工作区：
+编辑 `.env`，设置工作区：
 
 ```dotenv
-FLOWX_LLM_PROVIDER=deepseek
-FLOWX_LLM_MODEL=deepseek-flash
-FLOWX_LLM_API_KEY=
 FLOWX_DEFAULT_WORKSPACE=./.flowx_workspaces
 ```
+
+FlowX 不需要模型密钥。服务商和媒体变量（例如 `FLOWX_IMAGE_API_KEY`）只用于你生成的工作流，请放在进程环境或该工作流服务自己的 `.env` 中。
 
 安装后的 `flowx-mcp` 可以通过 `FLOWX_CONFIG_ROOT` 解析仓库检出目录之外的 `.env` 文件。`FLOWX_EXTRA_PATHS` 可以指向本地 [ag_ui_workflow](https://github.com/AIpRoBuilder/ag_ui_worflow) 源码，用于尚未安装到当前环境的情况。
 
@@ -219,7 +220,7 @@ python3.10 run_server.py
 <a name="register-flowx-in-an-mcp-client"></a>
 ### 在 MCP 客户端中注册 FlowX
 
-将可执行文件替换为虚拟环境中 `flowx-mcp` 的绝对路径，并设置凭据和工作区。MCP 宿主可能不会继承 shell 的 `PATH`。
+将可执行文件替换为虚拟环境中 `flowx-mcp` 的绝对路径，并设置工作区。MCP 宿主可能不会继承 shell 的 `PATH`。
 
 ```jsonc
 {
@@ -227,9 +228,6 @@ python3.10 run_server.py
     "flowx": {
       "command": "/absolute/path/to/your/venv/bin/flowx-mcp",
       "env": {
-        "FLOWX_LLM_PROVIDER": "deepseek",
-        "FLOWX_LLM_MODEL": "deepseek-flash",
-        "FLOWX_LLM_API_KEY": "<your key>",
         "FLOWX_DEFAULT_WORKSPACE": "/absolute/path/to/flowx_workspaces"
       }
     }
@@ -237,7 +235,7 @@ python3.10 run_server.py
 }
 ```
 
-请按 MCP 客户端的安全指南保存凭据，避免将其提交到仓库。
+请按 MCP 客户端的安全指南保存工作流所需的凭据，避免将其提交到仓库。
 
 <a name="install-the-flowx-agent-skill"></a>
 ### 安装 FlowX Agent Skill
@@ -271,7 +269,7 @@ cp -R skills/flowx-workflows/. ~/.copilot/skills/flowx-workflows/
 在支持技能的 Agent 中打开目标工作区，然后请求它使用 FlowX；支持技能斜杠命令的
 宿主也可以调用 `/flowx-workflows`。如果未发现技能，请重新加载工作区。安装技能
 会复制指导说明和脚本，但不会安装 SDK；首次使用时，如果缺少 FlowX，Agent 可以将其安装到合适的
-Python 环境中。LLM 配置和 MCP 服务器注册仍需单独完成。请参阅
+Python 环境中。MCP 服务器注册仍需单独完成。请参阅
 [安装](#installation)、[环境配置](#configure-the-environment)和
 [MCP 注册](#register-flowx-in-an-mcp-client)。通过 pip 安装 FlowX 不会自动安装 Agent Skill。
 
@@ -323,7 +321,7 @@ Hermes Hub 安装或更新跟踪。该技能与 FlowX MCP 服务器及其配置�
 <a name="quickstart"></a>
 ## ⚡ 快速开始
 
-完成[安装与配置](#setup)后，向支持 MCP 的 Agent 发送请求：
+完成[安装与配置](#setup)后，向支持 MCP 的编码 Agent 发送请求：
 
 ### 1. 描述工作流
 
@@ -335,25 +333,15 @@ assigns a priority, and drafts a reply. Name the reply node draft_reply.
 Return the category, priority, and draft reply as structured output.
 ```
 
-### 2. 构建并检查
+### 2. Agent 使用 FlowX 构建
 
-1. 调用 `create_workflow(name="Ticket Triage")`，然后调用 `start_new_workflow(workflow_id, prompt)`。可选名称同时是工作流文件夹名和 ID；省略时仍生成 ID。名称必须是安全的单个文件夹名，且不能覆盖已有路径。
-2. 轮询 `get_build_status(workflow_id)`，检查 `status` 和 `result.ok`；顶层 `ok` 只表示状态查询成功。
-3. 若状态为 `input_required`，展示 `awaiting.prompt` 和 `awaiting.test_log`，然后调用 `submit_background_build_input`，传入准确的 `workflow_id`、`revision`、`request_id`、作为 `step_id` 的 `awaiting.stepId` 和用户 `input`，再继续轮询。
-4. 使用 `get_workflow` 和 `list_nodes` 检查结果。步骤 ID 以生成的工作流为准。
+1. `create_workflow(name="Ticket Triage")` 分配文件夹和 `workflow_id`（安全的单个文件夹名，且不能覆盖已有路径）。
+2. `begin_build(workflow_id, intent)` 打开一个构建修订并返回 `next_tasks`：契约包，其中包含 `contract`（说明、规则、schema）、`context`、`meta` 和 `submit.slots`。
+3. Agent 编写每个产物并调用 `submit_task(workflow_id, task_id, artifacts)`：先是 `requirement`，然后是 `graph`，再是每个节点一个任务（`code` 和 `test`）。相互独立的节点会同时处于待办状态。
+4. 被拒绝时返回 `findings`（`rule_id`、`message`、`line`、`remediation`）、节点测试结果和修复任务（`attempt + 1`）。Agent 只需修复这些发现项；达到 `max_attempts` 后节点标记为 `failed`，其后代标记为 `blocked`。
+5. `get_build_state` 显示各阶段、每个节点的状态、`next_action` 和未解决的 `errors`；`get_build_events(since=seq)` 读取事件日志。`status` 为 `completed` 时，每个节点都已审计、测试并发布，入口也已渲染并审计。
 
-MCP 构建在后台运行；Python SDK 仍提供同步方法。旧版同步 MCP 构建工具已移除，升级前请使用旧服务器完成或取消已暂停的旧构建。生成过程会将需求及可能的日志发送给 LLM 提供商，并可能执行生成的测试；运行服务前请检查生成的代码。
-
-<details>
-<summary>后台构建选项与恢复</summary>
-
-- 分阶段构建可使用 `start_build_workflow_json`、`start_build_nodes` 和 `start_build_main_entrypoint`。图工具也可修改现有计划；`start_build_workflow` 和 `start_evolve_workflow` 可修改现有工作流。
-- 修复输入默认修改节点；`test: <指导>` 修改测试，`skip` 跳过本次修改，空回答仅使用测试日志。支持该参数的启动工具可设置 `interactive=false`，不询问用户而直接根据日志修复。
-- 使用准确的 `workflow_id`、`revision` 和 `request_id` 调用 `abort_background_build` 可取消暂停的构建。状态为 `recovery_required` 时，先用准确的 `workflow_id` 和 `revision` 调用 `recover_background_build`，再启动其他构建。
-- 所有工作流共用一个活动构建名额，暂停时仍占用。状态和暂停的构建保存在 MCP 服务器进程中，进程退出后无法恢复；`list_pending_builds` 只能在原进程存活时找回等待的问题。
-- 若恢复仍要求清理底层候选，停止原服务器、确认没有其他写入者后，按照[动态工作流文档](docs/DYNAMIC_WORKFLOW.md)检查未发布候选。部分生成的图计划不会被覆盖，应检查并修复现有工作流；若两个计划文件均不存在，确认没有写入者或残留候选后才能重试创建。
-
-</details>
+构建状态保存在 MCP 服务器进程和 `build/events.jsonl` 中；重启后再次调用 `begin_build` 即可：已发布的节点会被复用，只会重新请求未完成的工作。提交的节点测试会在本地用 pytest 运行，冒烟测试或服务运行会执行生成的代码；运行前请先检查。
 
 ### 3. 运行、演进与复用
 
@@ -364,125 +352,104 @@ Update the draft_reply node: for urgent tickets, include an escalation note.
 Then rerun the service.
 ```
 
-`run_service` 启动或重启生成的服务。`run_step` 向运行中的服务输入某个步骤的参数，并在工作流暂停等待更多输入时返回状态；`reset_session` 取消暂停的运行。`start_evolve_workflow` 可以修改整个工作流（`target="workflow"`）、某个节点（`list_nodes` 返回的 step id 或 node id），或由引擎自行判断；按上述方式轮询后台构建。
+`run_service` 启动或重启生成的服务并等待其响应。`run_step` 输入某个步骤的参数，并在工作流暂停等待更多输入时返回状态；`reset_session` 取消暂停的运行；`get_evidence` 返回最新的运行记录和服务日志尾部。修改工作流时调用 `begin_build(workflow_id, intent=<变更>, target=...)`，`target` 可以是 `"workflow"`（重做需求和图）或 `list_nodes` 返回的节点名或 `node_id`；输入发生变化的后代会被重新请求，其余全部复用。
 
 <a name="tool-surface"></a>
 ## 🧰 MCP 工具列表
 
-这些 MCP 工具让宿主 Agent 在同一段对话中操作工作流层。UI 渲染刻意留给宿主负责。
+这些 MCP 工具让宿主 Agent 在同一段对话中操作 FlowX 的两个实体。UI 渲染刻意留给宿主负责。
 
-| 类别 | 工具 | 用途 |
+| 实体 | 工具 | 用途 |
 | --- | --- | --- |
-| 后台构建 | `create_workflow(name=None)` | 创建空工作流，可指定文件夹名和 `workflow_id`。 |
-| 后台构建 | `start_new_workflow` | 开始构建已创建的空工作流并立即返回。 |
-| 后台构建 | `start_build_workflow_json(workflow_id, prompt, temperature=0.35)` | 为已分配的空工作流创建图和需求分析，或修改已有工作流的图和需求分析；不构建节点或主入口。 |
-| 后台构建 | `start_build_nodes` | 构建节点或按 step id 修改指定节点；未变化的节点会被复用。 |
-| 后台构建 | `start_build_main_entrypoint(workflow_id, amendment='', fastapi_port=8000, smoke_test=false)` | 基于最新节点创建或重新生成主入口，可选冒烟测试。 |
-| 后台构建 | `start_build_workflow` | 从请求和/或运行日志修改已有工作流；后续阶段可跟随前面的变更。 |
-| 后台构建 | `start_evolve_workflow` | 演进现有工作流（`target="workflow"`）或单个节点（step id 或 node id）；不传 `target` 时由引擎判断。 |
-| 后台构建 | `get_build_status` | 按 `workflow_id` 查询当前进程中最新的构建状态和审核问题。 |
-| 后台构建 | `submit_background_build_input` | 校验并接受暂停构建的审核回答，后台继续构建并立即返回。 |
-| 后台构建 | `abort_background_build`、`recover_background_build` | 放弃暂停的构建或重新检查不确定的引擎状态。 |
-| 后台构建 | `list_pending_builds` | 列出暂停的后台构建及其等待的问题；原服务进程存活时可在超时或客户端重启后恢复 `request_id` 和 `revision`。 |
-| 运行时 | `run_service` | 将构建好的工作流作为服务运行并返回 `base_url`；再次调用会使用最新文件重启服务。 |
-| 运行时 | `run_step` | 向运行中的服务输入某个步骤的参数；工作流暂停等待更多输入时返回 `awaiting`。 |
-| 运行时 | `reset_session` | 取消暂停的会话，使下一次 `run_step` 开始全新运行。 |
-| 运行时 | `stop_service` | 停止工作流正在运行的服务。 |
-| 检查 | `list_workflows` | 列出工作流 ID、节点 ID、版本和未解决的错误。 |
-| 检查 | `list_nodes` | 列出工作流的节点（step id、node id、版本）；可作为 `start_evolve_workflow` 的目标。 |
-| 检查 | `get_workflow` | 定位工作流的需求、`workflow.json`、节点版本和主入口。 |
+| 构建器 | `create_workflow(name=None, brief='')` | 创建空工作流，可指定文件夹名和 `workflow_id`。 |
+| 构建器 | `begin_build(workflow_id, intent, target=None, stages=None, runtime_evidence=None, fastapi_port=None, fastapi_host=None, smoke_test=False)` | 打开构建修订；返回状态和首批契约任务。 |
+| 构建器 | `get_build_state(workflow_id)` | 各阶段、节点状态、待办任务摘要、`next_action` 和未解决的错误。 |
+| 构建器 | `get_tasks(workflow_id, compact=False)` | 重新读取待办契约任务的完整内容。 |
+| 构建器 | `submit_task(workflow_id, task_id, artifacts)` | 提交一个任务的产物；通过则发布，被拒绝则返回发现项和修复任务。 |
+| 构建器 | `get_build_events(workflow_id, since=0, limit=200)` | 某个序号之后的构建事件日志。 |
+| 构建器 | `reopen_stage(workflow_id, stage, step_id=None, reason='')` | 在新修订中重做需求（连同图）、图、某个节点或入口。 |
+| 构建器 | `abort_build(workflow_id, reason='')` | 取消当前修订；已发布的版本会保留。 |
+| 服务 | `run_service`、`stop_service`、`service_status` | 启动（或替换）、停止和检查工作流服务。 |
+| 服务 | `run_step`、`reset_session` | 向运行中的服务输入某个步骤的参数；取消暂停的会话。 |
+| 服务 | `list_runs`、`get_run`、`get_evidence` | 读取运行记录，并为下一次修复收集证据。 |
+| 检查 | `list_workflows`、`list_nodes`、`get_workflow` | 工作流 ID、版本和错误；step id 和 node id；产物位置。 |
 
 <a name="python-sdk"></a>
 ## 🐍 Python SDK
 
-无需 MCP 传输，直接在 Python Agent 或你自己的智能 UI 后端中嵌入工作流构建能力。完整示例见 [examples/sdk_quickstart.py](examples/sdk_quickstart.py)。
+无需 MCP 传输，直接在 Python Agent 或你自己的智能 UI 后端中嵌入工作流构建能力。`FlowXClient` 提供与 MCP 工具相同的协议；`build()` 用你提供的函数回答每个任务，直至构建结束，你的模型或编辑器就接在这个函数里。完整示例见 [examples/sdk_quickstart.py](examples/sdk_quickstart.py)。
 
 ```python
 from flowx_sdk import FlowXClient
 
+def solve(task: dict) -> dict:
+    # task["contract"]、task["context"]、task["meta"]、task["submit"]["slots"] 说明需要编写什么。
+    # 返回 {槽位: 文本}：{"requirement": ...}、{"graph": ...} 或 {"code": ..., "test": ...}。
+    return my_agent.write(task)
+
 with FlowXClient(workspace="./workflows") as flowx:
-    created = flowx.build_workflow_json(
-        "Build a workflow that categorizes and prioritizes support tickets.",
-    ).raise_for_failure()                                  # workflow.json + requirements
-    workflow_id = created.workflow_id
-    flowx.build_nodes(workflow_id, await_repair_input=False).raise_for_failure()  # all nodes, or {step_id: amendment}
-    flowx.build_main_entrypoint(workflow_id).raise_for_failure()
-    print(flowx.run_service(workflow_id))                  # run as a service
+    workflow_id = flowx.create_workflow("ticket-triage")
+    state = flowx.build(workflow_id, "Categorize and prioritize support tickets.", solve)
+    assert state["status"] == "completed", state["errors"]
+    print(flowx.run_service(workflow_id))                  # 作为服务运行
     input("Press Enter to stop the service... ")
 ```
 
-  每次构建调用都会返回包含各阶段结果、错误、日志和产物路径的 `AgentResult`；`raise_for_failure()` 会在阶段失败时抛出异常。使用服务时请保持客户端打开；退出 `with` 代码块会停止该客户端启动的服务。
+使用服务时请保持客户端打开；退出 `with` 代码块会停止该客户端启动的服务并取消未完成的构建（已发布的版本会保留）。
 
-`build_nodes`、`build_workflow` 和 `evolve` 默认在节点测试失败时暂停。若 `status="input_required"`，检查 `awaiting`，然后用 `flowx.answer(request_id, input, awaiting["stepId"])` 继续。暂停时 `ok` 也可能为 `True`，不能仅凭 `raise_for_failure()` 判断构建完成。传入 `await_repair_input=False` 可自动根据测试日志修复。指导和输入选项参见 [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py)。
+需要更细粒度控制时直接使用协议：`begin_build`、`get_tasks`、`submit_task`（结果包含 `accepted`、`findings`、`test`、`next_tasks` 和 `state`）、`get_build_state`、`get_build_events`、`reopen_stage` 和 `abort_build`。可运行的修复示例见 [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py)。
 
-### 在终端回答节点构建暂停
+### 在终端中驱动构建器
 
-安装 SDK、导出 LLM 配置并构建工作流图后，在仓库根目录运行技能的构建脚本，
-将工作区和工作流 ID 替换为实际值：
+没有 MCP 的 Agent 可以使用技能的构建脚本：它保持一个客户端存活，并以 JSON 行使用相同的协议。在仓库根目录运行：
 
 ```bash
-python skills/flowx-workflows/scripts/build.py --workspace "$WS" nodes --workflow-id "$WF"
+python skills/flowx-workflows/scripts/build.py --workspace "$WS"
 ```
 
-如果脚本输出 `input_required` JSON 事件，查看 `awaiting.prompt` 和
-`awaiting.test_log`。保持**同一个进程**运行，在其标准输入中输入一行 JSON 并回车：
+它先输出 `{"event":"ready"}`，之后每条标准输入行都会得到一条响应行：
 
 ```json
-{"action":"answer","input":"调用 API 前先处理空输入。"}
+{"op":"begin_build","workflow_id":"ticket-triage","intent":"Categorize and prioritize support tickets."}
+{"op":"submit_task","workflow_id":"ticket-triage","task_id":"requirement:requirement:r1:a1","artifacts":{"requirement":{"file":"/tmp/requirement.md"}}}
 ```
 
-每次暂停只发送一个回答；后续节点再次暂停时重复此操作。输入
-`test: <指导>` 可修改生成的测试，`skip` 可跳过本次修改，空字符串根据测试日志修复。
-发送 `{"action":"abort"}` 可取消构建；关闭标准输入也会取消。可选的 `step_id`
-必须与 `awaiting.stepId` 一致。`--auto-repair` 会关闭这些测试修复暂停。请检查最终的
-`result.status`、`result.ok`、阶段、错误和日志，不要仅凭暂停或回答判断成功。
+产物值可以是 `{"file": path}`，表示从文件读取文本。整个构建过程中请保持该进程运行；`python build.py --help` 列出所有命令。详情参阅[技能说明](skills/flowx-workflows/SKILL.md)和[构建器文档](docs/DYNAMIC_WORKFLOW.md)。
 
-节点审计违规会根据审计报告自动修复，不会单独暂停等待用户输入。详情参见
-[技能说明](skills/flowx-workflows/SKILL.md)和[动态工作流文档](docs/DYNAMIC_WORKFLOW.md)。
-
-要修改现有工作流，可使用 `evolve(workflow_id, command, target=...)` 选择演进目标。`list_nodes` 会返回每个节点的 step id 与 node id；不传 `target` 时由引擎判断命令指向哪一部分。可运行示例见 [examples/sdk_evolve.py](examples/sdk_evolve.py)。
-
-如需对扩展后的 `DynamicWorkflowOrchestrator` 引擎进行不依赖 LLM 的直接冒烟测试，请参见 [examples/dynamic_workflow_orchestrator.py](examples/dynamic_workflow_orchestrator.py)。它覆盖逐节点生成/修复链、finalizer ID 以及增量业务图更新。
-
-```python
-from flowx_sdk import FlowXClient, WORKFLOW_TARGET
-
-workflow_id = "<existing workflow ID>"
-with FlowXClient(workspace="./workflows") as flowx:
-  flowx.evolve(workflow_id, "Add a language-detection step.", target=WORKFLOW_TARGET, await_repair_input=False).raise_for_failure()
-  nodes = flowx.list_nodes(workflow_id)
-  flowx.evolve(workflow_id, "Validate empty input.", target=nodes[0]["step_id"], await_repair_input=False).raise_for_failure()
-```
+要修改现有工作流，调用 `begin_build(workflow_id, intent, target=...)`，`target` 为 `"workflow"` 或 `list_nodes` 返回的 step id / node id；未变化的节点会被复用。可运行示例见 [examples/sdk_evolve.py](examples/sdk_evolve.py)。
 
 <a name="a2a-server"></a>
 ## 🤝 A2A 服务器
 
-通过非流式 Agent2Agent 端点，让另一个 Agent 将工作流生成委托给 FlowX：
+通过非流式 Agent2Agent 端点，让另一个 Agent 与 FlowX 一起构建工作流：
 
 ```bash
 flowx-a2a --host 127.0.0.1 --port 8001
 ```
 
-它在 `/.well-known/agent-card.json` 提供 A2A Agent Card，在 `/a2a`（以及 `/`）提供 JSON-RPC。支持的方法有 `message/send`、`tasks/get` 和 `tasks/cancel`。发送 A2A 文本消息即可构建工作流；添加 `metadata.workflowId` 可修改现有工作流。所有阶段成功时任务状态为 `completed`，否则为 `failed`；两种情况下都会携带结果，包括生成的产物路径。
+它在 `/.well-known/agent-card.json` 提供 A2A Agent Card，在 `/a2a`（以及 `/`）提供 JSON-RPC。支持的方法有 `message/send`、`tasks/get` 和 `tasks/cancel`。一次构建就是一个 A2A 任务：发送文本消息即可开始（`metadata.workflowId` 修改已有工作流，`metadata.target` 选择 `workflow` 或某个节点）。有契约任务待办时，任务处于 `input-required`，其状态消息以 data part 携带这些任务；请在同一 `taskId` 上发送消息回答，其 data part 为 `{"task_id": ..., "artifacts": {...}}`（或 `{"submissions": [...]}`）。构建完成时任务为 `completed`，构建失败时为 `failed`，`tasks/cancel` 后为 `canceled`；完成的任务会携带产物位置。
 
 <a name="architecture"></a>
 ## 🏗️ 架构
 
-生成式工作流层包含一个共享核心和三种面向 Agent 的接口：`flowx_core` 负责规划、生成、审计和运行工作流；`flowx_mcp`、`flowx_sdk` 与 `flowx_a2a` 将这些能力提供给不同的 Agent 宿主。生成后的运行时位于该层之下，智能 UI 位于该层之上。
+FlowX 是两个实体加三种面向 Agent 的接口。`flowx_core.builder`（**WorkflowBuilder**）向宿主 Agent 下发契约，用审计器和 pytest 验证返回的内容，发布版本并渲染服务；`flowx_core.service`（**ServiceManager**）运行并驱动结果。`flowx_mcp`、`flowx_sdk` 与 `flowx_a2a` 将两者提供给不同的 Agent 宿主。生成后的运行时位于下方，智能 UI 位于上方。
 
 ```mermaid
 flowchart TB
-  UI["智能 UI / Agent 宿主"] --> MCP["本地 MCP：构建、修改、运行"]
-  UI --> SDK["Python SDK：构建、修改、运行"]
-  PEER["对等 Agent"] --> A2A["A2A：委托生成"]
-  MCP --> CORE["FlowX · 生成式工作流层"]
-  SDK --> CORE
-  A2A --> CORE
-  CORE --> FILES["工作流图 + 节点代码 + 后端"]
-  FILES --> RUNTIME["FastAPI + ag_ui_workflow 运行时"]
-  MCP -->|"作为服务运行 / 重启"| RUNTIME
-  RUNTIME -.->|"AG-UI SSE 到自定义前端"| UI
-  MCP -->|"后续变更"| CORE
+  AGENT["编码 Agent（编写产物）"] --> MCP["本地 MCP"]
+  AGENT --> SDK["Python SDK"]
+  PEER["对等 Agent"] --> A2A["A2A：input-required 任务"]
+  MCP --> BUILDER
+  SDK --> BUILDER
+  A2A --> BUILDER
+  MCP --> SERVICES
+  SDK --> SERVICES
+  subgraph FLOWX["FlowX"]
+    BUILDER["WorkflowBuilder<br/>契约 · 审计 · 测试 · 版本"] -->|"已发布节点 + 入口"| SERVICES["ServiceManager<br/>运行 · 步骤 · 重置 · 证据"]
+    SERVICES -.->|"运行证据"| BUILDER
+  end
+  SERVICES --> RUNTIME["FastAPI + ag_ui_workflow 运行时"]
+  RUNTIME -.->|"AG-UI SSE 到自定义前端"| UI["智能 UI"]
 ```
 
 <a name="repository-layout"></a>
@@ -490,35 +457,36 @@ flowchart TB
 
 | 路径 | 导入名 | 职责 |
 | --- | --- | --- |
-| `packages/core` | `flowx_core` | 请求引擎、图与节点生成、审计、修复编排与服务监管。 |
+| `packages/core` | `flowx_core` | `builder`（契约、Gate、审计发现项、版本、入口渲染）、`service`（服务管理器）、审计器和原生引擎辅助工具。 |
 | `packages/mcp` | `flowx_mcp` | 本地 stdio MCP 服务器与工具接口。 |
-| `packages/sdk` | `flowx_sdk` | 用于构建、演进、检查和运行工作流的 Python 客户端。 |
+| `packages/sdk` | `flowx_sdk` | 用于构建、检查和运行工作流的 Python 客户端。 |
 | `packages/a2a` | `flowx_a2a` | 非流式 A2A 适配器。 |
-| `docs` | — | 动态工作流、运行时兼容性与来源说明。 |
-| `tests` | — | 跨包布局与来源检查。 |
+| `docs` | — | 构建器协议、运行时兼容性与来源说明。 |
+| `tests` | — | 跨包布局、技能与来源检查。 |
 
 <a name="artifact-flow"></a>
 ### 产物流转
 
-工作流编译是生成式工作流层的核心机制。规划与代码生成将意图转化为产物；审计在生成过程中和运行时提供反馈。下面的产物流程图与 [assets/architecture.mmd](assets/architecture.mmd) 保持一致。
+产物由 Agent 编写，FlowX 为每一个设置 Gate。下面的流程图与 [assets/architecture.mmd](assets/architecture.mmd) 保持一致。
 
 ```mermaid
 flowchart LR
-    A[原始需求] --> B[requirement_analysis.md]
+    A[意图] --> B[requirement_analysis.md]
     B --> C[workflow.json]
-    C --> D[node_docs/*.md]
-    D --> E[nodes/*.py]
-    E --> F[main.py]
+    C --> E[nodes/*.py + 测试]
+    E --> F[由已发布节点渲染的 main.py]
 
+    B --> R[需求检查]
     C --> G[图审计]
-    E --> H[节点审计]
+    E --> H[节点审计 + pytest]
     F --> I[入口审计]
-    F --> J[运行日志审计]
+    F --> J[可选冒烟运行]
 
-    G -->|反馈| C
-    H -->|反馈| E
-    I -->|反馈| F
-    J -->|反馈| E
+    R -->|发现项| B
+    G -->|发现项| C
+    H -->|发现项| E
+    I -->|修正节点集合| E
+    J -->|发现项| E
 ```
 
 <a name="runtime-compatibility"></a>

@@ -103,9 +103,9 @@ def test_workflow_step_meta_catalog_uses_meta_node_kind_metadata() -> None:
 
 
 def _file_example_source() -> str:
-    from flowx_core.worker.node_writer import ROOT_DIR
+    from flowx_core.builder.contracts import TEXT_DIR
 
-    prompt = (ROOT_DIR / "worker/prompts/pydaograph_node_prompt.md").read_text(encoding="utf-8")
+    prompt = (TEXT_DIR / "node.md").read_text(encoding="utf-8")
     return prompt.split("```python\n")[2].split("```", 1)[0]
 
 

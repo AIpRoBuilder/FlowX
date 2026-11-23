@@ -5,9 +5,10 @@
 # Added 2026-11-10: read the python, workspace and API key saved by the DeepSeek Harness plugin.
 # Modified 2026-11-16: export plugin-saved environment variables to skill processes.
 # Modified 2026-11-17: stop applying saved environment variables to skill processes.
-"""Use the interpreter, workspace and API key saved in the FlowX Harness plugin settings.
+# Modified 2026-11-22: FlowX calls no LLM, so a saved API key is no longer exported.
+"""Use the interpreter and workspace saved in the FlowX Harness plugin settings.
 
-Run directly to print the saved python and workspace as JSON (never the key).
+Run directly to print the saved python and workspace as JSON.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ def load() -> dict[str, Any]:
 
 
 def apply(workspace: str | None) -> str | None:
-    """Re-exec under the saved Python, export the saved API key and return the workspace to use."""
+    """Re-exec under the saved Python and return the workspace to use."""
     saved = load()
     python = saved.get("python")
     if (isinstance(python, str) and os.path.isabs(python) and os.access(python, os.X_OK)
@@ -52,9 +53,6 @@ def apply(workspace: str | None) -> str | None:
             and not os.environ.get(_REEXEC_GUARD)):
         os.environ[_REEXEC_GUARD] = "1"
         os.execv(python, [python, *sys.argv])
-    key = saved.get("apiKey")
-    if isinstance(key, str) and key:
-        os.environ["FLOWX_LLM_API_KEY"] = key
     saved_workspace = saved.get("workspace")
     if workspace is None and isinstance(saved_workspace, str) and os.path.isabs(saved_workspace):
         return saved_workspace
@@ -63,5 +61,4 @@ def apply(workspace: str | None) -> str | None:
 
 if __name__ == "__main__":
     data = load()
-    print(json.dumps({"python": data.get("python"), "workspace": data.get("workspace"),
-                      "api_key_set": bool(data.get("apiKey"))}))
+    print(json.dumps({"python": data.get("python"), "workspace": data.get("workspace")}))

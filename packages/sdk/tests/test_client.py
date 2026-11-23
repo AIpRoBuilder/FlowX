@@ -1,185 +1,188 @@
-# Modified 2026-11-03: cover allocated workflow graph delegation to the engine.
-# Modified 2026-11-11: cover named and legacy workflow allocation.
-
-from types import SimpleNamespace
-from unittest.mock import Mock
+# SPDX-FileCopyrightText: 2026 FlowX contributors
+# SPDX-License-Identifier: Apache-2.0
+# FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
+# Upstream: https://github.com/AIpRoBuilder/FlowX
+# Modified 2026-11-22: cover the contract protocol; the SDK no longer calls an LLM.
+# Modified 2026-11-23: cover begin_evolve, verify_workflow, and read_artifact.
+from pathlib import Path
 
 import pytest
 
 import flowx_sdk
-import flowx_sdk.client as client_module
-from flowx_core.agent_intent import AgentIntent, StagePlan
-from flowx_core.agent_workflow_engine import AgentResult, StageOutcome
+from flowx_core.builder import WorkflowBuilder
+from flowx_core.service import ServiceManager
+
+REQUIREMENT = """## Background
+Echo text.
+
+## Goals
+Echo.
+
+## Scope
+One node.
+
+## Functional Details
+| node id | meta_node_kind | ext_data.type | purpose | depends |
+| --- | --- | --- | --- | --- |
+| Echo | WorkflowStepNode | none | Echo | - |
+"""
+
+GRAPH = {"nodes": [{
+    "name": "Echo", "type": "Echo", "meta_node_kind": "WorkflowStepNode", "desc": "Echo",
+    "ext_data": {"type": "none", "desc": "local"}, "depends": [],
+}]}
+
+CODE = '''from __future__ import annotations
+
+from typing import Any
+
+from ag_ui_workflow.nodes import WorkflowStepNode
+from ag_ui_workflow.workflow_types import StepRunOutput
+
+
+class Echo(WorkflowStepNode):
+    STEP_ID = "Echo"
+    TITLE = "Echo"
+    PROMPT = "Echo"
+    DEPENDENCIES: list[str] = []
+    INPUT_REQUIRED = False
+
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        value = "echo"
+        session_state["Echo"] = value
+        return StepRunOutput(card={"label": "Echo", "value": value}, derived={"value": value})
+'''
+
+TEST = '''import importlib.util
+from pathlib import Path
+
+
+def _node():
+    path = Path(__file__).resolve().parents[1] / "Echo.py"
+    spec = importlib.util.spec_from_file_location("Echo", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Echo()
+
+
+def test_identity():
+    assert _node().STEP_ID == "Echo"
+
+
+def test_behavior():
+    assert _node().process_input("", {}, {}).derived == {"value": "echo"}
+'''
 
 
 @pytest.fixture
-def sdk(monkeypatch, tmp_path):
-    for name in ("FLOWX_DEFAULT_WORKSPACE", "FLOWX_LLM_API_KEY", "OPENAI_API_KEY", "FLOWX_LLM_MODEL", "FLOWX_LLM_PROVIDER"):
-        monkeypatch.delenv(name, raising=False)
-    builder = Mock(name="builder")
-    constructor = Mock(return_value=builder)
-    monkeypatch.setattr(client_module, "AgentBuilder", constructor)
-    client = client_module.FlowXClient(workspace=tmp_path, api_key="key", model="m", provider="p")
-    return SimpleNamespace(client=client, builder=builder, constructor=constructor, workspace=tmp_path.resolve())
+def client(monkeypatch, tmp_path):
+    monkeypatch.delenv("FLOWX_DEFAULT_WORKSPACE", raising=False)
+    with flowx_sdk.FlowXClient(workspace=tmp_path) as instance:
+        yield instance
 
 
-def test_builder_is_created_lazily_once_with_the_workspace_as_root(sdk):
-    sdk.constructor.assert_not_called()
-
-    assert sdk.client.builder is sdk.client.builder is sdk.builder
-
-    sdk.constructor.assert_called_once_with(
-        api_key="key", model="m", provider="p", root_dir=str(sdk.workspace),
-    )
+def solve(task):
+    return {
+        "requirement": {"requirement": REQUIREMENT},
+        "graph": {"graph": GRAPH},
+        "node": {"code": CODE, "test": TEST},
+    }[task["stage"]]
 
 
-def test_create_workflow_forwards_optional_name(sdk):
-    sdk.builder.engine.create_record.return_value.workflow_id = "Ticket Triage"
-    assert sdk.client.create_workflow("Ticket Triage") == "Ticket Triage"
-    sdk.builder.engine.create_record.assert_called_once_with("Ticket Triage")
-    sdk.client.create_workflow()
-    assert sdk.builder.engine.create_record.call_args.args == (None,)
+def test_the_two_entities_are_created_lazily_once_in_the_workspace(client, tmp_path):
+    assert client._agent is None
+
+    assert isinstance(client.builder, WorkflowBuilder)
+    assert isinstance(client.services, ServiceManager)
+    assert client.builder is client.agent.builder
+    assert client.builder.storage_dir == tmp_path.resolve() / "workflows"
 
 
-def test_llm_settings_fall_back_to_the_environment(monkeypatch, tmp_path):
-    monkeypatch.setenv("FLOWX_LLM_API_KEY", "env-key")
-    monkeypatch.setenv("FLOWX_LLM_MODEL", "env-model")
-    monkeypatch.setenv("FLOWX_LLM_PROVIDER", "env-provider")
-    monkeypatch.setenv("FLOWX_DEFAULT_WORKSPACE", str(tmp_path / "ws"))
+def test_workspace_falls_back_to_the_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOWX_DEFAULT_WORKSPACE", str(tmp_path / "env"))
 
-    client = client_module.FlowXClient()
-
-    assert (client.api_key, client.model, client.provider) == ("env-key", "env-model", "env-provider")
-    assert client.workspace == (tmp_path / "ws").resolve()
-    assert client.workspace.is_dir()
+    assert flowx_sdk.FlowXClient().workspace == (tmp_path / "env").resolve()
 
 
-def test_build_methods_delegate_to_the_engine_api(sdk):
-    builder, client = sdk.builder, sdk.client
-
-    client.build_workflow_json("  Triage tickets  ", temperature=0.1)
-    client.build_workflow_json("Add priority", workflow_id="wf1")
-    client.build_nodes("wf1")
-    client.build_nodes("wf1", {"Reply": "Escalate urgent tickets"}, cascade=True)
-    client.build_main_entrypoint("wf1", "Use port 9000", fastapi_port=9000)
-    client.build_workflow("Add a node", workflow_id="wf1", logs=("trace",))
-
-    assert builder.build_workflow_json.call_args_list[0].args == ("Triage tickets",)
-    assert builder.build_workflow_json.call_args_list[0].kwargs == {"workflow_id": None, "temperature": 0.1}
-    assert builder.build_workflow_json.call_args_list[1].kwargs == {"workflow_id": "wf1"}
-    assert [c.args for c in builder.build_nodes.call_args_list] == [("wf1", None), ("wf1", {"Reply": "Escalate urgent tickets"})]
-    assert builder.build_nodes.call_args_list[1].kwargs == {"cascade": True}
-    builder.build_main_entrypoint.assert_called_once_with("wf1", "Use port 9000", fastapi_port=9000)
-    builder.build_workflow.assert_called_once_with("Add a node", workflow_id="wf1", logs=("trace",))
+def test_create_workflow_forwards_optional_name_and_brief(client, tmp_path):
+    assert client.create_workflow("demo", brief="Echo text") == "demo"
+    assert (Path(client.workspace) / "workflows" / "demo" / "plan" / "brief.md").read_text() == "Echo text"
+    assert client.create_workflow()
+    with pytest.raises(ValueError):
+        client.create_workflow("../escape")
 
 
-def test_build_allocated_workflow_json_delegates_to_the_engine(sdk):
-    result = object()
-    sdk.builder.engine.build_allocated_workflow_json.return_value = result
+def test_build_answers_every_task_with_the_solver(client):
+    workflow_id = client.create_workflow()
+    seen = []
 
-    returned = sdk.client.build_allocated_workflow_json(
-        "wf1", "Collect tickets", temperature=0.17, max_retries=2,
-    )
+    def recording(task):
+        seen.append((task["stage"], task["step_id"]))
+        return solve(task)
 
-    assert returned is result
-    sdk.builder.engine.build_allocated_workflow_json.assert_called_once_with(
-        "wf1", "Collect tickets", temperature=0.17, max_retries=2,
-    )
-    sdk.builder.build_workflow_json.assert_not_called()
+    state = client.build(workflow_id, "Echo text", recording)
 
-
-def test_build_nodes_forwards_await_repair_input(sdk):
-    builder, client = sdk.builder, sdk.client
-
-    client.build_nodes("wf1", await_repair_input=True)
-
-    assert builder.build_nodes.call_args.kwargs == {"await_repair_input": True}
+    assert state["status"] == "completed"
+    assert seen == [("requirement", "requirement"), ("graph", "graph"), ("node", "Echo")]
+    assert client.list_nodes(workflow_id) == [{"step_id": "Echo", "node_id": client.list_nodes(workflow_id)[0]["node_id"], "version": 1}]
+    assert client.workflows()[workflow_id]["workflow_version"] == 1
+    assert client.artifacts(workflow_id)["nodes"]["Echo"]["version"] == 1
+    assert client.build_recovery_state(workflow_id) == {"status": "clear", "workflow_id": workflow_id}
+    assert client.get_build_events(workflow_id)["events"][-1]["type"] == "build_finished"
 
 
-def test_answer_abort_and_pending_requests_delegate_to_the_engine(sdk):
-    builder, client = sdk.builder, sdk.client
-    builder.engine.pending_requests.return_value = [
-        {"request_id": "r1", "workflow_id": "wf1", "awaiting": {"stepId": "Reply__amend_node"}},
-    ]
+def test_manual_protocol_round_trip_and_abort(client):
+    workflow_id = client.create_workflow()
+    opened = client.begin_build(workflow_id, "Echo text")
 
-    client.answer("r1", "use a fallback", "Reply__amend_node")
-    client.answer("r1")
-    client.abort("r1")
+    assert opened["status"] == "running" and opened["next_tasks"][0]["stage"] == "requirement"
+    assert client.build_recovery_state(workflow_id)["status"] == "input_required"
+    response = client.submit_task(workflow_id, opened["next_tasks"][0]["task_id"], {"requirement": "# bad"})
+    assert response["accepted"] is False and response["findings"]
+    assert client.get_tasks(workflow_id, compact=True)[0]["attempt"] == 2
 
-    assert builder.engine.answer.call_args_list[0].args == ("r1", "use a fallback", "Reply__amend_node")
-    assert builder.engine.answer.call_args_list[1].args == ("r1", "", "")
-    builder.engine.abort.assert_called_once_with("r1")
-    assert client.pending_requests() == builder.engine.pending_requests.return_value
+    assert client.abort_build(workflow_id, "stop")["status"] == "aborted"
+    assert client.reopen_stage(workflow_id, "requirement", reason="again")["status"] == "running"
 
 
-def test_evolve_and_list_nodes_delegate_to_the_engine(sdk):
-    builder, client = sdk.builder, sdk.client
-    builder.engine.list_nodes.return_value = [{"step_id": "Reply", "node_id": "n1", "version": 1}]
+def test_build_gives_up_after_max_turns(client):
+    workflow_id = client.create_workflow()
 
-    client.evolve("wf1", "  Add a summary  ", target="workflow", cascade=False)
-    client.evolve("wf1", "Escalate urgent tickets")
-
-    assert builder.evolve.call_args_list[0].args == ("wf1", "Add a summary")
-    assert builder.evolve.call_args_list[0].kwargs == {"target": "workflow", "cascade": False}
-    assert builder.evolve.call_args_list[1].kwargs == {"target": None}
-    assert client.list_nodes("wf1") == [{"step_id": "Reply", "node_id": "n1", "version": 1}]
-    builder.engine.list_nodes.assert_called_once_with("wf1")
-    with pytest.raises(ValueError, match="command"):
-        client.evolve("wf1", "  ")
+    with pytest.raises(RuntimeError, match="did not finish"):
+        client.build(workflow_id, "Echo text", lambda task: {}, max_turns=2)
 
 
-def test_build_workflow_json_rejects_an_empty_prompt(sdk):
-    with pytest.raises(ValueError, match="prompt"):
-        sdk.client.build_workflow_json("   ")
+def test_services_are_idle_until_started_and_close_is_idempotent(client):
+    client.stop_all_services()  # nothing created yet
+    workflow_id = client.create_workflow()
 
-    sdk.builder.build_workflow_json.assert_not_called()
-
-
-def test_service_and_inspection_methods(sdk):
-    builder = sdk.builder
-    builder.run_service.return_value = {"pid": 7}
-    builder.engine.catalog.return_value = {"wf1": {}}
-    builder.engine.artifacts.return_value = {"workflow_id": "wf1"}
-
-    assert sdk.client.run_service("wf1") == {"pid": 7}
-    sdk.client.stop_service("wf1")
-    assert sdk.client.workflows() == {"wf1": {}}
-    assert sdk.client.artifacts("wf1") == {"workflow_id": "wf1"}
-
-    builder.run_service.assert_called_once_with("wf1")
-    builder.stop_service.assert_called_once_with("wf1")
-    builder.engine.artifacts.assert_called_once_with("wf1")
+    assert client.service_status(workflow_id)["running"] is False
+    with pytest.raises(FileNotFoundError):
+        client.run_service(workflow_id)
+    client.close()
+    client.close()
 
 
-def test_close_releases_the_builder_once_and_a_new_one_is_created_afterwards(sdk):
-    with sdk.client as client:
-        assert client.builder is sdk.builder
+def test_evolve_verify_and_read_artifact(client):
+    workflow_id = client.create_workflow("echo-evolve")
+    assert client.build(workflow_id, "Echo text", solve)["status"] == "completed"
+    assert client.verify_workflow(workflow_id)["ok"] is True
 
-    sdk.builder.close.assert_called_once_with()
-    sdk.client.close()
-    sdk.builder.close.assert_called_once_with()
-    sdk.client.builder
-    assert sdk.constructor.call_count == 2
+    art = client.read_artifact(workflow_id, "source", node="Echo")
+    assert art["read_only"] is True and 'STEP_ID = "Echo"' in art["content"]
 
-
-def test_close_without_use_does_not_create_a_builder(sdk):
-    sdk.client.close()
-
-    sdk.constructor.assert_not_called()
-
-
-def test_result_to_dict_flattens_nested_dataclasses():
-    result = AgentResult(
-        workflow_id="wf1", ok=False,
-        intent=AgentIntent(workflow_id="wf1", graph=StagePlan("modify", "Add priority")),
-        stages={"graph": StageOutcome("graph", "completed", 1, changed=True), "nodes": StageOutcome("nodes", "failed", 2, "boom")},
-        errors={"nodes/Reply": "boom"}, logs={"main_run": "ok"}, artifacts={"workflow_id": "wf1"},
-    )
-
-    payload = client_module.result_to_dict(result)
-
-    assert payload["ok"] is False and payload["workflow_id"] == "wf1"
-    assert payload["intent"]["graph"]["mode"] == "modify"
-    assert payload["stages"]["nodes"]["status"] == "failed" and payload["stages"]["nodes"]["error"] == "boom"
-    assert payload["errors"] == {"nodes/Reply": "boom"}
-    assert payload["service"] is None
+    opened = client.begin_evolve(workflow_id, "echo louder", scope="node", node="Echo")
+    assert opened["mode"] == "edit_node" and opened["baseline_version"] == 1
+    task = opened["next_tasks"][0]
+    assert task["context"]["baseline"]["version"] == 1
+    updated_code = CODE.replace('value = "echo"', 'value = "ECHO"')
+    updated_test = TEST.replace('"echo"', '"ECHO"')
+    done = client.submit_task(workflow_id, task["task_id"], {"code": updated_code, "test": updated_test})
+    assert done["accepted"] is True and done["state"]["status"] == "completed"
+    assert client.list_nodes(workflow_id)[0]["version"] == 2
+    assert client.verify_workflow(workflow_id)["ok"] is True

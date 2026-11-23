@@ -23,7 +23,7 @@ const deferred = () => {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 };
-const settings = { python: '/bin/python', workspace: '/workspace', apiKey: '' };
+const settings = { python: '/bin/python', workspace: '/workspace' };
 const catalog = (...ids) => ({ workflows: Object.fromEntries(ids.map(id => [id, { workflow_version: 3, nodes: { n: 'id' } }])) });
 const entries = (...items) => ({ entries: items, truncated: false });
 const entry = (path, type = 'file', readable = true) => ({ name: path.split('/').at(-1), path, type, readable });
@@ -505,9 +505,9 @@ test('settings load, validate on the host, save paths and refresh the catalog', 
   await ui.click(ui.button('Settings'));
   const dialog = ui.find(node => node.props.role === 'dialog');
   assert.equal(dialog.props['aria-modal'], true);
-  for (const [key, label] of [['python', 'FLOWX_PYTHON'], ['workspace', 'FLOWX_WORKSPACE'], ['apiKey', 'FLOWX_LLM_API_KEY']]) {
+  for (const [key, label] of [['python', 'FLOWX_PYTHON'], ['workspace', 'FLOWX_WORKSPACE']]) {
     assert.equal(ui.input(key).props.value, settings[key]);
-    assert.equal(ui.input(key).props.required, key !== 'apiKey');
+    assert.equal(ui.input(key).props.required, true);
     assert.ok(ui.find(node => node.type === 'label' && node.props.htmlFor === `flowx-${key}` && ui.text(node) === label));
   }
   await ui.change('workspace', 'relative');

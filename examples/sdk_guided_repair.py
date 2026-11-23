@@ -1,83 +1,53 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build a FlowX workflow with user-guided node repair.
+# Modified 2026-11-22: repair from structured findings; the agent fixes what FlowX reports, no LLM key is needed.
+"""Build a FlowX workflow and repair a rejected node from its findings.
 
 Setup (from the repository root):
 
     pip install -e .
-    export FLOWX_LLM_PROVIDER=deepseek FLOWX_LLM_MODEL=deepseek-flash FLOWX_LLM_API_KEY=<your key>
     python examples/sdk_guided_repair.py
 
-``build_nodes(...)`` pauses when a node's test fails (gating is on by default).
-The result carries ``status="input_required"``, a ``request_id`` and ``awaiting``
-(node, prompt, pytest log and test result). Answer with ``flowx.answer(...)``:
-guidance amends the node, ``test: <guidance>`` amends the generated test instead,
-``"skip"`` skips the amendment, and an empty string amends the node from the test
-log alone.
+A rejected submission is not an error: ``submit_task`` returns ``accepted=False``, the ``findings`` (rule id,
+message, line, remediation), the node's ``test`` result, and a repair task (``attempt`` + 1) whose
+``context.last_findings`` and ``context.last_test_log`` repeat them. Fix exactly those findings and submit again;
+omitted slots keep their previous content. After ``max_attempts`` the node is marked failed and its descendants
+blocked. Here the scripted agent first gets a node wrong on purpose, then repairs it.
 """
 
 from __future__ import annotations
 
-import sys
-
+from _demo_agent import INTENT, node_code, node_test, solve
 from flowx_sdk import FlowXClient
 
-REQUIREMENT = (
-    "Build a workflow that accepts a support ticket, classifies its category, "
-    "assigns a priority, and drafts a reply."
-)
 
-
-def answer_prompt(awaiting: dict) -> str:
-    """Prompt for guidance after one node's test fails."""
-    print(f"\n=== {awaiting.get('node', 'node')} test failed ===")
-    print(awaiting.get("prompt", ""))
-    print((awaiting.get("test_log") or "")[-4000:])
-    return input(
-        "\nHow should I modify this node?\n"
-        "  - enter a direction to guide the node amendment\n"
-        "  - enter 'test: <direction>' to fix the generated test instead\n"
-        "  - enter 'skip' to skip this amendment attempt\n"
-        "  - press Enter to amend the node from the test log alone\n"
-        "> "
-    ).strip()
+def flawed_greeter() -> dict[str, str]:
+    """A wrong STEP_ID and a test that expects the wrong value."""
+    return {
+        "code": node_code("Greeter", step_id="Hello"),
+        "test": node_test("Greeter", expected="goodbye"),
+    }
 
 
 def main() -> None:
     with FlowXClient() as flowx:
-        if not flowx.api_key:
-            sys.exit("Set FLOWX_LLM_API_KEY (or pass api_key=...) before running this example.")
+        workflow_id = flowx.create_workflow()
+        flowx.begin_build(workflow_id, INTENT)
+        attempts = 0
+        while flowx.get_build_state(workflow_id)["status"] == "running":
+            task = flowx.get_tasks(workflow_id)[0]
+            if task["step_id"] == "Greeter" and attempts == 0:
+                artifacts, attempts = flawed_greeter(), 1
+            elif task["step_id"] == "Greeter":
+                artifacts = {"code": node_code("Greeter"), "test": node_test("Greeter")}
+            else:
+                artifacts = solve(task)
+            response = flowx.submit_task(workflow_id, task["task_id"], artifacts)
+            print(f"{task['task_id']}: accepted={response['accepted']}")
+            for finding in response.get("findings", []):
+                print(f"    [{finding['rule_id']}] {finding['message'][:100]!r} -> {finding['remediation']}")
 
-        # 1. Create workflow.json and its requirement analysis.
-        created = flowx.build_workflow_json(REQUIREMENT).raise_for_failure()
-        workflow_id = created.workflow_id
-        print(f"workflow {workflow_id}: {created.artifacts['graph']}")
-
-        # 2. Build the nodes. A failed node test pauses at that node's own gate (the
-        # default); answer each question and continue until the build finishes.
-        #
-        # For non-interactive automation, pass await_repair_input=False: the engine
-        # then amends from the test log without asking.
-        built = flowx.build_nodes(
-            workflow_id,
-            await_repair_input=True,
-            node_options={"max_repair_retries": 5},
-        )
-        asked = 0
-        while built.status == "input_required":
-            awaiting = built.awaiting
-            asked += 1
-            answer = answer_prompt(dict(awaiting))
-            built = flowx.answer(built.request_id, answer, awaiting["stepId"])
-        built.raise_for_failure()
-        print(f"nodes: {', '.join(built.artifacts['nodes'])}")
-        if asked:
-            print(f"guided repair prompts: {asked}")
-        else:
-            print("No repair prompt was needed: every node test passed.")
-
-        # 3. Generate the main entrypoint from the built nodes.
-        entrypoint = flowx.build_main_entrypoint(workflow_id).raise_for_failure()
-        print(f"entrypoint: {entrypoint.artifacts['main_entrypoint']['path']}")
+        state = flowx.get_build_state(workflow_id)
+        print(f"build {state['status']}; nodes: {[(node['step_id'], node['status']) for node in state['nodes']]}")
 
 
 if __name__ == "__main__":

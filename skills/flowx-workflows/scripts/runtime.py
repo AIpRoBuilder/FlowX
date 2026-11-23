@@ -6,6 +6,7 @@
 # Adapted the generated service HTTP and SSE protocol from flowx_mcp.server.
 # Modified 2026-11-11: describe workflow IDs without assuming they are generated.
 # Modified 2026-11-16: note that step events include node cards with media paths.
+# Modified 2026-11-22: use the workflow builder's records and the service manager's run_service.
 """Run one generated FlowX service and exchange JSON lines over stdin/stdout."""
 
 from __future__ import annotations
@@ -114,7 +115,7 @@ def _check_service_setup(client: Any, workflow_id: str) -> Any:
 
     if not os.path.samefile(select_python_command(), sys.executable):
         raise ServiceConfigurationError("SDK service interpreter differs; activate the matching environment")
-    record = client.builder.engine.record(workflow_id)
+    record = client.builder.record(workflow_id)
     addresses = socket.getaddrinfo(record.fastapi_host or None, record.fastapi_port,
                                    type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
     for family, kind, proto, _, address in addresses:
@@ -263,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
 
             with FlowXClient(workspace=args.workspace) as client:
                 record = _check_service_setup(client, args.workflow_id)
-                base_url = _base_url(client.run_service(args.workflow_id))
+                base_url = _base_url(client.run_service(args.workflow_id, wait=False))
                 phase = "readiness"
                 _wait_until_ready(base_url, args.ready_timeout, record.process)
                 _emit(output, {"event": "service_ready", "base_url": base_url,
