@@ -8,6 +8,7 @@
 <!-- Modified 2026-11-16: document per-node media canvas previews, run journals, layout storage, and Range streaming. -->
 <!-- Modified 2026-11-16: document saved environment variables for FlowX skill processes. -->
 <!-- Modified 2026-11-17: remove global environment settings and document per-workflow .env editing. -->
+<!-- Modified 2026-11-23: FlowX calls no LLM, so settings hold only the interpreter and workspace paths. -->
 
 # FlowX for DeepSeek Harness
 
@@ -38,23 +39,21 @@ compatibility, but the browser interface does not surface them.
 - The viewer and its settings need only the Python SDK. The FlowX skill is
   needed only by the retained build compatibility endpoints, which invoke its
   `build.py`.
-- A provider and model with authorized API access. Configure
-  `FLOWX_LLM_PROVIDER` and `FLOWX_LLM_MODEL` in the Harness host environment;
-  provide `FLOWX_LLM_API_KEY` there or save it in the viewer settings. The key
-  may be inherited by spawned skill processes. The SDK and skill scripts do not
-  automatically load a FlowX `.env` file; even inspection can require a provider
-  key. Harness model settings do not automatically configure FlowX.
+- No model provider or API key: FlowX calls no LLM, and the Harness agent writes
+  the workflow artifacts. Provider keys that a generated workflow needs belong in
+  that workflow service's `.env` file. The SDK and skill scripts do not
+  automatically load a FlowX `.env` file; Harness model settings do not
+  automatically configure FlowX.
 
 ## Install and configure
 
 ### Shared Python and skill setup
 
 The following macOS/Linux example starts at a FlowX checkout root. Replace the
-placeholder path, use a trusted checkout, and obtain the API key securely in
-your environment; do not put it in a command, shell history, chat, or a
-committed file. Create the virtual environment only if the chosen path is
-unused, or use an existing Python 3.10+ environment with FlowX installed. Git
-is needed to install FlowX's runtime dependency from its Git repository.
+placeholder path and use a trusted checkout. Create the virtual environment only
+if the chosen path is unused, or use an existing Python 3.10+ environment with
+FlowX installed. Git is needed to install FlowX's runtime dependency from its Git
+repository.
 
 ```sh
 cd /absolute/path/to/FlowX
@@ -70,11 +69,6 @@ cp -R skills/flowx-workflows/. .dsh/skills/flowx-workflows/
 export FLOWX_PYTHON="$PWD/.venv/bin/python"
 export FLOWX_WORKSPACE="$PWD/.flowx_workspaces"
 export FLOWX_SKILL_DIR="$PWD/.dsh/skills/flowx-workflows"
-export FLOWX_LLM_PROVIDER=deepseek
-export FLOWX_LLM_MODEL=deepseek-flash
-# Set FLOWX_LLM_API_KEY securely in this environment before continuing.
-: "${FLOWX_LLM_API_KEY:?Set FLOWX_LLM_API_KEY securely before launching Harness}"
-export FLOWX_LLM_API_KEY
 ```
 
 Then choose Web or Desktop below. The exported variables apply to this terminal
@@ -108,8 +102,8 @@ reported by `dsh web`. See the [Harness CLI guide](https://github.com/deepseek-a
   ```
 
 3. Reopen Desktop. Select **FlowX** in the sidebar and use **Settings** to save
-  the absolute Python and workspace paths and, if needed, the API key. Configure
-  the provider and model in the Desktop host environment before launch.
+  the absolute Python and workspace paths. No model provider or API key is
+  configured for FlowX itself.
 
 Web and Desktop have separate plugin profiles: installing in one does not
 install in the other. They share FlowX settings when they use the same
@@ -132,9 +126,9 @@ by the offline tests below.
 
 ### Viewer settings
 
-Select **Settings** in the overlay to edit two existing absolute paths and the
-API key. No skill directory is needed to save settings or view workflows; build
-endpoints locate the skill on demand
+Select **Settings** in the overlay to edit two existing absolute paths. No skill
+directory is needed to save settings or view workflows; build endpoints locate
+the skill on demand
 (`FLOWX_SKILL_DIR`, the source checkout, then
 `$DSH_HOME/skills/flowx-workflows` or `~/.dsh/skills/flowx-workflows`, then
 `./.dsh/skills/flowx-workflows`). The dialog reloads the workflow list
@@ -145,11 +139,13 @@ host restart.
 | --- | --- | --- |
 | `python` | `FLOWX_PYTHON` | Executable Python interpreter with the FlowX SDK installed. Preserve the virtual-environment executable path rather than resolving it to the base interpreter. |
 | `workspace` | `FLOWX_WORKSPACE` | Existing directory for FlowX artifacts, independent of the workspace selected in Harness. |
-| `apiKey` | `FLOWX_LLM_API_KEY` | Optional provider key. It is stored in the owner-only settings file, never returned to the browser, and an empty value keeps the saved key. |
 
 The separately installed skill's scripts read this same settings file, so they
-use the saved `python`, `workspace` and API key by default (explicit
+use the saved `python` and `workspace` by default (explicit
 `--workspace` still wins).
+
+A settings file saved by a version that stored an LLM API key is rejected as
+invalid; open **Settings** and save the two paths again.
 
 The host persists these paths in
 `$DSH_HOME/plugins/deepseek-harness-flowx/settings.json`, or
@@ -191,7 +187,7 @@ and [NOTICE](NOTICE).
    narrow windows this dismisses Harness's navigation drawer first; the current
    conversation and its selection are preserved. Press **Escape**, select
    **Close**, or use the footer action again to close the overlay. Select
-  **Settings** to configure `python`, `workspace`, and the API key.
+  **Settings** to configure `python` and `workspace`.
 2. Select a workflow to inspect its graph, dependencies, requirements, main
    entrypoint, and available node artifacts. The graph is the **current plan**,
    not necessarily the published revision: published workflow and node

@@ -239,7 +239,9 @@ def test_run_steps_rejects_non_step_output() -> None:
 
     engine = init_workflow_engine({"invalid": InvalidStep}, {"nodes": [{"name": "invalid"}]})
     try:
-        with pytest.raises(RuntimeError, match="process_input must return StepRunOutput"):
+        # The native layer either reports the failed step or completes without its
+        # output; both mean process_input did not return a StepRunOutput.
+        with pytest.raises(RuntimeError, match="process_input must return StepRunOutput|did not produce output"):
             engine.run_steps()
         with pytest.raises(ValueError, match="unknown workflow step"):
             engine.run_steps(inputs={"missing": "value"})

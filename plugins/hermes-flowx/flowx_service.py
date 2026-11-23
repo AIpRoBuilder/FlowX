@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Added 2026-11-19: read-only FlowX workspace inspection shared by the Hermes agent plugin and dashboard API.
+# Modified 2026-11-23: FlowX calls no LLM, so the viewer no longer reports provider or model settings.
 
 """Read-only inspection of a FlowX workspace for the Hermes plugin.
 
@@ -113,8 +114,6 @@ class Settings:
     single_workflow: bool
     single_id: str
     python: str
-    provider: str
-    model: str
     source: str
 
     @property
@@ -187,8 +186,6 @@ def load_settings() -> Settings:
         single_workflow=single,
         single_id=single_id,
         python=python_value,
-        provider=str(os.environ.get("FLOWX_LLM_PROVIDER") or "").strip(),
-        model=str(os.environ.get("FLOWX_LLM_MODEL") or "").strip(),
         source=source,
     )
 
@@ -204,8 +201,6 @@ def config_info() -> dict[str, Any]:
         "workflows_dir": str(settings.workflows_dir),
         "single_workflow": settings.single_workflow,
         "python": settings.python,
-        "provider": settings.provider,
-        "model": settings.model,
         "settings_source": settings.source,
     }
 

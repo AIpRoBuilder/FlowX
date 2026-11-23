@@ -28,11 +28,6 @@ const call = (service, endpoint, payload = null, peer = OWNER) => service.dispat
 const value = async (...args) => {
   const result = await call(...args);
   assert.equal(result.ok, true, JSON.stringify(result));
-  // Settings results are compared against the submitted shape; the key itself is never returned.
-  if (['getSettings', 'saveSettings'].includes(args[1])) {
-    const { apiKeySet, ...rest } = result.value;
-    return { ...rest, apiKey: '' };
-  }
   return result.value;
 };
 const waitFor = async (predicate, message = 'condition') => {
@@ -53,7 +48,7 @@ async function fixture(t) {
   await fs.writeFile(path.join(skill, 'scripts', 'build.py'), '');
   await fs.writeFile(path.join(skill, 'scripts', 'inspect_workflow.py'), '');
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  return { root, workspace, skill, env: { ...process.env, DSH_HOME: path.join(root, 'dsh'), FLOWX_WORKSPACE: workspace, FLOWX_PYTHON: process.execPath, FLOWX_SKILL_DIR: skill, FLOWX_LLM_API_KEY: 'test-secret-value' } };
+  return { root, workspace, skill, env: { ...process.env, DSH_HOME: path.join(root, 'dsh'), FLOWX_WORKSPACE: workspace, FLOWX_PYTHON: process.execPath, FLOWX_SKILL_DIR: skill, FLOWX_IMAGE_API_KEY: 'test-secret-value' } };
 }
 
 class FakeChild extends EventEmitter {
@@ -246,11 +241,11 @@ test('revisions are monotonic within a unique service instance', async t => {
   await second.dispose();
 });
 
-test('child environment retains Python and LLM configuration but drops unrelated credentials', async t => {
+test('child environment retains Python and provider configuration but drops unrelated credentials', async t => {
   const { env } = await fixture(t);
   Object.assign(env, {
     PYTHONPATH: '/python/modules', VIRTUAL_ENV: '/python/venv', OPENAI_BASE_URL: 'https://example.test/v1',
-    FLOWX_LLM_PROVIDER: 'qwen', DASHSCOPE_API_KEY: 'provider-key', OPENAI_API_KEY: 'openai-key',
+    DASHSCOPE_API_KEY: 'provider-key', OPENAI_API_KEY: 'openai-key',
     GOOGLE_APPLICATION_CREDENTIALS: '/home/user/credential.json', AWS_CONFIG_FILE: '/home/user/aws-config',
     GITHUB_TOKEN: 'github-token', AWS_SECRET_ACCESS_KEY: 'aws-secret', AWS_ACCESS_KEY_ID: 'aws-id',
     ANTHROPIC_API_KEY: 'unrelated-key', NPM_CONFIG_PASSWORD: 'npm-password', CI_JOB_JWT: 'job-jwt',
@@ -261,7 +256,7 @@ test('child environment retains Python and LLM configuration but drops unrelated
   t.after(() => service.dispose());
   const child = await startFake(service, fake);
   const inherited = fake.calls[0].options.env;
-  for (const key of ['PATH', 'HOME', 'PYTHONPATH', 'VIRTUAL_ENV', 'OPENAI_BASE_URL', 'FLOWX_LLM_PROVIDER', 'FLOWX_LLM_API_KEY', 'DASHSCOPE_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_APPLICATION_CREDENTIALS', 'AWS_CONFIG_FILE', 'HTTPS_PROXY']) assert.equal(inherited[key], env[key], key);
+  for (const key of ['PATH', 'HOME', 'PYTHONPATH', 'VIRTUAL_ENV', 'OPENAI_BASE_URL', 'DASHSCOPE_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_APPLICATION_CREDENTIALS', 'AWS_CONFIG_FILE', 'HTTPS_PROXY']) assert.equal(inherited[key], env[key], key);
   for (const key of ['GITHUB_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'AWS_ACCESS_KEY_ID', 'ANTHROPIC_API_KEY', 'NPM_CONFIG_PASSWORD', 'CI_JOB_JWT', 'DATABASE_URL']) assert.equal(Object.hasOwn(inherited, key), false, key);
   assert.equal(env.GITHUB_TOKEN, 'github-token');
   assert.doesNotMatch(service.redact('dbpass user pass dbuser'), /dbpass|dbuser|\buser\b|\bpass\b/);
@@ -713,15 +708,15 @@ test('abort cannot race a late success result into completed', async t => {
   await waitFor(() => service.state.status === 'failed' && !service.active);
 });
 
-const settingsFor = env => ({ python: env.FLOWX_PYTHON, workspace: env.FLOWX_WORKSPACE, apiKey: '' });
-const shown = (s, apiKeySet = true) => ({ python: s.python, workspace: s.workspace, apiKeySet });
+const settingsFor = env => ({ python: env.FLOWX_PYTHON, workspace: env.FLOWX_WORKSPACE });
+const shown = s => ({ python: s.python, workspace: s.workspace });
 const onDisk = s => ({ python: s.python, workspace: s.workspace });
 const settingsFile = env => path.join(env.DSH_HOME, 'plugins', 'deepseek-harness-flowx', 'settings.json');
 
 test('settings use environment fallbacks and persist privately across service restarts', async t => {
   const { root, workspace, skill, env } = await fixture(t);
   const fallback = new FlowXHostService({ env: { ...env, FLOWX_PYTHON: undefined, FLOWX_WORKSPACE: undefined } });
-  assert.deepEqual(await value(fallback, 'getSettings'), { python: null, workspace: null, apiKey: '' });
+  assert.deepEqual(await value(fallback, 'getSettings'), { python: null, workspace: null });
   await fallback.dispose();
   await assert.rejects(fs.lstat(env.DSH_HOME), { code: 'ENOENT' });
 
@@ -729,7 +724,7 @@ test('settings use environment fallbacks and persist privately across service re
   const interpreter = path.join(root, 'venv-python');
   await fs.mkdir(alternate);
   await fs.symlink(process.execPath, interpreter);
-  const settings = { python: interpreter, workspace: alternate, apiKey: '' };
+  const settings = { python: interpreter, workspace: alternate };
   const first = new FlowXHostService({ env });
   assert.deepEqual(await value(first, 'getSettings'), settingsFor(env));
   assert.deepEqual(await value(first, 'saveSettings', settings), settings);
@@ -737,7 +732,7 @@ test('settings use environment fallbacks and persist privately across service re
   const filename = settingsFile(env);
   const disk = await fs.readFile(filename, 'utf8');
   assert.deepEqual(JSON.parse(disk), onDisk(settings));
-  assert.doesNotMatch(disk, /test-secret-value|FLOWX_LLM_API_KEY/);
+  assert.doesNotMatch(disk, /test-secret-value/);
   assert.equal((await fs.stat(filename)).mode & 0o777, 0o600);
   assert.equal((await fs.stat(path.dirname(filename))).mode & 0o777, 0o700);
   await first.dispose();

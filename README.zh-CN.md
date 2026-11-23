@@ -64,11 +64,11 @@ FlowX 仍采用 Apache-2.0 许可证；欢迎符合许可证要求的 Fork 与�
 <details>
 <summary>📣 更新动态</summary>
 
-- **[2026.11.22]** 🧭 **由 Agent 驱动构建，FlowX 内部不再有 LLM。** FlowX 现在由两部分组成：**工作流构建器**和**服务管理器**。构建器保留 `ag_ui_workflow` 流水线（需求 → 图 → 每个节点一个 Gate → 入口），但各步骤等待*你的 Agent*：每个 Gate 返回契约包，接收产物，运行审计器和节点的 pytest，然后发布版本，或返回结构化的发现项并发出修复任务。Agent 可通过 `get_build_state` 和只追加的事件日志查看每个阶段与节点状态。旧的 `start_*`/`get_build_status` MCP 工具、`evolve`/`build_*` SDK 方法、修复门控和 `FLOWX_LLM_*` 设置均已移除。详见 [docs/DYNAMIC_WORKFLOW.md](docs/DYNAMIC_WORKFLOW.md)。
+- **[2026.11.22]** 🧭 **由 Agent 驱动构建，FlowX 内部不再有 LLM。** FlowX 现在由两部分组成：**工作流构建器**和**服务管理器**。构建器保留 `ag_ui_workflow` 流水线（需求 → 图 → 每个节点一个 Gate → 入口），但各步骤等待*你的 Agent*：每个 Gate 返回契约包，接收产物，运行审计器和节点的 pytest，然后发布版本，或返回结构化的发现项并发出修复任务。Agent 可通过 `get_build_state` 和只追加的事件日志查看每个阶段与节点状态。旧的 `start_*`/`get_build_status` MCP 工具、`evolve`/`build_*` SDK 方法、修复门控以及 LLM 提供商/API 密钥设置均已移除。详见 [docs/DYNAMIC_WORKFLOW.md](docs/DYNAMIC_WORKFLOW.md)。
 - **[2026.11.16]** 🖼️ **媒体工作流支持。** 生成的节点除了结构化文本外，还可以返回 `prompt`、`image` 和 `video` 卡片。新增的 `flowx_core.media` 工具包含图像/视频服务商调用封装、Pillow 缩放与裁剪、FFmpeg 裁剪与缩放、可选的 Blender 无界面渲染（需设置 `FLOWX_ENABLE_BLENDER=1`），以及用于零成本节点测试的 `FLOWX_MEDIA_DRY_RUN=1`。媒体产物与步骤卡片会记录到 `workflows/<workflow_id>/runs/`。服务商调用可能产生费用，生成的代码与测试也不在沙箱中运行。
 - **[2026.11.19]** 🎛️ **Hermes Agent 插件。**新的 [Hermes 插件](plugins/hermes-flowx/README.md)提供只读 FlowX Dashboard 标签页（可拖拽的计划图、运行日志卡片、受限媒体预览、工作流文件浏览器）以及五个 Agent 工具。它不会构建、运行或修改工作流，唯一写入的文件是 `canvas_layout.json`。使用 `hermes plugins install AIpRoBuilder/FlowX/plugins/hermes-flowx --enable` 单独安装。
 - **[2026.11.16]** 🎛️ **DeepSeek Harness 插件更新。** 工作流画布现在可以预览每个节点的 `prompt`、`image` 和 `video` 卡片，并支持运行历史（**Sync outputs**）、版本过期标记、缩放与宽画布、按工作流保存的拖拽布局，以及全尺寸灯箱预览。媒体通过仅限所有者的 `/api/flowx/media` 路由以带鉴权的 HTTP `Range` 响应提供。每个工作流还提供 **Edit .env** 面板，可查看和编辑其 `service_<id>/.env` 文件，用于配置该服务专用的提供商、媒体与工具参数。详见[插件 README](plugins/deepseek-harness-flowx/README.md)。
-- **[2026.11.10]** 🔑 **技能与插件更新。** DeepSeek Harness 插件设置现在可填写 `FLOWX_LLM_API_KEY`，且不再需要填写技能目录；FlowX 技能脚本会复用插件保存的 Python、工作区和 API Key。
+- **[2026.11.10]** 🔑 **技能与插件更新。** DeepSeek Harness 插件不再需要填写技能目录；FlowX 技能脚本会复用插件保存的 Python 和工作区。
 - **[2026.10.28]** 🧩 **扩展节点引擎。** 每个业务节点在发布前都会执行“生成 → 审计 → 测试 → 有界修复”链路。
 - **[2026.10.24]** ⚙️ **原生 WorkflowEngine 生成。** 图、节点和入口生成工作流现在都是 `WorkflowEngine` 的子类。
 - **[2026.10.22]** 🚀 **交互式运行时。** `run_service` 返回可连接的 `base_url`；MCP 新增 `run_step` 与 `reset_session`。

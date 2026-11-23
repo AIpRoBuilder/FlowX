@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowx"
-version = "0.2.0"
+version = "1.0.2"
 description = "Agent-driven workflow builder and service manager with MCP, SDK, and A2A interfaces"
 readme = "README.md"
 license = { file = "LICENSE" }

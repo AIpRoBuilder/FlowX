@@ -11,6 +11,7 @@
 // Modified 2026-11-16: add HTML-over-SVG media canvas, per-node prompt/image/video previews, run selector, and layout persistence.
 // Modified 2026-11-16: add a saved environment-variable area to plugin settings.
 // Modified 2026-11-17: remove global environment settings and show/edit each workflow's .env file.
+// Modified 2026-11-23: FlowX calls no LLM, so settings hold only the interpreter and workspace paths.
 
 window.__ModuleLoader__.load({
   id: 'dsh-flowx-plugin',
@@ -412,11 +413,11 @@ window.__ModuleLoader__.load({
       };
       const openSettings = async () => {
         const ticket = ++settingsTicket.current;
-        setSettings({ python: '', workspace: '', apiKey: '', apiKeySet: false }); setSettingsError(''); setSettingsBusy(true);
+        setSettings({ python: '', workspace: '' }); setSettingsError(''); setSettingsBusy(true);
         try {
           const value = await call('getSettings', null);
           if (mounted.current && ticket === settingsTicket.current) {
-            setSettings({ python: value?.python || '', workspace: value?.workspace || '', apiKey: '', apiKeySet: !!value?.apiKeySet });
+            setSettings({ python: value?.python || '', workspace: value?.workspace || '' });
           }
         } catch (failure) { if (mounted.current && ticket === settingsTicket.current) setSettingsError(failure.message || 'Unable to load settings.'); }
         finally { if (mounted.current && ticket === settingsTicket.current) setSettingsBusy(false); }
@@ -426,7 +427,7 @@ window.__ModuleLoader__.load({
         event.preventDefault(); if (!settings || settingsBusy || saving.current || operation.current || busy) return;
         const ticket = ++settingsTicket.current; saving.current = true; setSettingsBusy(true); setSettingsError('');
         try {
-          await call('saveSettings', { python: settings.python, workspace: settings.workspace, apiKey: settings.apiKey });
+          await call('saveSettings', { python: settings.python, workspace: settings.workspace });
           if (mounted.current && ticket === settingsTicket.current) { setSettings(null); settingsButton.current?.focus(); }
           notifySaved();
         } catch (failure) { if (mounted.current && ticket === settingsTicket.current) setSettingsError(failure.message || 'Unable to save settings.'); }
@@ -510,9 +511,9 @@ window.__ModuleLoader__.load({
                 : h('img', { src: lightbox.src, alt: lightbox.label, style: { maxWidth: '100%', maxHeight: '74vh', borderRadius: 10, display: 'block' } }))),
           settings && h('div', { role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'flowx-settings-title', onKeyDown: event => { if (event.key !== 'Tab') return; const controls = [...event.currentTarget.querySelectorAll('input:not(:disabled), textarea:not(:disabled), button:not(:disabled)')]; if (!controls.length) { event.preventDefault(); return; } const first = controls[0], last = controls[controls.length - 1]; if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); } else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); } }, style: { position: 'fixed', inset: 0, background: 'rgba(24, 39, 62, .45)', display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: 14, boxSizing: 'border-box', overflow: 'auto' } },
             h('form', { onSubmit: saveSettings, style: { ...styles.card, width: '100%', maxWidth: 520, boxShadow: '0 16px 50px rgba(0,0,0,.2)' } },
-              h('h2', { id: 'flowx-settings-title', style: styles.heading }, 'FlowX settings'), h('p', { style: styles.muted }, 'Absolute paths on the Harness host. Saved values take precedence over environment variables. The API key is stored owner-only on the host and never shown again; leave it empty to keep the current one.'),
+              h('h2', { id: 'flowx-settings-title', style: styles.heading }, 'FlowX settings'), h('p', { style: styles.muted }, 'Absolute paths on the Harness host. Saved values take precedence over environment variables.'),
               settingsError && h('p', { role: 'alert', style: styles.notice }, settingsError),
-              [['python', 'FLOWX_PYTHON'], ['workspace', 'FLOWX_WORKSPACE'], ['apiKey', 'FLOWX_LLM_API_KEY']].map(([key, label]) => h('div', { key }, h('label', { htmlFor: `flowx-${key}`, style: styles.label }, label), h('input', { id: `flowx-${key}`, ref: key === 'python' ? settingsRef : undefined, style: styles.input, type: key === 'apiKey' ? 'password' : 'text', autoComplete: key === 'apiKey' ? 'off' : undefined, placeholder: key === 'apiKey' && settings.apiKeySet ? 'Key is set' : undefined, value: settings[key], required: key !== 'apiKey', disabled: settingsBusy, onChange: event => setSettings(old => ({ ...old, [key]: event.target.value })) }))),
+              [['python', 'FLOWX_PYTHON'], ['workspace', 'FLOWX_WORKSPACE']].map(([key, label]) => h('div', { key }, h('label', { htmlFor: `flowx-${key}`, style: styles.label }, label), h('input', { id: `flowx-${key}`, ref: key === 'python' ? settingsRef : undefined, style: styles.input, type: 'text', value: settings[key], required: true, disabled: settingsBusy, onChange: event => setSettings(old => ({ ...old, [key]: event.target.value })) }))),
               h('div', { style: { ...styles.row, marginTop: 16 } }, h('button', { type: 'submit', style: styles.primary, disabled: settingsBusy || !!busy }, settingsBusy ? 'Working…' : 'Save settings'), h('button', { type: 'button', style: styles.button, disabled: saving.current, onClick: cancelSettings }, 'Cancel'))))));
     }
 

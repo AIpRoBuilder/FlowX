@@ -163,6 +163,6 @@ def workspace(service, tmp_path):
         encoding="utf-8",
     )
     (workflow / "runs" / "run-1" / "media" / "A" / "out.png").write_bytes(PNG)
-    (workflow / ".env").write_text("FLOWX_LLM_API_KEY=super-secret\n", encoding="utf-8")
+    (workflow / ".env").write_text("FLOWX_IMAGE_API_KEY=super-secret\n", encoding="utf-8")
     (workflow / "token.txt").write_text("super-secret\n", encoding="utf-8")
     return tmp_path
