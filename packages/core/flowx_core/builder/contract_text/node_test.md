@@ -1,7 +1,8 @@
 <!-- FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 Moved 2026-11-22 from worker/prompts/pydaograph_node_test_prompt.md and adapted from an LLM system prompt into a contract for a coding agent.
 Modified 2026-11-01: generated tests must construct native-derived nodes with `NodeClass()`, never `object.__new__`.
-Modified 2026-11-02: clarify runtime variable types and metadata dictionary access. -->
+Modified 2026-11-02: clarify runtime variable types and metadata dictionary access.
+Modified 2026-11-25: update WorkflowFileNode hook contract to files: dict[str, bytes]. -->
 # Node test contract
 
 You write the pytest module for exactly one node and submit it as the `test` artifact. It is run with `FLOWX_MEDIA_DRY_RUN=1`, offline and with a time limit, from a directory that contains the published upstream node modules and the node itself.
@@ -14,7 +15,7 @@ Core objective:
 Runtime variable types and access:
 - `step_meta()` returns `StepMeta`: `StepMeta` is a `TypedDict` and a `dict` at runtime, not an object with metadata attributes. Read its required fields as `meta["id"]` (`str`) and `meta["dependencies"]` (`list[str]`); never use `meta.id` or `meta.dependencies`. Other metadata keys are optional; use `.get(...)` when their presence is not guaranteed.
 - Node constants `STEP_ID`, `TITLE`, and `PROMPT` are `str`; `DEPENDENCIES` is `list[str]`; `INPUT_REQUIRED` is `bool`.
-- The `WorkflowStepNode.process_input` hook receives `user_input: str`; the `WorkflowFileNode.process_input` hook receives `file_bytes: bytes`. The file runtime accepts `bytes` or `bytearray` as raw input and passes `bytes` to the hook. When calling hooks directly, tests must supply the corresponding `str` or `bytes`.
+- The `WorkflowStepNode.process_input` hook receives `user_input: str`; the `WorkflowFileNode.process_input` hook receives `files: dict[str, bytes]`. The file runtime accepts a non-empty `dict[str, bytes | bytearray]` with non-empty string file names and passes a fresh `dict[str, bytes]` to the hook. When calling hooks directly, tests must supply the corresponding `str` or `dict[str, bytes]`.
 - Both hooks receive `dependency_results: dict[str, StepRunOutput]` and `session_state: dict[str, Any]`. A `StepRunOutput` is an object whose `.card` and `.derived` are `dict[str, Any]`; access an upstream value with `dependency_results[step_id].derived[key]`. Construct dependency values as `StepRunOutput(card=..., derived=...)`, not plain dictionaries. Values inside those dictionaries and `session_state` depend on the workflow and node code.
 - After pipeline attachment, `get_workflow_param()` returns a `WorkflowParam` object: `param.inputs` is `dict[str, StepRunInput]`, `param.outputs` is `dict[str, StepRunOutput]`, and `param.state` is `dict[str, Any]`. Raw input values are not necessarily `str` (they may also be bytes, bytearray, messages, lists, dictionaries, or `None`); distinguish them from the text passed to the step hook. Access shared inputs and state under `param.condition`.
 

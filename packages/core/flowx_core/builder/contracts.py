@@ -26,7 +26,8 @@ from flowx_core.tools.workflow_node_reference import (
 )
 
 # Bump when a contract's meaning changes; stored with every node version.
-CONTRACT_VERSION = "2026.11.22.1"
+# Modified 2026-11-25: bump CONTRACT_VERSION for WorkflowFileNode dict[str, bytes] contract.
+CONTRACT_VERSION = "2026.11.25.1"
 
 TEXT_DIR = Path(__file__).resolve().parent / "contract_text"
 

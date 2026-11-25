@@ -2,10 +2,12 @@
 
 Modified 2026-11-22: describe the workflow builder's gate steps; the LLM generation workflows are gone.
 Modified 2026-11-23: document FlowX-owned workflow file integrity checks, evolve modes, and optional OS sandboxing.
+Modified 2026-11-25: update WorkflowFileNode contract to files: dict[str, bytes] and multi-file HTTP decoding.
 
 FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream
-revision `0319046` (2026-10-23). That revision still reports package version `0.1.0`;
-the version string alone does not distinguish the older API.
+revision `27a8b4f` (with the `dict[str, bytes]` file-node update, 2026-11-25). That
+revision still reports package version `0.1.0`; the version string alone does not
+distinguish the older API.
 
 - Engine step metadata follows upstream `ag_ui_workflow.StepMeta`: `id` and
   `dependencies` are required, while `title`, `prompt`, `inputRequired`,
@@ -46,10 +48,10 @@ the version string alone does not distinguish the older API.
   releases the pool and is terminal. `build_workflow_pool()` is the shared
   construction seam that validates the class map and JSON topology, and
   `init_workflow_engine()` returns a `FlowXWorkflowEngine`.
-- `WorkflowFileNode` subclasses implement `process_input(file_bytes, dependency_results,
-  session_state)`. Generated backends decode one file path/base64 upload to bytes;
-  subclasses own processing and any persistence. Multiple uploads must be handled
-  explicitly rather than relying on inherited storage.
+- `WorkflowFileNode` subclasses implement `process_input(files, dependency_results,
+  session_state)` where `files` is a non-empty `dict[str, bytes]` mapping file names
+  to binary payloads. Generated backends decode one or multiple file-path/base64
+  uploads into `dict[str, bytes]`; subclasses own processing and any persistence.
 - Nodes install their own wait callbacks. Paused requests retain a pipeline slot;
   session reset cancels the old request before rotating its ID. Pool size comes
   from the planning config and resources close at backend shutdown.

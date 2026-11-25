@@ -307,8 +307,10 @@ to the **same process**, using a real step ID from inspection:
 {"action":"stop"}
 ```
 
-A step may include `file_path` instead of `input` for a file node; `input` also
-accepts a string, JSON object, or null. Use an input shape only when inspection
+A step may include `file_path` instead of `input` for a single file upload to a
+file node; `input` also accepts a string, JSON object (for example
+`{"files": [{"file_path": "..."}, {"file_name": "...", "base64": "..."}]}` for
+one or multiple files), list, or null. Use an input shape only when inspection
 confirms the step and field. If the `step` response has `status="input_required"`,
 show its `awaiting` prompt and send another `step` with its exact `stepId` and the
 user's answer; the session stays the same. `reset` cancels a paused run; `stop` or

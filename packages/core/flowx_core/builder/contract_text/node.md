@@ -3,7 +3,8 @@ Moved 2026-11-22 from worker/prompts/pydaograph_node_prompt.md and adapted from 
 Modified: explicit subclass wait gates for the pooled AG-UI runtime.
 Modified: bytes-only file processing, explicit persistence, and undecorated fresh node construction.
 Modified 2026-11-02: clarify runtime variable types and metadata dictionary access.
-Modified 2026-11-23: add node-editing baseline guidance and prohibit direct edits to FlowX-owned workflow files. -->
+Modified 2026-11-23: add node-editing baseline guidance and prohibit direct edits to FlowX-owned workflow files.
+Modified 2026-11-25: update WorkflowFileNode contract from single file_bytes to files: dict[str, bytes]. -->
 # Node contract
 
 You write one workflow node: a Python module that defines one `WorkflowStepNode` or `WorkflowFileNode` subclass. Submit it as the `code` artifact, together with its pytest module as the `test` artifact (see the test contract). Keep the code runnable with real logic inside the preferred subclass hook declared by the selected base-node reference in `meta.node_reference`.
@@ -17,7 +18,7 @@ Core objective:
 Runtime variable types and access:
 - `step_meta()` returns `StepMeta`: `StepMeta` is a `TypedDict` and a `dict` at runtime, not an object with metadata attributes. Read its required fields as `meta["id"]` (`str`) and `meta["dependencies"]` (`list[str]`); never use `meta.id` or `meta.dependencies`. Other metadata keys are optional; use `.get(...)` when their presence is not guaranteed.
 - Node constants `STEP_ID`, `TITLE`, and `PROMPT` are `str`; `DEPENDENCIES` is `list[str]`; `INPUT_REQUIRED` is `bool`.
-- The `WorkflowStepNode.process_input` hook receives `user_input: str`; the `WorkflowFileNode.process_input` hook receives `file_bytes: bytes`. The file runtime accepts `bytes` or `bytearray` as raw input and passes `bytes` to the hook.
+- The `WorkflowStepNode.process_input` hook receives `user_input: str`; the `WorkflowFileNode.process_input` hook receives `files: dict[str, bytes]`. The file runtime accepts a non-empty `dict[str, bytes | bytearray]` with non-empty string file names and passes a fresh `dict[str, bytes]` to the hook.
 - Both hooks receive `dependency_results: dict[str, StepRunOutput]` and `session_state: dict[str, Any]`. A `StepRunOutput` is an object whose `.card` and `.derived` are `dict[str, Any]`; access an upstream value with `dependency_results[step_id].derived[key]`. Values inside those dictionaries and `session_state` depend on the workflow, so do not assume their types without the node contract.
 - After pipeline attachment, `get_workflow_param()` returns a `WorkflowParam` object: `param.inputs` is `dict[str, StepRunInput]`, `param.outputs` is `dict[str, StepRunOutput]`, and `param.state` is `dict[str, Any]`. Raw input values are not necessarily `str` (they may also be bytes, bytearray, messages, lists, dictionaries, or `None`); distinguish them from the text passed to the step hook. Access shared inputs and state under `param.condition`.
 
@@ -36,7 +37,7 @@ Guidelines:
 - Pooled nodes are reused; keep request state in `session_state`/`WorkflowParam`, not persistent instance fields.
 - Import only the selected workflow base class from `ag_ui_workflow.nodes` and `StepRunOutput` from `ag_ui_workflow.workflow_types`, plus any actually used helpers.
 - Generate ordinary undecorated subclasses. The runtime uses per-`STEP_ID` class maps to construct fresh nodes; neither `@register_class` nor `clone(self) -> self` is required. Existing optional legacy decorators or clone methods may remain.
-- `WorkflowFileNode` is abstract: implement `process_input(self, file_bytes: bytes, dependency_results, session_state) -> StepRunOutput` to process one upload. Implement persistence explicitly only when required; the base class provides no upload decoding or file saving. The HTTP backend converts file paths/base64/uploads to bytes before engine input; do not normalize those formats in the subclass. A file gate requires step membership and `isinstance(param.inputs[self.STEP_ID], (bytes, bytearray))`, not truthiness; empty bytes may be valid.
+- `WorkflowFileNode` is abstract: implement `process_input(self, files: dict[str, bytes], dependency_results, session_state) -> StepRunOutput` to process uploaded files mapped by file name. Implement persistence explicitly only when required; the base class provides no upload decoding or file saving. The HTTP backend converts file paths/base64/uploads to `dict[str, bytes]` before engine input; do not normalize those formats in the subclass. A file gate requires a non-empty `dict` at `param.inputs[self.STEP_ID]` whose keys are non-empty stripped `str` file names and whose values are `(bytes, bytearray)`; an empty `b""` entry may be valid while `{}` is not.
 - Define class constants:
     - `STEP_ID` (machine-readable id)
     - `TITLE` (human-readable step title)
@@ -243,7 +244,7 @@ class SavingsPlanNode(WorkflowStepNode):
         return StepRunOutput(card=card, derived=derived)
 ```
 
-For a single uploaded text file, process bytes without assuming inherited persistence:
+For uploaded text files, process the `{file_name: file_bytes}` mapping without assuming inherited persistence:
 
 ```python
 from typing import Any
@@ -255,7 +256,7 @@ from ag_ui_workflow.workflow_types import StepRunOutput
 class UploadNode(WorkflowFileNode):
     STEP_ID = "UploadNode"
     TITLE = "Read uploaded text"
-    PROMPT = "Upload a UTF-8 text file"
+    PROMPT = "Upload one or more UTF-8 text files"
     DEPENDENCIES = []
 
     def __init__(self):
@@ -267,22 +268,29 @@ class UploadNode(WorkflowFileNode):
         with param.condition:
             if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
                 return True
-            ready = self.STEP_ID in param.inputs and isinstance(
-                param.inputs[self.STEP_ID], (bytes, bytearray)
+            raw_files = param.inputs.get(self.STEP_ID)
+            ready = (
+                isinstance(raw_files, dict)
+                and bool(raw_files)
+                and all(
+                    isinstance(name, str) and bool(name.strip()) and isinstance(data, (bytes, bytearray))
+                    for name, data in raw_files.items()
+                )
             )
             param.set_state(self.STEP_ID, "running" if ready else "awaiting_input")
             return ready
 
     def process_input(
         self,
-        file_bytes: bytes,
+        files: dict[str, bytes],
         dependency_results: dict[str, StepRunOutput],
         session_state: dict[str, Any],
     ) -> StepRunOutput:
-        text = file_bytes.decode("utf-8")
+        texts = {name: data.decode("utf-8") for name, data in files.items()}
+        byte_count = sum(len(data) for data in files.values())
         return StepRunOutput(
-            card={"label": "Uploaded text", "byteCount": len(file_bytes)},
-            derived={"text": text, "byteCount": len(file_bytes)},
+            card={"label": "Uploaded text", "fileNames": list(files), "byteCount": byte_count},
+            derived={"files": texts, "fileNames": list(files), "byteCount": byte_count},
         )
 ```
 

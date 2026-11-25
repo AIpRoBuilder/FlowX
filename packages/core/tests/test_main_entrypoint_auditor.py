@@ -118,3 +118,81 @@ def test_main_entrypoint_auditor_enforces_runtime_ownership(tmp_path, source, ru
     ok, violations = MainEntryPointAuditor().audit_file(_write_main_file(tmp_path, source=source))
     assert not ok
     assert rule in {item.rule for item in violations}
+
+
+def _load_entrypoint_helpers():
+    import ast
+    import base64
+    import binascii
+    from collections.abc import Mapping
+    from fastapi import HTTPException
+
+    source = _main_source()
+    tree = ast.parse(source)
+    helper_names = {"_decode_base64_bytes", "_extract_file_name", "_file_entry", "_file_input_mapping"}
+    helper_nodes = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in helper_names
+    ]
+    module = ast.Module(body=helper_nodes, type_ignores=[])
+    namespace = {
+        "Any": object,
+        "HTTPException": HTTPException,
+        "Mapping": Mapping,
+        "Path": Path,
+        "base64": base64,
+        "binascii": binascii,
+    }
+    exec(compile(module, "pydaograph_main.py.tmpl", "exec"), namespace)
+    return namespace["_file_input_mapping"], HTTPException
+
+
+def test_entrypoint_file_input_mapping_decodes_single_and_multiple_uploads(tmp_path):
+    import base64
+
+    file_input_mapping, HTTPException = _load_entrypoint_helpers()
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.bin"
+    first.write_bytes(b"hello")
+    second.write_bytes(b"\x00\xff")
+
+    assert file_input_mapping(None) is None
+    assert file_input_mapping(str(first)) == {"first.txt": b"hello"}
+    assert file_input_mapping({"file_path": str(first)}) == {"first.txt": b"hello"}
+    assert file_input_mapping({"file_name": "renamed.txt", "file_path": str(first)}) == {"renamed.txt": b"hello"}
+    assert file_input_mapping({"base64": base64.b64encode(b"abc").decode("ascii")}) == {"upload": b"abc"}
+    assert file_input_mapping({
+        "fileName": "inline.txt",
+        "contentBase64": "data:text/plain;base64," + base64.b64encode(b"xyz").decode("ascii"),
+    }) == {"inline.txt": b"xyz"}
+    assert file_input_mapping({
+        "files": [
+            str(first),
+            {"file_path": str(second)},
+            {"file_name": "note.txt", "base64": base64.b64encode(b"ok").decode("ascii")},
+        ]
+    }) == {"first.txt": b"hello", "second.bin": b"\x00\xff", "note.txt": b"ok"}
+    assert file_input_mapping({
+        "files": {
+            "a.txt": str(first),
+            "b.bin": {"base64": base64.b64encode(b"").decode("ascii")},
+            "c.bin": bytearray(b"raw"),
+        }
+    }) == {"a.txt": b"hello", "b.bin": b"", "c.bin": b"raw"}
+    assert file_input_mapping({"direct.bin": bytearray(b"123")}) == {"direct.bin": b"123"}
+
+    for invalid in (
+        {},
+        [],
+        {"files": []},
+        {"files": {}},
+        {"files": [None]},
+        {"file_path": ""},
+        {"file_name": "   ", "base64": base64.b64encode(b"x").decode("ascii")},
+        {"files": [str(first), {"file_name": "first.txt", "base64": base64.b64encode(b"dup").decode("ascii")}]},
+        {"   ": b"blank"},
+        {"base64": "not-valid-base64!!!"},
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            file_input_mapping(invalid)
+        assert exc_info.value.status_code == 422

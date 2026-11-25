@@ -274,7 +274,7 @@ class NodeAuditor(BaseAuditor):
                     rule="workflow_file_node_process_input_missing",
                     detail=(
                         "WorkflowFileNode is abstract; implement synchronous "
-                        "process_input(self, file_bytes: bytes, dependency_results, session_state) "
+                        "process_input(self, files: dict[str, bytes], dependency_results, session_state) "
                         "returning StepRunOutput. File processing and any required persistence "
                         "belong to this hook, not inherited storage behavior."
                     ),

@@ -393,14 +393,19 @@ def test_minimal_json_preserves_file_node_support() -> None:
     class FileNode(WorkflowFileNode):
         STEP_ID = "file"
 
-        def process_input(self, file_bytes, dependency_results, session_state):
+        def process_input(self, files, dependency_results, session_state):
             assert type(self) is FileNode
             assert session_state is self.get_workflow_param().state
-            return StepRunOutput(derived={"size": len(file_bytes)})
+            return StepRunOutput(
+                derived={"files": list(files), "size": sum(len(data) for data in files.values())}
+            )
 
     engine = init_workflow_engine({"file": FileNode}, {"nodes": [{"name": "file"}]})
     try:
-        assert engine.run_steps(inputs={"file": b"Ada"}).outputs["file"].derived == {"size": 3}
+        assert engine.run_steps(inputs={"file": {"ada.txt": b"Ada"}}).outputs["file"].derived == {
+            "files": ["ada.txt"],
+            "size": 3,
+        }
     finally:
         close_workflow_engine(engine)
 

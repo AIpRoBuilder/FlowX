@@ -3,6 +3,7 @@
 # Modified 2026-10-14: separate the NODES tuple from the reusable NODE_CLASSES map.
 # Modified 2026-10-23: type STEP_CHAIN with ag_ui_workflow.StepMeta.
 # Modified 2026-11-16: seed workflow root/request id on pool lease and tee SSE run journal.
+# Modified 2026-11-25: decode single or multiple HTTP file uploads into dict[str, bytes] for WorkflowFileNode.
 from __future__ import annotations
 
 import base64
@@ -147,7 +148,7 @@ app = FastAPI(title="AG-UI Lifecycle Backend - __APP_NAME__", lifespan=lifespan)
 class RunStepInput(BaseModel):
     sessionId: str
     stepId: str
-    input: str | dict[str, Any] | None = None
+    input: str | dict[str, Any] | list[Any] | None = None
     file_path: str | None = None
 
 
@@ -181,34 +182,9 @@ def _get_request_id(session_id: str) -> str:
         return SESSION_REQUESTS[session_id]
 
 
-def _file_input_bytes(value: Any) -> bytes | None:
-    """Decode one HTTP upload; storage and business processing belong to the node."""
-    if value is None:
-        return None  # A missing input lets the subclass's wait gate report a pause.
-    if isinstance(value, (bytes, bytearray)):
-        return bytes(value)
-    if isinstance(value, str):
-        value = {"file_path": value}
-    if not isinstance(value, Mapping):
-        raise HTTPException(status_code=422, detail="File input requires one file_path or base64 payload")
-    for key in ("files", "uploads"):
-        if key in value:
-            uploads = value[key]
-            if not isinstance(uploads, list) or len(uploads) != 1 or uploads[0] is None:
-                raise HTTPException(status_code=422, detail="File nodes accept exactly one upload per input")
-            return _file_input_bytes(uploads[0])
-    for key in ("file_path", "filePath", "path"):
-        if key in value:
-            path = value[key]
-            if not isinstance(path, str) or not path.strip():
-                raise HTTPException(status_code=422, detail="file_path must be a non-empty string")
-            try:
-                return Path(path).expanduser().read_bytes()
-            except OSError as exc:
-                raise HTTPException(status_code=422, detail="Unable to read the input file") from exc
-    encoded = value.get("base64", value.get("content_base64", value.get("data")))
+def _decode_base64_bytes(encoded: Any) -> bytes:
     if not isinstance(encoded, str):
-        raise HTTPException(status_code=422, detail="File input requires one file_path or base64 payload")
+        raise HTTPException(status_code=422, detail="File input requires a file_path or base64 payload")
     if encoded.startswith("data:"):
         prefix, separator, encoded = encoded.partition(",")
         if not separator or not prefix.endswith(";base64"):
@@ -217,6 +193,111 @@ def _file_input_bytes(value: Any) -> bytes | None:
         return base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(status_code=422, detail="Invalid base64 file input") from exc
+
+
+def _extract_file_name(value: Mapping[str, Any]) -> str | None:
+    for key in ("file_name", "fileName", "filename", "name"):
+        if key in value and value[key] is not None:
+            name = value[key]
+            if not isinstance(name, str) or not name.strip():
+                raise HTTPException(status_code=422, detail="File name must be a non-empty string")
+            return name.strip()
+    return None
+
+
+def _file_entry(
+    value: Any,
+    *,
+    key_name: str | None = None,
+    fallback_name: str = "upload",
+) -> tuple[str, bytes]:
+    if isinstance(value, (bytes, bytearray)):
+        name = key_name or fallback_name
+        return name, bytes(value)
+    if isinstance(value, str):
+        if value.startswith("data:"):
+            name = key_name or fallback_name
+            return name, _decode_base64_bytes(value)
+        value = {"file_path": value}
+    if not isinstance(value, Mapping):
+        raise HTTPException(status_code=422, detail="File input requires a file_path or base64 payload")
+    explicit_name = _extract_file_name(value)
+    for key in ("file_path", "filePath", "path"):
+        if key in value:
+            path = value[key]
+            if not isinstance(path, str) or not path.strip():
+                raise HTTPException(status_code=422, detail="file_path must be a non-empty string")
+            resolved = Path(path).expanduser()
+            try:
+                data = resolved.read_bytes()
+            except OSError as exc:
+                raise HTTPException(status_code=422, detail="Unable to read the input file") from exc
+            name = key_name or explicit_name or resolved.name
+            if not isinstance(name, str) or not name.strip():
+                raise HTTPException(status_code=422, detail="File name must be a non-empty string")
+            return name.strip(), data
+    for key in ("base64", "content_base64", "contentBase64", "fileContentBase64", "data"):
+        if key in value:
+            data = _decode_base64_bytes(value[key])
+            name = key_name or explicit_name or fallback_name
+            return name.strip(), data
+    raise HTTPException(status_code=422, detail="File input requires a file_path or base64 payload")
+
+
+def _file_input_mapping(value: Any) -> dict[str, bytes] | None:
+    """Decode HTTP upload(s) into {file_name: bytes}; storage and processing belong to the node."""
+    if value is None:
+        return None  # A missing input lets the subclass's wait gate report a pause.
+    if isinstance(value, (bytes, bytearray)):
+        return {"upload": bytes(value)}
+    if isinstance(value, str):
+        name, data = _file_entry(value)
+        return {name: data}
+    if isinstance(value, list):
+        if not value:
+            raise HTTPException(status_code=422, detail="File input list must not be empty")
+        files: dict[str, bytes] = {}
+        for index, item in enumerate(value, start=1):
+            if item is None:
+                raise HTTPException(status_code=422, detail="File input entries must not be null")
+            fallback = f"upload_{index}" if len(value) > 1 else "upload"
+            name, data = _file_entry(item, fallback_name=fallback)
+            if name in files:
+                raise HTTPException(status_code=422, detail=f"Duplicate file name in upload: {name}")
+            files[name] = data
+        return files
+    if not isinstance(value, Mapping) or not value:
+        raise HTTPException(status_code=422, detail="File input requires one or more files")
+    for key in ("files", "uploads"):
+        if key in value:
+            uploads = value[key]
+            if isinstance(uploads, list):
+                return _file_input_mapping(uploads)
+            if isinstance(uploads, Mapping) and uploads:
+                files = {}
+                for raw_name, item in uploads.items():
+                    if not isinstance(raw_name, str) or not raw_name.strip():
+                        raise HTTPException(status_code=422, detail="File names must be non-empty strings")
+                    if item is None:
+                        raise HTTPException(status_code=422, detail="File input entries must not be null")
+                    name, data = _file_entry(item, key_name=raw_name.strip())
+                    if name in files:
+                        raise HTTPException(status_code=422, detail=f"Duplicate file name in upload: {name}")
+                    files[name] = data
+                return files
+            raise HTTPException(status_code=422, detail="File input requires a non-empty files list or mapping")
+    if all(isinstance(v, (bytes, bytearray)) for v in value.values()):
+        files = {}
+        for raw_name, raw_bytes in value.items():
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise HTTPException(status_code=422, detail="File names must be non-empty strings")
+            name = raw_name.strip()
+            if name in files:
+                raise HTTPException(status_code=422, detail=f"Duplicate file name in upload: {name}")
+            files[name] = bytes(raw_bytes)
+        return files
+    name, data = _file_entry(value)
+    return {name: data}
 
 
 @app.get("/")
@@ -236,7 +317,7 @@ def run_step(payload: RunStepInput) -> StreamingResponse:
 
     step_id = _meta_field(step_meta, "id")
     if _meta_field(step_meta, "metaNodeKind") == "WorkflowFileNode":
-        normalized_input: Any = _file_input_bytes(
+        normalized_input: Any = _file_input_mapping(
             {"file_path": payload.file_path} if payload.file_path is not None else payload.input
         )
     else:

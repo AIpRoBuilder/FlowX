@@ -1,4 +1,4 @@
-"""Modified: verify bytes file hooks, undecorated auditing, and output schemas."""
+"""Modified: verify file-mapping hooks, undecorated auditing, and output schemas."""
 
 import pytest
 from ag_ui_workflow import StepRunOutput
@@ -52,7 +52,7 @@ def test_workflow_node_references_derive_traits_from_meta_node_kind() -> None:
     assert render_workflow_method_signatures(
         references["WorkflowFileNode"].base_class,
         references["WorkflowFileNode"].main_utility_methods,
-    ) == ("process_input(file_bytes, dependency_results, session_state)",)
+    ) == ("process_input(files, dependency_results, session_state)",)
 
 
 def test_workflow_node_references_prefer_ast_marked_hooks_over_runtime_helpers(monkeypatch) -> None:
@@ -97,7 +97,7 @@ def test_workflow_step_meta_catalog_uses_meta_node_kind_metadata() -> None:
     assert "repeatable: false" in catalog
     assert "decorator-marked main utility methods: process_input" in catalog
     assert "StepRunOutput card/derived contract methods: process_input" in catalog
-    assert "process_input(file_bytes, dependency_results, session_state)" in catalog
+    assert "process_input(files, dependency_results, session_state)" in catalog
     assert "StepRunOutput card/derived contract methods: build_step_output" not in catalog
     assert "nodeKind:" not in catalog
 
@@ -130,7 +130,7 @@ def test_file_node_missing_abstract_hook_is_rejected_by_runtime_and_auditor(tmp_
     assert [violation.rule for violation in violations] == ["workflow_file_node_process_input_missing"]
 
 
-def test_implemented_bytes_hook_passes_audit_and_preserves_output_schema(tmp_path) -> None:
+def test_implemented_file_mapping_hook_passes_audit_and_preserves_output_schema(tmp_path) -> None:
     source = _file_example_source()
     path = tmp_path / "UploadNode.py"
     path.write_text(source, encoding="utf-8")
@@ -142,20 +142,23 @@ def test_implemented_bytes_hook_passes_audit_and_preserves_output_schema(tmp_pat
 
     passed, violations = NodeAuditor().audit_file(str(path), node_meta=meta)
     assert passed, violations
-    assert compile_node_file_and_get_derived_keys(str(path)) == ["byteCount", "text"]
+    assert compile_node_file_and_get_derived_keys(str(path)) == ["byteCount", "fileNames", "files"]
     schema = compile_node_file_and_get_step_output_card_schema(str(path))
     assert schema is not None
     assert schema["step_id"] == "UploadNode"
     assert schema["card"]["label"] == "Uploaded text"
-    assert set(schema["card"]) == {"label", "byteCount"}
+    assert set(schema["card"]) == {"label", "fileNames", "byteCount"}
 
 
 @pytest.mark.parametrize("file_input, ready", [
-    (None, False), ("text", False), ({"file_path": "/tmp/upload"}, False),
-    ({"base64": ""}, False), ({"files": []}, False), ({"uploads": []}, False),
-    ([], False), (b"", True), (bytearray(), True), (b"hello", True),
+    (None, False), ("text", False), (b"", False), (bytearray(), False), (b"hello", False),
+    ({}, False), ({"file_path": "/tmp/upload"}, False), ({"base64": ""}, False),
+    ({"files": []}, False), ({"uploads": []}, False), ([], False),
+    ({"": b"hello"}, False), ({"   ": b"hello"}, False), ({"a.txt": "text"}, False),
+    ({"empty.txt": b""}, True), ({"buf.txt": bytearray()}, True),
+    ({"a.txt": b"hello", "b.txt": bytearray(b"world")}, True),
 ])
-def test_file_prompt_gate_accepts_bytes_including_empty_not_legacy_formats(monkeypatch, file_input, ready) -> None:
+def test_file_prompt_gate_accepts_file_mapping_including_empty_entries_not_legacy_formats(monkeypatch, file_input, ready) -> None:
     namespace = {}
     exec(compile(_file_example_source(), "<file-node-prompt>", "exec"), namespace)
     node = namespace["UploadNode"]()
@@ -172,8 +175,18 @@ def test_file_prompt_gate_accepts_bytes_including_empty_not_legacy_formats(monke
         assert not run_status.isErr()
         output = param.outputs[node.STEP_ID]
         assert isinstance(output, StepRunOutput)
-        assert output.card == {"label": "Uploaded text", "byteCount": len(file_input)}
-        assert output.derived == {"text": bytes(file_input).decode("utf-8"), "byteCount": len(file_input)}
+        expected_texts = {name: bytes(data).decode("utf-8") for name, data in file_input.items()}
+        expected_size = sum(len(data) for data in file_input.values())
+        assert output.card == {
+            "label": "Uploaded text",
+            "fileNames": list(file_input),
+            "byteCount": expected_size,
+        }
+        assert output.derived == {
+            "files": expected_texts,
+            "fileNames": list(file_input),
+            "byteCount": expected_size,
+        }
         assert node.wait_function() is True
 
     param.outputs.clear()
@@ -186,12 +199,12 @@ def test_file_runtime_rejects_non_step_output(monkeypatch) -> None:
     exec(compile(_file_example_source(), "<file-node-prompt>", "exec"), namespace)
     node = namespace["UploadNode"]()
     param = WorkflowParam()
-    param.inputs[node.STEP_ID] = b"file content"
+    param.inputs[node.STEP_ID] = {"sample.txt": b"file content"}
     monkeypatch.setattr(node, "get_workflow_param", lambda: param)
 
-    def invalid_output(file_bytes, dependency_results, session_state):
+    def invalid_output(files, dependency_results, session_state):
         del dependency_results, session_state
-        return {"derived": {"text": file_bytes.decode("utf-8")}}
+        return {"derived": {"files": {name: data.decode("utf-8") for name, data in files.items()}}}
 
     monkeypatch.setattr(node, "process_input", invalid_output)
 
@@ -238,7 +251,7 @@ def test_undecorated_nodes_keep_identity_and_metadata_validation(tmp_path, repla
 
 @pytest.mark.parametrize("base_name, hook_name, input_name", [
     ("WorkflowStepNode", "process_input", "user_input"),
-    ("WorkflowFileNode", "process_input", "file_bytes"),
+    ("WorkflowFileNode", "process_input", "files"),
 ])
 def test_auditor_checks_output_dependencies_for_undecorated_nodes(tmp_path, base_name, hook_name, input_name) -> None:
     source = (
