@@ -14,6 +14,7 @@
 # Modified 2026-11-22: expose the contract protocol of the two FlowX entities (workflow builder and service
 #   manager) instead of LLM-driven build methods; read methods keep their names and shapes.
 # Modified 2026-11-23: expose begin_evolve, verify_workflow, and read_artifact for safe read-only access and edits.
+# Modified 2026-11-26: expose describe_workflow for step descriptions and input formats.
 """Python SDK: drive the FlowX workflow builder as a coding agent, and run what it builds."""
 
 from __future__ import annotations
@@ -84,6 +85,10 @@ class FlowXClient:
     def artifacts(self, workflow_id: str) -> dict[str, Any]:
         """Read-only locations of a workflow's requirement, graph, nodes and main entrypoint."""
         return self.builder.artifacts(workflow_id)
+
+    def describe_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Purpose plus per-step descriptions, input formats, input modes and examples."""
+        return self.builder.describe_workflow(workflow_id)
 
     def verify_workflow(self, workflow_id: str, *, include_service: bool = True) -> dict[str, Any]:
         """Verify FlowX-owned workflow files against their recorded SHA-256 digests."""

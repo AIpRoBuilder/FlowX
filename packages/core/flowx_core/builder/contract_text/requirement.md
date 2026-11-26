@@ -24,6 +24,8 @@ Columns: `node id | meta_node_kind | ext_data.type | purpose | depends`.
   catalog entry. Do not invent node capabilities outside the catalog.
 - `WorkflowStepNode` rows use `ext_data.type` `user_input`, `none`, or a domain source such as `url`, `file`, `db`.
   `WorkflowFileNode` rows use `user_file_input`.
+- For `user_input` rows, list the expected input fields and their types in the row or in a short note; the graph stage
+  copies them into `inputs_format`.
 - Use the fewest nodes that cover the flow; avoid redundant nodes and repeated explanations.
 - Media work: uploads are `WorkflowFileNode` + `user_file_input`; remote image/video APIs use `url`; local resize,
   crop, FFmpeg or Blender processing uses `none`.

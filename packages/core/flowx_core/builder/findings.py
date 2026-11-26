@@ -79,6 +79,10 @@ CATALOG: dict[str, Rule] = _rules(
     Rule("graph.meta_node_kind_ext_data_mismatch",
          "`meta_node_kind` must agree with `ext_data.type` (user_input / user_file_input).",
          "Use WorkflowStepNode with user_input or WorkflowFileNode with user_file_input."),
+    Rule("graph.inputs_format",
+         "`user_input` nodes need a non-empty `inputs_format` mapping of field names to "
+         "string, number, integer, boolean, object, array or null.",
+         "Add `inputs_format` such as {\"ticket\": \"string\"}; do not declare it for file nodes."),
     Rule("graph.image_ext_type_unsupported", "`ext_data.type='image'` is deprecated.",
          "Use user_file_input for uploads, url for provider APIs, none for local processing."),
     Rule("graph.cycle_detected", "The graph must be acyclic.", "Remove one dependency from the cycle."),

@@ -52,7 +52,10 @@ You plan the workflow graph from the requirement analysis. Submit one JSON objec
 - `enable`: boolean.
 - `loop`: only 1 (or omit it). A node completes once per request; loop inside the node's code or start a new request.
 - `depends`: names of upstream nodes; omit when there are none.
-- `inputs_format`: for `user_input` nodes, an object mapping input fields to `string|number|boolean|object|array`.
+- `inputs_format`: required for `user_input` nodes. It must be a non-empty object mapping
+  input fields to `string|number|integer|boolean|object|array|null`. Use one field for plain text
+  (for example `{"ticket": "string"}`); use several fields only when the node's code parses the
+  submitted JSON text. Do not declare `inputs_format` for `WorkflowFileNode` / `user_file_input`.
 
 ## Rules of thumb
 

@@ -41,8 +41,8 @@ GRAPH = {"nodes": [{
 EXPECTED_TOOLS = {
     "create_workflow", "begin_build", "begin_evolve", "get_build_state", "get_tasks", "submit_task",
     "get_build_events", "reopen_stage", "abort_build", "list_workflows", "list_nodes", "get_workflow",
-    "read_workflow_artifact", "verify_workflow", "run_service", "stop_service", "service_status",
-    "run_step", "reset_session", "list_runs", "get_run", "get_evidence",
+    "describe_workflow", "read_workflow_artifact", "verify_workflow", "run_service", "stop_service",
+    "service_status", "run_step", "reset_session", "list_runs", "get_run", "get_evidence",
 }
 
 
@@ -114,6 +114,26 @@ def test_contract_round_trip_over_mcp(mcp):
             {"step_id": "Echo", "node_id": None, "version": 0},
         ]
         assert (await call("get_workflow", workflow_id="demo"))["workflow"]["workflow_version"] == 0
+        described = await call("describe_workflow", workflow_id="demo")
+        assert described["ok"] is True
+        assert described["description"] == "Echo text"
+        assert described["nodes"] == [{
+            "step_id": "Echo",
+            "node_id": None,
+            "version": 0,
+            "title": "Echo",
+            "description": "Echo",
+            "prompt": "local",
+            "meta_node_kind": "WorkflowStepNode",
+            "ext_data": {"type": "none", "desc": "local"},
+            "depends": [],
+            "inputs_format": {},
+            "input_required": False,
+            "input_mode": "automatic",
+            "input_example": None,
+            "input_note": "Automatic node; it runs after its dependencies.",
+            "source_parses_json": None,
+        }]
 
     run(mcp, steps)
 

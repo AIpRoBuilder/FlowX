@@ -695,6 +695,7 @@ class NodeGate(AgentGate):
             "node": name,
             "meta_node_kind": raw.get("meta_node_kind"),
             "ext_data": raw.get("ext_data"),
+            "inputs_format": raw.get("inputs_format") or {},
             "node_reference": node_reference_text(raw.get("meta_node_kind"), raw.get("ext_data")),
         }
         packet = self.make_packet(ctx, gate, contract=node_contract(), context=context, meta=meta)

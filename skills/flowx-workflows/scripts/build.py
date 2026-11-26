@@ -49,6 +49,7 @@ Commands ({"op": ..., arguments}):
   abort_build      workflow_id, reason?
   verify_workflow  workflow_id, include_service?
   read_artifact    workflow_id, slot, node?, version?
+  describe_workflow workflow_id
   list_workflows | list_nodes workflow_id | get_workflow workflow_id
   stop             close the client and exit
 
@@ -123,6 +124,7 @@ def handlers(client: FlowXClient) -> dict[str, Callable[..., Any]]:
         "abort_build": method("abort_build"),
         "verify_workflow": method("verify_workflow"),
         "read_artifact": method("read_artifact"),
+        "describe_workflow": method("describe_workflow"),
         "list_workflows": lambda: {"workflows": client.workflows()},
         "list_nodes": lambda workflow_id: {"nodes": client.list_nodes(workflow_id)},
         "get_workflow": lambda workflow_id: {"workflow": client.artifacts(workflow_id)},

@@ -3,6 +3,7 @@
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Modified 2026-11-23: add begin_evolve (edit_node/edit_graph modes), verify_workflow, read_artifact, and integrity gating.
+# Modified 2026-11-26: add describe_workflow with per-step input formats and input modes.
 """The workflow builder: a deterministic pipeline a host coding agent drives.
 
 FlowX no longer writes code. A build is a native ag_ui_workflow run whose gate steps
@@ -23,6 +24,7 @@ from threading import RLock
 from typing import Any, Iterable, Literal, Mapping
 
 from flowx_core.builder.contracts import ContractPacket, parse_task_id
+from flowx_core.builder.describe import describe_workflow as describe_workflow_data
 from flowx_core.builder.gates import (
     COMPILE_STEP,
     GRAPH_STEP,
@@ -193,6 +195,10 @@ class WorkflowBuilder:
                 "path": str(main) if main and main.is_file() else None,
             },
         }
+
+    def describe_workflow(self, workflow_id: str) -> dict[str, Any]:
+        """Workflow purpose and per-step descriptions, input formats and input modes."""
+        return describe_workflow_data(self.store(workflow_id))
 
     def list_nodes(self, workflow_id: str) -> list[dict[str, Any]]:
         """The workflow's enabled nodes as ``{step_id, node_id, version}``; ``node_id`` is None until built."""

@@ -18,6 +18,7 @@
 # Modified 2026-11-22: replace the background LLM build jobs with the contract protocol of the workflow builder
 #   (begin_build/get_tasks/submit_task/...) and expose the service manager; keep native output off the stdio stream.
 # Modified 2026-11-23: add begin_evolve, read_workflow_artifact, and verify_workflow; forbid direct workflow file edits.
+# Modified 2026-11-26: add describe_workflow and document step input modes.
 """FastMCP server exposing the FlowX workflow builder and service manager to a coding agent."""
 
 from __future__ import annotations
@@ -93,6 +94,10 @@ Evolving a built workflow
 - Edit graph topology / node specs: begin_evolve(workflow_id, intent=<change>, scope="graph",
   update_requirement=False|True). Plan writes are staged until all nodes pass; aborting leaves `plan/` untouched.
 - If a running service misbehaves, call get_evidence and pass it as `runtime_evidence` to begin_evolve.
+Running a workflow
+- Call describe_workflow before run_step: it returns the workflow purpose plus per-step description, prompt,
+  inputs_format, input_mode and input_example. Use input_mode to decide between a string, JSON object or file_path.
+  `WorkflowStepNode` input is normalized text; a dict without input/value/text becomes JSON text.
 Build state lives in this server process and in <workspace>/workflows/<id>/build/events.jsonl; after a restart call
 begin_build again: published nodes are reused.
 """
@@ -296,6 +301,11 @@ def create_server() -> Any:
         """Read-only locations of a workflow's requirement, workflow.json, node versions and main entrypoint.
         Never write to these paths directly; use `read_workflow_artifact` to inspect and `begin_build`/`begin_evolve` to change."""
         return await _call("get_workflow", lambda: {"workflow": _get_client().artifacts(workflow_id)})
+
+    @flowx_mcp.tool()
+    async def describe_workflow(workflow_id: str) -> str:
+        """Workflow purpose plus per-step descriptions, input formats, input modes and examples."""
+        return await _call("describe_workflow", lambda: _get_client().describe_workflow(workflow_id))
 
     @flowx_mcp.tool()
     async def read_workflow_artifact(

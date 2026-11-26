@@ -135,6 +135,13 @@ def test_build_answers_every_task_with_the_solver(client):
     assert client.build_recovery_state(workflow_id) == {"status": "clear", "workflow_id": workflow_id}
     assert client.get_build_events(workflow_id)["events"][-1]["type"] == "build_finished"
 
+    described = client.describe_workflow(workflow_id)
+    assert described["description"] == "Echo text"
+    assert described["nodes"][0]["step_id"] == "Echo"
+    assert described["nodes"][0]["description"] == "Echo"
+    assert described["nodes"][0]["input_mode"] == "automatic"
+    assert described["nodes"][0]["version"] == 1
+
 
 def test_manual_protocol_round_trip_and_abort(client):
     workflow_id = client.create_workflow()

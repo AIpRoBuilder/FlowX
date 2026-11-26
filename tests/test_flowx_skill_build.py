@@ -105,6 +105,16 @@ def test_bad_commands_get_an_error_line_and_do_not_end_the_session(line, fragmen
     assert responses[1]["ok"] is True
 
 
+def test_describe_workflow_dispatches_to_the_client():
+    client = Mock()
+    client.describe_workflow.return_value = {"workflow_id": "wf1", "nodes": []}
+
+    responses = run(client, {"op": "describe_workflow", "workflow_id": "wf1"}, {"op": "stop"})
+
+    assert responses == [{"ok": True, "op": "describe_workflow", "workflow_id": "wf1", "nodes": []}]
+    client.describe_workflow.assert_called_once_with(workflow_id="wf1")
+
+
 def test_file_artifacts_are_read_as_text(tmp_path):
     code = tmp_path / "Echo.py"
     code.write_text("print('é')\n", encoding="utf-8")
@@ -168,20 +178,23 @@ def test_inspection_dispatch_and_close(monkeypatch, capsys):
     client.__enter__ = Mock(return_value=client)
     client.__exit__ = Mock(return_value=False)
     client.list_nodes.return_value = [{"step_id": "s1"}]
+    client.describe_workflow.return_value = {"workflow_id": "wf1", "nodes": []}
     client.verify_workflow.return_value = {"ok": True, "workflow_id": "wf1", "modified": [], "remedy": ""}
     client.read_artifact.return_value = {"workflow_id": "wf1", "slot": "graph", "content": "{}", "read_only": True}
     monkeypatch.setattr(inspect_workflow, "FlowXClient", lambda **kwargs: client)
 
     assert inspect_workflow.main(["--workspace", "/tmp/work", "nodes", "--workflow-id", "wf1"]) == 0
+    assert inspect_workflow.main(["--workspace", "/tmp/work", "describe", "--workflow-id", "wf1"]) == 0
     assert inspect_workflow.main(["--workspace", "/tmp/work", "verify", "--workflow-id", "wf1"]) == 0
     assert inspect_workflow.main([
         "--workspace", "/tmp/work", "read", "--workflow-id", "wf1", "--slot", "graph",
     ]) == 0
 
     client.list_nodes.assert_called_once_with("wf1")
+    client.describe_workflow.assert_called_once_with("wf1")
     client.verify_workflow.assert_called_once_with("wf1")
     client.read_artifact.assert_called_once_with("wf1", "graph", node=None, version=None)
-    assert client.__exit__.call_count == 3
+    assert client.__exit__.call_count == 4
 
 
 def test_resolve_artifacts_rejects_paths_inside_flowx_workflow_tree(tmp_path):

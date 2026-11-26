@@ -457,3 +457,123 @@ def test_integrity_blocks_direct_edits_to_plan_nodes_and_snapshots(builder: Work
     record.graph_path.write_text(orig_graph, encoding="utf-8")
     builder.abort_build(workflow_id)
     assert builder.verify_workflow(workflow_id)["ok"] is True
+
+
+def test_describe_workflow_reports_steps_and_input_modes(builder: WorkflowBuilder) -> None:
+    workflow_id, _ = build_chain(builder)
+
+    described = builder.describe_workflow(workflow_id)
+
+    assert described["description"] == "Greet and shout"
+    assert described["has_graph"] is True and described["has_main"] is True
+    assert [node["step_id"] for node in described["nodes"]] == ["Greeter", "Shouter"]
+    assert described["nodes"][0]["description"] == "Greeter node"
+    assert described["nodes"][0]["title"] == "Greeter"
+    assert described["nodes"][0]["input_mode"] == "automatic"
+    assert described["nodes"][0]["version"] == 1
+
+
+def test_describe_workflow_marks_multi_field_input_as_json(builder: WorkflowBuilder) -> None:
+    workflow_id = builder.create_workflow()["workflow_id"]
+    builder.store(workflow_id).write_graph({
+        "nodes": [{
+            "name": "Ask", "type": "Ask", "meta_node_kind": "WorkflowStepNode", "desc": "Ask ticket",
+            "ext_data": {"type": "user_input", "desc": "ticket and priority"},
+            "inputs_format": {"ticket": "string", "priority": "number"},
+            "depends": [],
+        }],
+    })
+
+    described = builder.describe_workflow(workflow_id)
+
+    node = described["nodes"][0]
+    assert node["input_required"] is True
+    assert node["input_mode"] == "json"
+    assert node["inputs_format"] == {"ticket": "string", "priority": "number"}
+    assert node["input_example"] == {"ticket": "<string>", "priority": 0}
+    assert node["source_parses_json"] is None
+    assert "process_input" in node["input_note"]
+
+
+def test_describe_workflow_detects_a_json_parsing_node(builder: WorkflowBuilder) -> None:
+    workflow_id = builder.create_workflow()["workflow_id"]
+    graph = {
+        "nodes": [{
+            "name": "Ask", "type": "Ask", "meta_node_kind": "WorkflowStepNode", "desc": "Ask ticket",
+            "ext_data": {"type": "user_input", "desc": "ticket and priority"},
+            "inputs_format": {"ticket": "string", "priority": "number"},
+            "depends": [],
+        }],
+    }
+    code = '''from __future__ import annotations
+
+import json
+from typing import Any
+
+from ag_ui_workflow.nodes import WorkflowStepNode
+from ag_ui_workflow.workflow_types import StepRunOutput
+
+
+class Ask(WorkflowStepNode):
+    STEP_ID = "Ask"
+    TITLE = "Ask"
+    PROMPT = "Enter ticket and priority"
+    DEPENDENCIES: list[str] = []
+    INPUT_REQUIRED = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWaitFunc(self.wait_function)
+
+    def wait_function(self) -> bool:
+        param = self.get_workflow_param()
+        with param.condition:
+            if not param.can_run(self.STEP_ID, self.DEPENDENCIES):
+                return True
+            ready = self.STEP_ID in param.inputs
+            param.set_state(self.STEP_ID, "running" if ready else "awaiting_input")
+            return ready
+
+    def process_input(
+        self,
+        user_input: str,
+        dependency_results: dict[str, StepRunOutput],
+        session_state: dict[str, Any],
+    ) -> StepRunOutput:
+        payload = json.loads(user_input)
+        if not isinstance(payload, dict) or not isinstance(payload.get("ticket"), str):
+            raise ValueError("ticket is required")
+        return StepRunOutput(
+            card={"ticket": payload["ticket"]},
+            derived={"ticket": payload["ticket"], "priority": payload.get("priority")},
+        )
+'''
+    test = '''import importlib.util
+from pathlib import Path
+
+
+def _node():
+    path = Path(__file__).resolve().parents[1] / "Ask.py"
+    spec = importlib.util.spec_from_file_location("Ask", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Ask()
+
+
+def test_ask_identity():
+    assert _node().STEP_ID == "Ask"
+
+
+def test_ask_parses_json():
+    output = _node().process_input('{"ticket": "T", "priority": 2}', {}, {})
+    assert output.derived == {"ticket": "T", "priority": 2}
+'''
+    script = {**plan_script(graph), "node:Ask": [{"code": code, "test": test}]}
+    builder.begin_build(workflow_id, "Ask")
+    Agent(builder, workflow_id, script).run()
+
+    described = builder.describe_workflow(workflow_id)
+    node = described["nodes"][0]
+    assert node["input_mode"] == "json"
+    assert node["version"] == 1
+    assert node["source_parses_json"] is True

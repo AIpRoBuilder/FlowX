@@ -4,7 +4,8 @@
 # Upstream: https://github.com/AIpRoBuilder/FlowX
 # Added 2026-11-05: inspect workflow artifacts and node identifiers through the SDK.
 # Modified 2026-11-23: add verify and read subcommands for integrity checks and read-only content access.
-"""List workflows, nodes, read-only artifact paths/contents, integrity checks, or recovery state."""
+# Modified 2026-11-26: add describe for workflow purpose and per-step input formats.
+"""List workflows, nodes, descriptions, read-only artifact paths/contents, integrity checks, or recovery state."""
 
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--workspace", help="FlowX workspace; defaults to the plugin's saved workspace, then FLOWX_DEFAULT_WORKSPACE")
     commands = parser.add_subparsers(dest="operation", required=True)
     commands.add_parser("list", help="List workspace workflows")
-    for name in ("nodes", "artifacts", "recovery", "verify"):
+    for name in ("nodes", "artifacts", "describe", "recovery", "verify"):
         sub = commands.add_parser(name)
         sub.add_argument("--workflow-id", required=True)
     read_cmd = commands.add_parser("read", help="Read one FlowX-owned artifact as verified read-only text")
@@ -48,6 +49,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     data = client.list_nodes(args.workflow_id)
                 elif args.operation == "artifacts":
                     data = client.artifacts(args.workflow_id)
+                elif args.operation == "describe":
+                    data = client.describe_workflow(args.workflow_id)
                 elif args.operation == "verify":
                     data = client.verify_workflow(args.workflow_id)
                 elif args.operation == "read":

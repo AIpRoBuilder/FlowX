@@ -372,7 +372,7 @@ Then rerun the service.
 | 服务 | `run_service`、`stop_service`、`service_status` | 启动（或替换）、停止和检查工作流服务。 |
 | 服务 | `run_step`、`reset_session` | 向运行中的服务输入某个步骤的参数；取消暂停的会话。 |
 | 服务 | `list_runs`、`get_run`、`get_evidence` | 读取运行记录，并为下一次修复收集证据。 |
-| 检查 | `list_workflows`、`list_nodes`、`get_workflow` | 工作流 ID、版本和错误；step id 和 node id；产物位置。 |
+| 检查 | `list_workflows`、`list_nodes`、`get_workflow`、`describe_workflow` | 工作流 ID、版本和错误；step id 和 node id；产物位置；步骤描述、输入格式和输入模式。 |
 
 <a name="python-sdk"></a>
 ## 🐍 Python SDK
@@ -396,6 +396,8 @@ with FlowXClient(workspace="./workflows") as flowx:
 ```
 
 使用服务时请保持客户端打开；退出 `with` 代码块会停止该客户端启动的服务并取消未完成的构建（已发布的版本会保留）。
+
+运行已构建的工作流前，`flowx.describe_workflow(workflow_id)` 返回工作流用途以及每个步骤的描述、`inputs_format`、`input_mode` 和 `input_example`。用它判断某一步需要字符串、JSON 对象还是文件路径。
 
 需要更细粒度控制时直接使用协议：`begin_build`、`get_tasks`、`submit_task`（结果包含 `accepted`、`findings`、`test`、`next_tasks` 和 `state`）、`get_build_state`、`get_build_events`、`reopen_stage` 和 `abort_build`。可运行的修复示例见 [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py)。
 

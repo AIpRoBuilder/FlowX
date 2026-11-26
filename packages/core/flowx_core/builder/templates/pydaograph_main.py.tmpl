@@ -4,6 +4,7 @@
 # Modified 2026-10-23: type STEP_CHAIN with ag_ui_workflow.StepMeta.
 # Modified 2026-11-16: seed workflow root/request id on pool lease and tee SSE run journal.
 # Modified 2026-11-25: decode single or multiple HTTP file uploads into dict[str, bytes] for WorkflowFileNode.
+# Modified 2026-11-26: expose GET /api/steps and validate declared inputs_format on run-step.
 from __future__ import annotations
 
 import base64
@@ -49,6 +50,7 @@ PIPELINE_JSON_PATH = __PIPELINE_JSON_EXPR__
 GRAPH_CONFIG_ID = "__NODES_PACKAGE_NAME__"
 PIPELINE_POOL: WorkflowPipelinePool | None = None
 ENGINE: WorkflowEngine | None = None
+GRAPH_NODES: dict[str, dict[str, Any]] = {}
 SESSION_REQUESTS: dict[str, str] = {}
 _REQUEST_LOCK = Lock()
 RUN_JOURNAL = RunJournal(_WORKFLOW_ROOT)
@@ -116,6 +118,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     workflow_config = json.loads(PIPELINE_JSON_PATH.read_text(encoding="utf-8"))
     if not isinstance(workflow_config, dict):
         raise ValueError("Workflow config must be a JSON object")
+    GRAPH_NODES.clear()
+    GRAPH_NODES.update({
+        n["name"]: n for n in workflow_config.get("nodes", []) if isinstance(n, Mapping) and n.get("name")
+    })
     workflow_config.setdefault("pool_size", 4)
     pool_size = workflow_config["pool_size"]
     if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size < 1:
@@ -167,6 +173,38 @@ def _meta_field(meta: Any, key: str, default: Any = None) -> Any:
     if isinstance(meta, Mapping):
         return meta.get(key, default)
     return getattr(meta, key, default)
+
+
+_TYPE_CHECKS = {
+    "string": lambda v: isinstance(v, str),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "integer": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and float(v).is_integer(),
+    "boolean": lambda v: isinstance(v, bool),
+    "object": lambda v: isinstance(v, Mapping),
+    "array": lambda v: isinstance(v, list),
+    "null": lambda v: v is None,
+}
+
+
+def _validate_step_input(step_meta: Any, payload: RunStepInput) -> None:
+    if _meta_field(step_meta, "metaNodeKind") == "WorkflowFileNode" or not isinstance(payload.input, Mapping):
+        return
+    spec = GRAPH_NODES.get(str(_meta_field(step_meta, "id"))) or {}
+    fields = spec.get("inputs_format")
+    if not isinstance(fields, Mapping) or not fields:
+        return
+    if len(fields) > 1 and any(k in payload.input for k in ("input", "value", "text")):
+        raise HTTPException(status_code=422, detail={
+            "message": "A multi-field inputs_format cannot use reserved input/value/text keys; send the declared fields directly.",
+            "inputs_format": dict(fields),
+        })
+    for key, declared in fields.items():
+        check = _TYPE_CHECKS.get(str(declared).strip().lower())
+        if key in payload.input and check and not check(payload.input[key]):
+            raise HTTPException(status_code=422, detail={
+                "message": f"Input field {key!r} must be {declared}.",
+                "inputs_format": dict(fields),
+            })
 
 
 def _get_engine() -> WorkflowEngine:
@@ -305,6 +343,26 @@ def index() -> dict[str, str | bool]:
     return {"ok": True, "service": "ag-ui-lifecycle-backend"}
 
 
+@app.get("/api/steps")
+def list_steps() -> dict[str, Any]:
+    steps = []
+    for meta in STEP_CHAIN:
+        step_id = str(_meta_field(meta, "id") or "")
+        spec = GRAPH_NODES.get(step_id, {})
+        steps.append({
+            "step_id": step_id,
+            "title": _meta_field(meta, "title", ""),
+            "prompt": _meta_field(meta, "prompt", ""),
+            "description": spec.get("desc", ""),
+            "meta_node_kind": _meta_field(meta, "metaNodeKind", ""),
+            "ext_data": spec.get("ext_data") or {},
+            "dependencies": list(_meta_field(meta, "dependencies", []) or []),
+            "input_required": bool(_meta_field(meta, "inputRequired", False)),
+            "inputs_format": dict(spec.get("inputs_format") or {}),
+        })
+    return {"steps": steps}
+
+
 @app.post("/api/run-step")
 def run_step(payload: RunStepInput) -> StreamingResponse:
     step_meta = next(
@@ -314,6 +372,7 @@ def run_step(payload: RunStepInput) -> StreamingResponse:
         raise HTTPException(
             status_code=404, detail=f"Unknown stepId: {payload.stepId}"
         )
+    _validate_step_input(step_meta, payload)
 
     step_id = _meta_field(step_meta, "id")
     if _meta_field(step_meta, "metaNodeKind") == "WorkflowFileNode":

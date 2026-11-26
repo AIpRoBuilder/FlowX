@@ -92,6 +92,7 @@ def test_generated_media_nodes_pass_auditor_and_expose_static_ast_schemas(tmp_pa
                         "meta_node_kind": "WorkflowStepNode",
                         "desc": "Collect prompt",
                         "ext_data": {"type": "user_input", "desc": "prompt text"},
+                        "inputs_format": {"prompt": "string"},
                         "enable": True,
                     },
                     {
@@ -281,7 +282,12 @@ def test_end_to_end_generated_service_journals_run_and_media_outputs(
     graph = {
         "pool_size": 1,
         "nodes": [
-            {"name": "PromptInput", "depends": []},
+            {
+                "name": "PromptInput", "depends": [], "desc": "Prompt input",
+                "meta_node_kind": "WorkflowStepNode",
+                "ext_data": {"type": "user_input", "desc": "prompt"},
+                "inputs_format": {"prompt": "string", "style": "string"},
+            },
             {"name": "RenderPoster", "depends": ["PromptInput"]},
             {"name": "MakeTrailer", "depends": ["PromptInput", "RenderPoster"]},
         ],
@@ -388,6 +394,21 @@ class MakeTrailer(WorkflowStepNode):
 
     try:
         with TestClient(module.app) as client:
+            steps = client.get("/api/steps")
+            assert steps.status_code == 200
+            assert [step["step_id"] for step in steps.json()["steps"]] == [
+                "PromptInput", "RenderPoster", "MakeTrailer",
+            ]
+            assert steps.json()["steps"][0]["title"] == "Prompt Input"
+            assert steps.json()["steps"][0]["prompt"] == "Describe scene"
+            assert steps.json()["steps"][0]["inputs_format"] == {"prompt": "string", "style": "string"}
+
+            invalid = client.post(
+                "/api/run-step",
+                json={"sessionId": "sess-0", "stepId": "PromptInput", "input": {"input": "x", "style": "y"}},
+            )
+            assert invalid.status_code == 422
+
             resp = client.post(
                 "/api/run-step",
                 json={"sessionId": "sess-1", "stepId": "PromptInput", "input": "Cyberpunk harbor in rain"},

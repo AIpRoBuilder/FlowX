@@ -17,6 +17,8 @@ from flowx_core.tools.workflow_node_reference import (
 	workflow_meta_node_kind_name_set,
 )
 
+_INPUT_FIELD_TYPES = frozenset({"string", "number", "integer", "boolean", "object", "array", "null"})
+
 
 class GraphJsonAuditor(BaseJsonAuditor):
 	"""Audit graph JSON definitions for name/type consistency."""
@@ -62,6 +64,25 @@ class GraphJsonAuditor(BaseJsonAuditor):
 
 	def _extract_meta_node_kind(self, node: Dict[str, Any]) -> str:
 		return str(node.get("meta_node_kind") or node.get("metaNodeKind") or "").strip()
+
+	def _inputs_format_violations(self, name: str, node: Dict[str, Any], index: int) -> List[JsonRuleViolation]:
+		ext_type = self._extract_ext_type(node)
+		raw_format = node.get("inputs_format")
+		if ext_type == "user_file_input":
+			if raw_format in (None, {}):
+				return []
+			return [JsonRuleViolation("graph", "inputs_format", f"Node {name!r}: `inputs_format` is not supported for `user_file_input` nodes.", index)]
+		if ext_type != "user_input":
+			return []
+		if not isinstance(raw_format, Mapping) or not raw_format:
+			return [JsonRuleViolation("graph", "inputs_format", f"Node {name!r}: `user_input` needs a non-empty `inputs_format` mapping.", index)]
+		violations: List[JsonRuleViolation] = []
+		for field_name, declared in raw_format.items():
+			if not isinstance(field_name, str) or not field_name.strip():
+				violations.append(JsonRuleViolation("graph", "inputs_format", f"Node {name!r}: input field names must be non-empty strings.", index))
+			if not isinstance(declared, str) or declared.strip().lower() not in _INPUT_FIELD_TYPES:
+				violations.append(JsonRuleViolation("graph", "inputs_format", f"Node {name!r}: input field {field_name!r} must use one of {sorted(_INPUT_FIELD_TYPES)}.", index))
+		return violations
 
 	def audit_graph_json(self, source: Graph) -> tuple[bool, List[JsonRuleViolation]]:
 		"""Validate that every node's ``name`` matches its ``type``, check for cycles, and connectivity.
@@ -140,6 +161,8 @@ class GraphJsonAuditor(BaseJsonAuditor):
 							lineno=index,
 						)
 					)
+
+			violations.extend(self._inputs_format_violations(name, node, index))
 
 			if ext_type == "image":
 				violations.append(

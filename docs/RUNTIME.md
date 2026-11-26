@@ -3,6 +3,7 @@
 Modified 2026-11-22: describe the workflow builder's gate steps; the LLM generation workflows are gone.
 Modified 2026-11-23: document FlowX-owned workflow file integrity checks, evolve modes, and optional OS sandboxing.
 Modified 2026-11-25: update WorkflowFileNode contract to files: dict[str, bytes] and multi-file HTTP decoding.
+Modified 2026-11-26: document inputs_format semantics and GET /api/steps.
 
 FlowX targets the request-scoped `ag_ui_workflow` API, verified against upstream
 revision `27a8b4f` (with the `dict[str, bytes]` file-node update, 2026-11-25). That
@@ -15,6 +16,16 @@ distinguish the older API.
   `init_workflow_engine` forwards each class's `step_meta()` unchanged, and
   generated backends annotate `STEP_CHAIN: list[StepMeta]`. Minimal metadata such
   as `{"id": ..., "dependencies": []}` is accepted by the engine.
+- `inputs_format` in `workflow.json` is declarative: it is required for
+  `user_input` nodes and rejected for `user_file_input` nodes, but it is not a
+  runtime schema. `WorkflowStepNode.process_input` receives normalized text;
+  a dict without `input`/`value`/`text` becomes JSON text. Nodes that declare
+  several input fields must parse that JSON text themselves.
+- Generated services expose `GET /api/steps`, which merges the graph node
+  `desc`/`inputs_format` with `STEP_CHAIN` `title`/`prompt`/`inputRequired`.
+  `POST /api/run-step` rejects a multi-field dict that uses the reserved
+  `input`/`value`/`text` keys and checks declared field types when a dict is
+  submitted.
 - JSON pipeline pools require `node_classes`, keyed by each JSON node's `name`,
   with true concrete classes taken from a `NODES` tuple:
   `NODE_CLASSES = {node.STEP_ID: node for node in NODES}`.

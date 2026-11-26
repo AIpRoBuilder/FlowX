@@ -385,7 +385,7 @@ These MCP tools let the host agent operate both FlowX entities from the same con
 | Service | `run_service`, `stop_service`, `service_status` | Start (or replace), stop, and inspect a workflow's service. |
 | Service | `run_step`, `reset_session` | Feed one step's input to the running service; cancel a paused session. |
 | Service | `list_runs`, `get_run`, `get_evidence` | Read the run journal and collect evidence for the next fix. |
-| Inspection | `list_workflows`, `list_nodes`, `get_workflow` | Workflow ids, versions and errors; step ids and node ids; artifact locations. |
+| Inspection | `list_workflows`, `list_nodes`, `get_workflow`, `describe_workflow` | Workflow ids, versions and errors; step ids and node ids; artifact locations; step descriptions, input formats and input modes. |
 
 <a name="python-sdk"></a>
 ## 🐍 Python SDK
@@ -409,6 +409,8 @@ with FlowXClient(workspace="./workflows") as flowx:
 ```
 
 Keep the client open while using the service; exiting the `with` block stops services it started and aborts open builds (published versions stay).
+
+Before running a built workflow, `flowx.describe_workflow(workflow_id)` returns the workflow purpose and each step's description, `inputs_format`, `input_mode`, and `input_example`. Use it to decide whether a step takes a string, JSON object, or file path.
 
 For finer control use the protocol directly: `begin_build`, `get_tasks`, `submit_task` (the result has `accepted`, `findings`, `test`, `next_tasks`, and `state`), `get_build_state`, `get_build_events`, `reopen_stage`, and `abort_build`. A runnable repair walkthrough is in [examples/sdk_guided_repair.py](examples/sdk_guided_repair.py).
 

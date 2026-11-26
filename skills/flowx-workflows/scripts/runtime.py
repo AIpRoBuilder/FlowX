@@ -33,7 +33,9 @@ Send one JSON object per stdin line; commands are processed sequentially:
   {"action":"step","step_id":"ask","input":"answer","file_path":"optional path"}
   {"action":"reset"}
   {"action":"stop"}
-For step, input and file_path are optional. Responses are JSON lines: step includes
+For step, input and file_path are optional. WorkflowStepNode input is normalized
+text: a dict without input/value/text becomes JSON text; use file_path or a files
+mapping for WorkflowFileNode. Responses are JSON lines: step includes
 session_id, step_id, events, awaiting, status (input_required or response_received),
 and final if an SSE event supplied a result. To resume an input_required step, send
 another step with awaiting.stepId and its answer; the session ID stays the same.
