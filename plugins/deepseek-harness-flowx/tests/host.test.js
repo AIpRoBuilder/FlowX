@@ -9,6 +9,7 @@
 // Modified 2026-11-10: cover symlinked DSH_HOME resolution and retained confinement.
 // Modified 2026-11-10: exercise safe, catalog-bound workflow folder browsing.
 // Modified 2026-11-17: cover raw workflow service .env reads and writes.
+// Modified 2026-11-26: cover detailed run summaries for historical canvas results.
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -1404,7 +1405,7 @@ test('folder operations coordinate with builds, settings writes, and disposal', 
 
 test('listRuns, getRun, and layout persistence sanitize records and isolate canvas positions', async t => {
   const { directory, service } = await folderFixture(t);
-  assert.deepEqual(await value(service, 'listRuns', { workflowId: 'wf1' }), { workflowId: 'wf1', latestRunId: null, runs: [] });
+  assert.deepEqual(await value(service, 'listRuns', { workflowId: 'wf1' }), { workflowId: 'wf1', latestRunId: null, truncated: false, runs: [] });
   assert.deepEqual(await value(service, 'getLayout', { workflowId: 'wf1' }), { workflowId: 'wf1', positions: {} });
 
   const runDir = path.join(directory, 'runs', 'run_01');
@@ -1423,11 +1424,36 @@ test('listRuns, getRun, and layout persistence sanitize records and isolate canv
       Poster: { status: 'completed', title: 'Poster', card: { kind: 'image', media: 'runs/run_01/media/Poster/out.png', mime: 'image/png', width: 256, height: 256 } },
     },
   }));
+  const olderRunDir = path.join(directory, 'runs', 'run_00');
+  await fs.mkdir(olderRunDir, { recursive: true });
+  await fs.writeFile(path.join(olderRunDir, 'run.json'), JSON.stringify({
+    schema_version: 1,
+    run_id: 'run_00',
+    session_id: 's0',
+    workflow_version: 1,
+    status: 'input_required',
+    created_at: '2026-11-15T09:00:00Z',
+    updated_at: '2026-11-15T10:00:00Z',
+    awaiting: { stepId: 'Prompt', title: 'Prompt' },
+    nodes: { Prompt: { status: 'awaiting_input', title: 'Prompt', card: {} } },
+  }));
 
   const listed = await value(service, 'listRuns', { workflowId: 'wf1' });
   assert.equal(listed.latestRunId, 'run_01');
-  assert.equal(listed.runs.length, 1);
+  assert.equal(listed.truncated, false);
+  assert.deepEqual(listed.runs.map(item => item.run_id), ['run_01', 'run_00']);
   assert.equal(listed.runs[0].node_count, 2);
+  assert.equal(listed.runs[0].card_count, 2);
+  assert.equal(listed.runs[0].media_count, 1);
+  assert.equal(listed.runs[0].has_error, true);
+  assert.equal(listed.runs[0].awaiting_step, null);
+  assert.equal(listed.runs[0].created_at, null);
+  assert.equal(listed.runs[0].updated_at, '2026-11-16T12:00:00Z');
+  assert.equal(listed.runs[1].node_count, 1);
+  assert.equal(listed.runs[1].card_count, 0);
+  assert.equal(listed.runs[1].media_count, 0);
+  assert.equal(listed.runs[1].awaiting_step, 'Prompt');
+  assert.equal(listed.runs[1].created_at, '2026-11-15T09:00:00Z');
 
   const detail = (await value(service, 'getRun', { workflowId: 'wf1', runId: 'run_01' })).run;
   assert.equal(detail.run_id, 'run_01');

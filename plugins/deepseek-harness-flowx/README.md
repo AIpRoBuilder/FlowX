@@ -9,6 +9,7 @@
 <!-- Modified 2026-11-16: document saved environment variables for FlowX skill processes. -->
 <!-- Modified 2026-11-17: remove global environment settings and document per-workflow .env editing. -->
 <!-- Modified 2026-11-23: FlowX calls no LLM, so settings hold only the interpreter and workspace paths. -->
+<!-- Modified 2026-11-26: document automatic run history and viewing any recorded run's canvas outputs. -->
 
 # FlowX for DeepSeek Harness
 
@@ -18,7 +19,8 @@ plugin. The interface is an owner-only, **read-only workflow viewer**. The
 **FlowX** sidebar footer action opens a left-side overlay without replacing the
 conversation; it overlays part of the window instead of adding a native,
 resizable sidebar column. The overlay lists workflows, renders the current
-plan graph with node descriptions, and browses the workflow directory. It is a
+plan graph with node descriptions, browses the workflow directory, and shows
+the node outputs of any recorded run, not only the newest one. It is a
 UI and host integration, **not an agent tool**. Use the separately installed
 [FlowX workflow skill](https://github.com/AIpRoBuilder/FlowX/tree/main/skills/flowx-workflows)
 to create, evolve, and run workflows.
@@ -193,11 +195,17 @@ and [NOTICE](NOTICE).
    not necessarily the published revision: published workflow and node
    revisions or artifacts can differ after a graph-only update. Rebuild affected
    stages before relying on a consistent published workflow.
-3. Select **Sync outputs** to load run journals recorded under
-   `workspace/workflows/<workflow_id>/runs` and render per-node prompt, image,
-   and video cards directly on the graph canvas (with zoom, **Expand canvas**,
+3. Selecting a workflow also loads its **Run history** — every run journal
+   recorded under `workspace/workflows/<workflow_id>/runs`, newest first, with
+   status, plan revision, output count, and timestamps. Select any entry to
+   render that run's per-node prompt, image, and video cards directly on the
+   graph canvas; the default is the newest run, and **View latest** returns to
+   it. Outputs recorded for nodes that are not in the current plan remain
+   visible below the canvas. Run cards support zoom, **Expand canvas**,
    lightbox preview, stale-revision badges, and drag-to-arrange layout saved to
-   `canvas_layout.json` without affecting build fingerprints).
+   `canvas_layout.json` without affecting build fingerprints. **Sync outputs**
+   reloads the run list and the selected run, keeping a historical selection
+   when that run still exists.
 4. Expand the **Workflow folder** tree to browse the actual directory under
    `workspace/workflows/<workflow_id>` and open eligible files. Select
    **Refresh** after a separate skill operation finishes; there is no automatic

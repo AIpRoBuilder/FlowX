@@ -8,6 +8,7 @@
 // Modified 2026-11-10: test the read-only footer overlay, settings, folder browser and asynchronous races.
 // Modified 2026-11-10: verify navigation drawer handoff in narrow windows.
 // Modified 2026-11-17: cover the raw workflow .env editor.
+// Modified 2026-11-26: cover run history selection, historical outputs, and run-record failures.
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -364,6 +365,8 @@ test('inspects graph dependencies, descriptions, node state and selectable artif
     { endpoint: 'inspect', payload: { workflowId: 'wf1' } },
     { endpoint: 'readArtifact', payload: { workflowId: 'wf1', path: 'plan/graph.json' } },
     { endpoint: 'listFolder', payload: { workflowId: 'wf1', path: '' } },
+    { endpoint: 'getLayout', payload: { workflowId: 'wf1' } },
+    { endpoint: 'listRuns', payload: { workflowId: 'wf1' } },
   ]);
   assert.equal(ui.workflow('wf1').props['aria-pressed'], true);
   assert.match(ui.text(ui.page()), /Published workflow revision 3.*Current plan dependency graph.*may differ after graph-only updates/s);
@@ -904,7 +907,7 @@ test('syncCanvas renders prompt, image, video cards, stale badges, lightbox and 
   await ui.click(ui.workflow('wf_media'));
   await ui.click(ui.button('Sync outputs'));
 
-  assert.match(ui.text(ui.page()), /Run rev 2 · stale/);
+  assert.match(ui.text(ui.page()), /Latest run run_media_1 · completed · rev 2 · stale/);
   assert.match(ui.text(ui.page()), /Neon dusk over Tokyo/);
   assert.match(ui.text(ui.page()), /512×512/);
   assert.match(ui.text(ui.page()), /2\.5s/);
@@ -924,5 +927,110 @@ test('syncCanvas renders prompt, image, video cards, stale badges, lightbox and 
   assert.ok(ui.button('Compact view'));
   await ui.click(ui.button('Reset layout'));
   assert.deepEqual(savedLayouts.at(-1), { workflowId: 'wf_media', positions: {} });
+  ui.unmount();
+});
+
+test('run history lists every recorded run and renders historical results instead of only the newest run', async () => {
+  const graph = { nodes: [{ name: 'Plan', desc: 'Plan the work' }, { name: 'Draw', desc: 'Draw it', depends: ['Plan'] }] };
+  const older = {
+    run_id: 'run_older_0001', workflow_version: 2, status: 'input_required',
+    created_at: '2026-11-20T09:00:00Z', updated_at: '2026-11-20T10:00:00Z',
+    awaiting: { stepId: 'Plan', prompt: '' },
+    nodes: {
+      Plan: { status: 'awaiting_input', title: 'Plan', card: { kind: 'prompt', prompt: 'Older plan prompt' } },
+      Retired: { status: 'completed', title: 'Retired step', card: { kind: 'prompt', prompt: 'Retired output text' } },
+    },
+  };
+  const newer = {
+    run_id: 'run_newer_0002', workflow_version: 3, status: 'completed',
+    created_at: '2026-11-21T09:00:00Z', updated_at: '2026-11-21T10:00:00Z',
+    nodes: {
+      Plan: { status: 'completed', title: 'Plan', card: { kind: 'prompt', prompt: 'Newest plan prompt' } },
+      Draw: { status: 'completed', title: 'Draw', card: { kind: 'image', media: 'runs/run_newer_0002/media/Draw/out.png', width: 640, height: 480 } },
+    },
+  };
+  const calls = [];
+  const ui = harness((url, endpoint, payload) => {
+    calls.push({ endpoint, payload });
+    if (endpoint === 'list') return ok(catalog('wf_runs'));
+    if (endpoint === 'inspect') return ok({ artifacts: artifactMap({ graph: 'plan/workflow.json' }) });
+    if (endpoint === 'readArtifact') return ok({ content: JSON.stringify(graph) });
+    if (endpoint === 'listFolder') return ok(entries());
+    if (endpoint === 'getLayout') return ok({ workflowId: 'wf_runs', positions: {} });
+    if (endpoint === 'listRuns') return ok({
+      workflowId: 'wf_runs', latestRunId: 'run_newer_0002', truncated: false,
+      runs: [
+        { run_id: 'run_newer_0002', workflow_version: 3, status: 'completed', updated_at: '2026-11-21T10:00:00Z', node_count: 2, card_count: 2, media_count: 1, has_error: false, awaiting_step: null },
+        { run_id: 'run_older_0001', workflow_version: 2, status: 'input_required', updated_at: '2026-11-20T10:00:00Z', node_count: 2, card_count: 2, media_count: 0, has_error: false, awaiting_step: 'Plan' },
+      ],
+    });
+    if (endpoint === 'getRun') return ok({ workflowId: 'wf_runs', run: payload.runId === 'run_older_0001' ? older : newer });
+    throw new Error(`unexpected ${endpoint}`);
+  });
+  await ui.mount();
+  await ui.toggle();
+  await ui.click(ui.workflow('wf_runs'));
+
+  // Runs load with the workflow, so the canvas is not limited to an explicit sync.
+  assert.match(ui.text(ui.page()), /Newest plan prompt/);
+  assert.match(ui.text(ui.page()), /Latest run run_newer_00 · completed · rev 3/);
+  assert.equal(ui.all().filter(node => node.props['data-flowx-run']).length, 2);
+  assert.equal(ui.find(node => node.props['data-flowx-run'] === 'run_newer_0002').props['aria-pressed'], true);
+
+  const olderButton = ui.find(node => node.props['data-flowx-run'] === 'run_older_0001');
+  assert.equal(olderButton.props['aria-pressed'], false);
+  assert.match(ui.text(olderButton), /input_required.*rev 2.*waiting at Plan/s);
+
+  await ui.click(olderButton);
+  assert.match(ui.text(ui.page()), /Older plan prompt/);
+  assert.doesNotMatch(ui.text(ui.page()), /Newest plan prompt/);
+  assert.match(ui.text(ui.page()), /Viewing run run_older_00 · input_required · rev 2/);
+  assert.ok(ui.button('View latest'));
+  assert.match(ui.text(ui.find(node => node.props['data-flowx-run-node'] === 'Retired')), /Retired step.*Retired output text/s);
+
+  // A manual sync refreshes the run list but keeps the historical selection.
+  await ui.click(ui.button('Sync outputs'));
+  assert.equal(calls.filter(call => call.endpoint === 'getRun').at(-1).payload.runId, 'run_older_0001');
+  assert.match(ui.text(ui.page()), /Older plan prompt/);
+
+  await ui.click(ui.button('View latest'));
+  assert.match(ui.text(ui.page()), /Newest plan prompt/);
+  assert.match(ui.text(ui.page()), /Latest run run_newer_00/);
+  assert.equal(ui.all().some(node => node.props['data-flowx-run-node'] === 'Retired'), false);
+  ui.unmount();
+});
+
+test('a failed run record clears the canvas instead of leaving another run on screen', async () => {
+  const graph = { nodes: [{ name: 'Only', desc: 'Only step' }] };
+  const newest = {
+    run_id: 'run_ok', workflow_version: 1, status: 'completed',
+    nodes: { Only: { status: 'completed', title: 'Only', card: { kind: 'prompt', prompt: 'Newest output' } } },
+  };
+  const ui = harness((url, endpoint, payload) => {
+    if (endpoint === 'list') return ok(catalog('wf1'));
+    if (endpoint === 'inspect') return ok({ artifacts: artifactMap({ graph: 'g.json' }) });
+    if (endpoint === 'readArtifact') return ok({ content: JSON.stringify(graph) });
+    if (endpoint === 'listFolder') return ok(entries());
+    if (endpoint === 'getLayout') return ok({ workflowId: 'wf1', positions: {} });
+    if (endpoint === 'listRuns') return ok({
+      workflowId: 'wf1', latestRunId: 'run_ok', truncated: false,
+      runs: [
+        { run_id: 'run_ok', workflow_version: 1, status: 'completed', node_count: 1 },
+        { run_id: 'run_bad', workflow_version: 1, status: 'failed', node_count: 0 },
+      ],
+    });
+    if (endpoint === 'getRun') return payload.runId === 'run_bad'
+      ? fail('flowx/artifact-unavailable', 'The workflow run record is invalid or unsafe.')
+      : ok({ workflowId: 'wf1', run: newest });
+    throw new Error(`unexpected ${endpoint}`);
+  });
+  await ui.mount();
+  await ui.toggle();
+  await ui.click(ui.workflow('wf1'));
+  assert.match(ui.text(ui.page()), /Newest output/);
+  await ui.click(ui.find(node => node.props['data-flowx-run'] === 'run_bad'));
+  assert.doesNotMatch(ui.text(ui.page()), /Newest output/);
+  assert.match(ui.text(ui.find(node => node.props.role === 'alert')), /invalid or unsafe/);
+  assert.equal(ui.find(node => node.props['data-flowx-run'] === 'run_bad').props['aria-pressed'], true);
   ui.unmount();
 });

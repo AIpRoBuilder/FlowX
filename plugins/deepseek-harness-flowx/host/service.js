@@ -11,6 +11,7 @@
 // Modified 2026-11-16: save owner-configured environment variables for FlowX skill processes.
 // Modified 2026-11-17: remove global environment settings and expose each workflow's .env content.
 // Modified 2026-11-23: FlowX calls no LLM, so the plugin saves no API key and passes none to children.
+// Modified 2026-11-26: list every recorded run with card/media counts so the canvas can show historical results.
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -1196,9 +1197,9 @@ export class FlowXHostService {
       const runsDir = path.join(directory, 'runs');
       try {
         const stat = await fs.lstat(runsDir);
-        if (!stat.isDirectory() || stat.isSymbolicLink() || await fs.realpath(runsDir) !== runsDir) return { workflowId: id, latestRunId: null, runs: [] };
+        if (!stat.isDirectory() || stat.isSymbolicLink() || await fs.realpath(runsDir) !== runsDir) return { workflowId: id, latestRunId: null, truncated: false, runs: [] };
       } catch (error) {
-        if (error.code === 'ENOENT') return { workflowId: id, latestRunId: null, runs: [] };
+        if (error.code === 'ENOENT') return { workflowId: id, latestRunId: null, truncated: false, runs: [] };
         throw problem('artifact-unavailable', 'The workflow runs directory is unavailable or unsafe.');
       }
       let latestRunId = null;
@@ -1215,23 +1216,43 @@ export class FlowXHostService {
         try {
           const raw = await this.readMapped(config.root, id, `runs/${item.name}/run.json`, true, { browse: true });
           const summary = this.sanitizeRunRecord(raw.content, item.name);
+          let cardCount = 0, mediaCount = 0;
+          for (const entry of Object.values(summary.nodes)) {
+            const card = entry.card;
+            if (!card || Object.keys(card).length === 0) continue;
+            cardCount++;
+            if (typeof card.media === 'string' && card.media) mediaCount++;
+          }
+          const awaitingStep = typeof summary.awaiting?.stepId === 'string' && this.safeIdentifier(summary.awaiting.stepId) ? summary.awaiting.stepId : null;
           runs.push({
             run_id: summary.run_id,
             workflow_version: summary.workflow_version,
             status: summary.status,
+            created_at: summary.created_at,
             updated_at: summary.updated_at,
             node_count: Object.keys(summary.nodes).length,
+            card_count: cardCount,
+            media_count: mediaCount,
+            has_error: summary.has_error,
+            awaiting_step: awaitingStep,
           });
         } catch { /* ignore incomplete or invalid run folders */ }
       }
       runs.sort((a, b) => {
         const ta = a.updated_at || '', tb = b.updated_at || '';
         if (ta !== tb) return tb < ta ? -1 : 1;
+        const ca = a.created_at || '', cb = b.created_at || '';
+        if (ca !== cb) return cb < ca ? -1 : 1;
         return a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0;
       });
       const bounded = runs.slice(0, RUN_LIST_LIMIT);
       if (latestRunId && !bounded.some(item => item.run_id === latestRunId)) latestRunId = bounded[0]?.run_id ?? null;
-      return { workflowId: id, latestRunId: latestRunId ?? bounded[0]?.run_id ?? null, runs: bounded };
+      return {
+        workflowId: id,
+        latestRunId: latestRunId ?? bounded[0]?.run_id ?? null,
+        truncated: runs.length > bounded.length,
+        runs: bounded,
+      };
     });
   }
 

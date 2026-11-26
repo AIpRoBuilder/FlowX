@@ -12,6 +12,7 @@
 // Modified 2026-11-16: add a saved environment-variable area to plugin settings.
 // Modified 2026-11-17: remove global environment settings and show/edit each workflow's .env file.
 // Modified 2026-11-23: FlowX calls no LLM, so settings hold only the interpreter and workspace paths.
+// Modified 2026-11-26: list every recorded run and render historical run results on the canvas.
 
 window.__ModuleLoader__.load({
   id: 'dsh-flowx-plugin',
@@ -22,6 +23,13 @@ window.__ModuleLoader__.load({
     const CARD_WIDTH = 236;
     const mediaHref = (workflowId, relPath) => `api/flowx/media?workflowId=${encodeURIComponent(workflowId)}&path=${encodeURIComponent(relPath)}`;
     const statusTone = status => status === 'running' ? '#3b82f6' : status === 'completed' ? '#16a34a' : status === 'failed' ? '#dc2626' : status === 'awaiting_input' ? '#d97706' : '#7181eb';
+    const runTime = value => {
+      if (typeof value !== 'string' || !value) return '';
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? '' : date.toISOString().slice(5, 16).replace('T', ' ');
+    };
+    // Remembers the owner's run choice per workflow while the Harness page stays loaded.
+    const lastRunByWorkflow = new Map();
     const styles = {
       panel: { pointerEvents: 'auto', position: 'absolute', top: 8, bottom: 8, left: 8, width: 'min(680px, calc(100vw - 16px))', boxSizing: 'border-box', overflowY: 'auto', background: '#f5f8fc', color: '#192a44', border: '1px solid #dce5f3', borderRadius: 16, boxShadow: '0 20px 70px rgba(17, 33, 61, .25)', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', fontSize: 14 },
       panelExpanded: { pointerEvents: 'auto', position: 'absolute', top: 8, bottom: 8, left: 8, width: 'calc(100vw - 16px)', boxSizing: 'border-box', overflowY: 'auto', background: '#f5f8fc', color: '#192a44', border: '1px solid #dce5f3', borderRadius: 16, boxShadow: '0 20px 70px rgba(17, 33, 61, .25)', fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif', fontSize: 14 },
@@ -36,7 +44,6 @@ window.__ModuleLoader__.load({
       button: { border: '1px solid #d5dff0', background: '#fff', color: '#324864', borderRadius: 8, padding: '7px 10px', font: 'inherit', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
       primary: { border: '1px solid #5366db', background: '#5366db', color: '#fff', borderRadius: 8, padding: '8px 12px', font: 'inherit', fontSize: 13, fontWeight: 700, cursor: 'pointer' },
       input: { width: '100%', boxSizing: 'border-box', border: '1px solid #cfd9e8', borderRadius: 8, padding: 10, color: '#192a44', font: 'inherit', background: '#fbfcff' },
-      select: { border: '1px solid #cfd9e8', borderRadius: 8, padding: '6px 9px', color: '#192a44', font: 'inherit', fontSize: 12, background: '#fff' },
       badge: { display: 'inline-block', borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700, background: '#edf2ff', color: '#3b4cc0' },
       staleBadge: { display: 'inline-block', borderRadius: 999, padding: '2px 8px', fontSize: 11, fontWeight: 700, background: '#fff3cd', color: '#8a5a00', border: '1px solid #f5dca0' },
       label: { display: 'block', fontWeight: 700, fontSize: 12, margin: '14px 0 6px' },
@@ -248,18 +255,19 @@ window.__ModuleLoader__.load({
     function Page({ call, close, subscribeSaved, notifySaved }) {
       const [catalog, setCatalog] = useState(null), [error, setError] = useState(''), [busy, setBusy] = useState('');
       const [workflow, setWorkflow] = useState(null), [artifacts, setArtifacts] = useState(null), [rawGraph, setRawGraph] = useState(null), [layout, setLayout] = useState({}), [graphError, setGraphError] = useState('');
-      const [runs, setRuns] = useState([]), [selectedRunId, setSelectedRunId] = useState(''), [activeRun, setActiveRun] = useState(null);
+      const [runs, setRuns] = useState([]), [selectedRunId, setSelectedRunId] = useState(''), [activeRun, setActiveRun] = useState(null), [latestRunId, setLatestRunId] = useState('');
+      const [runsError, setRunsError] = useState(''), [runsLoading, setRunsLoading] = useState(false), [runsTruncated, setRunsTruncated] = useState(false), [runLoading, setRunLoading] = useState(false), [runError, setRunError] = useState('');
       const [wideCanvas, setWideCanvas] = useState(false), [zoom, setZoom] = useState(1), [lightbox, setLightbox] = useState(null);
       const [selectedNode, setSelectedNode] = useState(null), [viewer, setViewer] = useState(null), [folders, setFolders] = useState({});
       const [workflowEnv, setWorkflowEnv] = useState(null);
       const [settings, setSettings] = useState(null), [settingsError, setSettingsError] = useState(''), [settingsBusy, setSettingsBusy] = useState(false);
-      const mounted = useRef(false), generation = useRef(0), listTicket = useRef(0), viewTicket = useRef(0), runTicket = useRef(0), folderTickets = useRef({}), envTicket = useRef(0), settingsTicket = useRef(0), operation = useRef(''), saving = useRef(false), dragRef = useRef(null);
+      const mounted = useRef(false), generation = useRef(0), listTicket = useRef(0), viewTicket = useRef(0), runTicket = useRef(0), runListTicket = useRef(0), folderTickets = useRef({}), envTicket = useRef(0), settingsTicket = useRef(0), operation = useRef(''), saving = useRef(false), dragRef = useRef(null);
       const closeRef = useRef(null), settingsRef = useRef(null), settingsButton = useRef(null);
       const clearExplorer = useCallback(() => {
-        generation.current++; viewTicket.current++; runTicket.current++; envTicket.current++; folderTickets.current = {};
+        generation.current++; viewTicket.current++; runTicket.current++; runListTicket.current++; envTicket.current++; folderTickets.current = {};
         setWorkflow(null); setArtifacts(null); setRawGraph(null); setLayout({}); setGraphError('');
-        setRuns([]); setSelectedRunId(''); setActiveRun(null); setLightbox(null);
-        setSelectedNode(null); setViewer(null); setFolders({}); setWorkflowEnv(null);
+        setRuns([]); setSelectedRunId(''); setActiveRun(null); setLatestRunId(''); setRunsError(''); setRunsLoading(false); setRunsTruncated(false); setRunLoading(false); setRunError('');
+        setLightbox(null); setSelectedNode(null); setViewer(null); setFolders({}); setWorkflowEnv(null);
       }, []);
       const refresh = useCallback(async () => {
         const ticket = ++listTicket.current;
@@ -275,44 +283,69 @@ window.__ModuleLoader__.load({
         mounted.current = true; closeRef.current?.focus();
         const unsubscribe = subscribeSaved(refresh);
         refresh();
-        return () => { mounted.current = false; unsubscribe(); generation.current++; listTicket.current++; viewTicket.current++; runTicket.current++; envTicket.current++; settingsTicket.current++; };
+        return () => { mounted.current = false; unsubscribe(); generation.current++; listTicket.current++; viewTicket.current++; runTicket.current++; runListTicket.current++; envTicket.current++; settingsTicket.current++; };
       }, [refresh, subscribeSaved]);
       useEffect(() => { if (settings && !settingsBusy) settingsRef.current?.focus(); }, [!!settings, settingsBusy]);
 
       const loadRunDetail = async (id, runId, generationId) => {
-        if (!id || !runId) { setActiveRun(null); return; }
+        if (!id || !runId) { setActiveRun(null); setRunLoading(false); setRunError(''); return; }
         const ticket = ++runTicket.current;
+        setRunLoading(true); setRunError('');
         try {
           const detail = await call('getRun', { workflowId: id, runId });
-          if (mounted.current && generationId === generation.current && ticket === runTicket.current && detail?.run) {
-            setActiveRun(detail.run);
+          if (!mounted.current || generationId !== generation.current || ticket !== runTicket.current) return;
+          if (!detail?.run || detail.run.run_id !== runId) throw new Error('The workflow run record is invalid.');
+          setActiveRun(detail.run);
+        } catch (failure) {
+          if (mounted.current && generationId === generation.current && ticket === runTicket.current) {
+            setActiveRun(null);
+            setRunError(failure?.message || 'Unable to load the workflow run.');
           }
-        } catch { /* optional run state */ }
+        } finally {
+          if (mounted.current && generationId === generation.current && ticket === runTicket.current) setRunLoading(false);
+        }
       };
-      const syncCanvas = async () => {
-        if (!workflow || busy || operation.current) return;
-        const id = workflow, generationId = generation.current;
+      const syncCanvas = async (id, generationId = generation.current, preferredRunId) => {
+        if (!id || generationId !== generation.current) return;
         try {
           const savedLayout = await call('getLayout', { workflowId: id });
           if (mounted.current && generationId === generation.current && savedLayout?.positions && typeof savedLayout.positions === 'object') {
             setLayout(savedLayout.positions);
           }
         } catch { /* optional layout */ }
+        const ticket = ++runListTicket.current;
+        setRunsLoading(true);
         try {
           const listing = await call('listRuns', { workflowId: id });
-          if (!mounted.current || generationId !== generation.current || !Array.isArray(listing?.runs)) return;
-          setRuns(listing.runs);
-          const chosen = listing.latestRunId || listing.runs[0]?.run_id || '';
+          if (!mounted.current || generationId !== generation.current || ticket !== runListTicket.current) return;
+          if (!Array.isArray(listing?.runs)) throw new Error('The workflow run listing is invalid.');
+          setRunsLoading(false);
+          setRuns(listing.runs); setRunsTruncated(listing.truncated === true); setRunsError('');
+          const latest = typeof listing.latestRunId === 'string' && listing.runs.some(item => item.run_id === listing.latestRunId)
+            ? listing.latestRunId : listing.runs[0]?.run_id || '';
+          setLatestRunId(latest);
+          const remembered = preferredRunId || lastRunByWorkflow.get(id);
+          const chosen = remembered && listing.runs.some(item => item.run_id === remembered) ? remembered : latest;
           setSelectedRunId(chosen);
           if (chosen) await loadRunDetail(id, chosen, generationId);
-          else setActiveRun(null);
-        } catch { /* optional runs */ }
+          else { setActiveRun(null); setRunLoading(false); setRunError(''); }
+        } catch (failure) {
+          if (mounted.current && generationId === generation.current && ticket === runListTicket.current) {
+            setRuns([]); setRunsTruncated(false); setLatestRunId(''); setSelectedRunId(''); setActiveRun(null);
+            setRunsLoading(false); setRunLoading(false); setRunError(''); setRunsError(failure?.message || 'Unable to list workflow runs.');
+          }
+        }
       };
       const selectRun = async runId => {
-        setSelectedRunId(runId);
-        if (!workflow || !runId) { setActiveRun(null); return; }
+        if (!workflow || !runId) { setActiveRun(null); setSelectedRunId(''); return; }
+        // An explicit selection wins over any older run-list refresh.
+        runListTicket.current++; setRunsLoading(false);
+        lastRunByWorkflow.set(workflow, runId);
+        setSelectedRunId(runId); setRunError('');
+        if (activeRun?.run_id !== runId) setActiveRun(null);
         await loadRunDetail(workflow, runId, generation.current);
       };
+      const viewLatestRun = () => { if (latestRunId) return selectRun(latestRunId); };
       const moveNode = (name, x, y, persist) => {
         setLayout(old => {
           const next = { ...old, [name]: { x, y } };
@@ -344,7 +377,10 @@ window.__ModuleLoader__.load({
           }
         } catch (failure) { if (mounted.current && ticket === generation.current) setError(failure.message || 'Unable to inspect workflow.'); }
         finally { operation.current = ''; if (mounted.current && ticket === generation.current) setBusy(''); }
-        if (mounted.current && ticket === generation.current) loadFolder(id, '', ticket);
+        if (mounted.current && ticket === generation.current) {
+          loadFolder(id, '', ticket);
+          await syncCanvas(id, ticket);
+        }
       };
       const loadFolder = async (id, path, generationId) => {
         const ticket = (folderTickets.current[path] || 0) + 1; folderTickets.current[path] = ticket;
@@ -438,6 +474,10 @@ window.__ModuleLoader__.load({
       const node = graph?.nodes.find(item => item.name === selectedNode), nodeArtifacts = selectedNode && artifacts?.nodes?.[selectedNode];
       const selectedRunNode = selectedNode && activeRun?.nodes?.[selectedNode];
       const staleRun = !!(activeRun && Number.isInteger(artifacts?.workflow_version) && artifacts.workflow_version > 0 && activeRun.workflow_version > 0 && activeRun.workflow_version !== artifacts.workflow_version);
+      const planNames = new Set(graph ? graph.nodes.map(item => item.name) : []);
+      const runNodesOutsidePlan = activeRun ? Object.entries(activeRun.nodes || {}).filter(([name]) => !planNames.has(name)).sort(([a], [b]) => compare(a, b)) : [];
+      const viewingLatestRun = !!(activeRun && latestRunId && activeRun.run_id === latestRunId);
+      const runRevision = activeRun && Number.isInteger(activeRun.workflow_version) && activeRun.workflow_version > 0 ? ` · rev ${activeRun.workflow_version}` : '';
       const workflows = catalog ? Object.entries(catalog).sort(([a], [b]) => compare(a, b)) : [];
       return h('aside', { id: 'flowx-overlay', role: 'region', 'aria-label': 'FlowX workflow explorer', style: wideCanvas ? styles.panelExpanded : styles.panel, onKeyDown: event => { if (event.key === 'Escape') { event.stopPropagation(); if (lightbox) setLightbox(null); else if (settings) cancelSettings(); else close(); } } },
         h('div', { style: styles.content },
@@ -478,23 +518,70 @@ window.__ModuleLoader__.load({
               h('div', { style: { ...styles.row, justifyContent: 'space-between', marginTop: 16, marginBottom: 6 } },
                 h('h3', { style: { ...styles.heading, margin: 0 } }, 'Current plan dependency graph'),
                 graph && h('div', { style: styles.row },
-                  runs.length > 0 && h('select', { 'aria-label': 'Select workflow run', value: selectedRunId, style: styles.select, onChange: event => selectRun(event.target.value) },
-                    runs.map(item => h('option', { key: item.run_id, value: item.run_id }, `Run ${item.run_id.slice(0, 12)} · ${item.status} (rev ${item.workflow_version})`))),
-                  activeRun && h('span', { style: staleRun ? styles.staleBadge : styles.badge }, staleRun ? `Run rev ${activeRun.workflow_version} · stale` : `Run · ${activeRun.status}`),
-                  h('button', { type: 'button', style: styles.button, onClick: syncCanvas }, 'Sync outputs'),
+                  activeRun && h('span', { style: staleRun ? styles.staleBadge : styles.badge }, `${viewingLatestRun ? 'Latest' : 'Viewing'} run ${String(activeRun.run_id).slice(0, 12)} · ${activeRun.status}${runRevision}${staleRun ? ' · stale' : ''}`),
+                  activeRun && !viewingLatestRun && h('button', { type: 'button', style: styles.button, disabled: runLoading, onClick: viewLatestRun }, 'View latest'),
+                  h('button', { type: 'button', style: styles.button, disabled: !!busy, onClick: () => { if (busy || operation.current) return; syncCanvas(workflow, generation.current, selectedRunId); } }, 'Sync outputs'),
                   Object.keys(layout).length > 0 && h('button', { type: 'button', style: styles.button, onClick: resetLayout }, 'Reset layout'),
                   h('button', { type: 'button', style: styles.button, onClick: () => setZoom(z => Math.max(0.6, Math.round((z - 0.15) * 100) / 100)) }, '−'),
                   h('span', { style: { fontSize: 12, color: '#5d6e87', minWidth: 38, textAlign: 'center' } }, `${Math.round(zoom * 100)}%`),
                   h('button', { type: 'button', style: styles.button, onClick: () => setZoom(z => Math.min(1.6, Math.round((z + 0.15) * 100) / 100)) }, '+'))),
-              h('p', { style: { ...styles.muted, marginBottom: 10 } }, 'Published artifacts may differ after graph-only updates. Select a node for details, or drag cards with outputs to arrange layout.'),
+              h('div', { 'data-flowx-run-history': true, style: { marginBottom: 12, padding: '10px 12px', border: '1px solid #e3e9f5', borderRadius: 10 } },
+                h('div', { style: { ...styles.row, justifyContent: 'space-between', marginBottom: 8 } },
+                  h('h4', { style: { ...styles.heading, margin: 0, fontSize: 14 } }, 'Run history'),
+                  h('span', { style: { ...styles.muted, fontSize: 12 } }, runsLoading && runs.length === 0 ? 'Loading…' : runs.length ? `${runs.length}${runsTruncated ? '+' : ''} recorded ${runs.length === 1 ? 'run' : 'runs'}` : 'No recorded runs')),
+                runsError && h('div', { style: styles.row },
+                  h('p', { role: 'status', style: styles.muted }, `Run history unavailable: ${runsError}`),
+                  h('button', { type: 'button', style: styles.button, disabled: runsLoading || !!busy, onClick: () => syncCanvas(workflow, generation.current, selectedRunId) }, 'Retry runs')),
+                !runsError && runsLoading && runs.length === 0 && h('p', { role: 'status', style: styles.muted }, 'Loading run history…'),
+                !runsError && !runsLoading && runs.length === 0 && h('p', { style: styles.muted }, 'Run this workflow to create run journals. Every recorded run will be listed here so you can inspect older results, not only the newest run.'),
+                runs.length > 0 && h('div', { role: 'group', 'aria-label': 'Workflow run history', style: { display: 'grid', gap: 4, maxHeight: 190, overflowY: 'auto', paddingRight: 2 } },
+                  runs.map(item => {
+                    const selected = item.run_id === selectedRunId, isLatest = item.run_id === latestRunId, when = runTime(item.updated_at) || runTime(item.created_at);
+                    return h('button', {
+                      key: item.run_id,
+                      type: 'button',
+                      'data-flowx-run': item.run_id,
+                      'aria-pressed': selected,
+                      'aria-label': `View run ${item.run_id}, ${item.status}, revision ${item.workflow_version}${isLatest ? ', latest run' : ''}`,
+                      title: item.run_id,
+                      onClick: () => selectRun(item.run_id),
+                      style: { display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', width: '100%', textAlign: 'left', border: selected ? '1px solid #6071df' : '1px solid transparent', background: selected ? '#eef0ff' : '#f8faff', borderRadius: 8, padding: '6px 8px', font: 'inherit', fontSize: 12, color: '#26374f', cursor: 'pointer' },
+                    },
+                    h('span', { style: { width: 8, height: 8, borderRadius: 99, background: statusTone(item.status), flexShrink: 0 } }),
+                    h('strong', { style: { fontWeight: 700, fontVariantNumeric: 'tabular-nums' } }, `Run ${String(item.run_id).slice(0, 12)}`),
+                    h('span', { style: { color: statusTone(item.status), fontWeight: 700 } }, item.status),
+                    h('span', { style: { color: '#5d6e87' } }, `rev ${item.workflow_version}`),
+                    Number.isFinite(item.media_count) && item.media_count > 0 && h('span', { style: { color: '#3b4cc0' } }, `${item.media_count} ${item.media_count === 1 ? 'output' : 'outputs'}`),
+                    item.awaiting_step && h('span', { style: { color: '#8a5a00' } }, `waiting at ${item.awaiting_step}`),
+                    item.has_error && h('span', { style: styles.staleBadge }, 'error'),
+                    h('span', { style: { marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' } },
+                      when && h('span', { style: { color: '#76859c', fontVariantNumeric: 'tabular-nums' } }, when),
+                      isLatest && h('span', { style: styles.badge }, 'latest'),
+                      selected && h('span', { style: { ...styles.badge, background: '#dfe6ff' } }, 'viewing')));
+                  })),
+                runsTruncated && h('p', { style: { ...styles.muted, marginTop: 6 } }, 'Only the newest recorded runs are listed.'),
+                runLoading && h('p', { role: 'status', style: styles.muted }, 'Loading run outputs…'),
+                runError && h('p', { role: 'alert', style: styles.notice }, runError)),
+              h('p', { style: { ...styles.muted, marginBottom: 10 } }, 'Published artifacts may differ after graph-only updates. Select any recorded run to render its outputs on the canvas; select a node for details, or drag cards with outputs to arrange layout.'),
               graphError ? h('div', { role: 'alert', style: styles.notice }, graphError) : graph ? h(Graph, { model: graph, workflowId: workflow, run: activeRun, workflowVersion: artifacts.workflow_version, selected: selectedNode, zoom, dragRef, onSelect: setSelectedNode, onMoveNode: moveNode, onOpenLightbox: setLightbox }) : !artifacts.graph ? h('p', { style: styles.muted }, 'No graph artifact is available.') : null,
+              activeRun && runNodesOutsidePlan.length > 0 && h('div', { style: { marginTop: 12, padding: 12, border: '1px solid #e3e9f5', borderRadius: 10 } },
+                h('h3', { style: styles.heading }, graph ? 'Run outputs outside the current plan' : 'Run node outputs'),
+                h('p', { style: { ...styles.muted, marginBottom: 8 } }, graph ? 'This run recorded nodes that are not in the current plan graph. Their outputs remain available here.' : 'This run recorded these per-node outputs even though the current workflow has no plan graph.'),
+                h('div', { style: { display: 'grid', gap: 8 } },
+                  runNodesOutsidePlan.map(([name, entry]) => h('div', { key: name, 'data-flowx-run-node': name, style: { border: '1px solid #e8edf6', borderRadius: 10, padding: '8px 10px', background: '#fbfcff' } },
+                    h('div', { style: styles.row },
+                      h('span', { style: { width: 8, height: 8, borderRadius: 99, background: statusTone(entry?.status), flexShrink: 0 } }),
+                      h('strong', { style: { fontSize: 13, color: '#223451' } }, name),
+                      h('span', { style: { color: statusTone(entry?.status), fontSize: 12, fontWeight: 700 } }, entry?.status || 'unknown'),
+                      entry?.title && entry.title !== name && h('span', { style: { ...styles.muted, fontSize: 12 } }, entry.title)),
+                    h(NodeCardPreview, { workflowId: workflow, nodeName: name, runNode: entry, stale: staleRun, onOpenLightbox: setLightbox }))))),
               node && h('div', { style: { marginTop: 12, padding: 12, border: '1px solid #e3e9f5', borderRadius: 10 } },
                 h('h3', { style: styles.heading }, node.name),
                 h('p', { style: { ...styles.muted, whiteSpace: 'pre-wrap' } }, node.desc || 'No description provided.'),
                 h('p', { style: { ...styles.muted, marginTop: 8 } }, `Status: ${node.enabled ? 'Enabled' : 'Disabled'} · Depends on: ${node.depends.length ? node.depends.join(', ') : 'None'}`),
                 nodeArtifacts && h('p', { style: styles.muted }, `Node ID: ${nodeArtifacts.node_id} · Published node revision ${nodeArtifacts.version}`),
                 selectedRunNode && h('div', { style: { marginTop: 8 } },
-                  h('p', { style: { ...styles.muted, fontWeight: 700 } }, `Latest run status: ${selectedRunNode.status}${staleRun ? ' (stale revision)' : ''}`),
+                  h('p', { style: { ...styles.muted, fontWeight: 700 } }, `Run ${String(activeRun?.run_id || '').slice(0, 12)} status: ${selectedRunNode.status}${staleRun ? ' (stale revision)' : ''}`),
                   h(NodeCardPreview, { workflowId: workflow, nodeName: node.name, runNode: selectedRunNode, stale: staleRun, onOpenLightbox: setLightbox })),
                 h('div', { style: { ...styles.row, marginTop: 8 } }, nodeArtifacts && Object.entries(nodeArtifacts.artifacts || {}).sort(([a], [b]) => compare(a, b)).map(([label, path]) => artifactButton(label, path)))),
               h('h3', { style: { ...styles.heading, marginTop: 18 } }, 'Workflow folder'),
