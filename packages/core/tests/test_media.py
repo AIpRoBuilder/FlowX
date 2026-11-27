@@ -18,7 +18,7 @@ import pytest
 from flowx_core.architect.graph import NodeMeta
 from flowx_core.auditor.main_entrypoint_auditor import MainEntryPointAuditor
 from flowx_core.auditor.node_auditor import NodeAuditor
-from flowx_core.media import (
+from flowx_core.service.media import (
     REQUEST_ID_STATE_KEY,
     WORKFLOW_ROOT_STATE_KEY,
     media_space,
@@ -159,7 +159,7 @@ class PromptInput(WorkflowStepNode):
     poster_src = '''from typing import Any
 from ag_ui_workflow.nodes import WorkflowStepNode
 from ag_ui_workflow.workflow_types import StepRunOutput
-from flowx_core.media import media_space
+from flowx_core.service.media import media_space
 
 
 class GeneratePoster(WorkflowStepNode):
@@ -198,7 +198,7 @@ class GeneratePoster(WorkflowStepNode):
     video_src = '''from typing import Any
 from ag_ui_workflow.nodes import WorkflowStepNode
 from ag_ui_workflow.workflow_types import StepRunOutput
-from flowx_core.media import media_space
+from flowx_core.service.media import media_space
 
 
 class AnimateClip(WorkflowStepNode):
@@ -331,7 +331,7 @@ class PromptInput(WorkflowStepNode):
     (service_pkg / "RenderPoster.py").write_text(
         '''from ag_ui_workflow.nodes import WorkflowStepNode
 from ag_ui_workflow.workflow_types import StepRunOutput
-from flowx_core.media import media_space
+from flowx_core.service.media import media_space
 
 class RenderPoster(WorkflowStepNode):
     STEP_ID = "RenderPoster"
@@ -355,7 +355,7 @@ class RenderPoster(WorkflowStepNode):
     (service_pkg / "MakeTrailer.py").write_text(
         '''from ag_ui_workflow.nodes import WorkflowStepNode
 from ag_ui_workflow.workflow_types import StepRunOutput
-from flowx_core.media import media_space
+from flowx_core.service.media import media_space
 
 class MakeTrailer(WorkflowStepNode):
     STEP_ID = "MakeTrailer"
@@ -423,12 +423,33 @@ class MakeTrailer(WorkflowStepNode):
 
             run_record = json.loads((workflow_root / "runs" / run_id / "run.json").read_text(encoding="utf-8"))
             assert run_record["status"] == "completed"
+            assert run_record["awaiting"] is None
             assert set(run_record["nodes"]) == {"PromptInput", "RenderPoster", "MakeTrailer"}
             assert run_record["nodes"]["PromptInput"]["card"]["kind"] == "prompt"
             img_rel = run_record["nodes"]["RenderPoster"]["card"]["media"]
             vid_rel = run_record["nodes"]["MakeTrailer"]["card"]["media"]
             assert (workflow_root / img_rel).is_file()
             assert (workflow_root / vid_rel).is_file()
+
+            # Subsequent passes on the same sessionId must rotate to fresh completed run folders.
+            seen_ids = {run_id}
+            for prompt_text in ("Alpine observatory at dawn", "Desert train under stars"):
+                again = client.post(
+                    "/api/run-step",
+                    json={"sessionId": "sess-1", "stepId": "PromptInput", "input": prompt_text},
+                )
+                assert again.status_code == 200
+                assert "RUN_FINISHED" in again.text
+                latest_next = json.loads((workflow_root / "runs" / "latest.json").read_text(encoding="utf-8"))
+                assert latest_next["status"] == "completed"
+                next_id = latest_next["run_id"]
+                assert next_id not in seen_ids
+                seen_ids.add(next_id)
+                next_record = json.loads((workflow_root / "runs" / next_id / "run.json").read_text(encoding="utf-8"))
+                assert next_record["status"] == "completed"
+                assert next_record["awaiting"] is None
+                assert next_record["nodes"]["PromptInput"]["card"]["prompt"] == prompt_text
+            assert len(seen_ids) == 3
     finally:
         for loaded in list(sys.modules):
             if loaded == service_pkg.name or loaded.startswith(service_pkg.name + "."):

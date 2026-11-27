@@ -5,6 +5,7 @@
 # Modified 2026-11-16: seed workflow root/request id on pool lease and tee SSE run journal.
 # Modified 2026-11-25: decode single or multiple HTTP file uploads into dict[str, bytes] for WorkflowFileNode.
 # Modified 2026-11-26: expose GET /api/steps and validate declared inputs_format on run-step.
+# Modified 2026-11-27: use DAG-aware flowx_core.service.run_journal.RunJournal to rotate run IDs per workflow pass.
 from __future__ import annotations
 
 import base64
@@ -28,7 +29,7 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ag_ui_workflow import StepMeta, WorkflowEngine, WorkflowPipelinePool
-from flowx_core.media import RunJournal
+from flowx_core.service.run_journal import RunJournal
 
 from __NODES_PACKAGE_NAME__ import (
 __NODE_IMPORTS__
@@ -53,7 +54,6 @@ ENGINE: WorkflowEngine | None = None
 GRAPH_NODES: dict[str, dict[str, Any]] = {}
 SESSION_REQUESTS: dict[str, str] = {}
 _REQUEST_LOCK = Lock()
-RUN_JOURNAL = RunJournal(_WORKFLOW_ROOT)
 
 NODES = (
 __NODE_CLASS_ITEMS__
@@ -63,6 +63,7 @@ NODE_CLASSES = {node.STEP_ID: node for node in NODES}
 STEP_CHAIN: list[StepMeta] = [
 __STEP_CHAIN_ITEMS__
 ]
+RUN_JOURNAL = RunJournal(_WORKFLOW_ROOT, steps=STEP_CHAIN)
 
 
 def _ordered_node_classes() -> list[type]:
@@ -146,6 +147,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await run_in_threadpool(PIPELINE_POOL.close)
             ENGINE = None
             SESSION_REQUESTS.clear()
+            RUN_JOURNAL.clear_sessions()
 
 
 app = FastAPI(title="AG-UI Lifecycle Backend - __APP_NAME__", lifespan=lifespan)
@@ -213,11 +215,16 @@ def _get_engine() -> WorkflowEngine:
     return ENGINE
 
 
-def _get_request_id(session_id: str) -> str:
+def _get_request_id(session_id: str, step_id: str, engine: WorkflowEngine) -> str:
     with _REQUEST_LOCK:
-        if session_id not in SESSION_REQUESTS:
-            SESSION_REQUESTS[session_id] = str(uuid4())
-        return SESSION_REQUESTS[session_id]
+        request_id, _ = RUN_JOURNAL.resolve_run_id(
+            session_id,
+            step_id,
+            current_run_id=SESSION_REQUESTS.get(session_id),
+            on_abandon=engine.close,
+        )
+        SESSION_REQUESTS[session_id] = request_id
+        return request_id
 
 
 def _decode_base64_bytes(encoded: Any) -> bytes:
@@ -383,7 +390,7 @@ def run_step(payload: RunStepInput) -> StreamingResponse:
         normalized_input = payload.input
 
     engine = _get_engine()
-    request_id = _get_request_id(payload.sessionId)
+    request_id = _get_request_id(payload.sessionId, step_id, engine)
     # Subclasses install their own setWaitFunc callbacks; the engine never does.
     return StreamingResponse(
         RUN_JOURNAL.tee(
@@ -406,6 +413,7 @@ def reset_session(payload: ResetSessionInput) -> ResetSessionOutput:
             RUN_JOURNAL.mark_cancelled(request_id)
         new_request_id = str(uuid4())
         SESSION_REQUESTS[payload.sessionId] = new_request_id
+        RUN_JOURNAL.bind_session_run(payload.sessionId, new_request_id)
     # Preserve HTTP field names, not removed engine attributes.
     return ResetSessionOutput(
         ok=True,

@@ -155,7 +155,7 @@ the user to set the specific variables before a real run.
   forces node tests into dry run (`FLOWX_MEDIA_DRY_RUN=1`), so passing tests do
   not prove provider behavior; a smoke test and real runs can call paid APIs.
   Obtain authorization before the first real run and report that cost clearly.
-- Media nodes use `flowx_core.media`: `space = media_space(self.STEP_ID,
+- Media nodes use `flowx_core.service.media`: `space = media_space(self.STEP_ID,
   session_state)` and `generate_image`, `generate_video`, `save_image`,
   `save_bytes`, `resize_image`, `crop_image`, `ffmpeg_trim_resize`, `ffmpeg`, or
   `blender_render`. A node that calls a provider directly, reads private

@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # FlowX-Origin: urn:uuid:ea62b8c8-902a-4eb4-a42e-e5412ed08466
 # Upstream: https://github.com/AIpRoBuilder/FlowX
-"""Media workspace, functional transforms, provider adapters, and run journaling."""
+# Moved 2026-11-27 from flowx_core/media.py into flowx_core/service/media.py;
+# RunJournal moved to flowx_core/service/run_journal.py.
+"""Media workspace, functional transforms, and provider adapters."""
 
 from __future__ import annotations
 
@@ -23,14 +25,13 @@ import urllib.parse
 import urllib.request
 import uuid
 import zlib
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
 from typing import Any
 
-_SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+from flowx_core.service.run_journal import _safe_segment
+
 _SAFE_EXTENSION = re.compile(r"^\.[A-Za-z0-9]{1,8}$")
 
 WORKFLOW_ROOT_STATE_KEY = "__flowx_workflow_root__"
@@ -42,23 +43,9 @@ _BLENDER_ENABLE_ENV = "FLOWX_ENABLE_BLENDER"
 _DEFAULT_DOWNLOAD_LIMIT = 200 * 1024 * 1024  # 200 MiB
 
 
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 def _truthy_env(name: str) -> bool:
     value = os.environ.get(name, "").strip().lower()
     return value in {"1", "true", "yes", "on"}
-
-
-def _safe_segment(value: str, fallback: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("._")
-    if not cleaned:
-        cleaned = fallback
-    cleaned = cleaned[:96]
-    if not _SAFE_SEGMENT.match(cleaned):
-        return fallback
-    return cleaned
 
 
 def _safe_extension(ext: str, default: str = ".bin") -> str:
@@ -85,16 +72,6 @@ def _guess_mime(path: Path, fallback: str = "application/octet-stream") -> str:
         return known[suffix]
     guessed, _ = mimetypes.guess_type(path.name)
     return guessed or fallback
-
-
-def _write_json_atomic(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        temp.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temp, path)
-    finally:
-        temp.unlink(missing_ok=True)
 
 
 def _minimal_png_bytes(width: int = 64, height: int = 64, rgb: tuple[int, int, int] = (72, 98, 218)) -> bytes:
@@ -878,216 +855,10 @@ def prompt_card(prompt: str, *, label: str = "Prompt", extra: Mapping[str, Any] 
     return card
 
 
-@dataclass
-class _RunSnapshot:
-    run_id: str
-    session_id: str
-    workflow_version: int
-    status: str = "running"
-    created_at: str = field(default_factory=_utc_iso)
-    updated_at: str = field(default_factory=_utc_iso)
-    awaiting: dict[str, Any] | None = None
-    error: str | None = None
-    nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "schema_version": 1,
-            "run_id": self.run_id,
-            "session_id": self.session_id,
-            "workflow_version": self.workflow_version,
-            "status": self.status,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "awaiting": self.awaiting,
-            "error": self.error,
-            "nodes": self.nodes,
-        }
-
-
-class RunJournal:
-    """Thread-safe filesystem run journal writing `<workflow_root>/runs/<run_id>/run.json`."""
-
-    def __init__(self, workflow_root: str | os.PathLike[str], *, workflow_version: int | None = None) -> None:
-        self.workflow_root = Path(workflow_root).expanduser().resolve()
-        self.runs_dir = self.workflow_root / "runs"
-        self._lock = RLock()
-        self._explicit_version = workflow_version
-        self._snapshots: dict[str, _RunSnapshot] = {}
-
-    def _detect_workflow_version(self) -> int:
-        if self._explicit_version is not None:
-            return int(self._explicit_version)
-        manifest_path = self.workflow_root / "manifest.json"
-        try:
-            if manifest_path.is_file():
-                data = json.loads(manifest_path.read_text(encoding="utf-8"))
-                ver = data.get("workflow_version")
-                if isinstance(ver, int) and not isinstance(ver, bool) and ver >= 0:
-                    return ver
-        except Exception:
-            pass
-        return 0
-
-    def _load_or_create(self, run_id: str, session_id: str) -> _RunSnapshot:
-        safe_id = _safe_segment(run_id, "run")
-        snap = self._snapshots.get(safe_id)
-        if snap is not None:
-            if session_id:
-                snap.session_id = session_id
-            return snap
-        existing_file = self.runs_dir / safe_id / "run.json"
-        if existing_file.is_file():
-            try:
-                raw = json.loads(existing_file.read_text(encoding="utf-8"))
-                snap = _RunSnapshot(
-                    run_id=safe_id,
-                    session_id=str(raw.get("session_id") or session_id),
-                    workflow_version=int(raw.get("workflow_version") or self._detect_workflow_version()),
-                    status=str(raw.get("status") or "running"),
-                    created_at=str(raw.get("created_at") or _utc_iso()),
-                    updated_at=_utc_iso(),
-                    awaiting=raw.get("awaiting") if isinstance(raw.get("awaiting"), dict) else None,
-                    error=raw.get("error") if isinstance(raw.get("error"), str) else None,
-                    nodes=dict(raw.get("nodes") or {}),
-                )
-                self._snapshots[safe_id] = snap
-                return snap
-            except Exception:
-                pass
-        snap = _RunSnapshot(
-            run_id=safe_id,
-            session_id=session_id,
-            workflow_version=self._detect_workflow_version(),
-        )
-        self._snapshots[safe_id] = snap
-        return snap
-
-    def _flush(self, snap: _RunSnapshot) -> None:
-        snap.updated_at = _utc_iso()
-        payload = snap.to_dict()
-        run_file = self.runs_dir / snap.run_id / "run.json"
-        _write_json_atomic(run_file, payload)
-        _write_json_atomic(
-            self.runs_dir / "latest.json",
-            {
-                "schema_version": 1,
-                "run_id": snap.run_id,
-                "session_id": snap.session_id,
-                "workflow_version": snap.workflow_version,
-                "status": snap.status,
-                "updated_at": snap.updated_at,
-            },
-        )
-
-    def mark_cancelled(self, run_id: str) -> None:
-        safe_id = _safe_segment(run_id, "run")
-        with self._lock:
-            snap = self._snapshots.get(safe_id)
-            if snap is None and not (self.runs_dir / safe_id / "run.json").is_file():
-                return
-            snap = self._load_or_create(safe_id, "")
-            if snap.status in {"running", "input_required"}:
-                snap.status = "cancelled"
-                snap.awaiting = None
-                self._flush(snap)
-
-    def tee(self, run_id: str, session_id: str, events: Iterator[str]) -> Iterator[str]:
-        """Yield SSE lines unchanged while atomically journaling per-node status and cards."""
-        safe_id = _safe_segment(run_id, "run")
-        with self._lock:
-            snap = self._load_or_create(safe_id, session_id)
-            snap.status = "running"
-            snap.awaiting = None
-            snap.error = None
-            self._flush(snap)
-        for chunk in events:
-            self._ingest_chunk(safe_id, session_id, chunk)
-            yield chunk
-
-    def _ingest_chunk(self, safe_id: str, session_id: str, chunk: str) -> None:
-        for line in chunk.splitlines():
-            if not line.startswith("data:"):
-                continue
-            try:
-                event = json.loads(line[5:].strip())
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            with self._lock:
-                snap = self._load_or_create(safe_id, session_id)
-                etype = str(event.get("type") or "")
-                ename = str(event.get("name") or "")
-                if etype == "STEP_STARTED":
-                    step_name = str(event.get("stepName") or "").strip()
-                    if step_name:
-                        prev = snap.nodes.get(step_name) or {}
-                        snap.nodes[step_name] = {
-                            **prev,
-                            "status": "running",
-                            "updated_at": _utc_iso(),
-                        }
-                        self._flush(snap)
-                elif ename == "step_card" and isinstance(event.get("value"), Mapping):
-                    val = event["value"]
-                    step_name = str(val.get("stepId") or "").strip()
-                    if step_name:
-                        card = val.get("card")
-                        snap.nodes[step_name] = {
-                            "status": str(val.get("state") or "completed"),
-                            "title": str(val.get("title") or step_name),
-                            "card": dict(card) if isinstance(card, Mapping) else {},
-                            "is_final": bool(val.get("isFinal")),
-                            "updated_at": _utc_iso(),
-                        }
-                        self._flush(snap)
-                elif ename == "input_required" and isinstance(event.get("value"), Mapping):
-                    val = event["value"]
-                    step_name = str(val.get("stepId") or "").strip()
-                    snap.status = "input_required"
-                    snap.awaiting = {
-                        "stepId": step_name,
-                        "title": str(val.get("title") or ""),
-                        "prompt": str(val.get("prompt") or ""),
-                    }
-                    if step_name:
-                        prev = snap.nodes.get(step_name) or {}
-                        snap.nodes[step_name] = {
-                            **prev,
-                            "status": "awaiting_input",
-                            "updated_at": _utc_iso(),
-                        }
-                    self._flush(snap)
-                elif etype == "RUN_ERROR":
-                    snap.status = "failed"
-                    snap.error = str(event.get("message") or "Workflow step failed")
-                    self._flush(snap)
-                elif etype == "RUN_FINISHED":
-                    res = event.get("result") if isinstance(event.get("result"), Mapping) else {}
-                    if res.get("ok") is False:
-                        snap.status = "failed"
-                        failed_step = str(res.get("stepId") or "").strip()
-                        if failed_step:
-                            prev = snap.nodes.get(failed_step) or {}
-                            snap.nodes[failed_step] = {
-                                **prev,
-                                "status": "failed",
-                                "updated_at": _utc_iso(),
-                            }
-                    elif res.get("awaitingInput") or snap.awaiting:
-                        snap.status = "input_required"
-                    else:
-                        snap.status = "completed"
-                        snap.awaiting = None
-                    self._flush(snap)
-
-
 __all__ = [
     "MediaAsset",
     "MediaSpace",
     "REQUEST_ID_STATE_KEY",
-    "RunJournal",
     "WORKFLOW_ROOT_STATE_KEY",
     "WORKFLOW_VERSION_STATE_KEY",
     "media_space",
